@@ -160,7 +160,7 @@ export function allocString(mod: FirebirdWasmModule, str: string): number {
 
 type ModuleFactory = (opts?: Record<string, unknown>) => Promise<FirebirdWasmModule>;
 
-async function resolveFactory(options: WasmLoadOptions): Promise<ModuleFactory> {
+async function resolveFactory(_options: WasmLoadOptions): Promise<ModuleFactory> {
   // Node.js environment
   if (typeof globalThis !== 'undefined' && typeof (globalThis as Record<string, unknown>)['process'] !== 'undefined') {
     try {
@@ -180,7 +180,6 @@ async function resolveFactory(options: WasmLoadOptions): Promise<ModuleFactory> 
     return g['createFirebirdModule'] as ModuleFactory;
   }
 
-  void options;
   throw new Error(
     'Could not locate the Firebird WASM module.  ' +
       'In browsers, load firebird-embedded.js via a <script> tag before calling loadFirebirdWasm().',
