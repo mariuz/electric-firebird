@@ -14,7 +14,7 @@ jobs:
 
     services:
       firebird:
-        image: firebirdsql/firebird:5.0
+        image: firebirdsql/firebird:5
         env:
           FIREBIRD_ROOT_PASSWORD: masterkey
           FIREBIRD_DATABASE: test.fdb
