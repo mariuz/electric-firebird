@@ -23,7 +23,7 @@ jobs:
         ports:
           - 3050:3050
         options: >-
-          --health-cmd "nc -z localhost 3050"
+          --health-cmd "/bin/bash -c 'echo > /dev/tcp/localhost/3050'"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 12
