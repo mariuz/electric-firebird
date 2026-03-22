@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Test artifacts
+coverage/
+playwright-report/
+test-results/
+
+# Firebird database files
+*.fdb
+*.fdb-journal
+
+# Misc
+.DS_Store
+*.log
