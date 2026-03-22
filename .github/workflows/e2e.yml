@@ -1,0 +1,73 @@
+name: E2E Tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  e2e:
+    name: Playwright E2E Tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    services:
+      firebird:
+        image: jacobalberty/firebird:3.0
+        env:
+          ISC_PASSWORD: masterkey
+          FIREBIRD_DATABASE: /firebird/data/test.fdb
+          FIREBIRD_USER: sysdba
+          FIREBIRD_PASSWORD: masterkey
+        ports:
+          - 3050:3050
+        options: >-
+          --health-cmd "nc -z localhost 3050"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install Firebird client library
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libfbclient2
+          sudo ln -sf /usr/lib/x86_64-linux-gnu/libfbclient.so.2 \
+                      /usr/lib/x86_64-linux-gnu/libfbclient.so
+
+      - name: Install root dependencies
+        run: npm install
+
+      - name: Build packages
+        run: npm run build -w packages/firebird-wasm
+
+      - name: Install Playwright browsers
+        working-directory: e2e
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Playwright e2e tests
+        working-directory: e2e
+        env:
+          CI: 'true'
+          FIREBIRD_HOST: localhost
+          FIREBIRD_USER: SYSDBA
+          FIREBIRD_PASSWORD: masterkey
+        run: npx playwright test
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: e2e/playwright-report/
+          retention-days: 30
