@@ -4,8 +4,20 @@
   "description": "Firebird embedded in WASM, similar to PGlite for PostgreSQL",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "browser": "dist/browser/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./browser": {
+      "types": "./dist/browser/index.d.ts",
+      "default": "./dist/browser/index.js"
+    }
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "build:wasm": "bash wasm/build.sh",
     "test": "jest --forceExit",
     "lint": "eslint src --ext .ts",
     "clean": "rm -rf dist"
@@ -15,7 +27,9 @@
     "wasm",
     "embedded",
     "database",
-    "sql"
+    "sql",
+    "indexeddb",
+    "browser"
   ],
   "author": "mariuz",
   "license": "Apache-2.0",
@@ -36,6 +50,7 @@
     "preset": "ts-jest",
     "testEnvironment": "node",
     "testMatch": ["**/src/**/*.test.ts", "**/src/**/__tests__/**/*.test.ts"],
-    "testTimeout": 30000
+    "testTimeout": 30000,
+    "testPathIgnorePatterns": ["/node_modules/", "/src/browser/"]
   }
 }

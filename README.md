@@ -13,6 +13,8 @@ This monorepo contains:
 
 ## Quick start
 
+### Node.js (native driver)
+
 ```ts
 import { FirebirdLite } from 'firebird-wasm';
 
@@ -30,12 +32,28 @@ console.log(result.rows); // [ { ID: 1, NAME: 'hello' } ]
 await db.close();
 ```
 
+### Browser (WASM + IndexedDB)
+
+```ts
+import { FirebirdBrowser } from 'firebird-wasm/browser';
+
+const db = new FirebirdBrowser('mydb');
+
+await db.exec('CREATE TABLE items (id INTEGER, name VARCHAR(100))');
+const result = await db.query('SELECT * FROM items');
+console.log(result.rows);
+
+// Persist to IndexedDB before page unload
+await db.persist();
+await db.close();
+```
+
 ## Setup
 
 ### Requirements
 
 - Node.js 20+
-- Firebird 3.0 client library (`libfbclient.so` / `fbclient.dll`)
+- Firebird client library (`libfbclient.so` / `fbclient.dll`)
 
 ### Install
 
@@ -60,21 +78,50 @@ cd e2e
 FIREBIRD_PASSWORD=<password> npx playwright test
 ```
 
+### Build the WASM module (optional)
+
+Requires the [Emscripten SDK](https://emscripten.org/docs/getting_started/downloads.html):
+
+```bash
+source <emsdk>/emsdk_env.sh
+npm run build:wasm -w packages/firebird-wasm
+```
+
 ## Architecture
 
-The library uses the Firebird **Embedded Server** (single-process mode) via the
-[node-firebird-driver-native](https://github.com/asfernandes/node-firebird-drivers/tree/master/packages/node-firebird-driver-native)
-high-level TypeScript client. In embedded mode only one application process
-accesses the database file, providing an effective single-user context —
-analogous to how PGlite uses PostgreSQL's single-user mode.
+The library provides two execution backends:
+
+1. **Node.js** – Uses the Firebird **Embedded Server** (single-process mode) via
+   [node-firebird-driver-native](https://github.com/asfernandes/node-firebird-drivers/tree/master/packages/node-firebird-driver-native).
+
+2. **Browser (WASM)** – Compiles the Firebird embedded engine (`libfbembed`) to
+   WebAssembly via [Emscripten](https://emscripten.org).  Database pages are
+   persisted to **IndexedDB** so data survives page reloads.
+
+```
+┌─────────────────────────────────────────────────┐
+│  Application code (shared QueryResult/Row types) │
+├────────────────────┬────────────────────────────┤
+│  FirebirdLite      │  FirebirdBrowser           │
+│  (Node.js native)  │  (WASM + IndexedDB)        │
+├────────────────────┼────────────────────────────┤
+│  libfbclient.so    │  firebird-embedded.wasm    │
+│                    │  + IndexedDB VFS            │
+└────────────────────┴────────────────────────────┘
+```
 
 ### Roadmap
 
-- [ ] True WASM build compiled with Emscripten
-- [ ] Browser support via the WASM bundle
-- [ ] IndexedDB persistence layer for browsers
+- [x] True WASM build infrastructure (Emscripten CMake + build script)
+- [x] Browser support module (`FirebirdBrowser`)
+- [x] IndexedDB persistence layer (`IndexedDBVFS`)
+- [ ] Pre-built WASM binary published to npm
+- [ ] Firebird 4 & 5 support
 
 ## CI
+
+Both CI workflows use the official
+[firebirdsql/firebird](https://hub.docker.com/r/firebirdsql/firebird) Docker image.
 
 | Workflow | Trigger |
 |----------|---------|

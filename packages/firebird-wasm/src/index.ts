@@ -26,3 +26,12 @@ export type {
   TransactionOptions,
   IsolationLevel,
 } from './types';
+
+// WASM loader (available on all platforms)
+export { loadFirebirdWasm, allocString } from './wasm-loader';
+export type {
+  FirebirdWasmModule,
+  WasmLoadOptions,
+  EmscriptenFS,
+  FbHandle,
+} from './wasm-loader';
