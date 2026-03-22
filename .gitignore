@@ -14,6 +14,11 @@ test-results/
 *.fdb
 *.fdb-journal
 
+# WASM build artifacts
+packages/firebird-wasm/wasm/build/
+packages/firebird-wasm/wasm/firebird-src/
+*.wasm
+
 # Misc
 .DS_Store
 *.log

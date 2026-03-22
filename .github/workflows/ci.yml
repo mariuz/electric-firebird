@@ -14,19 +14,19 @@ jobs:
 
     services:
       firebird:
-        image: jacobalberty/firebird:3.0
+        image: firebirdsql/firebird:5.0
         env:
-          ISC_PASSWORD: masterkey
-          FIREBIRD_DATABASE: /firebird/data/test.fdb
-          FIREBIRD_USER: sysdba
+          FIREBIRD_ROOT_PASSWORD: masterkey
+          FIREBIRD_DATABASE: test.fdb
+          FIREBIRD_USER: SYSDBA
           FIREBIRD_PASSWORD: masterkey
         ports:
           - 3050:3050
         options: >-
           --health-cmd "nc -z localhost 3050"
-          --health-interval 5s
+          --health-interval 10s
           --health-timeout 5s
-          --health-retries 10
+          --health-retries 12
 
     steps:
       - name: Checkout
