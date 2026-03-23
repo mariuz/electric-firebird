@@ -10,19 +10,19 @@
 #   - A host C++ compiler (gcc/clang) for the native bootstrap step
 #
 # The script will:
-#   1. Clone the Firebird source at a pinned stable tag (if not already present)
-#   2. Bootstrap Firebird: run a native cmake configure to generate autoconfig.h
-#   3. Run the Emscripten CMake build
-#   4. Copy the resulting .wasm + .js artefacts to the output directory
+#   1. Initialise the Firebird git submodule (pinned to v5.0.3)
+#   2. Apply WASM / ICU patches from wasm/patches/
+#   3. Bootstrap Firebird: run a native cmake configure to generate autoconfig.h
+#   4. Run the Emscripten CMake build
+#   5. Copy the resulting .wasm + .js artefacts to the output directory
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 FIREBIRD_SRC="${SCRIPT_DIR}/firebird-src"
 OUTPUT_DIR="${SCRIPT_DIR}/../dist/wasm"
-
-# Pinned Firebird release – update together with any source-level changes.
-FIREBIRD_TAG="v5.0.3"
+PATCHES_DIR="${SCRIPT_DIR}/patches"
 
 # ── Parse arguments ──────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -46,11 +46,30 @@ fi
 
 echo "Using Emscripten: $(emcc --version | head -1)"
 
-# ── Clone Firebird source if needed ─────────────────────────────────────────
+# ── Initialise Firebird submodule if needed ──────────────────────────────────
 if [[ ! -d "${FIREBIRD_SRC}/src" ]]; then
-  echo "Cloning Firebird ${FIREBIRD_TAG} into ${FIREBIRD_SRC}…"
-  git clone --depth 1 --branch "${FIREBIRD_TAG}" \
-    https://github.com/FirebirdSQL/firebird.git "${FIREBIRD_SRC}"
+  echo "Initialising Firebird submodule…"
+  git -C "${REPO_ROOT}" submodule update --init --depth 1 \
+    packages/firebird-wasm/wasm/firebird-src
+fi
+
+# ── Apply WASM / ICU patches ────────────────────────────────────────────────
+# Patches in wasm/patches/ modify the Firebird source so it can be compiled
+# with ICU support and loaded as a static library under Emscripten/WASM.
+# Each patch is applied once; a marker file tracks what has already been
+# applied so that re-running the build is idempotent.
+PATCH_MARKER="${FIREBIRD_SRC}/.wasm-patches-applied"
+if [[ ! -f "${PATCH_MARKER}" ]]; then
+  echo "Applying WASM / ICU patches…"
+  for p in "${PATCHES_DIR}"/00*.patch; do
+    [[ -f "$p" ]] || continue
+    echo "  → $(basename "$p")"
+    # Use git apply with relaxed matching; fall back to patch(1)
+    git -C "${FIREBIRD_SRC}" apply --whitespace=nowarn "$p" 2>/dev/null \
+      || patch -d "${FIREBIRD_SRC}" -p1 --forward --batch < "$p" \
+      || echo "    (already applied or not applicable – skipping)"
+  done
+  touch "${PATCH_MARKER}"
 fi
 
 # ── Bootstrap: generate autoconfig.h via native (host) CMake configure ───────

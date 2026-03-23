@@ -1,0 +1,86 @@
+diff --git a/src/common/unicode_util.cpp b/src/common/unicode_util.cpp
+index 86eec7d86b..4c76a1b635 100644
+--- a/src/common/unicode_util.cpp
++++ b/src/common/unicode_util.cpp
+@@ -55,6 +55,7 @@
+ 
+ using namespace Firebird;
+ 
++#ifndef __EMSCRIPTEN__
+ namespace {
+ #if defined(WIN_NT)
+ const char* const inTemplate = "icuin%s.dll";
+@@ -481,11 +482,18 @@ private:
+ 	AutoPtr<ModuleLoader::Module> inModule;
+ };
+ 
++#endif // !__EMSCRIPTEN__
++
++#ifdef __EMSCRIPTEN__
++static UnicodeUtil::ConversionICU* convIcu = nullptr;
++#else
+ static ImplementConversionICU* convIcu = NULL;
+ static GlobalPtr<Mutex> convIcuMutex;
++#endif // __EMSCRIPTEN__
+ 
+ 
+ // cache ICU module instances to not load and unload many times
++#ifndef __EMSCRIPTEN__
+ class UnicodeUtil::ICUModules
+ {
+ 	typedef GenericMap<Pair<Left<string, ICU*> > > ModulesMap;
+@@ -511,6 +519,7 @@ public:
+ static const char* const COLL_30_VERSION = "41.128.4.4";	// ICU 3.0 collator version
+ 
+ static GlobalPtr<UnicodeUtil::ICUModules> icuModules;
++#endif // !__EMSCRIPTEN__
+ 
+ 
+ static void getVersions(const string& configInfo, ObjectsArray<string>& versions)
+@@ -1139,6 +1148,14 @@ void UnicodeUtil::utf8Normalize(UCharBuffer& data)
+ 	}
+ }
+ 
++#ifdef __EMSCRIPTEN__
++// Emscripten/WASM: ICU dynamic loading is not available.
++UnicodeUtil::ICU* UnicodeUtil::loadICU(const Firebird::string& /*icuVersion*/,
++	const Firebird::string& /*configInfo*/)
++{
++	return NULL;
++}
++#else
+ UnicodeUtil::ICU* UnicodeUtil::loadICU(const string& icuVersion, const string& configInfo)
+ {
+ 	ObjectsArray<string> versions;
+@@ -1271,6 +1288,7 @@ UnicodeUtil::ICU* UnicodeUtil::loadICU(const string& icuVersion, const string& c
+ 
+ 	return NULL;
+ }
++#endif // !__EMSCRIPTEN__
+ 
+ 
+ void UnicodeUtil::getICUVersion(ICU* icu, int& majorVersion, int& minorVersion)
+@@ -1282,6 +1300,15 @@ void UnicodeUtil::getICUVersion(ICU* icu, int& majorVersion, int& minorVersion)
+ 
+ UnicodeUtil::ConversionICU& UnicodeUtil::getConversionICU()
+ {
++#ifdef __EMSCRIPTEN__
++	// Static stub: no dynamic ICU available in WASM.
++	// Return a zero-initialised ConversionICU. Function pointers are NULL;
++	// callers that need ICU will check and raise an appropriate error.
++	static ConversionICU wasmStub = {};
++	wasmStub.vMajor = 0;
++	wasmStub.vMinor = 0;
++	return wasmStub;
++#else
+ 	if (convIcu)
+ 	{
+ 		return *convIcu;
+@@ -1376,6 +1403,7 @@ UnicodeUtil::ConversionICU& UnicodeUtil::getConversionICU()
+ 
+ 	// compiler warning silencer
+ 	return *convIcu;
++#endif // !__EMSCRIPTEN__
+ }
+ 
+ 

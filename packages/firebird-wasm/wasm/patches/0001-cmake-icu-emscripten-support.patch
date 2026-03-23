@@ -1,0 +1,20 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6bb9033ea0..6a78efca04 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -113,7 +113,14 @@ endif()
+ # icu
+ ########################################
+ 
+-if (UNIX)
++if (EMSCRIPTEN)
++    # Emscripten/WASM: accept an externally-provided ICU_INCLUDE_DIR
++    # (typically pointing at stub headers) and skip the library check.
++    if (ICU_INCLUDE_DIR)
++        set(ICU_INCLUDE_DIRS ${ICU_INCLUDE_DIR})
++        include_directories(${ICU_INCLUDE_DIRS})
++    endif()
++elseif (UNIX)
+     if (NOT ICU_INCLUDE_DIR)
+         find_path(ICU_INCLUDE_DIR unicode/ucnv.h
+             PATHS

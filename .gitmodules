@@ -1,0 +1,4 @@
+[submodule "packages/firebird-wasm/wasm/firebird-src"]
+	path = packages/firebird-wasm/wasm/firebird-src
+	url = https://github.com/FirebirdSQL/firebird.git
+	shallow = true
