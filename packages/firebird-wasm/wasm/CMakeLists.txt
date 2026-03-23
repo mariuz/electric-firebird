@@ -109,6 +109,10 @@ set(FB_INCLUDE_DIRS
   "${FIREBIRD_SRC}/extern/decNumber"
   # re2 – include path so that #include "re2/re2.h" and "util/*.h" resolve
   "${FIREBIRD_SRC}/extern/re2"
+  # libcds – Concurrent Data Structures library; jrd/jrd.h unconditionally
+  # includes <cds/threading/model.h>.  Only the headers are needed – no CDS
+  # source files are compiled for the WASM build.
+  "${FIREBIRD_SRC}/extern/libcds"
   # ICU stub headers – Firebird loads ICU dynamically at runtime so only
   # the type/enum definitions are needed at compile time.
   "${CMAKE_CURRENT_SOURCE_DIR}/stubs"
