@@ -16,6 +16,7 @@ test-results/
 
 # WASM build artifacts
 packages/firebird-wasm/wasm/build/
+packages/firebird-wasm/wasm/build-native-config/
 packages/firebird-wasm/wasm/firebird-src/
 *.wasm
 

@@ -1,0 +1,64 @@
+name: Build WASM
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  build-wasm:
+    name: Build Firebird WASM
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Set up Emscripten SDK
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: '3.1.64'
+          actions-cache-folder: 'emsdk-cache'
+
+      - name: Install build tools for Firebird native configure
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake git
+
+      - name: Cache Firebird source and native config
+        uses: actions/cache@v4
+        with:
+          path: |
+            packages/firebird-wasm/wasm/firebird-src
+            packages/firebird-wasm/wasm/build-native-config
+          # Update the version prefix when FIREBIRD_TAG in build.sh changes.
+          key: firebird-src-v5.0.3-${{ hashFiles('packages/firebird-wasm/wasm/build.sh') }}
+          restore-keys: firebird-src-v5.0.3-
+
+      - name: Install root dependencies
+        run: npm install
+
+      - name: Build WASM module (compile Firebird with Emscripten)
+        run: npm run build:wasm -w packages/firebird-wasm
+
+      - name: Build TypeScript package
+        run: npm run build -w packages/firebird-wasm
+
+      - name: Upload WASM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firebird-wasm
+          path: |
+            packages/firebird-wasm/dist/wasm/firebird-embedded.js
+            packages/firebird-wasm/dist/wasm/firebird-embedded.wasm
+          if-no-files-found: error
+          retention-days: 90
