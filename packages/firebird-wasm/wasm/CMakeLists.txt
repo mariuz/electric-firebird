@@ -84,6 +84,9 @@ set(FB_INCLUDE_DIRS
   "${FIREBIRD_SRC}/extern/libtommath"
   "${FIREBIRD_SRC}/extern/libtomcrypt/src/headers"
   "${FIREBIRD_SRC}/extern/decNumber"
+  # ICU stub headers – Firebird loads ICU dynamically at runtime so only
+  # the type/enum definitions are needed at compile time.
+  "${CMAKE_CURRENT_SOURCE_DIR}/stubs"
 )
 
 # ---------------------------------------------------------------------------
@@ -107,9 +110,25 @@ target_compile_definitions(firebird-embedded PRIVATE
   SUPERSERVER=1
   _REENTRANT=1
   LINUX=1
+  # Emscripten's pthread implementation does not provide the GNU/Linux-specific
+  # PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP constant or
+  # pthread_rwlockattr_setkind_np() function used in Firebird's rwlock.h.
+  # The constant's exact value is irrelevant here because the function call
+  # that consumes it is also stubbed out below.
+  PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP=1
   # libtomcrypt compile-time flags (same as upstream Firebird)
   LTC_NO_ROLC
   LTC_SOURCE
+)
+
+# Stub pthread_rwlockattr_setkind_np() as a no-op returning 0 (success).
+# This function only sets a scheduling-preference hint for rwlocks; Firebird
+# does not depend on the preference for correctness, so a silent no-op is
+# safe for the single-threaded / limited-threading WASM environment.
+# We use target_compile_options because CMake's target_compile_definitions
+# drops function-style macros.
+target_compile_options(firebird-embedded PRIVATE
+  "-Dpthread_rwlockattr_setkind_np(a,b)=0"
 )
 
 # ---------------------------------------------------------------------------
