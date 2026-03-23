@@ -70,6 +70,9 @@ file(GLOB_RECURSE FB_COMMON_SRCS
 # unqualified #includes ("tree.h", "alloc.h") that don't resolve with our
 # include paths and are not part of the embedded engine.
 list(FILTER FB_COMMON_SRCS EXCLUDE REGEX ".*/common/classes/misc/.*")
+# Exclude Boost unit tests in classes/tests/ – they require boost/test headers
+# which are not available in the WASM build environment.
+list(FILTER FB_COMMON_SRCS EXCLUDE REGEX ".*/common/classes/tests/.*")
 
 file(GLOB_RECURSE FB_DSQL_SRCS
   "${FIREBIRD_SRC}/src/dsql/*.cpp"
