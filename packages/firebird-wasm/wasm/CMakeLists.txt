@@ -66,6 +66,10 @@ set(RE2_SRCS ${RE2_LIB_SRCS} ${RE2_UTIL_SRCS})
 file(GLOB_RECURSE FB_COMMON_SRCS
   "${FIREBIRD_SRC}/src/common/*.cpp"
 )
+# Exclude standalone test / benchmark utilities in classes/misc/ – they use
+# unqualified #includes ("tree.h", "alloc.h") that don't resolve with our
+# include paths and are not part of the embedded engine.
+list(FILTER FB_COMMON_SRCS EXCLUDE REGEX ".*/common/classes/misc/.*")
 
 file(GLOB_RECURSE FB_DSQL_SRCS
   "${FIREBIRD_SRC}/src/dsql/*.cpp"
