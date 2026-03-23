@@ -34,4 +34,35 @@
 } UPRV_BLOCK_MACRO_END
 #endif
 
+/* ── Code-point byte length ─────────────────────────────────────────────── */
+#ifndef U8_LENGTH
+#define U8_LENGTH(c) \
+    ((uint32_t)(c)<=0x7f ? 1 : \
+        ((uint32_t)(c)<=0x7ff ? 2 : \
+            ((uint32_t)(c)<=0xffff ? 3 : 4)))
+#endif
+
+/* ── Append a code point (unsafe – caller guarantees capacity) ────────── */
+#ifndef U8_APPEND_UNSAFE
+#define U8_APPEND_UNSAFE(s, i, c) UPRV_BLOCK_MACRO_BEGIN { \
+    uint32_t __uc=(c); \
+    if(__uc<=0x7f) { \
+        (s)[(i)++]=(uint8_t)__uc; \
+    } else { \
+        if(__uc<=0x7ff) { \
+            (s)[(i)++]=(uint8_t)((__uc>>6)|0xc0); \
+        } else { \
+            if(__uc<=0xffff) { \
+                (s)[(i)++]=(uint8_t)((__uc>>12)|0xe0); \
+            } else { \
+                (s)[(i)++]=(uint8_t)((__uc>>18)|0xf0); \
+                (s)[(i)++]=(uint8_t)(((__uc>>12)&0x3f)|0x80); \
+            } \
+            (s)[(i)++]=(uint8_t)(((__uc>>6)&0x3f)|0x80); \
+        } \
+        (s)[(i)++]=(uint8_t)((__uc&0x3f)|0x80); \
+    } \
+} UPRV_BLOCK_MACRO_END
+#endif
+
 #endif /* UTF8_H_STUB */

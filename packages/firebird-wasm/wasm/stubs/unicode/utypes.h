@@ -34,4 +34,10 @@ typedef enum UErrorCode {
 #define U_SUCCESS(x) ((x) <= U_ZERO_ERROR)
 #define U_FAILURE(x) ((x) >  U_ZERO_ERROR)
 
+/* In real ICU, utypes.h → utf.h → utf8.h + utf16.h.  Include them here
+   so that any file pulling in utypes.h (directly or transitively via
+   ustring.h, ucol.h, etc.) also gets the UTF helper macros. */
+#include "unicode/utf8.h"
+#include "unicode/utf16.h"
+
 #endif /* UTYPES_H_STUB */

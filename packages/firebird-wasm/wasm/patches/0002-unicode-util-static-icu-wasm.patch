@@ -1,21 +1,11 @@
 diff --git a/src/common/unicode_util.cpp b/src/common/unicode_util.cpp
-index 86eec7d86b..4c76a1b635 100644
+index 86eec7d86b..XXXXXXX 100644
 --- a/src/common/unicode_util.cpp
 +++ b/src/common/unicode_util.cpp
-@@ -55,6 +55,7 @@
- 
- using namespace Firebird;
- 
-+#ifndef __EMSCRIPTEN__
- namespace {
- #if defined(WIN_NT)
- const char* const inTemplate = "icuin%s.dll";
-@@ -481,11 +482,18 @@ private:
+@@ -481,8 +481,14 @@ private:
  	AutoPtr<ModuleLoader::Module> inModule;
  };
  
-+#endif // !__EMSCRIPTEN__
-+
 +#ifdef __EMSCRIPTEN__
 +static UnicodeUtil::ConversionICU* convIcu = nullptr;
 +#else
