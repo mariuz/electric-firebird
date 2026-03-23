@@ -31,6 +31,24 @@ if(NOT EXISTS "${FIREBIRD_SRC}/src/include/firebird.h")
 endif()
 
 # ---------------------------------------------------------------------------
+# Extern library sources (mirroring upstream Firebird CMakeLists.txt)
+# ---------------------------------------------------------------------------
+
+# libtommath – arbitrary-precision integer arithmetic (used by BigInteger)
+file(GLOB LIBTOMMATH_SRCS "${FIREBIRD_SRC}/extern/libtommath/*.c")
+
+# libtomcrypt – cryptographic library (used by auth plugins)
+file(GLOB_RECURSE LIBTOMCRYPT_SRCS "${FIREBIRD_SRC}/extern/libtomcrypt/src/*.c")
+list(FILTER LIBTOMCRYPT_SRCS EXCLUDE REGEX ".*aes_tab\\.c")
+list(FILTER LIBTOMCRYPT_SRCS EXCLUDE REGEX ".*whirltab\\.c")
+list(FILTER LIBTOMCRYPT_SRCS EXCLUDE REGEX ".*sober128tab\\.c")
+
+# decNumber – IEEE 754 decimal-arithmetic library (used by numeric types)
+file(GLOB_RECURSE DECNUMBER_SRCS "${FIREBIRD_SRC}/extern/decNumber/*.c")
+list(FILTER DECNUMBER_SRCS EXCLUDE REGEX ".*decBasic\\.c")
+list(FILTER DECNUMBER_SRCS EXCLUDE REGEX ".*decCommon\\.c")
+
+# ---------------------------------------------------------------------------
 # Collect the embedded-engine source files
 # ---------------------------------------------------------------------------
 # The Firebird embedded engine (libfbembed) is compiled from a subset of the
@@ -57,11 +75,18 @@ file(GLOB_RECURSE FB_LOCK_SRCS
 # Include paths
 # ---------------------------------------------------------------------------
 set(FB_INCLUDE_DIRS
+  # ICU stub headers must come first so that Emscripten finds our minimal
+  # stubs instead of looking for (missing) system ICU packages.
+  "${CMAKE_CURRENT_SOURCE_DIR}/stubs"
   "${FIREBIRD_SRC}/src/include"
   "${FIREBIRD_SRC}/src/include/gen"
   "${FIREBIRD_SRC}/src/common"
   "${FIREBIRD_SRC}/src/jrd"
   "${FIREBIRD_SRC}/src"
+  # Extern headers required by Firebird source
+  "${FIREBIRD_SRC}/extern/libtommath"
+  "${FIREBIRD_SRC}/extern/libtomcrypt/src/headers"
+  "${FIREBIRD_SRC}/extern/decNumber"
 )
 
 # ---------------------------------------------------------------------------
@@ -72,6 +97,9 @@ add_executable(firebird-embedded
   ${FB_DSQL_SRCS}
   ${FB_JRD_SRCS}
   ${FB_LOCK_SRCS}
+  ${LIBTOMMATH_SRCS}
+  ${LIBTOMCRYPT_SRCS}
+  ${DECNUMBER_SRCS}
 )
 
 target_include_directories(firebird-embedded PRIVATE ${FB_INCLUDE_DIRS})
@@ -82,6 +110,14 @@ target_compile_definitions(firebird-embedded PRIVATE
   SUPERSERVER=1
   _REENTRANT=1
   LINUX=1
+  # libtomcrypt compile-time flags (same as upstream Firebird)
+  LTC_NO_ROLC
+  LTC_SOURCE
+  # Emscripten pthreads does not provide the Linux-specific
+  # PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP constant used in
+  # Firebird's rwlock.h.  Define it here so that the code compiles;
+  # the value (1) matches the glibc definition.
+  PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP=1
 )
 
 # ---------------------------------------------------------------------------
