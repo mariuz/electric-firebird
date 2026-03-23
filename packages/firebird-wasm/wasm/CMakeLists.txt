@@ -39,12 +39,16 @@ file(GLOB LIBTOMMATH_SRCS "${FIREBIRD_SRC}/extern/libtommath/*.c")
 
 # libtomcrypt – cryptographic library (used by auth plugins)
 file(GLOB_RECURSE LIBTOMCRYPT_SRCS "${FIREBIRD_SRC}/extern/libtomcrypt/src/*.c")
+# These files are not standalone translation units; they are #included by other
+# libtomcrypt .c files and would cause duplicate-symbol errors if compiled directly.
 list(FILTER LIBTOMCRYPT_SRCS EXCLUDE REGEX ".*aes_tab\\.c")
 list(FILTER LIBTOMCRYPT_SRCS EXCLUDE REGEX ".*whirltab\\.c")
 list(FILTER LIBTOMCRYPT_SRCS EXCLUDE REGEX ".*sober128tab\\.c")
 
 # decNumber – IEEE 754 decimal-arithmetic library (used by numeric types)
 file(GLOB_RECURSE DECNUMBER_SRCS "${FIREBIRD_SRC}/extern/decNumber/*.c")
+# decBasic.c and decCommon.c are #included by decQuad.c / decDouble.c / decSingle.c;
+# compiling them separately would cause duplicate definitions.
 list(FILTER DECNUMBER_SRCS EXCLUDE REGEX ".*decBasic\\.c")
 list(FILTER DECNUMBER_SRCS EXCLUDE REGEX ".*decCommon\\.c")
 
