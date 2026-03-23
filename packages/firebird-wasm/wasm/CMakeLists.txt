@@ -48,6 +48,14 @@ file(GLOB_RECURSE DECNUMBER_SRCS "${FIREBIRD_SRC}/extern/decNumber/*.c")
 list(FILTER DECNUMBER_SRCS EXCLUDE REGEX ".*decBasic\\.c")
 list(FILTER DECNUMBER_SRCS EXCLUDE REGEX ".*decCommon\\.c")
 
+# re2 – regular expression library (used by SimilarToRegex)
+file(GLOB RE2_LIB_SRCS "${FIREBIRD_SRC}/extern/re2/re2/*.cc")
+set(RE2_UTIL_SRCS
+  "${FIREBIRD_SRC}/extern/re2/util/rune.cc"
+  "${FIREBIRD_SRC}/extern/re2/util/strutil.cc"
+)
+set(RE2_SRCS ${RE2_LIB_SRCS} ${RE2_UTIL_SRCS})
+
 # ---------------------------------------------------------------------------
 # Collect the embedded-engine source files
 # ---------------------------------------------------------------------------
@@ -84,6 +92,8 @@ set(FB_INCLUDE_DIRS
   "${FIREBIRD_SRC}/extern/libtommath"
   "${FIREBIRD_SRC}/extern/libtomcrypt/src/headers"
   "${FIREBIRD_SRC}/extern/decNumber"
+  # re2 – include path so that #include "re2/re2.h" and "util/*.h" resolve
+  "${FIREBIRD_SRC}/extern/re2"
   # ICU stub headers – Firebird loads ICU dynamically at runtime so only
   # the type/enum definitions are needed at compile time.
   "${CMAKE_CURRENT_SOURCE_DIR}/stubs"
@@ -100,6 +110,7 @@ add_executable(firebird-embedded
   ${LIBTOMMATH_SRCS}
   ${LIBTOMCRYPT_SRCS}
   ${DECNUMBER_SRCS}
+  ${RE2_SRCS}
 )
 
 target_include_directories(firebird-embedded PRIVATE ${FB_INCLUDE_DIRS})
