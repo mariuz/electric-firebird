@@ -136,7 +136,7 @@ sed -i 's/^#define SIZEOF_LONG[[:space:]]*8/#define SIZEOF_LONG 4/' "${AUTOCONFI
 # However Emscripten's gettimeofday() *requires* two arguments (the second
 # may be NULL).  Replace the 1-arg form with a 2-arg form.
 # The substitution is idempotent.
-sed -i 's|^#define GETTIMEOFDAY(x) gettimeofday((x))$|#define GETTIMEOFDAY(x) gettimeofday((x), (struct timezone *)0)|' "${AUTOCONFIG_SRC}"
+sed -i 's|^#define GETTIMEOFDAY(x) gettimeofday((x))[[:space:]]*$|#define GETTIMEOFDAY(x) gettimeofday((x), (struct timezone *)0)|' "${AUTOCONFIG_SRC}"
 
 # ── CMake configure + build ──────────────────────────────────────────────────
 BUILD_DIR="${SCRIPT_DIR}/build"

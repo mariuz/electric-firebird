@@ -33,7 +33,8 @@ typedef enum {
 /* Wall-time handling attributes used by ucal_setAttribute() */
 typedef enum {
     UCAL_LENIENT,
-    UCAL_STRICT,
+    UCAL_FIRST_DAY_OF_WEEK,
+    UCAL_MINIMAL_DAYS_IN_FIRST_WEEK,
     UCAL_REPEATED_WALL_TIME,
     UCAL_SKIPPED_WALL_TIME
 } UCalendarAttribute;
