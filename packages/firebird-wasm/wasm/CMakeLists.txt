@@ -31,6 +31,24 @@ if(NOT EXISTS "${FIREBIRD_SRC}/src/include/firebird.h")
 endif()
 
 # ---------------------------------------------------------------------------
+# Extern library sources (mirroring upstream Firebird CMakeLists.txt)
+# ---------------------------------------------------------------------------
+
+# libtommath – arbitrary-precision integer arithmetic (used by BigInteger)
+file(GLOB LIBTOMMATH_SRCS "${FIREBIRD_SRC}/extern/libtommath/*.c")
+
+# libtomcrypt – cryptographic library (used by auth plugins)
+file(GLOB_RECURSE LIBTOMCRYPT_SRCS "${FIREBIRD_SRC}/extern/libtomcrypt/src/*.c")
+list(FILTER LIBTOMCRYPT_SRCS EXCLUDE REGEX ".*aes_tab\\.c")
+list(FILTER LIBTOMCRYPT_SRCS EXCLUDE REGEX ".*whirltab\\.c")
+list(FILTER LIBTOMCRYPT_SRCS EXCLUDE REGEX ".*sober128tab\\.c")
+
+# decNumber – IEEE 754 decimal-arithmetic library (used by numeric types)
+file(GLOB_RECURSE DECNUMBER_SRCS "${FIREBIRD_SRC}/extern/decNumber/*.c")
+list(FILTER DECNUMBER_SRCS EXCLUDE REGEX ".*decBasic\\.c")
+list(FILTER DECNUMBER_SRCS EXCLUDE REGEX ".*decCommon\\.c")
+
+# ---------------------------------------------------------------------------
 # Collect the embedded-engine source files
 # ---------------------------------------------------------------------------
 # The Firebird embedded engine (libfbembed) is compiled from a subset of the
@@ -62,6 +80,10 @@ set(FB_INCLUDE_DIRS
   "${FIREBIRD_SRC}/src/common"
   "${FIREBIRD_SRC}/src/jrd"
   "${FIREBIRD_SRC}/src"
+  # Extern headers required by Firebird source
+  "${FIREBIRD_SRC}/extern/libtommath"
+  "${FIREBIRD_SRC}/extern/libtomcrypt/src/headers"
+  "${FIREBIRD_SRC}/extern/decNumber"
 )
 
 # ---------------------------------------------------------------------------
@@ -72,6 +94,9 @@ add_executable(firebird-embedded
   ${FB_DSQL_SRCS}
   ${FB_JRD_SRCS}
   ${FB_LOCK_SRCS}
+  ${LIBTOMMATH_SRCS}
+  ${LIBTOMCRYPT_SRCS}
+  ${DECNUMBER_SRCS}
 )
 
 target_include_directories(firebird-embedded PRIVATE ${FB_INCLUDE_DIRS})
@@ -98,6 +123,9 @@ target_compile_definitions(firebird-embedded PRIVATE
 # drops function-style macros.
 target_compile_options(firebird-embedded PRIVATE
   "-Dpthread_rwlockattr_setkind_np(a,b)=0"
+  # libtomcrypt compile-time flags (same as upstream Firebird)
+  LTC_NO_ROLC
+  LTC_SOURCE
 )
 
 # ---------------------------------------------------------------------------
