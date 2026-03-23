@@ -115,6 +115,7 @@ The library provides two execution backends:
 - [x] True WASM build infrastructure (Emscripten CMake + build script)
 - [x] Browser support module (`FirebirdBrowser`)
 - [x] IndexedDB persistence layer (`IndexedDBVFS`)
+- [x] Pre-built WASM binary published as a CI artifact
 - [ ] Pre-built WASM binary published to npm
 - [ ] Firebird 4 & 5 support
 
@@ -127,6 +128,7 @@ Both CI workflows use the official
 |----------|---------|
 | [CI](.github/workflows/ci.yml) | push / PR — build + unit tests |
 | [E2E](.github/workflows/e2e.yml) | push / PR — Playwright e2e tests |
+| [Build WASM](.github/workflows/build-wasm.yml) | push / PR — compile Firebird to WASM + publish artifact |
 
 ## License
 
