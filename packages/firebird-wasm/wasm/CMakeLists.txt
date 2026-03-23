@@ -73,6 +73,12 @@ list(FILTER FB_COMMON_SRCS EXCLUDE REGEX ".*/common/classes/misc/.*")
 # Exclude Boost unit tests in classes/tests/ – they require boost/test headers
 # which are not available in the WASM build environment.
 list(FILTER FB_COMMON_SRCS EXCLUDE REGEX ".*/common/classes/tests/.*")
+# Exclude Darwin (macOS) and Win32 platform-specific sources – the WASM build
+# targets Emscripten (POSIX-compatible) so only the posix/ implementations
+# are used.  Darwin files require <mach-o/dyld.h>; Win32 files require
+# <windows.h> – neither is available under Emscripten.
+list(FILTER FB_COMMON_SRCS EXCLUDE REGEX ".*/common/os/darwin/.*")
+list(FILTER FB_COMMON_SRCS EXCLUDE REGEX ".*/common/os/win32/.*")
 
 file(GLOB_RECURSE FB_DSQL_SRCS
   "${FIREBIRD_SRC}/src/dsql/*.cpp"
