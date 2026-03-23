@@ -28,10 +28,18 @@ jobs:
           version: '3.1.64'
           actions-cache-folder: 'emsdk-cache'
 
+      - name: Install build tools for Firebird native configure
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake git
+
       - name: Cache Firebird source
         uses: actions/cache@v4
         with:
-          path: packages/firebird-wasm/wasm/firebird-src
+          path: |
+            packages/firebird-wasm/wasm/firebird-src
+            packages/firebird-wasm/wasm/build-native-config
           key: firebird-src-${{ hashFiles('packages/firebird-wasm/wasm/build.sh') }}
           restore-keys: firebird-src-
 

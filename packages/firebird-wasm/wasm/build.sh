@@ -10,8 +10,9 @@
 #
 # The script will:
 #   1. Clone the Firebird source (if not already present)
-#   2. Run the Emscripten CMake build
-#   3. Copy the resulting .wasm + .js artefacts to the output directory
+#   2. Bootstrap Firebird: run a native cmake configure to generate autoconfig.h
+#   3. Run the Emscripten CMake build
+#   4. Copy the resulting .wasm + .js artefacts to the output directory
 
 set -euo pipefail
 
@@ -45,6 +46,32 @@ echo "Using Emscripten: $(emcc --version | head -1)"
 if [[ ! -d "${FIREBIRD_SRC}/src" ]]; then
   echo "Cloning Firebird source into ${FIREBIRD_SRC}…"
   git clone --depth 1 https://github.com/FirebirdSQL/firebird.git "${FIREBIRD_SRC}"
+fi
+
+# ── Bootstrap: generate autoconfig.h via native (host) CMake configure ───────
+# Firebird's source tree requires a configure step to produce
+# src/include/gen/autoconfig.h before any compilation (including
+# cross-compilation with Emscripten) can succeed.
+NATIVE_BUILD_DIR="${SCRIPT_DIR}/build-native-config"
+if [[ ! -f "${FIREBIRD_SRC}/src/include/gen/autoconfig.h" ]]; then
+  echo "Bootstrapping Firebird source (generating autoconfig.h)…"
+  mkdir -p "${NATIVE_BUILD_DIR}"
+  # Run only the configure phase with the host compiler.  It may exit
+  # non-zero if optional Firebird dependencies are absent; that is fine
+  # as long as the configure_file() call that writes autoconfig.h has
+  # already executed.
+  cmake \
+    -B "${NATIVE_BUILD_DIR}" \
+    -S "${FIREBIRD_SRC}" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -Wno-dev 2>&1 || true
+
+  if [[ ! -f "${FIREBIRD_SRC}/src/include/gen/autoconfig.h" ]]; then
+    echo "Error: native CMake configure did not produce autoconfig.h." >&2
+    echo "       Ensure cmake and a host C++ compiler (gcc/clang) are installed." >&2
+    exit 1
+  fi
+  echo "autoconfig.h generated."
 fi
 
 # ── CMake configure + build ──────────────────────────────────────────────────
