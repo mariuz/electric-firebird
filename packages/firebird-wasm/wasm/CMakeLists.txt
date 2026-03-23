@@ -84,6 +84,9 @@ set(FB_INCLUDE_DIRS
   "${FIREBIRD_SRC}/extern/libtommath"
   "${FIREBIRD_SRC}/extern/libtomcrypt/src/headers"
   "${FIREBIRD_SRC}/extern/decNumber"
+  # ICU stub headers – Firebird loads ICU dynamically at runtime so only
+  # the type/enum definitions are needed at compile time.
+  "${CMAKE_CURRENT_SOURCE_DIR}/stubs"
 )
 
 # ---------------------------------------------------------------------------
