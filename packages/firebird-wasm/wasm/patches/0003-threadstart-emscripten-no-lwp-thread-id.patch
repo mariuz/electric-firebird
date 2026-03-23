@@ -1,0 +1,29 @@
+From: Copilot <noreply@github.com>
+Subject: [PATCH] ThreadStart.h: skip USE_LWP_AS_THREAD_ID under Emscripten
+
+Emscripten exposes a POSIX-like API but does not provide the
+Linux-specific SYS_gettid syscall number.  Adding an __EMSCRIPTEN__
+guard prevents USE_LWP_AS_THREAD_ID from being defined so that the
+code falls through to the USE_POSIX_THREADS branch (pthread_self()).
+
+This is a more targeted fix than defining LSB_BUILD, which causes
+ambiguous-call errors in os_utils.h because Emscripten's *64 POSIX
+functions (fgetpos64, readdir64, …) are macros that expand back to
+the base names, clashing with os_utils' inline wrappers.
+---
+ src/common/ThreadStart.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/common/ThreadStart.h b/src/common/ThreadStart.h
+index abcdef0..1234567 100644
+--- a/src/common/ThreadStart.h
++++ b/src/common/ThreadStart.h
+@@ -57,7 +57,7 @@ typedef THREAD_ENTRY_DECLARE ThreadEntryPoint(THREAD_ENTRY_PARAM);
+ 
+ #if defined(WIN_NT)
+ typedef DWORD ThreadId;
+-#elif defined(LINUX) && !defined(ANDROID) && !defined(LSB_BUILD)
++#elif defined(LINUX) && !defined(ANDROID) && !defined(LSB_BUILD) && !defined(__EMSCRIPTEN__)
+ #define USE_LWP_AS_THREAD_ID
+ typedef int ThreadId;
+ #elif defined(USE_POSIX_THREADS)

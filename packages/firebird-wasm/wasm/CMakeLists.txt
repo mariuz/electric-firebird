@@ -134,12 +134,6 @@ target_compile_definitions(firebird-embedded PRIVATE
   # TimeZoneUtil.cpp references it at compile time.  An empty string
   # disables the external tzdata lookup – fine for WASM.
   FB_TZDATADIR=""
-  # Emscripten exposes a POSIX-like API but is not a real Linux kernel.
-  # Setting LSB_BUILD prevents ThreadStart.h from defining
-  # USE_LWP_AS_THREAD_ID, which uses the Linux-specific syscall(SYS_gettid)
-  # that Emscripten does not provide.  The code falls through to the
-  # USE_POSIX_THREADS branch (pthread_self()) instead.
-  LSB_BUILD
 )
 
 # Stub pthread_rwlockattr_setkind_np() as a no-op returning 0 (success).
