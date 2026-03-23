@@ -99,6 +99,17 @@ if [[ ! -f "${AUTOCONFIG_SRC}" ]]; then
   fi
 fi
 
+# ── Patch autoconfig.h for 32-bit WASM ──────────────────────────────────────
+# autoconfig.h is generated on a 64-bit host where sizeof(long)==8, so it
+# contains "#define SIZEOF_LONG 8".  Emscripten targets 32-bit WASM where
+# sizeof(long)==4.  Without this patch fb_types.h defines SLONG as `int`,
+# while types_pub.h (which doesn't see _LP64) redefines ISC_LONG as
+# `signed long`, causing a "typedef redefinition with different types" error.
+# No backup is needed: this file is a generated copy we placed here ourselves;
+# the canonical source is ${NATIVE_BUILD_DIR}/src/include/gen/autoconfig.h.
+# The substitution is idempotent (no-op if already patched to 4).
+sed -i 's/^#define SIZEOF_LONG[[:space:]]*8/#define SIZEOF_LONG 4/' "${AUTOCONFIG_SRC}"
+
 # ── CMake configure + build ──────────────────────────────────────────────────
 BUILD_DIR="${SCRIPT_DIR}/build"
 mkdir -p "${BUILD_DIR}"

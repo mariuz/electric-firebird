@@ -40,6 +40,7 @@ jobs:
           path: |
             packages/firebird-wasm/wasm/firebird-src
             packages/firebird-wasm/wasm/build-native-config
+          # Update the version prefix when FIREBIRD_TAG in build.sh changes.
           key: firebird-src-v5.0.3-${{ hashFiles('packages/firebird-wasm/wasm/build.sh') }}
           restore-keys: firebird-src-v5.0.3-
 
