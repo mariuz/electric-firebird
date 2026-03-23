@@ -138,6 +138,15 @@ sed -i 's/^#define SIZEOF_LONG[[:space:]]*8/#define SIZEOF_LONG 4/' "${AUTOCONFI
 # The substitution is idempotent.
 sed -i 's|^#define GETTIMEOFDAY(x) gettimeofday((x))[[:space:]]*$|#define GETTIMEOFDAY(x) gettimeofday((x), (struct timezone *)0)|' "${AUTOCONFIG_SRC}"
 
+# ── Remove HAVE_ZLIB_H for Emscripten ───────────────────────────────────────
+# The native configure detects zlib on the host and sets HAVE_ZLIB_H, which
+# causes zip.h to #include <zlib.h>.  Emscripten does not ship zlib headers.
+# ZIP compression is used for wire-protocol compression (client ↔ server),
+# which is irrelevant for the embedded WASM engine.  Both zip.h and zip.cpp
+# guard their content with #ifdef HAVE_ZLIB_H, so removing the define makes
+# them compile to empty stubs.  The deletion is idempotent.
+sed -i '/^#define HAVE_ZLIB_H/d' "${AUTOCONFIG_SRC}"
+
 # ── CMake configure + build ──────────────────────────────────────────────────
 BUILD_DIR="${SCRIPT_DIR}/build"
 mkdir -p "${BUILD_DIR}"
