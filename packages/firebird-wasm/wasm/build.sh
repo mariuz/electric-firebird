@@ -129,6 +129,15 @@ fi
 # The substitution is idempotent (no-op if already patched to 4).
 sed -i 's/^#define SIZEOF_LONG[[:space:]]*8/#define SIZEOF_LONG 4/' "${AUTOCONFIG_SRC}"
 
+# ── Patch GETTIMEOFDAY for Emscripten ────────────────────────────────────────
+# The native cmake configure detects that gettimeofday() does NOT accept a
+# second (timezone) argument, so autoconfig.h ends up with:
+#   #define GETTIMEOFDAY(x) gettimeofday((x))
+# However Emscripten's gettimeofday() *requires* two arguments (the second
+# may be NULL).  Replace the 1-arg form with a 2-arg form.
+# The substitution is idempotent.
+sed -i 's|^#define GETTIMEOFDAY(x) gettimeofday((x))$|#define GETTIMEOFDAY(x) gettimeofday((x), (struct timezone *)0)|' "${AUTOCONFIG_SRC}"
+
 # ── CMake configure + build ──────────────────────────────────────────────────
 BUILD_DIR="${SCRIPT_DIR}/build"
 mkdir -p "${BUILD_DIR}"
