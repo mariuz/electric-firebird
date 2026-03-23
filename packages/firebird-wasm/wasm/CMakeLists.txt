@@ -113,6 +113,9 @@ target_compile_definitions(firebird-embedded PRIVATE
   # The constant's exact value is irrelevant here because the function call
   # that consumes it is also stubbed out below.
   PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP=1
+  # libtomcrypt compile-time flags (same as upstream Firebird)
+  LTC_NO_ROLC
+  LTC_SOURCE
 )
 
 # Stub pthread_rwlockattr_setkind_np() as a no-op returning 0 (success).
@@ -123,9 +126,6 @@ target_compile_definitions(firebird-embedded PRIVATE
 # drops function-style macros.
 target_compile_options(firebird-embedded PRIVATE
   "-Dpthread_rwlockattr_setkind_np(a,b)=0"
-  # libtomcrypt compile-time flags (same as upstream Firebird)
-  LTC_NO_ROLC
-  LTC_SOURCE
 )
 
 # ---------------------------------------------------------------------------
