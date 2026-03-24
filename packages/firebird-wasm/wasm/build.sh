@@ -86,11 +86,20 @@ fi
 # to satisfy that check without requiring the full libicu-dev package.
 #
 # Some optional build targets (makeHeader, message databases) reference
-# files that are absent in the released source tree; those cmake errors
-# are non-fatal for our purposes because configure_file() for autoconfig.h
-# runs in the root CMakeLists.txt before add_subdirectory("src").
-# We use `|| true` to allow cmake to exit non-zero while still capturing
-# the generated header.
+# generated files that are absent from the source tree.  CMake's Generate
+# step fails entirely if add_executable / add_custom_target references
+# source files that do not exist, which prevents *any* Makefile from being
+# produced (even for targets we *do* need, like "parse").
+# Create minimal stubs so the cmake Generate step succeeds.
+if [[ ! -f "${FIREBIRD_SRC}/src/misc/makeHeader.cpp" ]]; then
+  mkdir -p "${FIREBIRD_SRC}/src/misc"
+  echo 'int main() { return 0; }' > "${FIREBIRD_SRC}/src/misc/makeHeader.cpp"
+fi
+if [[ ! -f "${FIREBIRD_SRC}/src/msgs/facilities2.sql" ]]; then
+  mkdir -p "${FIREBIRD_SRC}/src/msgs"
+  touch "${FIREBIRD_SRC}/src/msgs/facilities2.sql"
+fi
+
 NATIVE_BUILD_DIR="${SCRIPT_DIR}/build-native-config"
 AUTOCONFIG_NATIVE="${NATIVE_BUILD_DIR}/src/include/gen/autoconfig.h"
 AUTOCONFIG_SRC="${FIREBIRD_SRC}/src/include/gen/autoconfig.h"
@@ -100,7 +109,9 @@ PARSE_CPP_NATIVE="${NATIVE_BUILD_DIR}/src/dsql/parse.cpp"
 PARSE_CPP_SRC="${FIREBIRD_SRC}/src/dsql/parse.cpp"
 
 # Ensure native build directory is configured (needed for both autoconfig.h
-# generation and the parse target).
+# generation and the parse target).  We keep `|| true` as a safety net in
+# case other optional cmake targets fail, but the stubs above should allow
+# the Generate step to succeed and produce valid Makefiles.
 if [[ ! -f "${NATIVE_BUILD_DIR}/CMakeCache.txt" ]]; then
   echo "Configuring native Firebird build (host compiler)…"
   mkdir -p "${NATIVE_BUILD_DIR}"
