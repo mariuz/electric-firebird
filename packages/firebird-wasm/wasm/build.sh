@@ -148,6 +148,19 @@ sed -i 's|^#define GETTIMEOFDAY(x) gettimeofday((x))[[:space:]]*$|#define GETTIM
 sed -i '/^#define HAVE_ZLIB_H/d' "${AUTOCONFIG_SRC}"
 
 # ── CMake configure + build ──────────────────────────────────────────────────
+# NOTE: The CMakeLists.txt uses -sUSE_ICU=1 which causes Emscripten to
+# download, build, and link ICU automatically (both common and i18n
+# libraries).  This provides full Unicode support (collation, case
+# mapping, calendar functions) for the embedded engine.
+#
+# ICU Data File (icudt):
+# Emscripten's ICU port embeds a minimal ICU data set into the compiled
+# WASM binary.  If your application requires additional locale data beyond
+# the default, you may need to package a full icudt*.dat file using
+# Emscripten's --preload-file flag.  If you see U_MISSING_RESOURCE_ERROR
+# at runtime, this is the likely cause.  Add to EMSCRIPTEN_LINK_FLAGS in
+# CMakeLists.txt:
+#   "--preload-file /path/to/icudt<ver>l.dat@/usr/share/icu/<ver>/icudt<ver>l.dat"
 BUILD_DIR="${SCRIPT_DIR}/build"
 mkdir -p "${BUILD_DIR}"
 

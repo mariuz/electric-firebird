@@ -27,22 +27,70 @@ index 86eec7d86b..XXXXXXX 100644
  
  
  static void getVersions(const string& configInfo, ObjectsArray<string>& versions)
-@@ -1139,6 +1148,14 @@ void UnicodeUtil::utf8Normalize(UCharBuffer& data)
+@@ -1139,6 +1148,83 @@ void UnicodeUtil::utf8Normalize(UCharBuffer& data)
  	}
  }
  
 +#ifdef __EMSCRIPTEN__
-+// Emscripten/WASM: ICU dynamic loading is not available.
++// Emscripten/WASM: ICU is linked statically via -sUSE_ICU=1.
++// Create an ICU instance with function pointers set directly to the real
++// ICU functions instead of loading them dynamically via dlsym.
++//
++// A single static ICU instance is returned for every version request;
++// the Emscripten build ships exactly one ICU version.
 +UnicodeUtil::ICU* UnicodeUtil::loadICU(const Firebird::string& /*icuVersion*/,
 +	const Firebird::string& /*configInfo*/)
 +{
-+	return NULL;
++	// Singleton: create once, return the same instance on every call.
++	static ICU* wasmIcu = nullptr;
++	if (wasmIcu)
++		return wasmIcu;
++
++	wasmIcu = FB_NEW_POOL(*getDefaultMemoryPool()) ICU(
++		U_ICU_VERSION_MAJOR_NUM, U_ICU_VERSION_MINOR_NUM);
++
++	// The Emscripten build does not use dynamic module loading.
++	// inModule and ucModule stay NULL – the destructor handles NULL safely.
++
++	// ── common library (libicuuc) functions ─────────────────────────
++	wasmIcu->uVersionToString   = u_versionToString;
++	wasmIcu->ulocCountAvailable = uloc_countAvailable;
++	wasmIcu->ulocGetAvailable   = uloc_getAvailable;
++	wasmIcu->usetClose          = uset_close;
++	wasmIcu->usetGetItem        = uset_getItem;
++	wasmIcu->usetGetItemCount   = uset_getItemCount;
++	wasmIcu->usetOpen           = uset_open;
++
++	// ── i18n library (libicui18n) functions ─────────────────────────
++	wasmIcu->ucolClose                       = ucol_close;
++	wasmIcu->ucolGetContractionsAndExpansions = ucol_getContractionsAndExpansions;
++	wasmIcu->ucolGetRules                    = ucol_getRules;
++	wasmIcu->ucolGetSortKey                  = ucol_getSortKey;
++	wasmIcu->ucolOpen                        = ucol_open;
++	wasmIcu->ucolOpenRules                   = ucol_openRules;
++	wasmIcu->ucolSetAttribute                = ucol_setAttribute;
++	wasmIcu->ucolStrColl                     = ucol_strcoll;
++	wasmIcu->ucolGetVersion                  = ucol_getVersion;
++	wasmIcu->utransOpenU                     = utrans_openU;
++	wasmIcu->utransClose                     = utrans_close;
++	wasmIcu->utransTransUChars               = utrans_transUChars;
++
++	// ── Obtain the default collation version ────────────────────────
++	UErrorCode status = U_ZERO_ERROR;
++	UCollator* collator = wasmIcu->ucolOpen("", &status);
++	if (collator)
++	{
++		wasmIcu->ucolGetVersion(collator, wasmIcu->collVersion);
++		wasmIcu->ucolClose(collator);
++	}
++
++	return wasmIcu;
 +}
 +#else
  UnicodeUtil::ICU* UnicodeUtil::loadICU(const string& icuVersion, const string& configInfo)
  {
  	ObjectsArray<string> versions;
-@@ -1271,6 +1288,7 @@ UnicodeUtil::ICU* UnicodeUtil::loadICU(const string& icuVersion, const string& c
+@@ -1271,6 +1357,7 @@ UnicodeUtil::ICU* UnicodeUtil::loadICU(const string& icuVersion, const string& c
  
  	return NULL;
  }
@@ -50,23 +98,55 @@ index 86eec7d86b..XXXXXXX 100644
  
  
  void UnicodeUtil::getICUVersion(ICU* icu, int& majorVersion, int& minorVersion)
-@@ -1282,6 +1300,15 @@ void UnicodeUtil::getICUVersion(ICU* icu, int& majorVersion, int& minorVersion)
+@@ -1282,6 +1369,30 @@ void UnicodeUtil::getICUVersion(ICU* icu, int& majorVersion, int& minorVersion)
  
  UnicodeUtil::ConversionICU& UnicodeUtil::getConversionICU()
  {
 +#ifdef __EMSCRIPTEN__
-+	// Static stub: no dynamic ICU available in WASM.
-+	// Return a zero-initialised ConversionICU. Function pointers are NULL;
-+	// callers that need ICU will check and raise an appropriate error.
-+	static ConversionICU wasmStub = {};
-+	wasmStub.vMajor = 0;
-+	wasmStub.vMinor = 0;
-+	return wasmStub;
++	// Emscripten/WASM: ICU is linked statically via -sUSE_ICU=1.
++	// Populate the ConversionICU struct with real ICU function pointers.
++	static ConversionICU wasmConv = {};
++	if (!wasmConv.ucnv_open)
++	{
++		wasmConv.ucnv_open            = ucnv_open;
++		wasmConv.ucnv_close           = ucnv_close;
++		wasmConv.ucnv_fromUChars      = ucnv_fromUChars;
++		wasmConv.u_tolower            = u_tolower;
++		wasmConv.u_toupper            = u_toupper;
++		wasmConv.u_strCompare         = u_strCompare;
++		wasmConv.u_countChar32        = u_countChar32;
++		wasmConv.utf8_nextCharSafeBody = utf8_nextCharSafeBody;
++		wasmConv.UCNV_TO_U_CALLBACK_STOP = UCNV_TO_U_CALLBACK_STOP;
++		wasmConv.ucnv_setToUCallBack  = ucnv_setToUCallBack;
++		wasmConv.ucnv_setFromUCallBack = ucnv_setFromUCallBack;
++		wasmConv.ucnv_fromUnicode     = ucnv_fromUnicode;
++		wasmConv.ucnv_toUnicode       = ucnv_toUnicode;
++		wasmConv.ucnv_getInvalidChars = ucnv_getInvalidChars;
++		wasmConv.ucnv_getMaxCharSize  = ucnv_getMaxCharSize;
++		wasmConv.ucnv_getMinCharSize  = ucnv_getMinCharSize;
++		wasmConv.ustrcmp              = u_strcmp;
++
++		// i18n (ucal_*) functions
++		wasmConv.ucalGetTZDataVersion          = ucal_getTZDataVersion;
++		wasmConv.ucalGetDefaultTimeZone        = ucal_getDefaultTimeZone;
++		wasmConv.ucalOpen                      = ucal_open;
++		wasmConv.ucalClose                     = ucal_close;
++		wasmConv.ucalSetAttribute              = ucal_setAttribute;
++		wasmConv.ucalSetMillis                 = ucal_setMillis;
++		wasmConv.ucalGet                       = ucal_get;
++		wasmConv.ucalSetDateTime               = ucal_setDateTime;
++		wasmConv.ucalGetNow                    = ucal_getNow;
++		wasmConv.ucalGetTimeZoneTransitionDate = ucal_getTimeZoneTransitionDate;
++
++		wasmConv.vMajor = U_ICU_VERSION_MAJOR_NUM;
++		wasmConv.vMinor = U_ICU_VERSION_MINOR_NUM;
++	}
++	return wasmConv;
 +#else
  	if (convIcu)
  	{
  		return *convIcu;
-@@ -1376,6 +1403,7 @@ UnicodeUtil::ConversionICU& UnicodeUtil::getConversionICU()
+@@ -1376,6 +1487,7 @@ UnicodeUtil::ConversionICU& UnicodeUtil::getConversionICU()
  
  	// compiler warning silencer
  	return *convIcu;

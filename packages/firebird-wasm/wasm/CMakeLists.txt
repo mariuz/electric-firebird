@@ -113,9 +113,9 @@ set(FB_INCLUDE_DIRS
   # includes <cds/threading/model.h>.  Only the headers are needed – no CDS
   # source files are compiled for the WASM build.
   "${FIREBIRD_SRC}/extern/libcds"
-  # ICU stub headers – Firebird loads ICU dynamically at runtime so only
-  # the type/enum definitions are needed at compile time.
-  "${CMAKE_CURRENT_SOURCE_DIR}/stubs"
+  # ICU headers are provided by Emscripten's ICU port (-sUSE_ICU=1).
+  # No stub headers are needed – the real ICU headers supply all type/enum
+  # definitions AND function declarations used by unicode_util.cpp.
 )
 
 # ---------------------------------------------------------------------------
@@ -161,8 +161,15 @@ target_compile_definitions(firebird-embedded PRIVATE
 # safe for the single-threaded / limited-threading WASM environment.
 # We use target_compile_options because CMake's target_compile_definitions
 # drops function-style macros.
+#
+# -sUSE_ICU=1 activates Emscripten's ICU port, which downloads, builds, and
+# links the ICU libraries (common + i18n) automatically.  The flag is needed
+# at compile time so that Emscripten's port system injects the ICU include
+# path into the compiler invocation, and at link time so the ICU libraries
+# are linked into the WASM binary.
 target_compile_options(firebird-embedded PRIVATE
   "-Dpthread_rwlockattr_setkind_np(a,b)=0"
+  "-sUSE_ICU=1"
 )
 
 # ---------------------------------------------------------------------------
@@ -183,6 +190,7 @@ set(EMSCRIPTEN_LINK_FLAGS
   "-s FORCE_FILESYSTEM=1"
   "-s ENVIRONMENT='web,worker,node'"
   "-s SINGLE_FILE=0"
+  "-s USE_ICU=1"
 )
 
 string(REPLACE ";" " " EMSCRIPTEN_LINK_FLAGS_STR "${EMSCRIPTEN_LINK_FLAGS}")
