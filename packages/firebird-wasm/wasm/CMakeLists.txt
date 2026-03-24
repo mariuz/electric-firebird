@@ -89,6 +89,10 @@ file(GLOB_RECURSE FB_DSQL_SRCS
 file(GLOB_RECURSE FB_JRD_SRCS
   "${FIREBIRD_SRC}/src/jrd/*.cpp"
 )
+# Exclude standalone test utilities in jrd/misc/ (e.g. evl_string_test.cpp) –
+# they are not part of the embedded engine and reference constructors/types
+# that may not compile in the WASM context.
+list(FILTER FB_JRD_SRCS EXCLUDE REGEX ".*/jrd/misc/.*")
 
 file(GLOB_RECURSE FB_LOCK_SRCS
   "${FIREBIRD_SRC}/src/lock/*.cpp"
