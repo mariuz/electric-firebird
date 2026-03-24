@@ -342,16 +342,10 @@ namespace Jrd {
         MET_object_unknown
     };
 
-    /* From dsql/sym.h – used by MET_dsql_cache_use/release. */
-    enum sym_type {
-        SYM_relation = 1,
-        SYM_udf,
-        SYM_procedure,
-        SYM_intlsym_charset,
-        SYM_intlsym_collation,
-        SYM_eof
-    };
 }
+
+/* From dsql/sym.h – used by MET_dsql_cache_use/release. */
+#include "dsql/sym.h"
 
 /* SubtypeInfo – replicated from met_proto.h (the original uses
    Firebird::UCharBuffer which needs array.h). */
@@ -716,7 +710,74 @@ void GRANT_privileges(Jrd::thread_db*, const Firebird::string&, ObjectType, Jrd:
  * ----------------------------------------------------------------------- */
 
 namespace Jrd {
-    enum dfw_t;
+    /* Full dfw_t definition from jrd/tra.h (v5.0.3).
+       ISO C++ forbids forward references to unscoped enums, and tra.h is not
+       included here.  We replicate the definition so that DFW_post_work and
+       friends can accept the enum by value. */
+    enum dfw_t {
+        dfw_null,
+        dfw_create_relation,
+        dfw_delete_relation,
+        dfw_update_format,
+        dfw_create_index,
+        dfw_delete_index,
+        dfw_compute_security,
+        dfw_add_file,
+        dfw_add_shadow,
+        dfw_delete_shadow,
+        dfw_delete_shadow_nodelete,
+        dfw_modify_file,
+        dfw_erase_file,
+        dfw_create_field,
+        dfw_delete_field,
+        dfw_modify_field,
+        dfw_delete_global,
+        dfw_delete_rfr,
+        dfw_post_event,
+        dfw_create_trigger,
+        dfw_delete_trigger,
+        dfw_modify_trigger,
+        dfw_grant,
+        dfw_revoke,
+        dfw_scan_relation,
+        dfw_create_expression_index,
+        dfw_create_procedure,
+        dfw_modify_procedure,
+        dfw_delete_procedure,
+        dfw_delete_prm,
+        dfw_create_collation,
+        dfw_delete_collation,
+        dfw_delete_exception,
+        dfw_delete_generator,
+        dfw_create_function,
+        dfw_modify_function,
+        dfw_delete_function,
+        dfw_add_difference,
+        dfw_delete_difference,
+        dfw_begin_backup,
+        dfw_end_backup,
+        dfw_user_management,
+        dfw_modify_package_header,
+        dfw_drop_package_header,
+        dfw_drop_package_body,
+        dfw_check_not_null,
+        dfw_store_view_context_type,
+        dfw_set_generator,
+        dfw_change_repl_state,
+        /* deferred works argument types */
+        dfw_arg_index_name,
+        dfw_arg_partner_rel_id,
+        dfw_arg_proc_name,
+        dfw_arg_force_computed,
+        dfw_arg_check_blr,
+        dfw_arg_rel_name,
+        dfw_arg_trg_type,
+        dfw_arg_new_name,
+        dfw_arg_field_not_null,
+        dfw_db_crypt,
+        dfw_set_linger,
+        dfw_clear_cache
+    };
 }
 
 USHORT DFW_assign_index_type(Jrd::thread_db*, const Jrd::MetaName&, SSHORT, SSHORT)
@@ -885,7 +946,6 @@ void DPM_delete_relation_pages(Jrd::thread_db*, Jrd::jrd_rel*, Jrd::RelationPage
 namespace Jrd {
     class Function;
     class impure_value;
-    class NestValueArray;
 }
 
 void FUN_evaluate(Jrd::thread_db*, const Jrd::Function*, const Jrd::NestValueArray&,
