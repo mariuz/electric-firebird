@@ -93,6 +93,9 @@ file(GLOB_RECURSE FB_JRD_SRCS
 # they are not part of the embedded engine and reference constructors/types
 # that may not compile in the WASM context.
 list(FILTER FB_JRD_SRCS EXCLUDE REGEX ".*/jrd/misc/.*")
+# Exclude Boost-dependent test files in jrd/tests/ (CompressorTest.cpp,
+# EngineTest.cpp) – they require Boost test headers unavailable in WASM.
+list(FILTER FB_JRD_SRCS EXCLUDE REGEX ".*/jrd/tests/.*")
 # Exclude Win32 platform-specific sources – they require <windows.h> which is
 # unavailable under Emscripten.
 list(FILTER FB_JRD_SRCS EXCLUDE REGEX ".*/jrd/os/win32/.*")
