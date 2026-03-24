@@ -101,9 +101,11 @@ const char* fb_query(int db_handle, const char* sql)
     const char* empty = "{\"columns\":[],\"rows\":[]}";
     size_t len = strlen(empty) + 1;
     char* result = static_cast<char*>(malloc(len));
-    if (result) {
-        memcpy(result, empty, len);
+    if (!result) {
+        /* malloc failure — return 0 which TypeScript interprets as error */
+        return nullptr;
     }
+    memcpy(result, empty, len);
     return result;
 }
 

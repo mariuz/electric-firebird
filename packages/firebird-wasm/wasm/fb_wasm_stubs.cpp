@@ -37,13 +37,14 @@ SLONG API_ROUTINE gds__vax_integer(const UCHAR* ptr, SSHORT length)
     SLONG value = 0;
     int shift = 0;
 
+    /* Process the first (length-1) bytes as unsigned */
     while (--length > 0)
     {
         value += ((SLONG) *ptr++) << shift;
         shift += 8;
     }
 
-    /* Sign-extend the most significant byte */
+    /* Sign-extend the most significant (final) byte */
     value += ((SLONG)(SCHAR) *ptr) << shift;
 
     return value;
