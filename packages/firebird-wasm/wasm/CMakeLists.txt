@@ -133,9 +133,23 @@ set(FB_INCLUDE_DIRS
 )
 
 # ---------------------------------------------------------------------------
+# WASM glue & stub sources
+# ---------------------------------------------------------------------------
+# fb_wasm_api.cpp  – extern "C" API surface exported to JavaScript via
+#                    -s EXPORTED_FUNCTIONS (fb_init, fb_create_database, …).
+# fb_wasm_stubs.cpp – minimal implementations of Firebird internal functions
+#                     whose canonical homes (yvalve/gds.cpp, …) are not yet
+#                     compiled into the WASM build.
+set(FB_WASM_GLUE_SRCS
+  "${CMAKE_CURRENT_SOURCE_DIR}/fb_wasm_api.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/fb_wasm_stubs.cpp"
+)
+
+# ---------------------------------------------------------------------------
 # WASM library target
 # ---------------------------------------------------------------------------
 add_executable(firebird-embedded
+  ${FB_WASM_GLUE_SRCS}
   ${FB_COMMON_SRCS}
   ${FB_DSQL_SRCS}
   ${FB_JRD_SRCS}
