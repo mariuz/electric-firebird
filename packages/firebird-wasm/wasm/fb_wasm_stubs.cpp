@@ -298,7 +298,6 @@ int sem_timedwait(sem_t* sem, const struct timespec* abs_timeout)
 /* Forward declarations – only pointers/references are used, so full
    definitions are not required. */
 struct dsc;
-class MemoryPool;
 
 namespace Jrd {
     class thread_db;
