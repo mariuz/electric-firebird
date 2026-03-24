@@ -282,56 +282,312 @@ int sem_timedwait(sem_t* sem, const struct timespec* abs_timeout)
  * metd.epp) are not compiled for WASM.  Minimal stubs are provided so
  * the linker can resolve the symbols.
  *
- * We include the actual Firebird headers that declare these functions to
- * guarantee that the C++ name-mangling matches what callers expect.
+ * We include the Firebird proto headers (met_proto.h, metd_proto.h) plus
+ * the necessary supporting headers to guarantee that the C++ name-
+ * mangling matches what callers expect.
  * ----------------------------------------------------------------------- */
 
-#include "firebird/impl/types_pub.h"
+/* Supporting headers for types used *by value* in function signatures. */
+#include "jrd/MetaName.h"                  /* Jrd::MetaName (used by value) */
+#include "jrd/QualifiedName.h"             /* Jrd::QualifiedName (used by value) */
+#include "common/classes/Nullable.h"       /* Nullable<bool> (used by value) */
+#include "common/classes/NestConst.h"      /* NestConst<T> (used by value) */
+#include "common/classes/GenericMap.h"     /* GenericMap (for MetaNamePairMap) */
+#include "common/classes/fb_pair.h"       /* MetaNamePair */
 
-/* Forward declarations – just enough for the prototypes below.
-   Full headers (scl.h, met_proto.h, metd_proto.h) pull in too many
-   transitive dependencies, so we replicate only the needed bits. */
+/* Forward declarations – only pointers/references are used, so full
+   definitions are not required. */
+struct dsc;
+class MemoryPool;
+
 namespace Jrd {
     class thread_db;
     class jrd_tra;
     class jrd_rel;
-    class MetaName;
+    class GeneratorItem;
+    class ExceptionItem;
+    class DmlNode;
+    class CompilerScratch;
+    class Format;
+    class jrd_fld;
+    class jrd_prc;
+    class Shadow;
+    class BlobFilter;
+    class Routine;
+    class DeferredWork;
+    class Statement;
+    class Request;
+    class Database;
+    class TrigVector;
+    class dsql_intlsym;
+    class dsql_udf;
+    class dsql_prc;
+    class dsql_rel;
+    class TypeClause;
+    class DsqlCompilerScratch;
+    class DsqlRequest;
+    class FieldNode;
+    struct bid;
+    struct index_desc;
+    struct FieldInfo;
+
+    /* From metd_proto.h */
+    typedef Firebird::GenericMap<MetaNamePair> MetaNamePairMap;
+
+    /* From met_proto.h */
+    enum IndexStatus
+    {
+        MET_object_active,
+        MET_object_deferred_active,
+        MET_object_inactive,
+        MET_object_unknown
+    };
+
+    /* From dsql/sym.h – used by MET_dsql_cache_use/release. */
+    enum sym_type {
+        SYM_relation = 1,
+        SYM_udf,
+        SYM_procedure,
+        SYM_intlsym_charset,
+        SYM_intlsym_collation,
+        SYM_eof
+    };
 }
 
-/* METD_get_charset_bpc – return bytes-per-character for a charset id.
- * Declared in dsql/metd_proto.h as:
- *   USHORT METD_get_charset_bpc(Jrd::jrd_tra*, SSHORT);
- * Returns 1 (single-byte) as a safe default. */
-USHORT METD_get_charset_bpc(Jrd::jrd_tra*, SSHORT)
+/* SubtypeInfo – replicated from met_proto.h (the original uses
+   Firebird::UCharBuffer which needs array.h). */
+struct SubtypeInfo
 {
-    return 1;
-}
+    SubtypeInfo() : attributes(0), ignoreAttributes(true) {}
+    Jrd::MetaName charsetName;
+    Jrd::MetaName collationName;
+    Jrd::MetaName baseCollationName;
+    USHORT attributes;
+    bool ignoreAttributes;
+    /* Simplified: callers only need the struct to exist; the specificAttributes
+       member is never populated by stub code.  Use the same concrete type
+       (HalfStaticArray) as the original to keep ABI-compatible. */
+    Firebird::HalfStaticArray<UCHAR, 32> specificAttributes;
+};
 
-/* MET_lookup_relation – look up a relation (table/view) by name.
- * Declared in jrd/met_proto.h as:
- *   Jrd::jrd_rel* MET_lookup_relation(Jrd::thread_db*, const Jrd::MetaName&);
- * Returns nullptr (not found) when metadata tables are unavailable. */
-Jrd::jrd_rel* MET_lookup_relation(Jrd::thread_db*, const Jrd::MetaName&)
-{
-    return nullptr;
-}
+/* -----------------------------------------------------------------------
+ * met.epp stubs  (MET_* functions from jrd/met_proto.h)
+ *
+ * In the WASM embedded build, system tables are not available, so all
+ * metadata-lookup functions return "not found" or no-op equivalents.
+ * ----------------------------------------------------------------------- */
 
-/* MET_lookup_field – look up a field in a relation by name.
- * Declared in jrd/met_proto.h as:
- *   int MET_lookup_field(Jrd::thread_db*, Jrd::jrd_rel*, const Jrd::MetaName&);
- * Returns -1 (not found). */
+void MET_activate_shadow(Jrd::thread_db*) {}
+
+ULONG MET_align(const dsc*, ULONG value) { return value; }
+
+Jrd::DeferredWork* MET_change_fields(Jrd::thread_db*, Jrd::jrd_tra*, const dsc*)
+{ return nullptr; }
+
+Jrd::Format* MET_current(Jrd::thread_db*, Jrd::jrd_rel*)
+{ return nullptr; }
+
+void MET_delete_dependencies(Jrd::thread_db*, const Jrd::MetaName&, int, Jrd::jrd_tra*) {}
+
+void MET_delete_shadow(Jrd::thread_db*, USHORT) {}
+
+bool MET_dsql_cache_use(Jrd::thread_db*, Jrd::sym_type, const Jrd::MetaName&, const Jrd::MetaName&)
+{ return false; }
+
+void MET_dsql_cache_release(Jrd::thread_db*, Jrd::sym_type, const Jrd::MetaName&, const Jrd::MetaName&) {}
+
+void MET_error(const TEXT*, ...) {}
+
+Jrd::Format* MET_format(Jrd::thread_db*, Jrd::jrd_rel*, USHORT)
+{ return nullptr; }
+
+bool MET_get_char_coll_subtype(Jrd::thread_db*, USHORT*, const UCHAR*, USHORT)
+{ return false; }
+
+bool MET_get_char_coll_subtype_info(Jrd::thread_db*, USHORT, SubtypeInfo*)
+{ return false; }
+
+Jrd::DmlNode* MET_get_dependencies(Jrd::thread_db*, Jrd::jrd_rel*, const UCHAR*, const ULONG,
+    Jrd::CompilerScratch*, Jrd::bid*, Jrd::Statement**, Jrd::CompilerScratch**,
+    const Jrd::MetaName&, int, USHORT, Jrd::jrd_tra*, const Jrd::MetaName&)
+{ return nullptr; }
+
+Jrd::jrd_fld* MET_get_field(const Jrd::jrd_rel*, USHORT)
+{ return nullptr; }
+
+ULONG MET_get_rel_flags_from_TYPE(USHORT) { return 0; }
+
+bool MET_get_repl_state(Jrd::thread_db*, const Jrd::MetaName&)
+{ return false; }
+
+void MET_get_shadow_files(Jrd::thread_db*, bool) {}
+void MET_load_db_triggers(Jrd::thread_db*, int) {}
+void MET_load_ddl_triggers(Jrd::thread_db*) {}
+
+bool MET_load_exception(Jrd::thread_db*, Jrd::ExceptionItem&)
+{ return false; }
+
+void MET_load_trigger(Jrd::thread_db*, Jrd::jrd_rel*, const Jrd::MetaName&, Jrd::TrigVector**) {}
+void MET_lookup_index_for_cnstrt(Jrd::thread_db*, Jrd::MetaName&, const Jrd::MetaName&) {}
+void MET_lookup_cnstrt_for_index(Jrd::thread_db*, Jrd::MetaName&, const Jrd::MetaName&) {}
+void MET_lookup_cnstrt_for_trigger(Jrd::thread_db*, Jrd::MetaName&, Jrd::MetaName&, const Jrd::MetaName&) {}
+void MET_lookup_exception(Jrd::thread_db*, SLONG, Jrd::MetaName&, Firebird::string*) {}
+
 int MET_lookup_field(Jrd::thread_db*, Jrd::jrd_rel*, const Jrd::MetaName&)
-{
-    return -1;
-}
+{ return -1; }
 
-/* Jrd::UserId::findGrantedRoles – populate granted roles for a user.
- * Declared in jrd/scl.h as a private method of class UserId:
- *   void findGrantedRoles(thread_db* tdbb) const;
- * We include scl.h to get the class definition so the mangled name
- * matches.  No-op when metadata tables are unavailable. */
-#include "jrd/scl.h"
+Jrd::BlobFilter* MET_lookup_filter(Jrd::thread_db*, SSHORT, SSHORT)
+{ return nullptr; }
 
+bool MET_load_generator(Jrd::thread_db*, Jrd::GeneratorItem&, bool*, SLONG*)
+{ return false; }
+
+SLONG MET_lookup_generator(Jrd::thread_db*, const Jrd::MetaName&, bool*, SLONG*)
+{ return 0; }
+
+bool MET_lookup_generator_id(Jrd::thread_db*, SLONG, Jrd::MetaName&, bool*)
+{ return false; }
+
+void MET_update_generator_increment(Jrd::thread_db*, SLONG, SLONG) {}
+void MET_lookup_index(Jrd::thread_db*, Jrd::MetaName&, const Jrd::MetaName&, USHORT) {}
+void MET_lookup_index_condition(Jrd::thread_db*, Jrd::jrd_rel*, Jrd::index_desc*) {}
+void MET_lookup_index_expression(Jrd::thread_db*, Jrd::jrd_rel*, Jrd::index_desc*) {}
+
+bool MET_lookup_index_expr_cond_blr(Jrd::thread_db*, const Jrd::MetaName&, Jrd::bid&, Jrd::bid&)
+{ return false; }
+
+SLONG MET_lookup_index_name(Jrd::thread_db*, const Jrd::MetaName&, SLONG*, Jrd::IndexStatus*)
+{ return 0; }
+
+bool MET_lookup_partner(Jrd::thread_db*, Jrd::jrd_rel*, struct Jrd::index_desc*, const TEXT*)
+{ return false; }
+
+Jrd::jrd_prc* MET_lookup_procedure(Jrd::thread_db*, const Jrd::QualifiedName&, bool)
+{ return nullptr; }
+
+Jrd::jrd_prc* MET_lookup_procedure_id(Jrd::thread_db*, USHORT, bool, bool, USHORT)
+{ return nullptr; }
+
+Jrd::jrd_rel* MET_lookup_relation(Jrd::thread_db*, const Jrd::MetaName&)
+{ return nullptr; }
+
+Jrd::jrd_rel* MET_lookup_relation_id(Jrd::thread_db*, SLONG, bool)
+{ return nullptr; }
+
+Jrd::DmlNode* MET_parse_blob(Jrd::thread_db*, Jrd::jrd_rel*, Jrd::bid*, Jrd::CompilerScratch**,
+    Jrd::Statement**, bool, bool)
+{ return nullptr; }
+
+void MET_parse_sys_trigger(Jrd::thread_db*, Jrd::jrd_rel*) {}
+void MET_post_existence(Jrd::thread_db*, Jrd::jrd_rel*) {}
+void MET_prepare(Jrd::thread_db*, Jrd::jrd_tra*, USHORT, const UCHAR*) {}
+
+Jrd::jrd_prc* MET_procedure(Jrd::thread_db*, USHORT, bool, USHORT)
+{ return nullptr; }
+
+Jrd::jrd_rel* MET_relation(Jrd::thread_db*, USHORT)
+{ return nullptr; }
+
+void MET_release_existence(Jrd::thread_db*, Jrd::jrd_rel*) {}
+void MET_release_trigger(Jrd::thread_db*, Jrd::TrigVector**, const Jrd::MetaName&) {}
+void MET_release_triggers(Jrd::thread_db*, Jrd::TrigVector**, bool) {}
+
+#ifdef DEV_BUILD
+void MET_verify_cache(Jrd::thread_db*) {}
+#endif
+
+void MET_clear_cache(Jrd::thread_db*) {}
+
+bool MET_routine_in_use(Jrd::thread_db*, Jrd::Routine*)
+{ return false; }
+
+void MET_revoke(Jrd::thread_db*, Jrd::jrd_tra*, const Jrd::MetaName&,
+    const Jrd::MetaName&, const Firebird::string&) {}
+
+void MET_scan_partners(Jrd::thread_db*, Jrd::jrd_rel*) {}
+void MET_scan_relation(Jrd::thread_db*, Jrd::jrd_rel*) {}
+void MET_trigger_msg(Jrd::thread_db*, Firebird::string&, const Jrd::MetaName&, USHORT) {}
+void MET_update_shadow(Jrd::thread_db*, Jrd::Shadow*, USHORT) {}
+void MET_update_transaction(Jrd::thread_db*, Jrd::jrd_tra*, const bool) {}
+void MET_get_domain(Jrd::thread_db*, MemoryPool&, const Jrd::MetaName&, dsc*, Jrd::FieldInfo*) {}
+
+Jrd::MetaName MET_get_relation_field(Jrd::thread_db*, MemoryPool&,
+    const Jrd::MetaName&, const Jrd::MetaName&, dsc*, Jrd::FieldInfo*)
+{ return Jrd::MetaName(); }
+
+void MET_update_partners(Jrd::thread_db*) {}
+int MET_get_linger(Jrd::thread_db*) { return 0; }
+
+Nullable<bool> MET_get_ss_definer(Jrd::thread_db*)
+{ return Nullable<bool>(); }
+
+/* MET_store_dependencies uses CompilerScratch::Dependency, a nested type
+   from jrd/exe.h.  exe.h brings in the entire JRD header chain.  We
+   include it only for this single stub. */
+#include "jrd/exe.h"
+
+void MET_store_dependencies(Jrd::thread_db*, Firebird::Array<Jrd::CompilerScratch::Dependency>&,
+    const Jrd::jrd_rel*, const Jrd::MetaName&, int, Jrd::jrd_tra*) {}
+
+/* -----------------------------------------------------------------------
+ * metd.epp stubs  (METD_* functions from dsql/metd_proto.h)
+ *
+ * Same rationale as MET_* above – system tables are unavailable.
+ * ----------------------------------------------------------------------- */
+
+void METD_drop_charset(Jrd::jrd_tra*, const Jrd::MetaName&) {}
+void METD_drop_collation(Jrd::jrd_tra*, const Jrd::MetaName&) {}
+void METD_drop_function(Jrd::jrd_tra*, const Jrd::QualifiedName&) {}
+void METD_drop_procedure(Jrd::jrd_tra*, const Jrd::QualifiedName&) {}
+void METD_drop_relation(Jrd::jrd_tra*, const Jrd::MetaName&) {}
+
+Jrd::dsql_intlsym* METD_get_charset(Jrd::jrd_tra*, USHORT, const char*)
+{ return nullptr; }
+
+USHORT METD_get_charset_bpc(Jrd::jrd_tra*, SSHORT)
+{ return 1; }
+
+Jrd::MetaName METD_get_charset_name(Jrd::jrd_tra*, SSHORT)
+{ return Jrd::MetaName(); }
+
+Jrd::dsql_intlsym* METD_get_collation(Jrd::jrd_tra*, const Jrd::MetaName&, USHORT)
+{ return nullptr; }
+
+Jrd::MetaName METD_get_default_charset(Jrd::jrd_tra*)
+{ return Jrd::MetaName(); }
+
+bool METD_get_domain(Jrd::jrd_tra*, Jrd::TypeClause*, const Jrd::MetaName&)
+{ return false; }
+
+Jrd::dsql_udf* METD_get_function(Jrd::jrd_tra*, Jrd::DsqlCompilerScratch*, const Jrd::QualifiedName&)
+{ return nullptr; }
+
+void METD_get_primary_key(Jrd::jrd_tra*, const Jrd::MetaName&,
+    Firebird::Array<NestConst<Jrd::FieldNode> >&) {}
+
+Jrd::dsql_prc* METD_get_procedure(Jrd::jrd_tra*, Jrd::DsqlCompilerScratch*, const Jrd::QualifiedName&)
+{ return nullptr; }
+
+Jrd::dsql_rel* METD_get_relation(Jrd::jrd_tra*, Jrd::DsqlCompilerScratch*, const Jrd::MetaName&)
+{ return nullptr; }
+
+bool METD_get_type(Jrd::jrd_tra*, const Jrd::MetaName&, const char*, SSHORT*)
+{ return false; }
+
+Jrd::dsql_rel* METD_get_view_base(Jrd::jrd_tra*, Jrd::DsqlCompilerScratch*, const char*,
+    Jrd::MetaNamePairMap&)
+{ return nullptr; }
+
+bool METD_get_view_relation(Jrd::jrd_tra*, Jrd::DsqlCompilerScratch*, const Jrd::MetaName&,
+    const Jrd::MetaName&, Jrd::dsql_rel*&, Jrd::dsql_prc*&)
+{ return false; }
+
+/* -----------------------------------------------------------------------
+ * scl.epp stub (Jrd::UserId::findGrantedRoles)
+ *
+ * Defined in scl.epp (which needs gpre).  scl.h is already pulled in by
+ * exe.h above, so we only need the method definition.
+ * ----------------------------------------------------------------------- */
 namespace Jrd {
     void UserId::findGrantedRoles(thread_db*) const
     {
