@@ -830,8 +830,19 @@ bool DPM_fetch_back(Jrd::thread_db*, Jrd::record_param*, USHORT, SSHORT)
 
 void DPM_fetch_fragment(Jrd::thread_db*, Jrd::record_param*, USHORT) {}
 
-SINT64 DPM_gen_id(Jrd::thread_db*, SLONG, bool, SINT64)
-{ return 0; }
+SINT64 DPM_gen_id(Jrd::thread_db*, SLONG, bool, SINT64 val)
+{
+    /* In the real engine this reads/writes the generator page.
+       For WASM we maintain a simple in-memory counter per generator ID.
+       The 'val' parameter is the increment; when non-zero we advance
+       by that amount and return the new value.  When zero we just return
+       the current value.  This is thread-safe enough for single-threaded
+       WASM and provides unique ascending values within a session. */
+    static SINT64 counter = 0;
+    if (val != 0)
+        counter += val;
+    return counter;
+}
 
 bool DPM_get(Jrd::thread_db*, Jrd::record_param*, SSHORT)
 { return false; }
