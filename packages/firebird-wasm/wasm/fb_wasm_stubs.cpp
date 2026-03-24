@@ -595,6 +595,344 @@ namespace Jrd {
 }
 
 /* -----------------------------------------------------------------------
+ * scl.epp stubs  (SCL_* functions from jrd/scl_proto.h)
+ *
+ * Security class functions check access privileges.  In the WASM
+ * embedded build no security enforcement is needed, so all checks
+ * are no-ops and lookups return "not found".
+ *
+ * scl.h is already available via exe.h included above.
+ * Signatures match Firebird v5.0.3 scl_proto.h.
+ * ----------------------------------------------------------------------- */
+
+#include "jrd/obj.h"      /* ObjectType (SSHORT) */
+
+void SCL_check_access(Jrd::thread_db*, const Jrd::SecurityClass*,
+    SLONG, const Jrd::MetaName&,
+    Jrd::SecurityClass::flags_t, ObjectType, bool, const Jrd::MetaName&,
+    const Jrd::MetaName&) {}
+
+void SCL_check_create_access(Jrd::thread_db*, ObjectType) {}
+void SCL_check_charset(Jrd::thread_db*, const Jrd::MetaName&, Jrd::SecurityClass::flags_t) {}
+void SCL_check_collation(Jrd::thread_db*, const Jrd::MetaName&, Jrd::SecurityClass::flags_t) {}
+void SCL_check_database(Jrd::thread_db*, Jrd::SecurityClass::flags_t) {}
+void SCL_check_domain(Jrd::thread_db*, const Jrd::MetaName&, Jrd::SecurityClass::flags_t) {}
+
+bool SCL_check_exception(Jrd::thread_db*, const Jrd::MetaName&, Jrd::SecurityClass::flags_t)
+{ return true; }
+
+bool SCL_check_generator(Jrd::thread_db*, const Jrd::MetaName&, Jrd::SecurityClass::flags_t)
+{ return true; }
+
+void SCL_check_index(Jrd::thread_db*, const Jrd::MetaName&, UCHAR, Jrd::SecurityClass::flags_t) {}
+
+bool SCL_check_package(Jrd::thread_db*, const dsc*, Jrd::SecurityClass::flags_t)
+{ return true; }
+
+bool SCL_check_procedure(Jrd::thread_db*, const dsc*, Jrd::SecurityClass::flags_t)
+{ return true; }
+
+bool SCL_check_function(Jrd::thread_db*, const dsc*, Jrd::SecurityClass::flags_t)
+{ return true; }
+
+void SCL_check_filter(Jrd::thread_db*, const Jrd::MetaName&, Jrd::SecurityClass::flags_t) {}
+
+void SCL_check_relation(Jrd::thread_db*, const dsc*, Jrd::SecurityClass::flags_t, bool) {}
+
+bool SCL_check_view(Jrd::thread_db*, const dsc*, Jrd::SecurityClass::flags_t)
+{ return true; }
+
+void SCL_check_role(Jrd::thread_db*, const Jrd::MetaName&, Jrd::SecurityClass::flags_t) {}
+
+Jrd::SecurityClass* SCL_get_class(Jrd::thread_db*, const TEXT*)
+{ return nullptr; }
+
+Jrd::SecurityClass::flags_t SCL_get_mask(Jrd::thread_db*, const TEXT*, const TEXT*)
+{ return 0; }
+
+void SCL_clear_classes(Jrd::thread_db*, const TEXT*) {}
+void SCL_release_all(Jrd::SecurityClassList*&) {}
+
+bool SCL_role_granted(Jrd::thread_db*, const Jrd::UserId&, const TEXT*)
+{ return false; }
+
+Jrd::SecurityClass::flags_t SCL_get_object_mask(ObjectType)
+{ return 0; }
+
+ULONG SCL_get_number(const UCHAR*)
+{ return 0; }
+
+USHORT SCL_convert_privilege(Jrd::thread_db*, Jrd::jrd_tra*, const Firebird::string&)
+{ return 0; }
+
+namespace Jrd {
+typedef Firebird::Array<UCHAR> Acl;
+}
+
+bool SCL_move_priv(Jrd::SecurityClass::flags_t, Jrd::Acl&)
+{ return false; }
+
+/* -----------------------------------------------------------------------
+ * ini.epp stubs  (INI_* functions from jrd/ini_proto.h)
+ *
+ * Initialization functions that set up system tables and relations.
+ * In WASM, no system tables are created from scratch.
+ * Signatures match Firebird v5.0.3 ini_proto.h.
+ * ----------------------------------------------------------------------- */
+
+namespace Jrd {
+    class dsql_dbb;
+}
+
+void INI_format(Jrd::thread_db*, const Firebird::string&) {}
+
+USHORT INI_get_trig_flags(const Jrd::MetaName&)
+{ return 0; }
+
+void INI_init(Jrd::thread_db*) {}
+void INI_init_dsql(Jrd::thread_db*, Jrd::dsql_dbb*) {}
+
+Firebird::string INI_owner_privileges()
+{ return Firebird::string(); }
+
+void INI_upgrade(Jrd::thread_db*) {}
+
+/* -----------------------------------------------------------------------
+ * grant.epp stub  (GRANT_privileges from jrd/grant_proto.h)
+ *
+ * Privilege granting operates on system tables.  No-op for WASM.
+ * Signature matches Firebird v5.0.3 grant_proto.h.
+ * ----------------------------------------------------------------------- */
+
+void GRANT_privileges(Jrd::thread_db*, const Firebird::string&, ObjectType, Jrd::jrd_tra*) {}
+
+/* -----------------------------------------------------------------------
+ * dfw.epp stubs  (DFW_* functions from jrd/dfw_proto.h)
+ *
+ * Deferred Work Framework – operations queued during DDL that execute
+ * at transaction commit.  In WASM, DDL is not supported so these are
+ * all no-ops.
+ *
+ * Signatures match Firebird v5.0.3 dfw_proto.h.
+ * ----------------------------------------------------------------------- */
+
+namespace Jrd {
+    enum dfw_t;
+}
+
+USHORT DFW_assign_index_type(Jrd::thread_db*, const Jrd::MetaName&, SSHORT, SSHORT)
+{ return 0; }
+
+void DFW_delete_deferred(Jrd::jrd_tra*, SINT64) {}
+
+Firebird::SortedArray<int>& DFW_get_ids(Jrd::DeferredWork* work)
+{
+    /* This stub should never be called in practice.  We return a
+       reference to a static empty array to satisfy the linker. */
+    static Firebird::SortedArray<int> dummy;
+    return dummy;
+}
+
+void DFW_merge_work(Jrd::jrd_tra*, SINT64, SINT64) {}
+void DFW_perform_work(Jrd::thread_db*, Jrd::jrd_tra*) {}
+void DFW_perform_post_commit_work(Jrd::jrd_tra*) {}
+
+Jrd::DeferredWork* DFW_post_work(Jrd::jrd_tra*, Jrd::dfw_t, const dsc*, USHORT,
+    const Jrd::MetaName&)
+{ return nullptr; }
+
+Jrd::DeferredWork* DFW_post_work(Jrd::jrd_tra*, Jrd::dfw_t, const Firebird::string&,
+    USHORT, const Jrd::MetaName&)
+{ return nullptr; }
+
+Jrd::DeferredWork* DFW_post_work_arg(Jrd::jrd_tra*, Jrd::DeferredWork*, const dsc*, USHORT)
+{ return nullptr; }
+
+Jrd::DeferredWork* DFW_post_work_arg(Jrd::jrd_tra*, Jrd::DeferredWork*, const dsc*, USHORT,
+    Jrd::dfw_t)
+{ return nullptr; }
+
+void DFW_update_index(const TEXT*, USHORT, const Firebird::HalfStaticArray<float, 4>&,
+    Jrd::jrd_tra*) {}
+
+void DFW_reset_icu(Jrd::thread_db*) {}
+
+/* -----------------------------------------------------------------------
+ * dpm.epp stubs  (DPM_* functions from jrd/dpm_proto.h)
+ *
+ * Data Page Manager – low-level page and record operations.  These
+ * are called from many places in the engine for record fetch, store,
+ * delete, and sequence generation (DPM_gen_id).
+ *
+ * In the WASM embedded build without a real ODS (On-Disk Structure),
+ * all operations are no-ops or return safe defaults.
+ *
+ * Signatures match Firebird v5.0.3 dpm_proto.h.
+ * ----------------------------------------------------------------------- */
+
+#include "jrd/RecordNumber.h"  /* RecordNumber (used by value in DPM_store_blob) */
+
+/* Forward declarations for types used in DPM function signatures.
+   PageNumber and PageStack are available via exe.h → Relation.h → pag.h. */
+namespace Ods {
+    struct pag;
+    struct data_page;
+}
+
+namespace Jrd {
+    class blb;
+    struct record_param;
+    class Record;
+    struct win;
+
+    enum RecordStorageType
+    {
+        DPM_primary = 1,
+        DPM_secondary,
+        DPM_other
+    };
+
+    enum FindNextRecordScope
+    {
+        DPM_next_all,
+        DPM_next_data_page,
+        DPM_next_pointer_page
+    };
+
+    class RelationPages;
+}
+
+Ods::pag* DPM_allocate(Jrd::thread_db*, Jrd::win*)
+{ return nullptr; }
+
+void DPM_backout(Jrd::thread_db*, Jrd::record_param*) {}
+void DPM_backout_mark(Jrd::thread_db*, Jrd::record_param*, const Jrd::jrd_tra*) {}
+
+double DPM_cardinality(Jrd::thread_db*, Jrd::jrd_rel*, const Jrd::Format*)
+{ return 0.0; }
+
+bool DPM_chain(Jrd::thread_db*, Jrd::record_param*, Jrd::record_param*)
+{ return false; }
+
+void DPM_create_relation(Jrd::thread_db*, Jrd::jrd_rel*) {}
+
+ULONG DPM_data_pages(Jrd::thread_db*, Jrd::jrd_rel*)
+{ return 0; }
+
+void DPM_delete(Jrd::thread_db*, Jrd::record_param*, ULONG) {}
+void DPM_delete_relation(Jrd::thread_db*, Jrd::jrd_rel*) {}
+
+bool DPM_fetch(Jrd::thread_db*, Jrd::record_param*, USHORT)
+{ return false; }
+
+bool DPM_fetch_back(Jrd::thread_db*, Jrd::record_param*, USHORT, SSHORT)
+{ return false; }
+
+void DPM_fetch_fragment(Jrd::thread_db*, Jrd::record_param*, USHORT) {}
+
+SINT64 DPM_gen_id(Jrd::thread_db*, SLONG, bool, SINT64)
+{ return 0; }
+
+bool DPM_get(Jrd::thread_db*, Jrd::record_param*, SSHORT)
+{ return false; }
+
+ULONG DPM_get_blob(Jrd::thread_db*, Jrd::blb*, RecordNumber, bool, ULONG)
+{ return 0; }
+
+bool DPM_next(Jrd::thread_db*, Jrd::record_param*, USHORT, Jrd::FindNextRecordScope)
+{ return false; }
+
+void DPM_pages(Jrd::thread_db*, SSHORT, int, ULONG, ULONG) {}
+
+ULONG DPM_pointer_pages(Jrd::thread_db*, Jrd::jrd_rel*)
+{ return 0; }
+
+void DPM_scan_pages(Jrd::thread_db*) {}
+
+void DPM_store(Jrd::thread_db*, Jrd::record_param*, Jrd::PageStack&,
+    const Jrd::RecordStorageType) {}
+
+RecordNumber DPM_store_blob(Jrd::thread_db*, Jrd::blb*, Jrd::Record*)
+{ return RecordNumber(); }
+
+void DPM_rewrite_header(Jrd::thread_db*, Jrd::record_param*) {}
+void DPM_update(Jrd::thread_db*, Jrd::record_param*, Jrd::PageStack*,
+    const Jrd::jrd_tra*) {}
+
+void DPM_create_relation_pages(Jrd::thread_db*, Jrd::jrd_rel*, Jrd::RelationPages*) {}
+void DPM_delete_relation_pages(Jrd::thread_db*, Jrd::jrd_rel*, Jrd::RelationPages*) {}
+
+/* -----------------------------------------------------------------------
+ * fun.epp stubs  (FUN_evaluate and IbUtil from jrd/fun_proto.h)
+ *
+ * User-defined function support.  In WASM, external UDFs are not
+ * available.
+ *
+ * fun_proto.h includes Nodes.h which has heavy deps, so we replicate
+ * only the IbUtil class declaration and provide method definitions.
+ * ----------------------------------------------------------------------- */
+
+namespace Jrd {
+    class Function;
+    class impure_value;
+    class NestValueArray;
+}
+
+void FUN_evaluate(Jrd::thread_db*, const Jrd::Function*, const Jrd::NestValueArray&,
+    Jrd::impure_value*, Firebird::Array<UCHAR>&) {}
+
+/* IbUtil class – replicated from fun_proto.h to avoid pulling in Nodes.h.
+   Only the static method definitions are needed by the linker. */
+class IbUtil
+{
+public:
+    static void initialize();
+    static void* alloc(long size);
+    static bool free(void* ptr);
+};
+
+void IbUtil::initialize() {}
+
+void* IbUtil::alloc(long size)
+{ return malloc(size > 0 ? (size_t)size : 1); }
+
+bool IbUtil::free(void* ptr)
+{ ::free(ptr); return true; }
+
+/* -----------------------------------------------------------------------
+ * dyn_util.epp stubs  (DYN_UTIL_* functions from jrd/dyn_ut_proto.h)
+ *
+ * Dynamic utility functions for DDL operations (generating names,
+ * checking uniqueness, etc.).  In WASM, DDL is not supported.
+ *
+ * Signatures match Firebird v5.0.3 dyn_ut_proto.h.
+ * ----------------------------------------------------------------------- */
+
+void DYN_UTIL_store_check_constraints(Jrd::thread_db*, Jrd::jrd_tra*,
+    const Jrd::MetaName&, const Jrd::MetaName&) {}
+
+bool DYN_UTIL_find_field_source(Jrd::thread_db*, Jrd::jrd_tra*,
+    const Jrd::MetaName&, USHORT, const TEXT*, TEXT*)
+{ return false; }
+
+void DYN_UTIL_generate_generator_name(Jrd::thread_db*, Jrd::MetaName&) {}
+void DYN_UTIL_generate_trigger_name(Jrd::thread_db*, Jrd::jrd_tra*, Jrd::MetaName&) {}
+void DYN_UTIL_generate_index_name(Jrd::thread_db*, Jrd::jrd_tra*, Jrd::MetaName&, UCHAR) {}
+void DYN_UTIL_generate_field_position(Jrd::thread_db*, const Jrd::MetaName&, SLONG*) {}
+
+void DYN_UTIL_generate_field_name(Jrd::thread_db*, TEXT*) {}
+
+void DYN_UTIL_generate_field_name(Jrd::thread_db*, Jrd::MetaName&) {}
+
+void DYN_UTIL_generate_constraint_name(Jrd::thread_db*, Jrd::MetaName&) {}
+
+void DYN_UTIL_check_unique_name(Jrd::thread_db*, Jrd::jrd_tra*,
+    const Jrd::MetaName&, int) {}
+
+SINT64 DYN_UTIL_gen_unique_id(Jrd::thread_db*, SSHORT, const char*)
+{ return 0; }
+
+/* -----------------------------------------------------------------------
  * Stubs for libcds (Concurrent Data Structures) symbols.
  *
  * The full libcds source files (init.cpp, thread_data.cpp, hp.cpp, …)
