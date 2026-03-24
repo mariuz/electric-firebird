@@ -61,4 +61,13 @@ typedef int8_t   UBool;
 #define U_CALLCONV U_EXPORT2
 #endif
 
+/* ── Block-macro helpers (used by utf8.h / utf16.h macros) ─────────────── */
+#ifndef UPRV_BLOCK_MACRO_BEGIN
+#define UPRV_BLOCK_MACRO_BEGIN do
+#endif
+
+#ifndef UPRV_BLOCK_MACRO_END
+#define UPRV_BLOCK_MACRO_END while (0)
+#endif
+
 #endif /* UMACHINE_H_STUB */

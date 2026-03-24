@@ -48,6 +48,14 @@ file(GLOB_RECURSE DECNUMBER_SRCS "${FIREBIRD_SRC}/extern/decNumber/*.c")
 list(FILTER DECNUMBER_SRCS EXCLUDE REGEX ".*decBasic\\.c")
 list(FILTER DECNUMBER_SRCS EXCLUDE REGEX ".*decCommon\\.c")
 
+# re2 – regular expression library (used by SimilarToRegex)
+file(GLOB RE2_LIB_SRCS "${FIREBIRD_SRC}/extern/re2/re2/*.cc")
+set(RE2_UTIL_SRCS
+  "${FIREBIRD_SRC}/extern/re2/util/rune.cc"
+  "${FIREBIRD_SRC}/extern/re2/util/strutil.cc"
+)
+set(RE2_SRCS ${RE2_LIB_SRCS} ${RE2_UTIL_SRCS})
+
 # ---------------------------------------------------------------------------
 # Collect the embedded-engine source files
 # ---------------------------------------------------------------------------
@@ -58,6 +66,21 @@ list(FILTER DECNUMBER_SRCS EXCLUDE REGEX ".*decCommon\\.c")
 file(GLOB_RECURSE FB_COMMON_SRCS
   "${FIREBIRD_SRC}/src/common/*.cpp"
 )
+# Exclude standalone test / benchmark utilities in classes/misc/ – they use
+# unqualified #includes ("tree.h", "alloc.h") that don't resolve with our
+# include paths and are not part of the embedded engine.
+list(FILTER FB_COMMON_SRCS EXCLUDE REGEX ".*/common/classes/misc/.*")
+# Exclude Boost unit tests in classes/tests/ – they require boost/test headers
+# which are not available in the WASM build environment.
+list(FILTER FB_COMMON_SRCS EXCLUDE REGEX ".*/common/classes/tests/.*")
+# Exclude top-level common/tests/ (e.g. CommonTest.cpp) – same Boost dependency.
+list(FILTER FB_COMMON_SRCS EXCLUDE REGEX ".*/common/tests/.*")
+# Exclude Darwin (macOS) and Win32 platform-specific sources – the WASM build
+# targets Emscripten (POSIX-compatible) so only the posix/ implementations
+# are used.  Darwin files require <mach-o/dyld.h>; Win32 files require
+# <windows.h> – neither is available under Emscripten.
+list(FILTER FB_COMMON_SRCS EXCLUDE REGEX ".*/common/os/darwin/.*")
+list(FILTER FB_COMMON_SRCS EXCLUDE REGEX ".*/common/os/win32/.*")
 
 file(GLOB_RECURSE FB_DSQL_SRCS
   "${FIREBIRD_SRC}/src/dsql/*.cpp"
@@ -66,6 +89,20 @@ file(GLOB_RECURSE FB_DSQL_SRCS
 file(GLOB_RECURSE FB_JRD_SRCS
   "${FIREBIRD_SRC}/src/jrd/*.cpp"
 )
+# Exclude standalone test utilities in jrd/misc/ (e.g. evl_string_test.cpp) –
+# they are not part of the embedded engine and reference constructors/types
+# that may not compile in the WASM context.
+list(FILTER FB_JRD_SRCS EXCLUDE REGEX ".*/jrd/misc/.*")
+# Exclude Boost-dependent test files in jrd/tests/ (CompressorTest.cpp,
+# EngineTest.cpp) – they require Boost test headers unavailable in WASM.
+list(FILTER FB_JRD_SRCS EXCLUDE REGEX ".*/jrd/tests/.*")
+# Exclude Win32 platform-specific sources – they require <windows.h> which is
+# unavailable under Emscripten.
+list(FILTER FB_JRD_SRCS EXCLUDE REGEX ".*/jrd/os/win32/.*")
+# Exclude POSIX physical I/O (unix.cpp) – it requires <aio.h> for async I/O
+# which Emscripten does not provide.  The WASM embedded engine uses an
+# in-memory virtual filesystem and does not need native disk I/O.
+list(FILTER FB_JRD_SRCS EXCLUDE REGEX ".*/jrd/os/posix/.*")
 
 file(GLOB_RECURSE FB_LOCK_SRCS
   "${FIREBIRD_SRC}/src/lock/*.cpp"
@@ -84,15 +121,36 @@ set(FB_INCLUDE_DIRS
   "${FIREBIRD_SRC}/extern/libtommath"
   "${FIREBIRD_SRC}/extern/libtomcrypt/src/headers"
   "${FIREBIRD_SRC}/extern/decNumber"
-  # ICU stub headers – Firebird loads ICU dynamically at runtime so only
-  # the type/enum definitions are needed at compile time.
-  "${CMAKE_CURRENT_SOURCE_DIR}/stubs"
+  # re2 – include path so that #include "re2/re2.h" and "util/*.h" resolve
+  "${FIREBIRD_SRC}/extern/re2"
+  # libcds – Concurrent Data Structures library; jrd/jrd.h unconditionally
+  # includes <cds/threading/model.h>.  Only the headers are needed – no CDS
+  # source files are compiled for the WASM build.  The few CDS symbols
+  # referenced at link time are stubbed in fb_wasm_stubs.cpp.
+  "${FIREBIRD_SRC}/extern/libcds"
+  # ICU headers are provided by Emscripten's ICU port (-sUSE_ICU=1).
+  # No stub headers are needed – the real ICU headers supply all type/enum
+  # definitions AND function declarations used by unicode_util.cpp.
+)
+
+# ---------------------------------------------------------------------------
+# WASM glue & stub sources
+# ---------------------------------------------------------------------------
+# fb_wasm_api.cpp  – extern "C" API surface exported to JavaScript via
+#                    -s EXPORTED_FUNCTIONS (fb_init, fb_create_database, …).
+# fb_wasm_stubs.cpp – minimal implementations of Firebird internal functions
+#                     whose canonical homes (yvalve/gds.cpp, …) are not yet
+#                     compiled into the WASM build.
+set(FB_WASM_GLUE_SRCS
+  "${CMAKE_CURRENT_SOURCE_DIR}/fb_wasm_api.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/fb_wasm_stubs.cpp"
 )
 
 # ---------------------------------------------------------------------------
 # WASM library target
 # ---------------------------------------------------------------------------
 add_executable(firebird-embedded
+  ${FB_WASM_GLUE_SRCS}
   ${FB_COMMON_SRCS}
   ${FB_DSQL_SRCS}
   ${FB_JRD_SRCS}
@@ -100,6 +158,7 @@ add_executable(firebird-embedded
   ${LIBTOMMATH_SRCS}
   ${LIBTOMCRYPT_SRCS}
   ${DECNUMBER_SRCS}
+  ${RE2_SRCS}
 )
 
 target_include_directories(firebird-embedded PRIVATE ${FB_INCLUDE_DIRS})
@@ -119,6 +178,10 @@ target_compile_definitions(firebird-embedded PRIVATE
   # libtomcrypt compile-time flags (same as upstream Firebird)
   LTC_NO_ROLC
   LTC_SOURCE
+  # FB_TZDATADIR is normally set by the autotools configure; Firebird's
+  # TimeZoneUtil.cpp references it at compile time.  An empty string
+  # disables the external tzdata lookup – fine for WASM.
+  FB_TZDATADIR=""
 )
 
 # Stub pthread_rwlockattr_setkind_np() as a no-op returning 0 (success).
@@ -127,8 +190,15 @@ target_compile_definitions(firebird-embedded PRIVATE
 # safe for the single-threaded / limited-threading WASM environment.
 # We use target_compile_options because CMake's target_compile_definitions
 # drops function-style macros.
+#
+# -sUSE_ICU=1 activates Emscripten's ICU port, which downloads, builds, and
+# links the ICU libraries (common + i18n) automatically.  The flag is needed
+# at compile time so that Emscripten's port system injects the ICU include
+# path into the compiler invocation, and at link time so the ICU libraries
+# are linked into the WASM binary.
 target_compile_options(firebird-embedded PRIVATE
   "-Dpthread_rwlockattr_setkind_np(a,b)=0"
+  "-sUSE_ICU=1"
 )
 
 # ---------------------------------------------------------------------------
@@ -149,6 +219,7 @@ set(EMSCRIPTEN_LINK_FLAGS
   "-s FORCE_FILESYSTEM=1"
   "-s ENVIRONMENT='web,worker,node'"
   "-s SINGLE_FILE=0"
+  "-s USE_ICU=1"
 )
 
 string(REPLACE ";" " " EMSCRIPTEN_LINK_FLAGS_STR "${EMSCRIPTEN_LINK_FLAGS}")

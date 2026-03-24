@@ -15,6 +15,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: true
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -34,15 +36,13 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake git
 
-      - name: Cache Firebird source and native config
+      - name: Cache native config
         uses: actions/cache@v4
         with:
           path: |
-            packages/firebird-wasm/wasm/firebird-src
             packages/firebird-wasm/wasm/build-native-config
-          # Update the version prefix when FIREBIRD_TAG in build.sh changes.
-          key: firebird-src-v5.0.3-${{ hashFiles('packages/firebird-wasm/wasm/build.sh') }}
-          restore-keys: firebird-src-v5.0.3-
+          key: firebird-native-config-v5.0.3-${{ hashFiles('packages/firebird-wasm/wasm/build.sh') }}
+          restore-keys: firebird-native-config-v5.0.3-
 
       - name: Install root dependencies
         run: npm install

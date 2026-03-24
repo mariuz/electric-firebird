@@ -30,16 +30,30 @@ typedef enum {
     UCAL_FIELD_COUNT
 } UCalendarDateFields;
 
+/* Wall-time handling attributes used by ucal_setAttribute() */
 typedef enum {
     UCAL_LENIENT,
-    UCAL_STRICT
+    UCAL_FIRST_DAY_OF_WEEK,
+    UCAL_MINIMAL_DAYS_IN_FIRST_WEEK,
+    UCAL_REPEATED_WALL_TIME,
+    UCAL_SKIPPED_WALL_TIME
 } UCalendarAttribute;
+
+/* Wall-time option values */
+typedef enum {
+    UCAL_WALLTIME_LAST,
+    UCAL_WALLTIME_FIRST,
+    UCAL_WALLTIME_NEXT_VALID
+} UCalendarWallTimeOption;
 
 typedef enum {
     UCAL_TRADITIONAL,
     UCAL_DEFAULT = UCAL_TRADITIONAL,
     UCAL_GREGORIAN
 } UCalendarType;
+
+/* Milliseconds-per-minute constant used by TimeZoneUtil.cpp */
+#define U_MILLIS_PER_MINUTE 60000
 
 typedef enum {
     UCAL_TZ_TRANSITION_NEXT,
