@@ -72,7 +72,7 @@ SINT64 API_ROUTINE isc_portable_integer(const UCHAR* ptr, SSHORT length)
         shift += 8;
     }
 
-    value += ((SINT64)(SCHAR) *ptr) << shift;
+    value += ((SINT64)(UCHAR) *ptr) << shift;
 
     return value;
 }
@@ -222,8 +222,8 @@ int fallocate(int fd, int mode, off_t offset, off_t len)
  * sem_timedwait  –  POSIX semaphore wait with timeout.
  *
  * Emscripten does not provide sem_timedwait.  In the single-threaded
- * WASM environment, semaphore waits would deadlock anyway, so we return
- * 0 (success / semaphore acquired) immediately.
+ * WASM environment, blocking waits would deadlock, so we attempt a
+ * non-blocking sem_trywait and return ETIMEDOUT on failure.
  * ----------------------------------------------------------------------- */
 #include <semaphore.h>
 #include <errno.h>
@@ -233,8 +233,9 @@ extern "C"
 int sem_timedwait(sem_t* sem, const struct timespec* abs_timeout)
 {
     (void)abs_timeout;
-    /* Try a non-blocking decrement; if that fails just return success
-       to avoid deadlocking the single-threaded WASM runtime. */
+    /* Try a non-blocking decrement first. If that fails, return
+       ETIMEDOUT rather than blocking (which would deadlock the
+       single-threaded WASM runtime). */
     if (sem_trywait(sem) == 0)
         return 0;
     errno = ETIMEDOUT;
