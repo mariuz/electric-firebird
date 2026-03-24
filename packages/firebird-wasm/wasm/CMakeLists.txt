@@ -93,6 +93,13 @@ file(GLOB_RECURSE FB_JRD_SRCS
 # they are not part of the embedded engine and reference constructors/types
 # that may not compile in the WASM context.
 list(FILTER FB_JRD_SRCS EXCLUDE REGEX ".*/jrd/misc/.*")
+# Exclude Win32 platform-specific sources – they require <windows.h> which is
+# unavailable under Emscripten.
+list(FILTER FB_JRD_SRCS EXCLUDE REGEX ".*/jrd/os/win32/.*")
+# Exclude POSIX physical I/O (unix.cpp) – it requires <aio.h> for async I/O
+# which Emscripten does not provide.  The WASM embedded engine uses an
+# in-memory virtual filesystem and does not need native disk I/O.
+list(FILTER FB_JRD_SRCS EXCLUDE REGEX ".*/jrd/os/posix/.*")
 
 file(GLOB_RECURSE FB_LOCK_SRCS
   "${FIREBIRD_SRC}/src/lock/*.cpp"
