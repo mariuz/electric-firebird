@@ -13,8 +13,9 @@
 #   1. Initialise the Firebird git submodule (pinned to v5.0.3)
 #   2. Apply WASM / ICU patches from wasm/patches/
 #   3. Bootstrap Firebird: run a native cmake configure to generate autoconfig.h
-#   4. Run the Emscripten CMake build
-#   5. Copy the resulting .wasm + .js artefacts to the output directory
+#   4. Build the btyacc parser generator and run it to produce parse.h/parse.cpp
+#   5. Run the Emscripten CMake build
+#   6. Copy the resulting .wasm + .js artefacts to the output directory
 
 set -euo pipefail
 
@@ -72,10 +73,13 @@ if [[ ! -f "${PATCH_MARKER}" ]]; then
   touch "${PATCH_MARKER}"
 fi
 
-# ── Bootstrap: generate autoconfig.h via native (host) CMake configure ───────
+# ── Bootstrap: native (host) CMake configure ─────────────────────────────────
 # Firebird's source tree requires a configure step to produce
 # src/include/gen/autoconfig.h before any compilation (including
 # cross-compilation with Emscripten) can succeed.
+#
+# The same native build directory is also used to build the btyacc parser
+# generator tool and run the "parse" target to produce parse.h / parse.cpp.
 #
 # The Firebird cmake checks for ICU headers on UNIX and exits with
 # FATAL_ERROR if they are not found.  We pass -DICU_INCLUDE_DIR=/usr/include
@@ -90,23 +94,27 @@ fi
 NATIVE_BUILD_DIR="${SCRIPT_DIR}/build-native-config"
 AUTOCONFIG_NATIVE="${NATIVE_BUILD_DIR}/src/include/gen/autoconfig.h"
 AUTOCONFIG_SRC="${FIREBIRD_SRC}/src/include/gen/autoconfig.h"
+PARSE_H_NATIVE="${NATIVE_BUILD_DIR}/src/include/gen/parse.h"
+PARSE_H_SRC="${FIREBIRD_SRC}/src/include/gen/parse.h"
+PARSE_CPP_NATIVE="${NATIVE_BUILD_DIR}/src/dsql/parse.cpp"
+PARSE_CPP_SRC="${FIREBIRD_SRC}/src/dsql/parse.cpp"
 
-if [[ ! -f "${AUTOCONFIG_SRC}" ]]; then
-  echo "Bootstrapping Firebird source (generating autoconfig.h)…"
+# Ensure native build directory is configured (needed for both autoconfig.h
+# generation and the parse target).
+if [[ ! -f "${NATIVE_BUILD_DIR}/CMakeCache.txt" ]]; then
+  echo "Configuring native Firebird build (host compiler)…"
   mkdir -p "${NATIVE_BUILD_DIR}"
-  # Run only the configure phase with the host compiler.  The cmake may
-  # report errors for missing optional files (makeHeader.cpp, facilities2.sql)
-  # but configure_file() for autoconfig.h runs before those targets.
   cmake \
     -B "${NATIVE_BUILD_DIR}" \
     -S "${FIREBIRD_SRC}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DICU_INCLUDE_DIR=/usr/include \
     -Wno-dev 2>&1 || true
+fi
 
-  # cmake writes autoconfig.h to the binary (build) directory, not the
-  # source tree.  Copy it to src/include/gen/ so that all source files
-  # using #include "gen/autoconfig.h" can find it during the Emscripten build.
+# ── Step 1: autoconfig.h ─────────────────────────────────────────────────────
+if [[ ! -f "${AUTOCONFIG_SRC}" ]]; then
+  echo "Copying autoconfig.h from native build…"
   if [[ -f "${AUTOCONFIG_NATIVE}" ]]; then
     mkdir -p "${FIREBIRD_SRC}/src/include/gen"
     cp "${AUTOCONFIG_NATIVE}" "${AUTOCONFIG_SRC}"
@@ -114,6 +122,41 @@ if [[ ! -f "${AUTOCONFIG_SRC}" ]]; then
   else
     echo "Error: native CMake configure did not produce autoconfig.h." >&2
     echo "       Ensure cmake and a host C++ compiler (gcc/clang) are installed." >&2
+    exit 1
+  fi
+fi
+
+# ── Step 2: parse.h + parse.cpp (btyacc parser generation) ──────────────────
+# Firebird's SQL parser is generated from src/dsql/parse.y by the btyacc
+# (backtracking YACC) tool that ships in extern/btyacc/.  The upstream
+# CMakeLists.txt defines a "parse" custom target that:
+#   1. Builds the btyacc executable from extern/btyacc/*.c
+#   2. Runs btyacc on parse.y with the Firebird skeleton (btyacc_fb.ske)
+#   3. Post-processes token defines to add TOK_ prefixes
+#   4. Copies the result to include/gen/parse.h and dsql/parse.cpp
+#
+# We build only the "parse" target (and its btyacc dependency) using the
+# native host compiler.  The generated files are then copied into the
+# source tree so the Emscripten cross-compilation can find them.
+if [[ ! -f "${PARSE_H_SRC}" ]]; then
+  echo "Generating parse.h and parse.cpp (building btyacc + parse target)…"
+  cmake --build "${NATIVE_BUILD_DIR}" --target parse -j"$(nproc)" 2>&1 || true
+
+  if [[ -f "${PARSE_H_NATIVE}" ]]; then
+    mkdir -p "${FIREBIRD_SRC}/src/include/gen"
+    cp "${PARSE_H_NATIVE}" "${PARSE_H_SRC}"
+    echo "parse.h generated and copied to source tree."
+  else
+    echo "Error: native build did not produce parse.h." >&2
+    echo "       Ensure a host C compiler is installed (btyacc is built from C)." >&2
+    exit 1
+  fi
+
+  if [[ -f "${PARSE_CPP_NATIVE}" ]]; then
+    cp "${PARSE_CPP_NATIVE}" "${PARSE_CPP_SRC}"
+    echo "parse.cpp generated and copied to source tree."
+  else
+    echo "Error: native build did not produce parse.cpp." >&2
     exit 1
   fi
 fi
