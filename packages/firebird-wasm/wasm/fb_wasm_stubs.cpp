@@ -219,6 +219,37 @@ int fallocate(int fd, int mode, off_t offset, off_t len)
 }
 
 /* -----------------------------------------------------------------------
+ * gds__prefix  –  build a path from the Firebird installation prefix.
+ *
+ * In WASM there is no installation directory.  We return "/firebird/" +
+ * root so callers get a syntactically valid path inside the virtual FS.
+ * ----------------------------------------------------------------------- */
+extern "C"
+void API_ROUTINE gds__prefix(TEXT* string, const TEXT* root)
+{
+    if (!string)
+        return;
+    strcpy(string, "/firebird/");
+    if (root)
+        strcat(string, root);
+}
+
+/* -----------------------------------------------------------------------
+ * gds__prefix_msg  –  build a path for the message file.
+ *
+ * Same pattern as gds__prefix – return a path under the virtual FS.
+ * ----------------------------------------------------------------------- */
+extern "C"
+void API_ROUTINE gds__prefix_msg(TEXT* string, const TEXT* root)
+{
+    if (!string)
+        return;
+    strcpy(string, "/firebird/");
+    if (root)
+        strcat(string, root);
+}
+
+/* -----------------------------------------------------------------------
  * sem_timedwait  –  POSIX semaphore wait with timeout.
  *
  * Emscripten does not provide sem_timedwait.  In the single-threaded
@@ -241,3 +272,151 @@ int sem_timedwait(sem_t* sem, const struct timespec* abs_timeout)
     errno = ETIMEDOUT;
     return -1;
 }
+
+/* -----------------------------------------------------------------------
+ * Stubs for functions defined in .epp (embedded-preprocessor) generated
+ * files that are not yet available in the WASM build.
+ *
+ * The .epp → .cpp generation requires the gpre preprocessor (which needs
+ * a running Firebird database), so these files (met.epp, scl.epp,
+ * metd.epp) are not compiled for WASM.  Minimal stubs are provided so
+ * the linker can resolve the symbols.
+ *
+ * We include the actual Firebird headers that declare these functions to
+ * guarantee that the C++ name-mangling matches what callers expect.
+ * ----------------------------------------------------------------------- */
+
+#include "firebird/impl/types_pub.h"
+
+/* Forward declarations – just enough for the prototypes below.
+   Full headers (scl.h, met_proto.h, metd_proto.h) pull in too many
+   transitive dependencies, so we replicate only the needed bits. */
+namespace Jrd {
+    class thread_db;
+    class jrd_tra;
+    class jrd_rel;
+    class MetaName;
+}
+
+/* METD_get_charset_bpc – return bytes-per-character for a charset id.
+ * Declared in dsql/metd_proto.h as:
+ *   USHORT METD_get_charset_bpc(Jrd::jrd_tra*, SSHORT);
+ * Returns 1 (single-byte) as a safe default. */
+USHORT METD_get_charset_bpc(Jrd::jrd_tra*, SSHORT)
+{
+    return 1;
+}
+
+/* MET_lookup_relation – look up a relation (table/view) by name.
+ * Declared in jrd/met_proto.h as:
+ *   Jrd::jrd_rel* MET_lookup_relation(Jrd::thread_db*, const Jrd::MetaName&);
+ * Returns nullptr (not found) when metadata tables are unavailable. */
+Jrd::jrd_rel* MET_lookup_relation(Jrd::thread_db*, const Jrd::MetaName&)
+{
+    return nullptr;
+}
+
+/* MET_lookup_field – look up a field in a relation by name.
+ * Declared in jrd/met_proto.h as:
+ *   int MET_lookup_field(Jrd::thread_db*, Jrd::jrd_rel*, const Jrd::MetaName&);
+ * Returns -1 (not found). */
+int MET_lookup_field(Jrd::thread_db*, Jrd::jrd_rel*, const Jrd::MetaName&)
+{
+    return -1;
+}
+
+/* Jrd::UserId::findGrantedRoles – populate granted roles for a user.
+ * Declared in jrd/scl.h as a private method of class UserId:
+ *   void findGrantedRoles(thread_db* tdbb) const;
+ * We include scl.h to get the class definition so the mangled name
+ * matches.  No-op when metadata tables are unavailable. */
+#include "jrd/scl.h"
+
+namespace Jrd {
+    void UserId::findGrantedRoles(thread_db*) const
+    {
+    }
+}
+
+/* -----------------------------------------------------------------------
+ * Stubs for libcds (Concurrent Data Structures) symbols.
+ *
+ * The full libcds source files (init.cpp, thread_data.cpp, hp.cpp, …)
+ * pull in a deep dependency chain (hazard-pointer GC, RCU, …) that is
+ * not meaningful in the single-threaded WASM environment.  We define
+ * only the symbols that the Firebird engine references at link time.
+ *
+ * The headers below mirror the conditional includes from libcds/src/init.cpp.
+ * ----------------------------------------------------------------------- */
+#include <cds/threading/details/_common.h>
+#if CDS_COMPILER == CDS_COMPILER_GCC || CDS_COMPILER == CDS_COMPILER_CLANG || CDS_COMPILER == CDS_COMPILER_INTEL
+#   include <cds/threading/details/gcc_manager.h>
+#endif
+#include <cds/threading/details/pthread_manager.h>
+#ifdef CDS_CXX11_THREAD_LOCAL_SUPPORT
+#   include <cds/threading/details/cxx11_manager.h>
+#endif
+#include <cds/algo/backoff_strategy.h>
+
+namespace cds {
+
+    /* Static pthread TLS key used by the pthread threading manager. */
+    pthread_key_t threading::pthread::Manager::Holder::m_key;
+
+    /* GCC/Clang __thread thread-local storage variables. */
+#if CDS_COMPILER == CDS_COMPILER_GCC || CDS_COMPILER == CDS_COMPILER_CLANG
+    __thread threading::gcc_internal::ThreadDataPlaceholder CDS_DATA_ALIGNMENT(8) threading::gcc_internal::s_threadData;
+    __thread threading::ThreadData * threading::gcc_internal::s_pThreadData = nullptr;
+#endif
+
+    /* C++11 thread_local storage variables. */
+#ifdef CDS_CXX11_THREAD_LOCAL_SUPPORT
+    thread_local threading::cxx11_internal::ThreadDataPlaceholder CDS_DATA_ALIGNMENT(8) threading::cxx11_internal::s_threadData;
+    thread_local threading::ThreadData * threading::cxx11_internal::s_pThreadData = nullptr;
+#endif
+
+    namespace threading {
+        /* Static data members of ThreadData */
+        CDS_EXPORT_API atomics::atomic<size_t> ThreadData::s_nLastUsedProcNo(0);
+        CDS_EXPORT_API size_t ThreadData::s_nProcCount = 1;
+
+        /* Thread lifecycle – simplified for single-threaded WASM.
+         * The real init() attaches to HP/DHP GC and RCU, which we skip. */
+        CDS_EXPORT_API void ThreadData::init()
+        {
+            ++m_nAttachCount;
+        }
+
+        CDS_EXPORT_API bool ThreadData::fini()
+        {
+            if (--m_nAttachCount == 0)
+                return true;
+            return false;
+        }
+    } // namespace threading
+
+    namespace details {
+        static atomics::atomic<size_t> s_nInitCallCount(0);
+
+        bool CDS_EXPORT_API init_first_call()
+        {
+            return s_nInitCallCount.fetch_add(1, atomics::memory_order_relaxed) == 0;
+        }
+
+        bool CDS_EXPORT_API fini_last_call()
+        {
+            if (s_nInitCallCount.fetch_sub(1, atomics::memory_order_relaxed) == 1) {
+                atomics::atomic_thread_fence(atomics::memory_order_release);
+                return true;
+            }
+            return false;
+        }
+    } // namespace details
+
+    namespace backoff {
+        /*static*/ size_t exponential_runtime_traits::lower_bound = 16;
+        /*static*/ size_t exponential_runtime_traits::upper_bound = 16 * 1024;
+        /*static*/ unsigned delay_runtime_traits::timeout = 5;
+    } // namespace backoff
+
+} // namespace cds

@@ -125,7 +125,8 @@ set(FB_INCLUDE_DIRS
   "${FIREBIRD_SRC}/extern/re2"
   # libcds – Concurrent Data Structures library; jrd/jrd.h unconditionally
   # includes <cds/threading/model.h>.  Only the headers are needed – no CDS
-  # source files are compiled for the WASM build.
+  # source files are compiled for the WASM build.  The few CDS symbols
+  # referenced at link time are stubbed in fb_wasm_stubs.cpp.
   "${FIREBIRD_SRC}/extern/libcds"
   # ICU headers are provided by Emscripten's ICU port (-sUSE_ICU=1).
   # No stub headers are needed – the real ICU headers supply all type/enum
