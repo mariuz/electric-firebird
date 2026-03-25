@@ -110,6 +110,14 @@ list(FILTER FB_JRD_SRCS EXCLUDE REGEX ".*/jrd/tests/.*")
 # Exclude Win32 platform-specific sources – they require <windows.h> which is
 # unavailable under Emscripten.
 list(FILTER FB_JRD_SRCS EXCLUDE REGEX ".*/jrd/os/win32/.*")
+# Exclude the External Data Sources (extds/) subsystem – it connects to remote
+# Firebird servers via the legacy isc_* client API (isc_attach_database,
+# isc_array_*, isc_blob_*, isc_commit_transaction, etc.) and requires
+# UserId::populateDpb (implemented in scl.epp, not compiled for WASM).
+# Without this exclusion the linker reports 20+ undefined isc_* symbols.
+# The External Data Sources feature is irrelevant in a single-process
+# in-memory WASM embedded engine.
+list(FILTER FB_JRD_SRCS EXCLUDE REGEX ".*/jrd/extds/.*")
 # jrd/os/posix/unix.cpp provides the physical page I/O (PIO_read, PIO_write,
 # PIO_open, PIO_create, PIO_close, etc.) that the page cache (cch.cpp) and
 # other JRD modules require.  It compiles cleanly under Emscripten because:
