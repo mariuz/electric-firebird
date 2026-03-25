@@ -1657,3 +1657,158 @@ USHORT API_ROUTINE gds__parse_bpb2(USHORT bpb_length, const UCHAR* /*bpb*/,
     return 0;
 }
 
+/* -----------------------------------------------------------------------
+ * UserId::sclInit / UserId::populateDpb  (scl.epp stubs)
+ *
+ * sclInit() initialises the security-class list for a new attachment by
+ * scanning RDB$USER_PRIVILEGES.  In the embedded WASM build there is no
+ * security database and we skip this step.
+ *
+ * populateDpb() injects user/role credentials into a DPB (Database
+ * Parameter Block) before opening a remote connection.  In the WASM
+ * build external data sources are disabled (jrd/extds/ is not compiled),
+ * so this stub should never be reached; it is provided for completeness
+ * in case any residual reference appears.
+ *
+ * Both are instance methods of Jrd::UserId declared in jrd/scl.h and
+ * implemented in scl.epp (not compiled for WASM).
+ * ----------------------------------------------------------------------- */
+
+namespace Jrd {
+
+void UserId::sclInit(thread_db* /*tdbb*/, bool /*create*/) {}
+void UserId::populateDpb(Firebird::ClumpletWriter& /*dpb*/, bool /*embeddedSupport*/) {}
+
+} // namespace Jrd
+
+/* -----------------------------------------------------------------------
+ * EDS (External Data Sources) stubs
+ *
+ * jrd/extds/ is excluded from the WASM build because it requires the
+ * legacy isc_* client API and UserId::populateDpb.  However the
+ * following compiled files still call EDS:: symbols:
+ *
+ *   dsql/StmtNodes.cpp  – EDS::Manager::getConnection,
+ *                         EDS::Connection::createStatement,
+ *                         EDS::Statement::{bindToRequest, prepare,
+ *                           setTimeout, open, execute, fetch, close}
+ *                         EDS::Transaction::getTransaction
+ *   jrd/SysFunction.cpp – EDS::Manager::getConnPool
+ *   jrd/exe.cpp         – EDS::Statement::close
+ *   jrd/jrd.cpp         – EDS::Transaction::jrdTransactionEnd,
+ *                         EDS::Manager::{jrdAttachmentEnd, shutdown}
+ *
+ * All stubs are no-ops / null returns.  We forward-declare minimal class
+ * skeletons rather than including ExtDS.h directly (that header pulls in
+ * the legacy isc_* interface).
+ *
+ * The parameter types used below are all available transitively via the
+ * jrd/exe.h include already present above:
+ *   Jrd::thread_db, Jrd::jrd_tra, Jrd::MetaName, Jrd::ValueListNode,
+ *   Firebird::string (= StringBase<StringComparator>), Firebird::Array.
+ *
+ * Jrd::Attachment and Jrd::Request are not provided by exe.h, so we
+ * forward-declare them here.
+ * ----------------------------------------------------------------------- */
+
+namespace Jrd {
+    class Attachment;
+    class Request;
+}
+
+namespace EDS {
+
+/* TraScope enum – must match ExtDS.h exactly so that callers compiled
+   with the real header link against the same mangled names. */
+enum TraScope { traNotSet = 0, traAutonomous, traCommon, traTwoPhase };
+
+/* ParamNumbers – typedef from ExtDS.h line ~673 */
+typedef Firebird::Array<USHORT> ParamNumbers;
+
+/* ---- Minimal class skeletons (stubs only – no inheritance needed) ---- */
+
+class ConnectionsPool;
+class Connection;
+class Transaction;
+
+class Manager {
+public:
+    static Connection* getConnection(Jrd::thread_db*,
+        const Firebird::string&, const Firebird::string&,
+        const Firebird::string&, const Firebird::string&, TraScope);
+    static ConnectionsPool* getConnPool(bool);
+    static void jrdAttachmentEnd(Jrd::thread_db*, Jrd::Attachment*, bool);
+    static int shutdown();
+};
+
+class Connection {
+public:
+    class Statement* createStatement(const Firebird::string&);
+};
+
+class Transaction {
+public:
+    static Transaction* getTransaction(Jrd::thread_db*, Connection*, TraScope);
+    static void jrdTransactionEnd(Jrd::thread_db*, Jrd::jrd_tra*, bool, bool, bool);
+};
+
+class Statement {
+public:
+    void bindToRequest(Jrd::Request*, Statement**);
+    void prepare(Jrd::thread_db*, Transaction*, const Firebird::string&, bool);
+    void setTimeout(Jrd::thread_db*, unsigned int);
+    void open(Jrd::thread_db*, Transaction*,
+              const Jrd::MetaName* const*, const Jrd::ValueListNode*,
+              const ParamNumbers*, bool);
+    void execute(Jrd::thread_db*, Transaction*,
+                 const Jrd::MetaName* const*, const Jrd::ValueListNode*,
+                 const ParamNumbers*, const Jrd::ValueListNode*);
+    bool fetch(Jrd::thread_db*, const Jrd::ValueListNode*);
+    void close(Jrd::thread_db*, bool = false);
+};
+
+/* ---- Manager stubs ---- */
+
+/*static*/ Connection* Manager::getConnection(Jrd::thread_db*, const Firebird::string&,
+    const Firebird::string&, const Firebird::string&, const Firebird::string&, TraScope)
+{ return nullptr; }
+
+/*static*/ ConnectionsPool* Manager::getConnPool(bool) { return nullptr; }
+
+/*static*/ void Manager::jrdAttachmentEnd(Jrd::thread_db*, Jrd::Attachment*, bool) {}
+
+/*static*/ int Manager::shutdown() { return 0; }
+
+/* ---- Connection stub ---- */
+
+Statement* Connection::createStatement(const Firebird::string&) { return nullptr; }
+
+/* ---- Transaction stubs ---- */
+
+/*static*/ Transaction* Transaction::getTransaction(Jrd::thread_db*, Connection*, TraScope)
+{ return nullptr; }
+
+/*static*/ void Transaction::jrdTransactionEnd(Jrd::thread_db*, Jrd::jrd_tra*, bool, bool, bool) {}
+
+/* ---- Statement stubs ---- */
+
+void Statement::bindToRequest(Jrd::Request*, Statement**) {}
+
+void Statement::prepare(Jrd::thread_db*, Transaction*, const Firebird::string&, bool) {}
+
+void Statement::setTimeout(Jrd::thread_db*, unsigned int) {}
+
+void Statement::open(Jrd::thread_db*, Transaction*,
+    const Jrd::MetaName* const*, const Jrd::ValueListNode*,
+    const ParamNumbers*, bool) {}
+
+void Statement::execute(Jrd::thread_db*, Transaction*,
+    const Jrd::MetaName* const*, const Jrd::ValueListNode*,
+    const ParamNumbers*, const Jrd::ValueListNode*) {}
+
+bool Statement::fetch(Jrd::thread_db*, const Jrd::ValueListNode*) { return false; }
+
+void Statement::close(Jrd::thread_db*, bool) {}
+
+} // namespace EDS
+
