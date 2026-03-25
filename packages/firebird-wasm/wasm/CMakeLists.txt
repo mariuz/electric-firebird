@@ -56,6 +56,17 @@ set(RE2_UTIL_SRCS
 )
 set(RE2_SRCS ${RE2_LIB_SRCS} ${RE2_UTIL_SRCS})
 
+# libcds DHP (Dynamic Hazard Pointer) GC – dhp.cpp provides the SMR
+# (Safe Memory Reclamation) implementation: smr::construct, smr::destruct,
+# smr::set_memory_allocator, smr::tls, and related helpers.
+# dhp.cpp compiles cleanly under Emscripten (uses only standard C++ and
+# POSIX pthreads).  init.cpp and thread_data.cpp are NOT compiled here
+# because their symbols are provided as lightweight stubs in
+# fb_wasm_stubs.cpp (those files pull in heavy URCU dependencies).
+set(FB_CDS_DHP_SRCS
+  "${FIREBIRD_SRC}/extern/libcds/src/dhp.cpp"
+)
+
 # ---------------------------------------------------------------------------
 # Collect the embedded-engine source files
 # ---------------------------------------------------------------------------
@@ -99,10 +110,17 @@ list(FILTER FB_JRD_SRCS EXCLUDE REGEX ".*/jrd/tests/.*")
 # Exclude Win32 platform-specific sources – they require <windows.h> which is
 # unavailable under Emscripten.
 list(FILTER FB_JRD_SRCS EXCLUDE REGEX ".*/jrd/os/win32/.*")
-# Exclude POSIX physical I/O (unix.cpp) – it requires <aio.h> for async I/O
-# which Emscripten does not provide.  The WASM embedded engine uses an
-# in-memory virtual filesystem and does not need native disk I/O.
-list(FILTER FB_JRD_SRCS EXCLUDE REGEX ".*/jrd/os/posix/.*")
+# jrd/os/posix/unix.cpp provides the physical page I/O (PIO_read, PIO_write,
+# PIO_open, PIO_create, PIO_close, etc.) that the page cache (cch.cpp) and
+# other JRD modules require.  It compiles cleanly under Emscripten because:
+#  - HAVE_PREAD / HAVE_PWRITE are set by the native-host autoconfig.h, so the
+#    async-I/O fallback (which uses <aio.h>) is compiled out.
+#  - build.sh removes HAVE_AIO_H and HAVE_LINUX_FALLOC_H from autoconfig.h
+#    so neither <aio.h> nor <linux/falloc.h> is included.
+#  - SUPPORT_RAW_DEVICES is not defined, so the ioctl() / <linux/fs.h> paths
+#    are excluded.
+# Emscripten exposes pread/pwrite via its MEMFS virtual filesystem, giving the
+# WASM engine real in-memory page storage without any native disk dependency.
 
 file(GLOB_RECURSE FB_LOCK_SRCS
   "${FIREBIRD_SRC}/src/lock/*.cpp"
@@ -159,6 +177,7 @@ add_executable(firebird-embedded
   ${LIBTOMCRYPT_SRCS}
   ${DECNUMBER_SRCS}
   ${RE2_SRCS}
+  ${FB_CDS_DHP_SRCS}
 )
 
 target_include_directories(firebird-embedded PRIVATE ${FB_INCLUDE_DIRS})

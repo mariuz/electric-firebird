@@ -1075,6 +1075,11 @@ namespace cds {
             }
             return false;
         }
+
+        /* Called from cds::Initialize() (inline in cds/init.h) to record
+           whether HP statistics collection was compiled in.  No-op in WASM. */
+        void CDS_EXPORT_API check_hpstat_enabled(bool /*enabled*/) {}
+
     } // namespace details
 
     namespace backoff {
@@ -1162,6 +1167,15 @@ Function* Function::lookup(thread_db* /*tdbb*/, const QualifiedName& /*name*/,
 bool Function::checkCache(thread_db* /*tdbb*/) const { return false; }
 void Function::clearCache(thread_db* /*tdbb*/) {}
 bool Function::reload(thread_db* /*tdbb*/) { return false; }
+
+/* Second static lookup overload – by numeric ID.  Returns nullptr. */
+Function* Function::lookup(thread_db* /*tdbb*/, USHORT /*id*/,
+    bool /*return_deleted*/, bool /*noscan*/, USHORT /*flags*/)
+{ return nullptr; }
+
+/* Releases existence lock and marks function for reclamation.
+   No-op in WASM (no lock manager). */
+void Function::releaseLocks(thread_db* /*tdbb*/) {}
 
 } // namespace Jrd
 
@@ -1575,4 +1589,72 @@ Firebird::string DropPackageBodyNode::internalPrint(NodePrinter& /*p*/) const
 void DropPackageBodyNode::checkPermission(thread_db*, jrd_tra*) {}
 void DropPackageBodyNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
+/* ------- RelationNode constructor ---------------------------------------- */
+/* RelationNode::RelationNode() is defined in DdlNodes.epp (not compiled).
+   Provide a minimal constructor that initialises all members. */
+
+RelationNode::RelationNode(MemoryPool& p, RelationSourceNode* aDsqlNode)
+    : DdlNode(p),
+      dsqlNode(aDsqlNode),
+      name(p),
+      clauses(p)
+{}
+
 } // namespace Jrd
+
+/* -----------------------------------------------------------------------
+ * jrd_prc (Procedure) virtual method stubs  (met.epp)
+ *
+ * jrd_prc is declared in jrd/jrd.h (included via jrd/exe.h).  Its three
+ * non-inline virtual methods – checkCache, clearCache, reload – are
+ * implemented in met.epp which is NOT compiled for WASM.  Providing
+ * no-op stubs here anchors the vtable and satisfies the linker.
+ * ----------------------------------------------------------------------- */
+
+namespace Jrd {
+
+bool jrd_prc::checkCache(thread_db* /*tdbb*/) const { return false; }
+void jrd_prc::clearCache(thread_db* /*tdbb*/) {}
+bool jrd_prc::reload(thread_db* /*tdbb*/) { return false; }
+
+} // namespace Jrd
+
+/* -----------------------------------------------------------------------
+ * UserId::makeRoleName  (scl.epp stub)
+ *
+ * makeRoleName() normalises a SQL role name to uppercase for dialect 1,
+ * and leaves it unchanged for dialect 3.  In the WASM build we skip
+ * security enforcement, so a no-op is safe.
+ *
+ * scl.h / jrd/scl.h is pulled in transitively through jrd/exe.h.
+ * ----------------------------------------------------------------------- */
+
+namespace Jrd {
+
+/*static*/ void UserId::makeRoleName(Firebird::MetaString& /*role*/,
+    const int /*dialect*/) {}
+
+} // namespace Jrd
+
+/* -----------------------------------------------------------------------
+ * gds__parse_bpb2  (yvalve/gds.cpp stub)
+ *
+ * gds__parse_bpb2 parses a Blob Parameter Block version 2 into its
+ * component fields.  blb.cpp and blob_filter.cpp call it to inspect
+ * blob type / sub-type information.  In the embedded WASM build blob
+ * sub-types are not relevant; return 0 (no parameters found).
+ *
+ * Signature from src/yvalve/gds_proto.h.
+ * ----------------------------------------------------------------------- */
+
+extern "C"
+USHORT API_ROUTINE gds__parse_bpb2(USHORT bpb_length, const UCHAR* /*bpb*/,
+    SSHORT* /*source_type*/, SSHORT* /*target_type*/,
+    USHORT* /*source_interp*/, USHORT* /*target_interp*/,
+    bool* /*source_nullable*/, bool* /*target_nullable*/,
+    bool* /*db_key_scope*/, bool* /*expected_scope*/)
+{
+    (void) bpb_length;
+    return 0;
+}
+
