@@ -62,3 +62,27 @@ jobs:
             packages/firebird-wasm/dist/wasm/firebird-embedded.wasm
           if-no-files-found: error
           retention-days: 90
+
+      # ── WASM tests ────────────────────────────────────────────────────────
+
+      - name: Run WASM console (Node.js) integration tests
+        working-directory: packages/firebird-wasm
+        run: npx jest --testPathPattern=wasm-integration --forceExit
+
+      - name: Install Playwright browsers for WASM browser tests
+        working-directory: e2e
+        run: npx playwright install --with-deps chromium
+
+      - name: Run WASM browser (Playwright) e2e tests
+        working-directory: e2e
+        env:
+          CI: 'true'
+        run: npx playwright test --config playwright.wasm.config.ts
+
+      - name: Upload WASM Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-wasm
+          path: e2e/playwright-report-wasm/
+          retention-days: 30
