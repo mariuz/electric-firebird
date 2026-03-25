@@ -1603,18 +1603,17 @@ RelationNode::RelationNode(MemoryPool& p, RelationSourceNode* aDsqlNode)
 } // namespace Jrd
 
 /* -----------------------------------------------------------------------
- * jrd_prc (Procedure) virtual method stubs  (met.epp)
+ * jrd_prc::reload stub  (met.epp)
  *
- * jrd_prc is declared in jrd/jrd.h (included via jrd/exe.h).  Its three
- * non-inline virtual methods – checkCache, clearCache, reload – are
- * implemented in met.epp which is NOT compiled for WASM.  Providing
- * no-op stubs here anchors the vtable and satisfies the linker.
+ * jrd_prc::checkCache and jrd_prc::clearCache are implemented in
+ * jrd/Routine.cpp which IS compiled for WASM; those are NOT stubbed here.
+ * jrd_prc::reload is implemented in met.epp which is NOT compiled for
+ * WASM (requires the gpre preprocessor).  A no-op stub is provided here
+ * to satisfy the linker; the vtable is already anchored by Routine.cpp.
  * ----------------------------------------------------------------------- */
 
 namespace Jrd {
 
-bool jrd_prc::checkCache(thread_db* /*tdbb*/) const { return false; }
-void jrd_prc::clearCache(thread_db* /*tdbb*/) {}
 bool jrd_prc::reload(thread_db* /*tdbb*/) { return false; }
 
 } // namespace Jrd
