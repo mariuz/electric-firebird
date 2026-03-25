@@ -1812,3 +1812,70 @@ void Statement::close(Jrd::thread_db*, bool) {}
 
 } // namespace EDS
 
+/* -----------------------------------------------------------------------
+ * Service utility entry-point stubs  (jrd/svc.cpp references)
+ *
+ * jrd/svc.cpp registers the following entry points in its service table,
+ * but the corresponding utility source trees (burp/, alice/, utilities/)
+ * are not compiled for the WASM build.  All stubs return 1 (failure).
+ *
+ * Signatures come from the respective proto headers at v5.0.3:
+ *   BURP_main   – burp/burp_proto.h
+ *   ALICE_main  – alice/alice_proto.h
+ *   GSEC_main   – utilities/gsec/gsec_proto.h
+ *   main_gstat  – forward-declared inline in svc.cpp (int main_gstat(...))
+ *   NBACKUP_main – utilities/nbackup/nbk_proto.h
+ * ----------------------------------------------------------------------- */
+
+namespace Firebird { class UtilSvc; }
+
+int BURP_main(Firebird::UtilSvc*) { return 1; }
+int ALICE_main(Firebird::UtilSvc*) { return 1; }
+int GSEC_main(Firebird::UtilSvc*) { return 1; }
+int main_gstat(Firebird::UtilSvc*) { return 1; }
+int NBACKUP_main(Firebird::UtilSvc*) { return 1; }
+
+/* -----------------------------------------------------------------------
+ * fb_shutdown / fb_database_crypt_callback  (yvalve/why.cpp stubs)
+ *
+ * jrd/svc.cpp calls fb_shutdown (graceful engine shutdown) and
+ * fb_database_crypt_callback (encryption callback registration).
+ * Neither yvalve/why.cpp nor the Client API is compiled into the WASM
+ * build; no-op stubs are safe.
+ *
+ * Signatures from src/include/firebird/ibase.h:
+ *   int fb_shutdown(unsigned int timeout_millis, const int reason);
+ *   ISC_STATUS fb_database_crypt_callback(ISC_STATUS*, void* callback);
+ * ----------------------------------------------------------------------- */
+
+extern "C" {
+
+int fb_shutdown(unsigned int /*timeout_millis*/, const int /*reason*/)
+{ return 0; }
+
+ISC_STATUS fb_database_crypt_callback(ISC_STATUS* status, void* /*callback*/)
+{
+    if (status) status[0] = 0;
+    return 0;
+}
+
+/* -----------------------------------------------------------------------
+ * gds__decode  (yvalve/gds.cpp stub)
+ *
+ * jrd/trace/TraceCmdLine.cpp calls gds__decode to decompose a status
+ * code into facility/code parts.  Return 0 (success, unknown code).
+ *
+ * Signature from src/yvalve/gds_proto.h:
+ *   ISC_STATUS gds__decode(ISC_STATUS code, USHORT* fac, USHORT* num);
+ * ----------------------------------------------------------------------- */
+
+ISC_STATUS API_ROUTINE gds__decode(ISC_STATUS /*code*/,
+    USHORT* fac, USHORT* num)
+{
+    if (fac) *fac = 0;
+    if (num) *num = 0;
+    return 0;
+}
+
+} /* extern "C" */
+
