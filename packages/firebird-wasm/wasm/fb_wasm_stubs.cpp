@@ -298,7 +298,6 @@ int sem_timedwait(sem_t* sem, const struct timespec* abs_timeout)
 /* Forward declarations – only pointers/references are used, so full
    definitions are not required. */
 struct dsc;
-class MemoryPool;
 
 namespace Jrd {
     class thread_db;
@@ -343,16 +342,10 @@ namespace Jrd {
         MET_object_unknown
     };
 
-    /* From dsql/sym.h – used by MET_dsql_cache_use/release. */
-    enum sym_type {
-        SYM_relation = 1,
-        SYM_udf,
-        SYM_procedure,
-        SYM_intlsym_charset,
-        SYM_intlsym_collation,
-        SYM_eof
-    };
 }
+
+/* From dsql/sym.h – used by MET_dsql_cache_use/release. */
+#include "dsql/sym.h"
 
 /* SubtypeInfo – replicated from met_proto.h (the original uses
    Firebird::UCharBuffer which needs array.h). */
@@ -717,7 +710,74 @@ void GRANT_privileges(Jrd::thread_db*, const Firebird::string&, ObjectType, Jrd:
  * ----------------------------------------------------------------------- */
 
 namespace Jrd {
-    enum dfw_t;
+    /* Full dfw_t definition from jrd/tra.h (v5.0.3).
+       ISO C++ forbids forward references to unscoped enums, and tra.h is not
+       included here.  We replicate the definition so that DFW_post_work and
+       friends can accept the enum by value. */
+    enum dfw_t {
+        dfw_null,
+        dfw_create_relation,
+        dfw_delete_relation,
+        dfw_update_format,
+        dfw_create_index,
+        dfw_delete_index,
+        dfw_compute_security,
+        dfw_add_file,
+        dfw_add_shadow,
+        dfw_delete_shadow,
+        dfw_delete_shadow_nodelete,
+        dfw_modify_file,
+        dfw_erase_file,
+        dfw_create_field,
+        dfw_delete_field,
+        dfw_modify_field,
+        dfw_delete_global,
+        dfw_delete_rfr,
+        dfw_post_event,
+        dfw_create_trigger,
+        dfw_delete_trigger,
+        dfw_modify_trigger,
+        dfw_grant,
+        dfw_revoke,
+        dfw_scan_relation,
+        dfw_create_expression_index,
+        dfw_create_procedure,
+        dfw_modify_procedure,
+        dfw_delete_procedure,
+        dfw_delete_prm,
+        dfw_create_collation,
+        dfw_delete_collation,
+        dfw_delete_exception,
+        dfw_delete_generator,
+        dfw_create_function,
+        dfw_modify_function,
+        dfw_delete_function,
+        dfw_add_difference,
+        dfw_delete_difference,
+        dfw_begin_backup,
+        dfw_end_backup,
+        dfw_user_management,
+        dfw_modify_package_header,
+        dfw_drop_package_header,
+        dfw_drop_package_body,
+        dfw_check_not_null,
+        dfw_store_view_context_type,
+        dfw_set_generator,
+        dfw_change_repl_state,
+        /* deferred works argument types */
+        dfw_arg_index_name,
+        dfw_arg_partner_rel_id,
+        dfw_arg_proc_name,
+        dfw_arg_force_computed,
+        dfw_arg_check_blr,
+        dfw_arg_rel_name,
+        dfw_arg_trg_type,
+        dfw_arg_new_name,
+        dfw_arg_field_not_null,
+        dfw_db_crypt,
+        dfw_set_linger,
+        dfw_clear_cache
+    };
 }
 
 USHORT DFW_assign_index_type(Jrd::thread_db*, const Jrd::MetaName&, SSHORT, SSHORT)
@@ -886,7 +946,6 @@ void DPM_delete_relation_pages(Jrd::thread_db*, Jrd::jrd_rel*, Jrd::RelationPage
 namespace Jrd {
     class Function;
     class impure_value;
-    class NestValueArray;
 }
 
 void FUN_evaluate(Jrd::thread_db*, const Jrd::Function*, const Jrd::NestValueArray&,
@@ -1016,6 +1075,11 @@ namespace cds {
             }
             return false;
         }
+
+        /* Called from cds::Initialize() (inline in cds/init.h) to record
+           whether HP statistics collection was compiled in.  No-op in WASM. */
+        void CDS_EXPORT_API check_hpstat_enabled(bool /*enabled*/) {}
+
     } // namespace details
 
     namespace backoff {
@@ -1025,3 +1089,793 @@ namespace cds {
     } // namespace backoff
 
 } // namespace cds
+
+/* -----------------------------------------------------------------------
+ * yvalve/gds.cpp stubs  (gds__sqlcode, fb_sqlstate, fb_print_blr)
+ *
+ * StmtNodes.cpp references gds__sqlcode and fb_sqlstate to translate
+ * internal error codes to SQL-standard codes.  dsql.cpp references
+ * fb_print_blr for debug pretty-printing of BLR buffers.
+ * All are no-ops / safe defaults in the WASM embedded build.
+ *
+ * Signatures match Firebird v5.0.3 src/yvalve/gds.cpp.
+ * ----------------------------------------------------------------------- */
+
+extern "C"
+SLONG API_ROUTINE gds__sqlcode(const ISC_STATUS* status_vector)
+{
+    if (!status_vector)
+        return -999;  /* GENERIC_SQLCODE: no SQL code known */
+    /* Scan for isc_arg_gds / isc_arg_sql_int in the status vector and
+       return the SQL code stored there.  For the WASM stub we just
+       return a generic "unknown" code; SQL-code mapping requires the
+       full Firebird error-message tables which are absent in the
+       embedded WASM build. */
+    return -999;  /* GENERIC_SQLCODE */
+}
+
+extern "C"
+void API_ROUTINE fb_sqlstate(char* sqlstate, const ISC_STATUS* /*status_vector*/)
+{
+    /* FB_SQLSTATE_SIZE = 6 (5 chars + NUL terminator) */
+    if (sqlstate)
+        /* HY000 = general error – the correct default when no mapping is
+           available (mirrors the yvalve/gds.cpp fallback string). */
+        strncpy(sqlstate, "HY000", 6);
+}
+
+extern "C"
+int API_ROUTINE fb_print_blr(const UCHAR* /*blr*/, ULONG /*blr_length*/,
+    FPTR_PRINT_CALLBACK /*routine*/, void* /*user_arg*/, SSHORT /*language*/)
+{
+    /* BLR pretty-printer not supported in WASM embedded build. */
+    return -1; /* FB_FAILURE */
+}
+
+/* -----------------------------------------------------------------------
+ * scl.epp stub  (UserId::setRoleTrusted)
+ *
+ * setRoleTrusted() promotes the current SQL role to the "trusted role"
+ * slot so it survives role-switching.  In WASM there is no real security
+ * enforcement, so a no-op is safe.
+ * ----------------------------------------------------------------------- */
+
+void Jrd::UserId::setRoleTrusted() {}
+
+/* -----------------------------------------------------------------------
+ * Function.epp stubs  (Jrd::Function virtual methods + static lookup)
+ *
+ * Function.epp (jrd/Function.epp) is an embedded-preprocessor source
+ * file that requires gpre to generate a .cpp.  It is NOT compiled in
+ * the WASM build.  Defining the non-inline virtual methods here causes
+ * the compiler to emit the vtable for Jrd::Function in this translation
+ * unit, satisfying the linker.
+ *
+ * Signatures match Firebird v5.0.3 jrd/Function.h.
+ * ----------------------------------------------------------------------- */
+
+#include "jrd/Function.h"
+
+namespace Jrd {
+
+/* Static lookup – returns nullptr (no metadata scanning in WASM). */
+Function* Function::lookup(thread_db* /*tdbb*/, const QualifiedName& /*name*/,
+    bool /*noscan*/)
+{ return nullptr; }
+
+/* Virtual methods – no-op / safe-default implementations. */
+bool Function::checkCache(thread_db* /*tdbb*/) const { return false; }
+void Function::clearCache(thread_db* /*tdbb*/) {}
+bool Function::reload(thread_db* /*tdbb*/) { return false; }
+
+/* Second static lookup overload – by numeric ID.  Returns nullptr. */
+Function* Function::lookup(thread_db* /*tdbb*/, USHORT /*id*/,
+    bool /*return_deleted*/, bool /*noscan*/, USHORT /*flags*/)
+{ return nullptr; }
+
+/* Releases existence lock and marks function for reclamation.
+   No-op in WASM (no lock manager). */
+void Function::releaseLocks(thread_db* /*tdbb*/) {}
+
+} // namespace Jrd
+
+/* -----------------------------------------------------------------------
+ * DdlNodes.epp stubs  (all concrete DDL node execute/checkPermission/
+ *                       internalPrint + DdlNode helper methods)
+ *
+ * DdlNodes.epp and PackageNodes.epp are embedded-preprocessor sources
+ * that are NOT compiled in the WASM build (they require gpre).  Each
+ * concrete DDL node class declares its execute(), checkPermission(), and
+ * internalPrint() methods non-inline; these are the "key functions" that
+ * drive vtable emission in the Itanium C++ ABI.  Without them, the
+ * vtable for every DDL node class is absent from the binary and the
+ * linker fails.
+ *
+ * In WASM, DDL is not supported – all execute() / checkPermission()
+ * methods are no-ops.  internalPrint() returns the class name string.
+ *
+ * Signatures match Firebird v5.0.3 dsql/DdlNodes.h and
+ * dsql/PackageNodes.h.
+ * ----------------------------------------------------------------------- */
+
+#include "dsql/DdlNodes.h"
+#include "dsql/PackageNodes.h"
+
+namespace Jrd {
+
+/* ------- DdlNode base-class helper methods (non-virtual, non-inline) --- */
+
+/* Static overload: fires DDL triggers; no-op in WASM. */
+void DdlNode::executeDdlTrigger(thread_db* /*tdbb*/, jrd_tra* /*transaction*/,
+    DdlNode::DdlTriggerWhen /*when*/, int /*action*/,
+    const MetaName& /*objectName*/, const MetaName& /*oldNewObjectName*/,
+    const Firebird::string& /*sqlText*/) {}
+
+/* Protected instance overload (no sqlText parameter). */
+void DdlNode::executeDdlTrigger(thread_db* /*tdbb*/,
+    DsqlCompilerScratch* /*dsqlScratch*/, jrd_tra* /*transaction*/,
+    DdlTriggerWhen /*when*/, int /*action*/,
+    const MetaName& /*objectName*/, const MetaName& /*oldNewObjectName*/) {}
+
+/* Helpers used during CREATE/ALTER TABLE, CREATE PROCEDURE, etc. */
+void DdlNode::storeGlobalField(thread_db* /*tdbb*/, jrd_tra* /*transaction*/,
+    MetaName& /*name*/, const TypeClause* /*field*/,
+    const Firebird::string& /*computedSource*/,
+    const BlrDebugWriter::BlrData& /*computedValue*/) {}
+
+bool DdlNode::deleteSecurityClass(thread_db* /*tdbb*/, jrd_tra* /*transaction*/,
+    const MetaName& /*secClass*/)
+{ return false; }
+
+void DdlNode::storePrivileges(thread_db* /*tdbb*/, jrd_tra* /*transaction*/,
+    const MetaName& /*name*/, int /*type*/, const char* /*privileges*/) {}
+
+void DdlNode::deletePrivilegesByRelName(thread_db* /*tdbb*/,
+    jrd_tra* /*transaction*/, const MetaName& /*name*/, int /*type*/) {}
+
+/* ------- ExecInSecurityDb ------------------------------------------------ */
+
+void ExecInSecurityDb::executeInSecurityDb(jrd_tra* /*tra*/) {}
+
+/* ------- ParameterClause constructor ------------------------------------- */
+
+ParameterClause::ParameterClause(Firebird::MemoryPool& /*pool*/,
+    dsql_fld* field, const MetaName& /*aCollate*/,
+    ValueSourceClause* aDefaultClause, ValueExprNode* aParameterExpr)
+    : type(field),
+      defaultClause(aDefaultClause),
+      parameterExpr(aParameterExpr)
+{}
+
+Firebird::string ParameterClause::internalPrint(NodePrinter& /*printer*/) const
+{ return "ParameterClause"; }
+
+/* ------- AlterCharSetNode ------------------------------------------------ */
+
+Firebird::string AlterCharSetNode::internalPrint(NodePrinter& /*p*/) const
+{ return "AlterCharSetNode"; }
+void AlterCharSetNode::checkPermission(thread_db*, jrd_tra*) {}
+void AlterCharSetNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- AlterEDSPoolSetNode --------------------------------------------- */
+
+void AlterEDSPoolSetNode::checkPermission(thread_db*, jrd_tra*) {}
+Firebird::string AlterEDSPoolSetNode::internalPrint(NodePrinter& /*p*/) const
+{ return "AlterEDSPoolSetNode"; }
+void AlterEDSPoolSetNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- AlterEDSPoolClearNode ------------------------------------------- */
+
+void AlterEDSPoolClearNode::checkPermission(thread_db*, jrd_tra*) {}
+Firebird::string AlterEDSPoolClearNode::internalPrint(NodePrinter& /*p*/) const
+{ return "AlterEDSPoolClearNode"; }
+void AlterEDSPoolClearNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- CommentOnNode --------------------------------------------------- */
+
+Firebird::string CommentOnNode::internalPrint(NodePrinter& /*p*/) const
+{ return "CommentOnNode"; }
+void CommentOnNode::checkPermission(thread_db*, jrd_tra*) {}
+void CommentOnNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- CreateAlterFunctionNode ----------------------------------------- */
+
+Firebird::string CreateAlterFunctionNode::internalPrint(NodePrinter& /*p*/) const
+{ return "CreateAlterFunctionNode"; }
+DdlNode* CreateAlterFunctionNode::dsqlPass(DsqlCompilerScratch* s)
+{ return DdlNode::dsqlPass(s); }
+void CreateAlterFunctionNode::checkPermission(thread_db*, jrd_tra*) {}
+void CreateAlterFunctionNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- AlterExternalFunctionNode --------------------------------------- */
+
+Firebird::string AlterExternalFunctionNode::internalPrint(NodePrinter& /*p*/) const
+{ return "AlterExternalFunctionNode"; }
+void AlterExternalFunctionNode::checkPermission(thread_db*, jrd_tra*) {}
+void AlterExternalFunctionNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- DropFunctionNode ------------------------------------------------ */
+
+Firebird::string DropFunctionNode::internalPrint(NodePrinter& /*p*/) const
+{ return "DropFunctionNode"; }
+DdlNode* DropFunctionNode::dsqlPass(DsqlCompilerScratch* s)
+{ return DdlNode::dsqlPass(s); }
+void DropFunctionNode::checkPermission(thread_db*, jrd_tra*) {}
+void DropFunctionNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- CreateAlterProcedureNode ---------------------------------------- */
+
+Firebird::string CreateAlterProcedureNode::internalPrint(NodePrinter& /*p*/) const
+{ return "CreateAlterProcedureNode"; }
+DdlNode* CreateAlterProcedureNode::dsqlPass(DsqlCompilerScratch* s)
+{ return DdlNode::dsqlPass(s); }
+void CreateAlterProcedureNode::checkPermission(thread_db*, jrd_tra*) {}
+void CreateAlterProcedureNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- DropProcedureNode ----------------------------------------------- */
+
+Firebird::string DropProcedureNode::internalPrint(NodePrinter& /*p*/) const
+{ return "DropProcedureNode"; }
+DdlNode* DropProcedureNode::dsqlPass(DsqlCompilerScratch* s)
+{ return DdlNode::dsqlPass(s); }
+void DropProcedureNode::checkPermission(thread_db*, jrd_tra*) {}
+void DropProcedureNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- CreateAlterTriggerNode ------------------------------------------ */
+
+Firebird::string CreateAlterTriggerNode::internalPrint(NodePrinter& /*p*/) const
+{ return "CreateAlterTriggerNode"; }
+DdlNode* CreateAlterTriggerNode::dsqlPass(DsqlCompilerScratch* s)
+{ return DdlNode::dsqlPass(s); }
+void CreateAlterTriggerNode::checkPermission(thread_db*, jrd_tra*) {}
+void CreateAlterTriggerNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- DropTriggerNode ------------------------------------------------- */
+
+Firebird::string DropTriggerNode::internalPrint(NodePrinter& /*p*/) const
+{ return "DropTriggerNode"; }
+DdlNode* DropTriggerNode::dsqlPass(DsqlCompilerScratch* s)
+{ return DdlNode::dsqlPass(s); }
+void DropTriggerNode::checkPermission(thread_db*, jrd_tra*) {}
+void DropTriggerNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- CreateCollationNode --------------------------------------------- */
+
+Firebird::string CreateCollationNode::internalPrint(NodePrinter& /*p*/) const
+{ return "CreateCollationNode"; }
+DdlNode* CreateCollationNode::dsqlPass(DsqlCompilerScratch* s)
+{ return DdlNode::dsqlPass(s); }
+void CreateCollationNode::checkPermission(thread_db*, jrd_tra*) {}
+void CreateCollationNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- DropCollationNode ----------------------------------------------- */
+
+Firebird::string DropCollationNode::internalPrint(NodePrinter& /*p*/) const
+{ return "DropCollationNode"; }
+void DropCollationNode::checkPermission(thread_db*, jrd_tra*) {}
+void DropCollationNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- CreateDomainNode ------------------------------------------------ */
+
+Firebird::string CreateDomainNode::internalPrint(NodePrinter& /*p*/) const
+{ return "CreateDomainNode"; }
+void CreateDomainNode::checkPermission(thread_db*, jrd_tra*) {}
+void CreateDomainNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- AlterDomainNode ------------------------------------------------- */
+
+Firebird::string AlterDomainNode::internalPrint(NodePrinter& /*p*/) const
+{ return "AlterDomainNode"; }
+void AlterDomainNode::checkPermission(thread_db*, jrd_tra*) {}
+void AlterDomainNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- DropDomainNode -------------------------------------------------- */
+
+Firebird::string DropDomainNode::internalPrint(NodePrinter& /*p*/) const
+{ return "DropDomainNode"; }
+void DropDomainNode::checkPermission(thread_db*, jrd_tra*) {}
+void DropDomainNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- CreateAlterExceptionNode ---------------------------------------- */
+
+Firebird::string CreateAlterExceptionNode::internalPrint(NodePrinter& /*p*/) const
+{ return "CreateAlterExceptionNode"; }
+void CreateAlterExceptionNode::checkPermission(thread_db*, jrd_tra*) {}
+void CreateAlterExceptionNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- DropExceptionNode ----------------------------------------------- */
+
+Firebird::string DropExceptionNode::internalPrint(NodePrinter& /*p*/) const
+{ return "DropExceptionNode"; }
+void DropExceptionNode::checkPermission(thread_db*, jrd_tra*) {}
+void DropExceptionNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- CreateAlterSequenceNode ----------------------------------------- */
+
+Firebird::string CreateAlterSequenceNode::internalPrint(NodePrinter& /*p*/) const
+{ return "CreateAlterSequenceNode"; }
+void CreateAlterSequenceNode::checkPermission(thread_db*, jrd_tra*) {}
+void CreateAlterSequenceNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+void CreateAlterSequenceNode::putErrorPrefix(Firebird::Arg::StatusVector& /*sv*/) {}
+
+/* ------- DropSequenceNode ------------------------------------------------ */
+
+Firebird::string DropSequenceNode::internalPrint(NodePrinter& /*p*/) const
+{ return "DropSequenceNode"; }
+void DropSequenceNode::checkPermission(thread_db*, jrd_tra*) {}
+void DropSequenceNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- CreateRelationNode ---------------------------------------------- */
+
+Firebird::string CreateRelationNode::internalPrint(NodePrinter& /*p*/) const
+{ return "CreateRelationNode"; }
+void CreateRelationNode::checkPermission(thread_db*, jrd_tra*) {}
+void CreateRelationNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- AlterRelationNode ----------------------------------------------- */
+
+Firebird::string AlterRelationNode::internalPrint(NodePrinter& /*p*/) const
+{ return "AlterRelationNode"; }
+void AlterRelationNode::checkPermission(thread_db*, jrd_tra*) {}
+void AlterRelationNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- DropRelationNode ------------------------------------------------ */
+
+Firebird::string DropRelationNode::internalPrint(NodePrinter& /*p*/) const
+{ return "DropRelationNode"; }
+void DropRelationNode::checkPermission(thread_db*, jrd_tra*) {}
+void DropRelationNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+void DropRelationNode::deleteGlobalField(thread_db* /*tdbb*/,
+    jrd_tra* /*transaction*/, const MetaName& /*globalName*/) {}
+
+/* ------- CreateAlterViewNode --------------------------------------------- */
+
+Firebird::string CreateAlterViewNode::internalPrint(NodePrinter& /*p*/) const
+{ return "CreateAlterViewNode"; }
+DdlNode* CreateAlterViewNode::dsqlPass(DsqlCompilerScratch* s)
+{ return DdlNode::dsqlPass(s); }
+void CreateAlterViewNode::checkPermission(thread_db*, jrd_tra*) {}
+void CreateAlterViewNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- CreateIndexNode ------------------------------------------------- */
+
+Firebird::string CreateIndexNode::internalPrint(NodePrinter& /*p*/) const
+{ return "CreateIndexNode"; }
+void CreateIndexNode::checkPermission(thread_db*, jrd_tra*) {}
+void CreateIndexNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- AlterIndexNode -------------------------------------------------- */
+
+Firebird::string AlterIndexNode::internalPrint(NodePrinter& /*p*/) const
+{ return "AlterIndexNode"; }
+void AlterIndexNode::checkPermission(thread_db*, jrd_tra*) {}
+void AlterIndexNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- SetStatisticsNode ----------------------------------------------- */
+
+Firebird::string SetStatisticsNode::internalPrint(NodePrinter& /*p*/) const
+{ return "SetStatisticsNode"; }
+void SetStatisticsNode::checkPermission(thread_db*, jrd_tra*) {}
+void SetStatisticsNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- DropIndexNode --------------------------------------------------- */
+
+Firebird::string DropIndexNode::internalPrint(NodePrinter& /*p*/) const
+{ return "DropIndexNode"; }
+void DropIndexNode::checkPermission(thread_db*, jrd_tra*) {}
+void DropIndexNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+bool DropIndexNode::deleteSegmentRecords(thread_db* /*tdbb*/,
+    jrd_tra* /*transaction*/, const MetaName& /*name*/)
+{ return false; }
+
+/* ------- CreateFilterNode ------------------------------------------------ */
+
+Firebird::string CreateFilterNode::internalPrint(NodePrinter& /*p*/) const
+{ return "CreateFilterNode"; }
+void CreateFilterNode::checkPermission(thread_db*, jrd_tra*) {}
+void CreateFilterNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- DropFilterNode -------------------------------------------------- */
+
+Firebird::string DropFilterNode::internalPrint(NodePrinter& /*p*/) const
+{ return "DropFilterNode"; }
+void DropFilterNode::checkPermission(thread_db*, jrd_tra*) {}
+void DropFilterNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- CreateShadowNode ------------------------------------------------ */
+
+Firebird::string CreateShadowNode::internalPrint(NodePrinter& /*p*/) const
+{ return "CreateShadowNode"; }
+void CreateShadowNode::checkPermission(thread_db*, jrd_tra*) {}
+void CreateShadowNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- DropShadowNode -------------------------------------------------- */
+
+Firebird::string DropShadowNode::internalPrint(NodePrinter& /*p*/) const
+{ return "DropShadowNode"; }
+void DropShadowNode::checkPermission(thread_db*, jrd_tra*) {}
+void DropShadowNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- CreateAlterRoleNode --------------------------------------------- */
+
+Firebird::string CreateAlterRoleNode::internalPrint(NodePrinter& /*p*/) const
+{ return "CreateAlterRoleNode"; }
+void CreateAlterRoleNode::checkPermission(thread_db*, jrd_tra*) {}
+void CreateAlterRoleNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- MappingNode ----------------------------------------------------- */
+
+Firebird::string MappingNode::internalPrint(NodePrinter& /*p*/) const
+{ return "MappingNode"; }
+void MappingNode::checkPermission(thread_db*, jrd_tra*) {}
+void MappingNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+void MappingNode::validateAdmin() {}
+void MappingNode::runInSecurityDb(SecDbContext* /*ctx*/) {}
+
+/* ------- DropRoleNode ---------------------------------------------------- */
+
+Firebird::string DropRoleNode::internalPrint(NodePrinter& /*p*/) const
+{ return "DropRoleNode"; }
+void DropRoleNode::checkPermission(thread_db*, jrd_tra*) {}
+void DropRoleNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- UserNode base --------------------------------------------------- */
+
+MetaName UserNode::upper(const MetaName& str) { return str; }
+
+/* ------- CreateAlterUserNode --------------------------------------------- */
+
+Firebird::string CreateAlterUserNode::internalPrint(NodePrinter& /*p*/) const
+{ return "CreateAlterUserNode"; }
+void CreateAlterUserNode::checkPermission(thread_db*, jrd_tra*) {}
+void CreateAlterUserNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- DropUserNode ---------------------------------------------------- */
+
+Firebird::string DropUserNode::internalPrint(NodePrinter& /*p*/) const
+{ return "DropUserNode"; }
+void DropUserNode::checkPermission(thread_db*, jrd_tra*) {}
+void DropUserNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- GrantRevokeNode ------------------------------------------------- */
+
+Firebird::string GrantRevokeNode::internalPrint(NodePrinter& /*p*/) const
+{ return "GrantRevokeNode"; }
+void GrantRevokeNode::checkPermission(thread_db*, jrd_tra*) {}
+void GrantRevokeNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+void GrantRevokeNode::runInSecurityDb(SecDbContext* /*ctx*/) {}
+
+/* ------- AlterDatabaseNode ----------------------------------------------- */
+
+Firebird::string AlterDatabaseNode::internalPrint(NodePrinter& /*p*/) const
+{ return "AlterDatabaseNode"; }
+void AlterDatabaseNode::checkPermission(thread_db*, jrd_tra*) {}
+void AlterDatabaseNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* -----------------------------------------------------------------------
+ * PackageNodes.epp stubs  (CreateAlterPackageNode, DropPackageNode,
+ *                           CreatePackageBodyNode, DropPackageBodyNode)
+ * ----------------------------------------------------------------------- */
+
+/* ------- CreateAlterPackageNode ------------------------------------------ */
+
+DdlNode* CreateAlterPackageNode::dsqlPass(DsqlCompilerScratch* s)
+{ return DdlNode::dsqlPass(s); }
+Firebird::string CreateAlterPackageNode::internalPrint(NodePrinter& /*p*/) const
+{ return "CreateAlterPackageNode"; }
+void CreateAlterPackageNode::checkPermission(thread_db*, jrd_tra*) {}
+void CreateAlterPackageNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- DropPackageNode ------------------------------------------------- */
+
+Firebird::string DropPackageNode::internalPrint(NodePrinter& /*p*/) const
+{ return "DropPackageNode"; }
+void DropPackageNode::checkPermission(thread_db*, jrd_tra*) {}
+void DropPackageNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- CreatePackageBodyNode ------------------------------------------- */
+
+DdlNode* CreatePackageBodyNode::dsqlPass(DsqlCompilerScratch* s)
+{ return DdlNode::dsqlPass(s); }
+Firebird::string CreatePackageBodyNode::internalPrint(NodePrinter& /*p*/) const
+{ return "CreatePackageBodyNode"; }
+void CreatePackageBodyNode::checkPermission(thread_db*, jrd_tra*) {}
+void CreatePackageBodyNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- DropPackageBodyNode --------------------------------------------- */
+
+Firebird::string DropPackageBodyNode::internalPrint(NodePrinter& /*p*/) const
+{ return "DropPackageBodyNode"; }
+void DropPackageBodyNode::checkPermission(thread_db*, jrd_tra*) {}
+void DropPackageBodyNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
+
+/* ------- RelationNode constructor ---------------------------------------- */
+/* RelationNode::RelationNode() is defined in DdlNodes.epp (not compiled).
+   Provide a minimal constructor that initialises all members. */
+
+RelationNode::RelationNode(MemoryPool& p, RelationSourceNode* aDsqlNode)
+    : DdlNode(p),
+      dsqlNode(aDsqlNode),
+      name(p),
+      clauses(p)
+{}
+
+} // namespace Jrd
+
+/* -----------------------------------------------------------------------
+ * jrd_prc::reload stub  (met.epp)
+ *
+ * jrd_prc::checkCache and jrd_prc::clearCache are implemented in
+ * jrd/Routine.cpp which IS compiled for WASM; those are NOT stubbed here.
+ * jrd_prc::reload is implemented in met.epp which is NOT compiled for
+ * WASM (requires the gpre preprocessor).  A no-op stub is provided here
+ * to satisfy the linker; the vtable is already anchored by Routine.cpp.
+ * ----------------------------------------------------------------------- */
+
+namespace Jrd {
+
+bool jrd_prc::reload(thread_db* /*tdbb*/) { return false; }
+
+} // namespace Jrd
+
+/* -----------------------------------------------------------------------
+ * UserId::makeRoleName  (scl.epp stub)
+ *
+ * makeRoleName() normalises a SQL role name to uppercase for dialect 1,
+ * and leaves it unchanged for dialect 3.  In the WASM build we skip
+ * security enforcement, so a no-op is safe.
+ *
+ * scl.h / jrd/scl.h is pulled in transitively through jrd/exe.h.
+ * ----------------------------------------------------------------------- */
+
+namespace Jrd {
+
+/*static*/ void UserId::makeRoleName(Firebird::MetaString& /*role*/,
+    const int /*dialect*/) {}
+
+} // namespace Jrd
+
+/* -----------------------------------------------------------------------
+ * gds__parse_bpb2  (yvalve/gds.cpp stub)
+ *
+ * gds__parse_bpb2 parses a Blob Parameter Block version 2 into its
+ * component fields.  blb.cpp and blob_filter.cpp call it to inspect
+ * blob type / sub-type information.  In the embedded WASM build blob
+ * sub-types are not relevant; return 0 (no parameters found).
+ *
+ * Signature from src/yvalve/gds_proto.h.
+ * ----------------------------------------------------------------------- */
+
+extern "C"
+USHORT API_ROUTINE gds__parse_bpb2(USHORT bpb_length, const UCHAR* /*bpb*/,
+    SSHORT* /*source_type*/, SSHORT* /*target_type*/,
+    USHORT* /*source_interp*/, USHORT* /*target_interp*/,
+    bool* /*source_nullable*/, bool* /*target_nullable*/,
+    bool* /*db_key_scope*/, bool* /*expected_scope*/)
+{
+    (void) bpb_length;
+    return 0;
+}
+
+/* -----------------------------------------------------------------------
+ * UserId::sclInit / UserId::populateDpb  (scl.epp stubs)
+ *
+ * sclInit() initialises the security-class list for a new attachment by
+ * scanning RDB$USER_PRIVILEGES.  In the embedded WASM build there is no
+ * security database and we skip this step.
+ *
+ * populateDpb() injects user/role credentials into a DPB (Database
+ * Parameter Block) before opening a remote connection.  In the WASM
+ * build external data sources are disabled (jrd/extds/ is not compiled),
+ * so this stub should never be reached; it is provided for completeness
+ * in case any residual reference appears.
+ *
+ * Both are instance methods of Jrd::UserId declared in jrd/scl.h and
+ * implemented in scl.epp (not compiled for WASM).
+ * ----------------------------------------------------------------------- */
+
+namespace Jrd {
+
+void UserId::sclInit(thread_db* /*tdbb*/, bool /*create*/) {}
+void UserId::populateDpb(Firebird::ClumpletWriter& /*dpb*/, bool /*embeddedSupport*/) {}
+
+} // namespace Jrd
+
+/* -----------------------------------------------------------------------
+ * EDS (External Data Sources) stubs
+ *
+ * jrd/extds/ is excluded from the WASM build because it requires the
+ * legacy isc_* client API and UserId::populateDpb.  However the
+ * following compiled files still call EDS:: symbols:
+ *
+ *   dsql/StmtNodes.cpp  – EDS::Manager::getConnection,
+ *                         EDS::Connection::createStatement,
+ *                         EDS::Statement::{bindToRequest, prepare,
+ *                           setTimeout, open, execute, fetch, close}
+ *                         EDS::Transaction::getTransaction
+ *   jrd/SysFunction.cpp – EDS::Manager::getConnPool
+ *   jrd/exe.cpp         – EDS::Statement::close
+ *   jrd/jrd.cpp         – EDS::Transaction::jrdTransactionEnd,
+ *                         EDS::Manager::{jrdAttachmentEnd, shutdown}
+ *
+ * All stubs are no-ops / null returns.  We forward-declare minimal class
+ * skeletons rather than including ExtDS.h directly (that header pulls in
+ * the legacy isc_* interface).
+ *
+ * The parameter types used below are all available transitively via the
+ * jrd/exe.h include already present above:
+ *   Jrd::thread_db, Jrd::jrd_tra, Jrd::MetaName, Jrd::ValueListNode,
+ *   Firebird::string (= StringBase<StringComparator>), Firebird::Array.
+ *
+ * Jrd::Attachment and Jrd::Request are not provided by exe.h, so we
+ * forward-declare them here.
+ * ----------------------------------------------------------------------- */
+
+namespace Jrd {
+    class Attachment;
+    class Request;
+}
+
+namespace EDS {
+
+/* TraScope enum – must match ExtDS.h exactly so that callers compiled
+   with the real header link against the same mangled names. */
+enum TraScope { traNotSet = 0, traAutonomous, traCommon, traTwoPhase };
+
+/* ParamNumbers – typedef from ExtDS.h line ~673 */
+typedef Firebird::Array<USHORT> ParamNumbers;
+
+/* ---- Minimal class skeletons (stubs only – no inheritance needed) ---- */
+
+class ConnectionsPool;
+class Connection;
+class Transaction;
+
+class Manager {
+public:
+    static Connection* getConnection(Jrd::thread_db*,
+        const Firebird::string&, const Firebird::string&,
+        const Firebird::string&, const Firebird::string&, TraScope);
+    static ConnectionsPool* getConnPool(bool);
+    static void jrdAttachmentEnd(Jrd::thread_db*, Jrd::Attachment*, bool);
+    static int shutdown();
+};
+
+class Connection {
+public:
+    class Statement* createStatement(const Firebird::string&);
+};
+
+class Transaction {
+public:
+    static Transaction* getTransaction(Jrd::thread_db*, Connection*, TraScope);
+    static void jrdTransactionEnd(Jrd::thread_db*, Jrd::jrd_tra*, bool, bool, bool);
+};
+
+class Statement {
+public:
+    void bindToRequest(Jrd::Request*, Statement**);
+    void prepare(Jrd::thread_db*, Transaction*, const Firebird::string&, bool);
+    void setTimeout(Jrd::thread_db*, unsigned int);
+    void open(Jrd::thread_db*, Transaction*,
+              const Jrd::MetaName* const*, const Jrd::ValueListNode*,
+              const ParamNumbers*, bool);
+    void execute(Jrd::thread_db*, Transaction*,
+                 const Jrd::MetaName* const*, const Jrd::ValueListNode*,
+                 const ParamNumbers*, const Jrd::ValueListNode*);
+    bool fetch(Jrd::thread_db*, const Jrd::ValueListNode*);
+    void close(Jrd::thread_db*, bool = false);
+};
+
+/* ---- Manager stubs ---- */
+
+/*static*/ Connection* Manager::getConnection(Jrd::thread_db*, const Firebird::string&,
+    const Firebird::string&, const Firebird::string&, const Firebird::string&, TraScope)
+{ return nullptr; }
+
+/*static*/ ConnectionsPool* Manager::getConnPool(bool) { return nullptr; }
+
+/*static*/ void Manager::jrdAttachmentEnd(Jrd::thread_db*, Jrd::Attachment*, bool) {}
+
+/*static*/ int Manager::shutdown() { return 0; }
+
+/* ---- Connection stub ---- */
+
+Statement* Connection::createStatement(const Firebird::string&) { return nullptr; }
+
+/* ---- Transaction stubs ---- */
+
+/*static*/ Transaction* Transaction::getTransaction(Jrd::thread_db*, Connection*, TraScope)
+{ return nullptr; }
+
+/*static*/ void Transaction::jrdTransactionEnd(Jrd::thread_db*, Jrd::jrd_tra*, bool, bool, bool) {}
+
+/* ---- Statement stubs ---- */
+
+void Statement::bindToRequest(Jrd::Request*, Statement**) {}
+
+void Statement::prepare(Jrd::thread_db*, Transaction*, const Firebird::string&, bool) {}
+
+void Statement::setTimeout(Jrd::thread_db*, unsigned int) {}
+
+void Statement::open(Jrd::thread_db*, Transaction*,
+    const Jrd::MetaName* const*, const Jrd::ValueListNode*,
+    const ParamNumbers*, bool) {}
+
+void Statement::execute(Jrd::thread_db*, Transaction*,
+    const Jrd::MetaName* const*, const Jrd::ValueListNode*,
+    const ParamNumbers*, const Jrd::ValueListNode*) {}
+
+bool Statement::fetch(Jrd::thread_db*, const Jrd::ValueListNode*) { return false; }
+
+void Statement::close(Jrd::thread_db*, bool) {}
+
+} // namespace EDS
+
+/* -----------------------------------------------------------------------
+ * Service utility entry-point stubs  (jrd/svc.cpp references)
+ *
+ * jrd/svc.cpp registers the following entry points in its service table,
+ * but the corresponding utility source trees (burp/, alice/, utilities/)
+ * are not compiled for the WASM build.  All stubs return 1 (failure).
+ *
+ * Signatures come from the respective proto headers at v5.0.3:
+ *   BURP_main   – burp/burp_proto.h
+ *   ALICE_main  – alice/alice_proto.h
+ *   GSEC_main   – utilities/gsec/gsec_proto.h
+ *   main_gstat  – forward-declared inline in svc.cpp (int main_gstat(...))
+ *   NBACKUP_main – utilities/nbackup/nbk_proto.h
+ * ----------------------------------------------------------------------- */
+
+namespace Firebird { class UtilSvc; }
+
+int BURP_main(Firebird::UtilSvc*) { return 1; }
+int ALICE_main(Firebird::UtilSvc*) { return 1; }
+int GSEC_main(Firebird::UtilSvc*) { return 1; }
+int main_gstat(Firebird::UtilSvc*) { return 1; }
+int NBACKUP_main(Firebird::UtilSvc*) { return 1; }
+
+/* -----------------------------------------------------------------------
+ * fb_shutdown / fb_database_crypt_callback  (yvalve/why.cpp stubs)
+ *
+ * jrd/svc.cpp calls fb_shutdown (graceful engine shutdown) and
+ * fb_database_crypt_callback (encryption callback registration).
+ * Neither yvalve/why.cpp nor the Client API is compiled into the WASM
+ * build; no-op stubs are safe.
+ *
+ * Signatures from src/include/firebird/ibase.h:
+ *   int fb_shutdown(unsigned int timeout_millis, const int reason);
+ *   ISC_STATUS fb_database_crypt_callback(ISC_STATUS*, void* callback);
+ * ----------------------------------------------------------------------- */
+
+extern "C" {
+
+int fb_shutdown(unsigned int /*timeout_millis*/, const int /*reason*/)
+{ return 0; }
+
+ISC_STATUS fb_database_crypt_callback(ISC_STATUS* status, void* /*callback*/)
+{
+    if (status) status[0] = 0;
+    return 0;
+}
+
+/* -----------------------------------------------------------------------
+ * gds__decode  (yvalve/gds.cpp stub)
+ *
+ * jrd/trace/TraceCmdLine.cpp calls gds__decode to decompose a status
+ * code into facility/code parts.  Return 0 (success, unknown code).
+ *
+ * Signature from src/yvalve/gds_proto.h:
+ *   ISC_STATUS gds__decode(ISC_STATUS code, USHORT* fac, USHORT* num);
+ * ----------------------------------------------------------------------- */
+
+ISC_STATUS API_ROUTINE gds__decode(ISC_STATUS /*code*/,
+    USHORT* fac, USHORT* num)
+{
+    if (fac) *fac = 0;
+    if (num) *num = 0;
+    return 0;
+}
+
+} /* extern "C" */
+

@@ -201,6 +201,35 @@ sed -i 's|^#define GETTIMEOFDAY(x) gettimeofday((x))[[:space:]]*$|#define GETTIM
 # them compile to empty stubs.  The deletion is idempotent.
 sed -i '/^#define HAVE_ZLIB_H/d' "${AUTOCONFIG_SRC}"
 
+# ── Remove HAVE_AIO_H for Emscripten ─────────────────────────────────────────
+# The native configure detects <aio.h> on Linux and sets HAVE_AIO_H.
+# Emscripten does not provide <aio.h> (async I/O is Linux-kernel-specific).
+# unix.cpp guards #include <aio.h> with #ifdef HAVE_AIO_H, and the actual
+# aio_read/aio_write calls are further guarded by
+# #if !(defined HAVE_PREAD && defined HAVE_PWRITE) – since Emscripten provides
+# both pread and pwrite, that code is excluded anyway.  Removing HAVE_AIO_H
+# prevents the stray #include <aio.h> from failing compilation.
+sed -i '/^#define HAVE_AIO_H/d' "${AUTOCONFIG_SRC}"
+
+# ── Remove HAVE_LINUX_FALLOC_H for Emscripten ────────────────────────────────
+# The native configure may detect <linux/falloc.h> and set HAVE_LINUX_FALLOC_H.
+# Emscripten does not provide Linux kernel headers.
+# unix.cpp guards both #include <linux/falloc.h> and the fallocate() call with
+# #ifdef HAVE_LINUX_FALLOC_H, so removing the define skips both cleanly.
+# (A no-op fallocate() stub in fb_wasm_stubs.cpp handles any other callers.)
+sed -i '/^#define HAVE_LINUX_FALLOC_H/d' "${AUTOCONFIG_SRC}"
+
+# ── Remove SUPPORT_RAW_DEVICES for Emscripten ────────────────────────────────
+# The native configure on Linux may detect raw-device support and set
+# SUPPORT_RAW_DEVICES.  unix.cpp guards a block with this define that
+# includes <sys/ioctl.h> and (when LINUX is also defined) <linux/fs.h>.
+# Emscripten does not ship Linux kernel headers, so <linux/fs.h> is not
+# available.  Raw-device databases (using a block device as a database
+# file) are not supported in the WASM build; removing the define fully
+# disables that code path.  The PIO functions provided by unix.cpp are
+# still compiled and provide real in-memory I/O via Emscripten's MEMFS.
+sed -i '/^#define SUPPORT_RAW_DEVICES/d' "${AUTOCONFIG_SRC}"
+
 # ── CMake configure + build ──────────────────────────────────────────────────
 # NOTE: The CMakeLists.txt uses -sUSE_ICU=1 which causes Emscripten to
 # download, build, and link ICU automatically (both common and i18n
