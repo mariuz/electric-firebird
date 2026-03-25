@@ -219,6 +219,17 @@ sed -i '/^#define HAVE_AIO_H/d' "${AUTOCONFIG_SRC}"
 # (A no-op fallocate() stub in fb_wasm_stubs.cpp handles any other callers.)
 sed -i '/^#define HAVE_LINUX_FALLOC_H/d' "${AUTOCONFIG_SRC}"
 
+# ── Remove SUPPORT_RAW_DEVICES for Emscripten ────────────────────────────────
+# The native configure on Linux may detect raw-device support and set
+# SUPPORT_RAW_DEVICES.  unix.cpp guards a block with this define that
+# includes <sys/ioctl.h> and (when LINUX is also defined) <linux/fs.h>.
+# Emscripten does not ship Linux kernel headers, so <linux/fs.h> is not
+# available.  Raw-device databases (using a block device as a database
+# file) are not supported in the WASM build; removing the define fully
+# disables that code path.  The PIO functions provided by unix.cpp are
+# still compiled and provide real in-memory I/O via Emscripten's MEMFS.
+sed -i '/^#define SUPPORT_RAW_DEVICES/d' "${AUTOCONFIG_SRC}"
+
 # ── CMake configure + build ──────────────────────────────────────────────────
 # NOTE: The CMakeLists.txt uses -sUSE_ICU=1 which causes Emscripten to
 # download, build, and link ICU automatically (both common and i18n

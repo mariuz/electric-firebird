@@ -115,10 +115,10 @@ list(FILTER FB_JRD_SRCS EXCLUDE REGEX ".*/jrd/os/win32/.*")
 # other JRD modules require.  It compiles cleanly under Emscripten because:
 #  - HAVE_PREAD / HAVE_PWRITE are set by the native-host autoconfig.h, so the
 #    async-I/O fallback (which uses <aio.h>) is compiled out.
-#  - build.sh removes HAVE_AIO_H and HAVE_LINUX_FALLOC_H from autoconfig.h
-#    so neither <aio.h> nor <linux/falloc.h> is included.
-#  - SUPPORT_RAW_DEVICES is not defined, so the ioctl() / <linux/fs.h> paths
-#    are excluded.
+#  - build.sh removes HAVE_AIO_H, HAVE_LINUX_FALLOC_H, and SUPPORT_RAW_DEVICES
+#    from autoconfig.h so neither <aio.h>, <linux/falloc.h>, nor <linux/fs.h>
+#    are included.  Raw-device database support is not meaningful in the
+#    in-memory WASM VFS and is fully disabled by this removal.
 # Emscripten exposes pread/pwrite via its MEMFS virtual filesystem, giving the
 # WASM engine real in-memory page storage without any native disk dependency.
 
