@@ -1,5 +1,10 @@
+import * as fs from 'fs';
+import * as path from 'path';
 import { allocString, loadFirebirdWasm } from '../wasm-loader';
 import type { FirebirdWasmModule } from '../wasm-loader';
+
+const WASM_JS_PATH = path.resolve(__dirname, '../../dist/wasm/firebird-embedded.js');
+const hasWasm = fs.existsSync(WASM_JS_PATH);
 
 describe('wasm-loader', () => {
   it('exports loadFirebirdWasm function', () => {
@@ -10,11 +15,16 @@ describe('wasm-loader', () => {
     expect(typeof allocString).toBe('function');
   });
 
-  it('loadFirebirdWasm rejects when WASM binary is not available', async () => {
-    // In a test/CI environment the WASM binary has not been built,
-    // so calling loadFirebirdWasm should fail with a descriptive error.
-    await expect(loadFirebirdWasm()).rejects.toThrow();
-  });
+  // This negative test only applies when the WASM binary has not been built.
+  // When the binary is present, the wasm-integration tests exercise the module.
+  (hasWasm ? it.skip : it)(
+    'loadFirebirdWasm rejects when WASM binary is not available',
+    async () => {
+      // In a test/CI environment the WASM binary has not been built,
+      // so calling loadFirebirdWasm should fail with a descriptive error.
+      await expect(loadFirebirdWasm()).rejects.toThrow();
+    },
+  );
 
   describe('allocString', () => {
     it('allocates and fills a UTF-8 C string on the WASM heap', () => {
