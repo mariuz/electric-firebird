@@ -4,7 +4,9 @@
   "version": "0.1.0",
   "scripts": {
     "test": "playwright test",
-    "test:headed": "playwright test --headed"
+    "test:headed": "playwright test --headed",
+    "test:browser": "playwright test --config playwright.wasm.config.ts",
+    "test:browser:headed": "playwright test --config playwright.wasm.config.ts --headed"
   },
   "dependencies": {
     "firebird-wasm": "*"
@@ -12,6 +14,7 @@
   "devDependencies": {
     "@playwright/test": "^1.45.0",
     "@types/node": "^20.14.10",
+    "esbuild": "^0.23.1",
     "ts-node": "^10.9.2",
     "typescript": "^5.5.3"
   }

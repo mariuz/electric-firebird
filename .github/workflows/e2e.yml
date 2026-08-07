@@ -6,6 +6,46 @@ on:
   pull_request:
 
 jobs:
+  browser:
+    name: Playwright Browser Tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    # No Firebird service and no client library: this suite exercises the
+    # browser build (FirebirdBrowser + IndexedDBVFS) against a stub C ABI,
+    # plus the WASM artifact tests, which skip themselves when it is absent.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install root dependencies
+        run: npm install
+
+      - name: Install Playwright browsers
+        working-directory: e2e
+        run: npx playwright install --with-deps chromium
+
+      - name: Run browser tests
+        working-directory: e2e
+        env:
+          CI: 'true'
+        run: npx playwright test --config playwright.wasm.config.ts
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-browser
+          path: e2e/playwright-report-wasm/
+          retention-days: 30
+
   e2e:
     name: Playwright E2E Tests
     runs-on: ubuntu-latest

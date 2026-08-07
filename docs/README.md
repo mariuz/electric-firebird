@@ -10,6 +10,7 @@
 | [API Reference](./api.md) | Full API reference for `FirebirdLite`, `FirebirdBrowser`, and all types |
 | [Browser / WASM](./browser.md) | Running Firebird in the browser with IndexedDB persistence |
 | [Architecture](./architecture.md) | How the two backends (native driver & WASM) are structured |
+| [Roadmap](./roadmap.md) | Current status, PGlite feature comparison, and the staged plan |
 | [Contributing](./contributing.md) | How to build, test, and contribute to the project |
 
 ## At a glance

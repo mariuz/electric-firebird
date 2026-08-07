@@ -2,6 +2,9 @@ import { defineConfig } from '@playwright/test';
 
 export default defineConfig({
   testDir: './tests',
+  // Browser-only suites have their own server and run under
+  // playwright.wasm.config.ts; they must not be picked up here.
+  testIgnore: ['**/wasm.spec.ts', '**/browser-api.spec.ts'],
   fullyParallel: false,
   forbidOnly: !!process.env['CI'],
   retries: process.env['CI'] ? 2 : 0,

@@ -17,7 +17,7 @@ import * as path from 'path';
 
 const WASM_JS = path.resolve(
   __dirname,
-  '../../../packages/firebird-wasm/dist/wasm/firebird-embedded.js',
+  '../../packages/firebird-wasm/dist/wasm/firebird-embedded.js',
 );
 const wasmAvailable = fs.existsSync(WASM_JS);
 

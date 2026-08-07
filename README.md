@@ -75,6 +75,12 @@ FIREBIRD_PASSWORD=<password> npm test -w packages/firebird-wasm
 
 ```bash
 cd e2e
+
+# Browser suite — needs no Firebird server and no WASM artifact
+npx playwright install chromium
+npm run test:browser
+
+# Node.js suite — needs a running Firebird server
 FIREBIRD_PASSWORD=<password> npx playwright test
 ```
 
@@ -112,21 +118,36 @@ The library provides two execution backends:
 
 ### Roadmap
 
-- [x] True WASM build infrastructure (Emscripten CMake + build script)
+> **Status:** the Node.js backend works.  The browser backend does **not** run
+> Firebird yet — every export in `wasm/fb_wasm_api.cpp` is still a `TODO` stub,
+> so `FirebirdBrowser` cannot open a database.  The TypeScript layer around it
+> (`FirebirdBrowser`, `IndexedDBVFS`) is implemented and tested.
+
+- [x] WASM build infrastructure (Emscripten CMake + build script, targets Firebird 5.0.3)
 - [x] Browser support module (`FirebirdBrowser`)
 - [x] IndexedDB persistence layer (`IndexedDBVFS`)
+- [x] Browser test suite (Playwright, real Chromium + real IndexedDB)
+- [ ] **Wire the C API to the real engine** — `fb_init`, `fb_*_database`, `fb_execute`, `fb_query`
+- [ ] Parameterised queries in the browser (currently accepted and silently ignored)
+- [ ] Transactions that bind statements to the transaction handle
+- [ ] Incremental, atomic IndexedDB persistence
+- [ ] Web Worker + multi-tab safety
 - [ ] Pre-built WASM binary published to npm
-- [ ] Firebird 4 & 5 support
+- [ ] Live queries / `POST_EVENT`-based notifications
+
+See [docs/roadmap.md](./docs/roadmap.md) for the full status audit, a
+feature-by-feature comparison with PGlite, and the staged plan.
 
 ## CI
 
 Both CI workflows use the official
 [firebirdsql/firebird](https://hub.docker.com/r/firebirdsql/firebird) Docker image.
 
-| Workflow | Trigger |
-|----------|---------|
-| [CI](.github/workflows/ci.yml) | push / PR — build + unit tests |
-| [E2E](.github/workflows/e2e.yml) | push / PR — Playwright e2e tests |
+| Workflow | Job | Trigger |
+|----------|-----|---------|
+| [CI](.github/workflows/ci.yml) | Build & unit tests | push / PR |
+| [E2E](.github/workflows/e2e.yml) | Playwright browser tests (no Firebird needed) | push / PR |
+| [E2E](.github/workflows/e2e.yml) | Playwright e2e tests (against Firebird) | push / PR |
 
 ## License
 

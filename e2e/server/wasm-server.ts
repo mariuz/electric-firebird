@@ -1,30 +1,49 @@
 /**
- * wasm-server.ts – Minimal static HTTP server for Firebird WASM browser tests.
+ * wasm-server.ts – Minimal static HTTP server for Firebird browser tests.
  *
  * This server has NO dependency on Firebird or node-firebird-driver-native.
- * It exists solely to serve the WASM build artifacts to Playwright-controlled
- * browsers during e2e testing.
+ * It serves two things to Playwright-controlled browsers:
+ *
+ *   1. The WASM build artifacts (when they have been built).
+ *   2. An ESM bundle of `packages/firebird-wasm/src/browser`, so the real
+ *      `FirebirdBrowser` / `IndexedDBVFS` code can be driven from a real
+ *      browser — with the real IndexedDB — regardless of whether the WASM
+ *      artifact exists.
  *
  * Routes:
  *   GET /health                        → { status: 'ok' }
  *   GET /wasm/firebird-embedded.js     → Emscripten JS glue (text/javascript)
  *   GET /wasm/firebird-embedded.wasm   → WASM binary (application/wasm)
- *   GET /wasm-test                     → HTML test harness page
+ *   GET /wasm-test                     → HTML harness driving the raw C API
+ *   GET /dist/firebird-browser.mjs     → esbuild bundle of src/browser (ESM)
+ *   GET /browser-harness               → blank page exposing the bundle as
+ *                                        `window.FB`; the engine comes from
+ *                                        whatever installed
+ *                                        `globalThis.createFirebirdModule`
+ *   GET /browser-harness-wasm          → same, but also loads the real
+ *                                        Emscripten glue via <script>
  */
 
 import * as http from 'http';
 import * as fs from 'fs';
 import * as path from 'path';
+import { buildSync } from 'esbuild';
 
 const PORT = parseInt(process.env['PORT'] ?? '3001', 10);
 
 // WASM artifacts produced by `npm run build:wasm` + `npm run build`
 const WASM_DIR = path.resolve(
   __dirname,
-  '../../../packages/firebird-wasm/dist/wasm',
+  '../../packages/firebird-wasm/dist/wasm',
 );
 const WASM_JS   = path.join(WASM_DIR, 'firebird-embedded.js');
 const WASM_BIN  = path.join(WASM_DIR, 'firebird-embedded.wasm');
+
+// TypeScript entry point of the browser build, bundled on demand.
+const BROWSER_ENTRY = path.resolve(
+  __dirname,
+  '../../packages/firebird-wasm/src/browser/index.ts',
+);
 
 // ---------------------------------------------------------------------------
 // In-page test harness
@@ -89,6 +108,93 @@ const WASM_TEST_HTML = `<!DOCTYPE html>
 </body>
 </html>`;
 
+/**
+ * Blank harness page.  It only exposes the library on `window.FB`; every
+ * assertion is driven from the test file via `page.evaluate()`, which keeps
+ * the test logic in TypeScript instead of in a string of HTML.
+ *
+ * @param withWasmGlue - also load the real Emscripten glue script, so the
+ *                       library talks to the actual engine instead of to a
+ *                       stub installed by `page.addInitScript()`.
+ */
+function browserHarnessHtml(withWasmGlue: boolean): string {
+  const glue = withWasmGlue
+    ? '<script src="/wasm/firebird-embedded.js"></script>'
+    : '';
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>firebird-wasm browser harness</title>
+  ${glue}
+</head>
+<body>
+  <div id="app">firebird-wasm browser harness</div>
+  <script type="module">
+    import * as FB from '/dist/firebird-browser.mjs';
+    window.FB = FB;
+  </script>
+</body>
+</html>`;
+}
+
+// ---------------------------------------------------------------------------
+// Browser bundle
+// ---------------------------------------------------------------------------
+
+const BROWSER_SRC = path.resolve(
+  __dirname,
+  '../../packages/firebird-wasm/src',
+);
+
+let browserBundle: string | null = null;
+let browserBundleStamp = -1;
+
+/** Most recent mtime across the library sources, used as a cache key. */
+function sourceStamp(dir: string): number {
+  let newest = 0;
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      newest = Math.max(newest, sourceStamp(full));
+    } else if (entry.name.endsWith('.ts')) {
+      newest = Math.max(newest, fs.statSync(full).mtimeMs);
+    }
+  }
+  return newest;
+}
+
+/**
+ * Bundle `src/browser/index.ts` into a single ES module.
+ *
+ * The result is cached — the tests hit this route on every navigation, and a
+ * rebuild per request would dominate the suite runtime — but the cache is
+ * keyed on source mtimes.  Playwright reuses a running dev server between
+ * runs, so without that key an edit to the library would be invisible to the
+ * next test run.
+ */
+function getBrowserBundle(): string {
+  const stamp = sourceStamp(BROWSER_SRC);
+  if (browserBundle !== null && stamp === browserBundleStamp) {
+    return browserBundle;
+  }
+
+  const result = buildSync({
+    entryPoints: [BROWSER_ENTRY],
+    bundle: true,
+    format: 'esm',
+    platform: 'browser',
+    target: 'es2020',
+    write: false,
+    sourcemap: 'inline',
+  });
+
+  browserBundle = result.outputFiles[0]!.text;
+  browserBundleStamp = stamp;
+  return browserBundle;
+}
+
 // ---------------------------------------------------------------------------
 // HTTP helpers
 // ---------------------------------------------------------------------------
@@ -115,6 +221,32 @@ const server = http.createServer((req, res) => {
 
   if (req.method === 'GET' && url === '/health') {
     sendJson(res, 200, { status: 'ok' });
+    return;
+  }
+
+  if (req.method === 'GET' && url === '/dist/firebird-browser.mjs') {
+    try {
+      const bundle = getBrowserBundle();
+      res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8' });
+      res.end(bundle);
+    } catch (err) {
+      sendJson(res, 500, {
+        error: 'Failed to bundle src/browser',
+        detail: err instanceof Error ? err.message : String(err),
+      });
+    }
+    return;
+  }
+
+  if (req.method === 'GET' && url === '/browser-harness') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(browserHarnessHtml(false));
+    return;
+  }
+
+  if (req.method === 'GET' && url === '/browser-harness-wasm') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(browserHarnessHtml(true));
     return;
   }
 

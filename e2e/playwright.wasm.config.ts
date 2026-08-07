@@ -1,9 +1,15 @@
 /**
- * playwright.wasm.config.ts – Playwright configuration for WASM browser tests.
+ * playwright.wasm.config.ts – Playwright configuration for browser tests.
  *
- * Uses the minimal `wasm-server.ts` (no Firebird dependency) so these tests
- * can run directly after the WASM artifact is built, without needing a
- * running Firebird server.
+ * Uses the minimal `wasm-server.ts` (no Firebird dependency), so these tests
+ * need neither a running Firebird server nor the Firebird client library.
+ *
+ * Two suites run under this config:
+ *
+ *   • `browser-api.spec.ts` – drives the real `FirebirdBrowser` /
+ *     `IndexedDBVFS` classes against a stub C ABI.  Always runs.
+ *   • `wasm.spec.ts` – drives the compiled Firebird engine.  Skips itself
+ *     until `npm run build:wasm` has produced the artifact.
  *
  * Run with:
  *   npx playwright test --config playwright.wasm.config.ts
@@ -12,7 +18,7 @@ import { defineConfig } from '@playwright/test';
 
 export default defineConfig({
   testDir: './tests',
-  testMatch: ['**/wasm.spec.ts'],
+  testMatch: ['**/wasm.spec.ts', '**/browser-api.spec.ts'],
   fullyParallel: false,
   forbidOnly: !!process.env['CI'],
   retries: process.env['CI'] ? 2 : 0,

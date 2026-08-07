@@ -168,12 +168,49 @@ await db.transaction(async (tx) => {
 
 ## Current limitations
 
+> **The browser backend does not execute SQL yet.**  Every export in
+> `wasm/fb_wasm_api.cpp` is still a `TODO` stub — `fb_create_database()`
+> returns a null handle, so the quick-start above throws
+> `Failed to open database`.  The TypeScript layer documented on this page is
+> implemented and covered by browser tests; the engine behind it is not wired
+> up.  See [roadmap.md](./roadmap.md) §M1.
+
 | Feature | Status |
 |---------|--------|
-| Parameterised queries (`?` placeholders) | Not yet supported in WASM build |
+| SQL execution (the engine itself) | **Stubbed** — see above |
+| Parameterised queries (`?` placeholders) | Accepted by `query()` but **silently ignored**; do not pass parameters in the browser |
+| Transaction-scoped statements | `tx.exec()` / `tx.query()` run against the database handle, not the transaction handle, so a rollback does not undo them |
+| Concurrent tabs | **Unsafe** — two tabs open the same IndexedDB store and each `persist()` rewrites the whole image, so the last writer wins and the other tab's writes are lost |
+| Incremental / atomic persistence | `persist()` rewrites every page; an interrupted persist can truncate the database |
+| Typed values (BLOB, BIGINT, TIMESTAMP) | The result ABI is JSON, so binary is unsupported and 64-bit integers lose precision |
 | Pre-built WASM binary on npm | Planned |
 | Multi-tab / SharedWorker | Not yet supported |
 | Web Worker offloading | Planned |
+
+---
+
+## Testing the browser layer
+
+The browser build has its own Playwright suite that runs in real Chromium
+against real IndexedDB, and needs neither a Firebird server nor the compiled
+WASM artifact:
+
+```bash
+cd e2e
+npx playwright install chromium
+npm run test:browser
+```
+
+The C ABI is supplied by `e2e/fixtures/stub-engine.js` — a strict stub with a
+real byte heap (so leaked or double-freed pointers are detected) and a real
+in-memory filesystem (so `IndexedDBVFS` import/export is exercised for real).
+The code under test is the actual bundled library, served by
+`e2e/server/wasm-server.ts`, which bundles `src/browser` with esbuild on
+demand.
+
+Once the engine is wired up, the same server also serves
+`/browser-harness-wasm`, which loads the real Emscripten glue instead of the
+stub.
 
 ---
 
