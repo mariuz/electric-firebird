@@ -26,12 +26,14 @@ const STUB_ENGINE = path.resolve(__dirname, '../fixtures/stub-engine.js');
 interface StubControl {
   factoryCalls: number;
   calls: Array<{ fn: string; args: unknown[] }>;
+  initRc: number;
   execRc: number;
   queryResult: { columns: string[]; rows: unknown[][] };
   queryReturnsNull: boolean;
   createFails: boolean;
   startTxFails: boolean;
   commitRc: number;
+  lastError: string;
   callNames(): string[];
   firstCall(fn: string): { fn: string; args: unknown[] } | null;
   countCalls(fn: string): number;
@@ -409,11 +411,19 @@ test.describe('FirebirdBrowser', () => {
       const call = window.__stub.firstCall('_fb_execute');
       const stats = window.__stub.stats();
       await db.close();
-      return { sql: call?.args[1], liveAllocations: stats.liveAllocations };
+      return {
+        dbHandle: call?.args[0],
+        txHandle: call?.args[1],
+        sql: call?.args[2],
+        liveAllocations: stats.liveAllocations,
+      };
     });
 
     // Non-ASCII must survive the UTF-8 round-trip through the heap.
     expect(result.sql).toBe("INSERT INTO t VALUES (1, 'héllo')");
+    expect(result.dbHandle).toBeGreaterThan(0);
+    // Outside an explicit transaction the engine is asked to supply its own.
+    expect(result.txHandle).toBe(0);
     expect(result.liveAllocations).toBe(0);
   });
 
@@ -571,7 +581,7 @@ test.describe('FirebirdBrowser', () => {
     expect(result.names).not.toContain('_fb_commit');
   });
 
-  test('transaction() rolls back when the commit itself fails', async ({
+  test('transaction() surfaces a failed commit without a second rollback', async ({
     page,
   }) => {
     const result = await page.evaluate(async () => {
@@ -596,7 +606,10 @@ test.describe('FirebirdBrowser', () => {
     });
 
     expect(result.message).toContain('335544336');
-    expect(result.names).toContain('_fb_rollback');
+    // fb_commit() finishes the transaction whatever the outcome, so rolling
+    // back afterwards would be operating on a dead handle.
+    expect(result.names).not.toContain('_fb_rollback');
+    expect(result.names).toContain('_fb_commit');
   });
 
   test('transaction() throws when the engine refuses to start one', async ({
@@ -713,6 +726,145 @@ test.describe('FirebirdBrowser', () => {
     expect(result.magic).toBe(0xfb);
     // Two statements were executed before persisting.
     expect(result.statements).toBe(2);
+  });
+
+  test('refuses query parameters rather than silently dropping them', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      window.__stub.queryResult = { columns: ['id'], rows: [[1]] };
+      const db = new window.FB.FirebirdBrowser('params');
+
+      const capture = async (fn: () => Promise<unknown>): Promise<string | null> => {
+        try {
+          await fn();
+          return null;
+        } catch (err) {
+          return (err as Error).message;
+        }
+      };
+
+      const topLevel = await capture(() =>
+        db.query('SELECT * FROM t WHERE id = ?', [1]),
+      );
+
+      // An empty parameter list is the normal no-parameter call and must work.
+      const emptyArray = await capture(() => db.query('SELECT * FROM t', []));
+      const noArgument = await capture(() => db.query('SELECT * FROM t'));
+
+      const inTransaction = await capture(() =>
+        db.transaction(async (tx) => tx.query('SELECT * FROM t WHERE id = ?', [1])),
+      );
+
+      // Nothing may reach the engine on the rejected paths.
+      const queries = window.__stub.calls
+        .filter((c) => c.fn === '_fb_query')
+        .map((c) => c.args[2]);
+
+      await db.close();
+      return { topLevel, emptyArray, noArgument, inTransaction, queries };
+    });
+
+    expect(result.topLevel).toContain('not supported');
+    expect(result.topLevel).toContain('SELECT * FROM t WHERE id = ?');
+    expect(result.inTransaction).toContain('not supported');
+    expect(result.emptyArray).toBeNull();
+    expect(result.noArgument).toBeNull();
+    // Only the two parameterless queries were executed.
+    expect(result.queries).toEqual(['SELECT * FROM t', 'SELECT * FROM t']);
+  });
+
+  test('binds statements inside a transaction to the transaction handle', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      window.__stub.queryResult = { columns: ['cnt'], rows: [[1]] };
+      const db = new window.FB.FirebirdBrowser('tx-binding');
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      window.__stub.resetCalls();
+
+      await db.transaction(async (tx) => {
+        await tx.exec('INSERT INTO t VALUES (1)');
+        await tx.query('SELECT COUNT(*) AS cnt FROM t');
+      });
+
+      const started = window.__stub.firstCall('_fb_start_transaction');
+      const exec = window.__stub.firstCall('_fb_execute');
+      const query = window.__stub.firstCall('_fb_query');
+      const commit = window.__stub.firstCall('_fb_commit');
+
+      await db.close();
+      return {
+        txHandle: commit?.args[0],
+        execTx: exec?.args[1],
+        queryTx: query?.args[1],
+        startedOn: started?.args[0],
+      };
+    });
+
+    // The handle the transaction was opened with must be the one every
+    // statement runs under — otherwise a rollback would not undo them.
+    expect(result.txHandle).toBeGreaterThan(0);
+    expect(result.execTx).toBe(result.txHandle);
+    expect(result.queryTx).toBe(result.txHandle);
+    expect(result.startedOn).toBeGreaterThan(0);
+  });
+
+  test('surfaces the engine error text, not just a numeric code', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('engine-errors');
+      await db.exec('CREATE TABLE t (id INTEGER)');
+
+      const capture = async (fn: () => Promise<unknown>): Promise<string> => {
+        try {
+          await fn();
+          return '';
+        } catch (err) {
+          return (err as Error).message;
+        }
+      };
+
+      window.__stub.execRc = 335544569;
+      window.__stub.lastError =
+        'Dynamic SQL Error: SQL error code = -204, Table unknown: MISSING';
+      const execMessage = await capture(() => db.exec('SELECT * FROM missing'));
+
+      window.__stub.execRc = 0;
+      window.__stub.queryReturnsNull = true;
+      window.__stub.lastError = 'fb_query: prepare failed: Column unknown: NOPE';
+      const queryMessage = await capture(() => db.query('SELECT nope FROM t'));
+
+      window.__stub.queryReturnsNull = false;
+      window.__stub.lastError = '';
+      await db.close();
+      return { execMessage, queryMessage };
+    });
+
+    expect(result.execMessage).toContain('Table unknown: MISSING');
+    expect(result.execMessage).toContain('335544569');
+    expect(result.queryMessage).toContain('Column unknown: NOPE');
+  });
+
+  test('reports why the engine failed to initialise', async ({ page }) => {
+    const message = await page.evaluate(async () => {
+      window.__stub.initRc = 3;
+      window.__stub.lastError = 'fb_init: no Firebird provider available';
+      const db = new window.FB.FirebirdBrowser('init-failure');
+      try {
+        await db.exec('SELECT 1');
+        return null;
+      } catch (err) {
+        return (err as Error).message;
+      } finally {
+        window.__stub.initRc = 0;
+        window.__stub.lastError = '';
+      }
+    });
+
+    expect(message).toContain('no Firebird provider available');
+    expect(message).toContain('(code 3)');
   });
 
   test('reopens an existing database after a reload instead of recreating it', async ({

@@ -8,13 +8,14 @@
  * What is exercised:
  *   - The Emscripten module factory loads without throwing.
  *   - Every exported `_fb_*` C API function is present and callable.
- *   - Return values match the expected contract (currently stub behaviour).
+ *   - A real round-trip: create a database, execute DDL/DML, read rows back,
+ *     roll a transaction back, and surface engine error text.
  *   - `allocString` correctly allocates a UTF-8 string on the WASM heap.
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { loadFirebirdWasm, allocString } from '../wasm-loader';
+import { loadFirebirdWasm, allocString, lastError } from '../wasm-loader';
 import type { FirebirdWasmModule } from '../wasm-loader';
 
 // The WASM artifact lives at dist/wasm/ after `npm run build:wasm` +
@@ -40,6 +41,7 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
     it('exports all required C API functions', () => {
       const exports: Array<keyof FirebirdWasmModule> = [
         '_fb_init',
+        '_fb_last_error',
         '_fb_create_database',
         '_fb_attach_database',
         '_fb_detach_database',
@@ -96,97 +98,154 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
       mod._free(ptr);
     });
 
-    // ── _fb_init ────────────────────────────────────────────────────────
+    // ── Real engine round-trip ──────────────────────────────────────────
+    //
+    // These assertions describe the *real* C API contract, not the stub one
+    // the file previously encoded (handle 0 is no longer "success", it is an
+    // invalid handle).  They only run once a working artifact exists.
 
-    it('_fb_init() returns 0 (success)', () => {
+    /** Read the engine's message for the most recent failure. */
+    const errorText = (): string => lastError(mod);
+
+    it('_fb_init() succeeds', () => {
       const rc = mod._fb_init();
-      expect(rc).toBe(0);
+      expect(`${rc} ${errorText()}`).toBe('0 ');
     });
 
-    // ── _fb_create_database / _fb_attach_database / _fb_detach_database ─
-
-    it('_fb_create_database() accepts a path pointer and returns a number', () => {
-      const pathPtr = allocString(mod, '/data/test.fdb');
-      try {
-        const handle = mod._fb_create_database(pathPtr);
-        expect(typeof handle).toBe('number');
-      } finally {
-        mod._free(pathPtr);
-      }
+    it('_fb_init() is idempotent', () => {
+      expect(mod._fb_init()).toBe(0);
+      expect(mod._fb_init()).toBe(0);
     });
 
-    it('_fb_attach_database() accepts a path pointer and returns a number', () => {
-      const pathPtr = allocString(mod, '/data/test.fdb');
-      try {
-        const handle = mod._fb_attach_database(pathPtr);
-        expect(typeof handle).toBe('number');
-      } finally {
-        mod._free(pathPtr);
-      }
-    });
-
-    it('_fb_detach_database() returns 0 (success)', () => {
-      const rc = mod._fb_detach_database(0);
-      expect(rc).toBe(0);
-    });
-
-    // ── _fb_execute ─────────────────────────────────────────────────────
-
-    it('_fb_execute() returns 0 (success)', () => {
+    it('rejects an unknown database handle instead of silently succeeding', () => {
       const sqlPtr = allocString(mod, 'CREATE TABLE t (id INTEGER)');
       try {
-        const rc = mod._fb_execute(0, sqlPtr);
-        expect(rc).toBe(0);
+        expect(mod._fb_execute(0, 0, sqlPtr)).not.toBe(0);
+        expect(errorText()).toContain('unknown database handle');
       } finally {
         mod._free(sqlPtr);
       }
     });
 
-    // ── _fb_query ───────────────────────────────────────────────────────
-
-    it('_fb_query() returns a non-zero pointer', () => {
-      const sqlPtr = allocString(mod, 'SELECT 1 FROM RDB$DATABASE');
-      try {
-        const resultPtr = mod._fb_query(0, sqlPtr);
-        expect(resultPtr).toBeGreaterThan(0);
-        mod._fb_free_result(resultPtr);
-      } finally {
-        mod._free(sqlPtr);
+    it('creates a database, round-trips a row, and detaches', () => {
+      mod._fb_init();
+      if (!mod.FS.analyzePath('/data').exists) {
+        mod.FS.mkdir('/data');
       }
-    });
 
-    it('_fb_query() result is valid JSON with columns and rows arrays', () => {
-      const sqlPtr = allocString(mod, 'SELECT 1 FROM RDB$DATABASE');
+      const dbPath = '/data/integration.fdb';
+      if (mod.FS.analyzePath(dbPath).exists) {
+        mod.FS.unlink(dbPath);
+      }
+
+      const pathPtr = allocString(mod, dbPath);
+      let db = 0;
       try {
-        const resultPtr = mod._fb_query(0, sqlPtr);
-        expect(resultPtr).toBeGreaterThan(0);
+        db = mod._fb_create_database(pathPtr);
+        expect(`${db} ${errorText()}`).not.toContain('0 ');
+        expect(db).toBeGreaterThan(0);
+      } finally {
+        mod._free(pathPtr);
+      }
+
+      const exec = (sql: string): void => {
+        const ptr = allocString(mod, sql);
+        try {
+          const rc = mod._fb_execute(db, 0, ptr);
+          expect(`${sql} -> ${rc} ${errorText()}`).toBe(`${sql} -> 0 `);
+        } finally {
+          mod._free(ptr);
+        }
+      };
+
+      exec('CREATE TABLE items (id INTEGER, name VARCHAR(32))');
+      exec("INSERT INTO items VALUES (1, 'alpha')");
+
+      const sqlPtr = allocString(mod, 'SELECT id, name FROM items ORDER BY id');
+      try {
+        const resultPtr = mod._fb_query(db, 0, sqlPtr);
+        expect(`${resultPtr} ${errorText()}`).not.toContain('0 ');
 
         const json = mod.UTF8ToString(resultPtr);
         mod._fb_free_result(resultPtr);
 
         const parsed = JSON.parse(json) as { columns: string[]; rows: unknown[][] };
-        expect(Array.isArray(parsed.columns)).toBe(true);
-        expect(Array.isArray(parsed.rows)).toBe(true);
+        expect(parsed.columns).toEqual(['ID', 'NAME']);
+        expect(parsed.rows).toEqual([[1, 'alpha']]);
       } finally {
         mod._free(sqlPtr);
       }
+
+      expect(mod._fb_detach_database(db)).toBe(0);
     });
 
-    // ── _fb_start_transaction / _fb_commit / _fb_rollback ───────────────
+    it('rolls a transaction back', () => {
+      mod._fb_init();
 
-    it('_fb_start_transaction() returns a number', () => {
-      const txHandle = mod._fb_start_transaction(0);
-      expect(typeof txHandle).toBe('number');
+      const dbPath = '/data/rollback.fdb';
+      if (mod.FS.analyzePath(dbPath).exists) {
+        mod.FS.unlink(dbPath);
+      }
+
+      const pathPtr = allocString(mod, dbPath);
+      const db = mod._fb_create_database(pathPtr);
+      mod._free(pathPtr);
+      expect(db).toBeGreaterThan(0);
+
+      const exec = (sql: string, tx: number): number => {
+        const ptr = allocString(mod, sql);
+        try {
+          return mod._fb_execute(db, tx, ptr);
+        } finally {
+          mod._free(ptr);
+        }
+      };
+
+      expect(exec('CREATE TABLE t (id INTEGER)', 0)).toBe(0);
+
+      const tx = mod._fb_start_transaction(db);
+      expect(tx).toBeGreaterThan(0);
+      expect(exec('INSERT INTO t VALUES (1)', tx)).toBe(0);
+      expect(mod._fb_rollback(tx)).toBe(0);
+
+      // The insert ran inside the transaction, so the rollback must undo it.
+      const sqlPtr = allocString(mod, 'SELECT COUNT(*) AS CNT FROM t');
+      try {
+        const resultPtr = mod._fb_query(db, 0, sqlPtr);
+        const parsed = JSON.parse(mod.UTF8ToString(resultPtr)) as {
+          rows: unknown[][];
+        };
+        mod._fb_free_result(resultPtr);
+        expect(parsed.rows).toEqual([[0]]);
+      } finally {
+        mod._free(sqlPtr);
+      }
+
+      expect(mod._fb_detach_database(db)).toBe(0);
     });
 
-    it('_fb_commit() returns 0 (success)', () => {
-      const rc = mod._fb_commit(0);
-      expect(rc).toBe(0);
-    });
+    it('reports a readable message for invalid SQL', () => {
+      mod._fb_init();
 
-    it('_fb_rollback() returns 0 (success)', () => {
-      const rc = mod._fb_rollback(0);
-      expect(rc).toBe(0);
+      const dbPath = '/data/errors.fdb';
+      if (mod.FS.analyzePath(dbPath).exists) {
+        mod.FS.unlink(dbPath);
+      }
+      const pathPtr = allocString(mod, dbPath);
+      const db = mod._fb_create_database(pathPtr);
+      mod._free(pathPtr);
+
+      const sqlPtr = allocString(mod, 'SELECT * FROM no_such_table');
+      try {
+        expect(mod._fb_query(db, 0, sqlPtr)).toBe(0);
+        // Not just a numeric code — the engine's own text must reach the caller.
+        expect(errorText().length).toBeGreaterThan(0);
+        expect(errorText().toUpperCase()).toContain('NO_SUCH_TABLE');
+      } finally {
+        mod._free(sqlPtr);
+      }
+
+      mod._fb_detach_database(db);
     });
   },
 );

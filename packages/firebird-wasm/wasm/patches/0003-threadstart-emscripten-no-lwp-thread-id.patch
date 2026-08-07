@@ -1,4 +1,4 @@
-From: Copilot <noreply@github.com>
+From: electric-firebird
 Subject: [PATCH] ThreadStart.h: skip USE_LWP_AS_THREAD_ID under Emscripten
 
 Emscripten exposes a POSIX-like API but does not provide the
@@ -10,20 +10,20 @@ This is a more targeted fix than defining LSB_BUILD, which causes
 ambiguous-call errors in os_utils.h because Emscripten's *64 POSIX
 functions (fgetpos64, readdir64, …) are macros that expand back to
 the base names, clashing with os_utils' inline wrappers.
----
- src/common/ThreadStart.h | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
 
+Regenerated against Firebird master, which added an INVALID_ID
+constant to each branch of the #if chain.
+---
 diff --git a/src/common/ThreadStart.h b/src/common/ThreadStart.h
-index abcdef0..1234567 100644
+index 25b8424..f7dadc3 100644
 --- a/src/common/ThreadStart.h
 +++ b/src/common/ThreadStart.h
-@@ -57,7 +57,7 @@ typedef THREAD_ENTRY_DECLARE ThreadEntryPoint(THREAD_ENTRY_PARAM);
- 
+@@ -58,7 +58,7 @@ typedef THREAD_ENTRY_DECLARE ThreadEntryPoint(THREAD_ENTRY_PARAM);
  #if defined(WIN_NT)
  typedef DWORD ThreadId;
+ constexpr static ThreadId INVALID_ID = 0;
 -#elif defined(LINUX) && !defined(ANDROID) && !defined(LSB_BUILD)
 +#elif defined(LINUX) && !defined(ANDROID) && !defined(LSB_BUILD) && !defined(__EMSCRIPTEN__)
  #define USE_LWP_AS_THREAD_ID
  typedef int ThreadId;
- #elif defined(USE_POSIX_THREADS)
+ constexpr static ThreadId INVALID_ID = 0;

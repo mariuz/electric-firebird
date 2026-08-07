@@ -1,8 +1,20 @@
+From: electric-firebird
+Subject: [PATCH] unicode_util: use statically linked ICU under Emscripten
+
+Emscripten links ICU statically via -sUSE_ICU=1, so there is no shared
+module to dlopen and no dlsym to bind against.  Under __EMSCRIPTEN__ the
+ICU and ConversionICU function tables are therefore populated directly
+with the real ICU symbols, and the module-cache machinery (ICUModules,
+convIcuMutex) is compiled out because nothing can load or unload a module.
+
+Regenerated against Firebird master; the previous revision of this patch
+had malformed hunk headers and never applied.
+---
 diff --git a/src/common/unicode_util.cpp b/src/common/unicode_util.cpp
-index 86eec7d86b..XXXXXXX 100644
+index 05ffe21..a1544b3 100644
 --- a/src/common/unicode_util.cpp
 +++ b/src/common/unicode_util.cpp
-@@ -481,8 +481,14 @@ private:
+@@ -480,11 +480,16 @@ private:
  	AutoPtr<ModuleLoader::Module> inModule;
  };
  
@@ -19,7 +31,7 @@ index 86eec7d86b..XXXXXXX 100644
  class UnicodeUtil::ICUModules
  {
  	typedef GenericMap<Pair<Left<string, ICU*> > > ModulesMap;
-@@ -511,6 +519,7 @@ public:
+@@ -510,6 +515,7 @@ public:
  static const char* const COLL_30_VERSION = "41.128.4.4";	// ICU 3.0 collator version
  
  static GlobalPtr<UnicodeUtil::ICUModules> icuModules;
@@ -27,21 +39,18 @@ index 86eec7d86b..XXXXXXX 100644
  
  
  static void getVersions(const string& configInfo, ObjectsArray<string>& versions)
-@@ -1139,6 +1148,83 @@ void UnicodeUtil::utf8Normalize(UCharBuffer& data)
+@@ -1138,6 +1144,58 @@ void UnicodeUtil::utf8Normalize(UCharBuffer& data)
  	}
  }
  
 +#ifdef __EMSCRIPTEN__
-+// Emscripten/WASM: ICU is linked statically via -sUSE_ICU=1.
-+// Create an ICU instance with function pointers set directly to the real
-+// ICU functions instead of loading them dynamically via dlsym.
-+//
-+// A single static ICU instance is returned for every version request;
-+// the Emscripten build ships exactly one ICU version.
++// Emscripten/WASM: ICU is linked statically via -sUSE_ICU=1, so the function
++// pointers are bound directly to the real ICU symbols instead of being looked
++// up with dlsym().  Exactly one ICU version ships in the binary, so the
++// requested version is ignored and a singleton is returned.
 +UnicodeUtil::ICU* UnicodeUtil::loadICU(const Firebird::string& /*icuVersion*/,
 +	const Firebird::string& /*configInfo*/)
 +{
-+	// Singleton: create once, return the same instance on every call.
 +	static ICU* wasmIcu = nullptr;
 +	if (wasmIcu)
 +		return wasmIcu;
@@ -49,10 +58,10 @@ index 86eec7d86b..XXXXXXX 100644
 +	wasmIcu = FB_NEW_POOL(*getDefaultMemoryPool()) ICU(
 +		U_ICU_VERSION_MAJOR_NUM, U_ICU_VERSION_MINOR_NUM);
 +
-+	// The Emscripten build does not use dynamic module loading.
-+	// inModule and ucModule stay NULL – the destructor handles NULL safely.
++	// No dynamic module loading: inModule and ucModule stay NULL, which the
++	// destructor handles safely.
 +
-+	// ── common library (libicuuc) functions ─────────────────────────
++	// common library (libicuuc)
 +	wasmIcu->uVersionToString   = u_versionToString;
 +	wasmIcu->ulocCountAvailable = uloc_countAvailable;
 +	wasmIcu->ulocGetAvailable   = uloc_getAvailable;
@@ -61,21 +70,20 @@ index 86eec7d86b..XXXXXXX 100644
 +	wasmIcu->usetGetItemCount   = uset_getItemCount;
 +	wasmIcu->usetOpen           = uset_open;
 +
-+	// ── i18n library (libicui18n) functions ─────────────────────────
-+	wasmIcu->ucolClose                       = ucol_close;
++	// i18n library (libicui18n)
++	wasmIcu->ucolClose                        = ucol_close;
 +	wasmIcu->ucolGetContractionsAndExpansions = ucol_getContractionsAndExpansions;
-+	wasmIcu->ucolGetRules                    = ucol_getRules;
-+	wasmIcu->ucolGetSortKey                  = ucol_getSortKey;
-+	wasmIcu->ucolOpen                        = ucol_open;
-+	wasmIcu->ucolOpenRules                   = ucol_openRules;
-+	wasmIcu->ucolSetAttribute                = ucol_setAttribute;
-+	wasmIcu->ucolStrColl                     = ucol_strcoll;
-+	wasmIcu->ucolGetVersion                  = ucol_getVersion;
-+	wasmIcu->utransOpenU                     = utrans_openU;
-+	wasmIcu->utransClose                     = utrans_close;
-+	wasmIcu->utransTransUChars               = utrans_transUChars;
++	wasmIcu->ucolGetRules                     = ucol_getRules;
++	wasmIcu->ucolGetSortKey                   = ucol_getSortKey;
++	wasmIcu->ucolOpen                         = ucol_open;
++	wasmIcu->ucolOpenRules                    = ucol_openRules;
++	wasmIcu->ucolSetAttribute                 = ucol_setAttribute;
++	wasmIcu->ucolStrColl                      = ucol_strcoll;
++	wasmIcu->ucolGetVersion                   = ucol_getVersion;
++	wasmIcu->utransOpenU                      = utrans_openU;
++	wasmIcu->utransClose                      = utrans_close;
++	wasmIcu->utransTransUChars                = utrans_transUChars;
 +
-+	// ── Obtain the default collation version ────────────────────────
 +	UErrorCode status = U_ZERO_ERROR;
 +	UCollator* collator = wasmIcu->ucolOpen("", &status);
 +	if (collator)
@@ -90,43 +98,41 @@ index 86eec7d86b..XXXXXXX 100644
  UnicodeUtil::ICU* UnicodeUtil::loadICU(const string& icuVersion, const string& configInfo)
  {
  	ObjectsArray<string> versions;
-@@ -1271,6 +1357,7 @@ UnicodeUtil::ICU* UnicodeUtil::loadICU(const string& icuVersion, const string& c
+@@ -1270,6 +1328,7 @@ UnicodeUtil::ICU* UnicodeUtil::loadICU(const string& icuVersion, const string& c
  
  	return NULL;
  }
 +#endif // !__EMSCRIPTEN__
  
  
- void UnicodeUtil::getICUVersion(ICU* icu, int& majorVersion, int& minorVersion)
-@@ -1282,6 +1369,30 @@ void UnicodeUtil::getICUVersion(ICU* icu, int& majorVersion, int& minorVersion)
+ void UnicodeUtil::getICUVersion(ICU* icu, int& majorVersion, int& minorVersion) noexcept
+@@ -1281,6 +1340,45 @@ void UnicodeUtil::getICUVersion(ICU* icu, int& majorVersion, int& minorVersion)
  
  UnicodeUtil::ConversionICU& UnicodeUtil::getConversionICU()
  {
 +#ifdef __EMSCRIPTEN__
-+	// Emscripten/WASM: ICU is linked statically via -sUSE_ICU=1.
-+	// Populate the ConversionICU struct with real ICU function pointers.
++	// Statically linked ICU: populate ConversionICU with the real symbols.
 +	static ConversionICU wasmConv = {};
 +	if (!wasmConv.ucnv_open)
 +	{
-+		wasmConv.ucnv_open            = ucnv_open;
-+		wasmConv.ucnv_close           = ucnv_close;
-+		wasmConv.ucnv_fromUChars      = ucnv_fromUChars;
-+		wasmConv.u_tolower            = u_tolower;
-+		wasmConv.u_toupper            = u_toupper;
-+		wasmConv.u_strCompare         = u_strCompare;
-+		wasmConv.u_countChar32        = u_countChar32;
++		wasmConv.ucnv_open             = ucnv_open;
++		wasmConv.ucnv_close            = ucnv_close;
++		wasmConv.ucnv_fromUChars       = ucnv_fromUChars;
++		wasmConv.u_tolower             = u_tolower;
++		wasmConv.u_toupper             = u_toupper;
++		wasmConv.u_strCompare          = u_strCompare;
++		wasmConv.u_countChar32         = u_countChar32;
 +		wasmConv.utf8_nextCharSafeBody = utf8_nextCharSafeBody;
 +		wasmConv.UCNV_TO_U_CALLBACK_STOP = UCNV_TO_U_CALLBACK_STOP;
-+		wasmConv.ucnv_setToUCallBack  = ucnv_setToUCallBack;
++		wasmConv.ucnv_setToUCallBack   = ucnv_setToUCallBack;
 +		wasmConv.ucnv_setFromUCallBack = ucnv_setFromUCallBack;
-+		wasmConv.ucnv_fromUnicode     = ucnv_fromUnicode;
-+		wasmConv.ucnv_toUnicode       = ucnv_toUnicode;
-+		wasmConv.ucnv_getInvalidChars = ucnv_getInvalidChars;
-+		wasmConv.ucnv_getMaxCharSize  = ucnv_getMaxCharSize;
-+		wasmConv.ucnv_getMinCharSize  = ucnv_getMinCharSize;
-+		wasmConv.ustrcmp              = u_strcmp;
++		wasmConv.ucnv_fromUnicode      = ucnv_fromUnicode;
++		wasmConv.ucnv_toUnicode        = ucnv_toUnicode;
++		wasmConv.ucnv_getInvalidChars  = ucnv_getInvalidChars;
++		wasmConv.ucnv_getMaxCharSize   = ucnv_getMaxCharSize;
++		wasmConv.ucnv_getMinCharSize   = ucnv_getMinCharSize;
++		wasmConv.ustrcmp               = u_strcmp;
 +
-+		// i18n (ucal_*) functions
 +		wasmConv.ucalGetTZDataVersion          = ucal_getTZDataVersion;
 +		wasmConv.ucalGetDefaultTimeZone        = ucal_getDefaultTimeZone;
 +		wasmConv.ucalOpen                      = ucal_open;
@@ -146,7 +152,7 @@ index 86eec7d86b..XXXXXXX 100644
  	if (convIcu)
  	{
  		return *convIcu;
-@@ -1376,6 +1487,7 @@ UnicodeUtil::ConversionICU& UnicodeUtil::getConversionICU()
+@@ -1375,6 +1473,7 @@ UnicodeUtil::ConversionICU& UnicodeUtil::getConversionICU()
  
  	// compiler warning silencer
  	return *convIcu;

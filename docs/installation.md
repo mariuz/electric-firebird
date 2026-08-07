@@ -73,7 +73,7 @@ npm run build:wasm -w packages/firebird-wasm
 ```
 
 The build script (`packages/firebird-wasm/wasm/build.sh`) downloads the
-Firebird 5.0.3 source tree, applies the necessary patches, and produces
+Firebird master source tree, applies the necessary patches, and produces
 `dist/wasm/firebird-embedded.js` and `dist/wasm/firebird-embedded.wasm`.
 
 ---

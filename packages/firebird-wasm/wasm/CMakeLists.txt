@@ -134,6 +134,25 @@ file(GLOB_RECURSE FB_LOCK_SRCS
   "${FIREBIRD_SRC}/src/lock/*.cpp"
 )
 
+# yvalve – the "Y-valve".  fb_wasm_api.cpp drives the engine through Firebird's
+# public OO API, whose entry points all live here:
+#
+#   MasterImplementation.cpp  fb_get_master_interface(), IStatus, getDispatcher()
+#   utl.cpp                   IUtil (XPB builder, date/time decoding,
+#                             formatStatus, IInt128, IDecFloat*)
+#   PluginManager.cpp         IPluginManager, used by fb_init() to find the
+#                             statically linked engine provider
+#   why.cpp                   the Y-valve object model + fb_shutdown()
+#
+# gds.cpp is excluded: it implements the legacy isc_* client API, which the OO
+# API bridge does not use, and its gds__* helpers are already provided as
+# lightweight stubs in fb_wasm_stubs.cpp.  Compiling both would be a
+# duplicate-symbol error for 16 symbols (gds__alloc, gds__log, gds__prefix, …).
+file(GLOB FB_YVALVE_SRCS
+  "${FIREBIRD_SRC}/src/yvalve/*.cpp"
+)
+list(FILTER FB_YVALVE_SRCS EXCLUDE REGEX ".*/yvalve/gds\\.cpp")
+
 # ---------------------------------------------------------------------------
 # Include paths
 # ---------------------------------------------------------------------------
@@ -181,6 +200,7 @@ add_executable(firebird-embedded
   ${FB_DSQL_SRCS}
   ${FB_JRD_SRCS}
   ${FB_LOCK_SRCS}
+  ${FB_YVALVE_SRCS}
   ${LIBTOMMATH_SRCS}
   ${LIBTOMCRYPT_SRCS}
   ${DECNUMBER_SRCS}
@@ -239,7 +259,7 @@ target_compile_options(firebird-embedded PRIVATE
 set(EMSCRIPTEN_LINK_FLAGS
   "-s MODULARIZE=1"
   "-s EXPORT_NAME='createFirebirdModule'"
-  "-s EXPORTED_FUNCTIONS='[\"_fb_init\",\"_fb_create_database\",\"_fb_attach_database\",\"_fb_detach_database\",\"_fb_execute\",\"_fb_query\",\"_fb_free_result\",\"_fb_start_transaction\",\"_fb_commit\",\"_fb_rollback\",\"_malloc\",\"_free\"]'"
+  "-s EXPORTED_FUNCTIONS='[\"_fb_init\",\"_fb_last_error\",\"_fb_create_database\",\"_fb_attach_database\",\"_fb_detach_database\",\"_fb_execute\",\"_fb_query\",\"_fb_free_result\",\"_fb_start_transaction\",\"_fb_commit\",\"_fb_rollback\",\"_malloc\",\"_free\"]'"
   "-s EXPORTED_RUNTIME_METHODS='[\"UTF8ToString\",\"stringToUTF8\",\"lengthBytesUTF8\",\"FS\",\"MEMFS\"]'"
   "-s ALLOW_MEMORY_GROWTH=1"
   "-s INITIAL_MEMORY=67108864"

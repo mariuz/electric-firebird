@@ -168,24 +168,34 @@ await db.transaction(async (tx) => {
 
 ## Current limitations
 
-> **The browser backend does not execute SQL yet.**  Every export in
-> `wasm/fb_wasm_api.cpp` is still a `TODO` stub — `fb_create_database()`
-> returns a null handle, so the quick-start above throws
-> `Failed to open database`.  The TypeScript layer documented on this page is
-> implemented and covered by browser tests; the engine behind it is not wired
-> up.  See [roadmap.md](./roadmap.md) §M1.
+> **The WASM artifact has not been built or run yet.**  `wasm/fb_wasm_api.cpp`
+> is now a real implementation over Firebird's public OO API — it is no longer
+> a stub — but linking it needs the Emscripten SDK, and that step is still
+> outstanding.  Until a `firebird-embedded.wasm` exists, the quick-start above
+> cannot run.  See [roadmap.md](./roadmap.md) §M1.
 
 | Feature | Status |
 |---------|--------|
-| SQL execution (the engine itself) | **Stubbed** — see above |
-| Parameterised queries (`?` placeholders) | Accepted by `query()` but **silently ignored**; do not pass parameters in the browser |
-| Transaction-scoped statements | `tx.exec()` / `tx.query()` run against the database handle, not the transaction handle, so a rollback does not undo them |
+| Pre-built WASM binary on npm | Not published — you must build it yourself with emsdk |
+| Parameterised queries (`?` placeholders) | **Rejected** — `query()` throws if you pass parameters, rather than silently dropping them. Inline the values, or use the Node.js backend |
 | Concurrent tabs | **Unsafe** — two tabs open the same IndexedDB store and each `persist()` rewrites the whole image, so the last writer wins and the other tab's writes are lost |
 | Incremental / atomic persistence | `persist()` rewrites every page; an interrupted persist can truncate the database |
-| Typed values (BLOB, BIGINT, TIMESTAMP) | The result ABI is JSON, so binary is unsupported and 64-bit integers lose precision |
-| Pre-built WASM binary on npm | Planned |
+| Typed values | Decoded from their real Firebird types, but flattened for JSON: `NUMERIC`/`DECFLOAT`/`INT128` and out-of-range `BIGINT` arrive as exact decimal **strings**, dates as ISO-8601 strings, binary BLOBs as base64. A typed ABI is planned |
+| Multi-statement `exec()` | Single statement only |
 | Multi-tab / SharedWorker | Not yet supported |
 | Web Worker offloading | Planned |
+
+### Transaction-scoped statements
+
+`tx.exec()` and `tx.query()` run under the transaction handle the callback was
+given, so a rollback really does undo them:
+
+```ts
+await db.transaction(async (tx) => {
+  await tx.exec('INSERT INTO items VALUES (3, \'gamma\')');
+  throw new Error('changed my mind'); // the insert is rolled back
+});
+```
 
 ---
 
@@ -220,7 +230,8 @@ See [Installation → Building the WASM module](./installation.md#building-the-w
 for full instructions.
 
 The build script (`packages/firebird-wasm/wasm/build.sh`) targets
-**Firebird 5.0.3** and produces:
+**Firebird master** (currently 6.0.0 — the submodule tracks the upstream
+`master` branch) and produces:
 
 ```
 packages/firebird-wasm/dist/wasm/

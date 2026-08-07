@@ -50,15 +50,22 @@ const BROWSER_ENTRY = path.resolve(
 // ---------------------------------------------------------------------------
 
 /**
- * Minimal HTML page that loads the Emscripten module and exercises the C API.
- * Results are written to element data attributes so Playwright can read them
- * with simple DOM assertions.
+ * Minimal HTML page that loads the Emscripten module and drives the C API
+ * through a full round-trip: initialise, create a database, run DDL and DML,
+ * then read the rows back.  Results are written to element data attributes so
+ * Playwright can read them with simple DOM assertions.
+ *
+ * This is deliberately an end-to-end exercise rather than a "does the function
+ * exist" check — the API used to be stubbed, and a smoke test that only
+ * asserted "returns 0" could not tell a working engine from a stub.
  *
  * Expected data attributes on #result when complete:
  *   data-done="true"         – all steps finished without exception
  *   data-init-rc="0"         – _fb_init() returned 0
+ *   data-db-handle="…"       – handle from _fb_create_database() (>0)
  *   data-query-json="…"      – JSON string from _fb_query()
- *   data-error="…"           – set only if an exception was thrown
+ *   data-error="…"           – set only if a step failed
+ *   data-engine-error="…"    – _fb_last_error() text at the point of failure
  */
 const WASM_TEST_HTML = `<!DOCTYPE html>
 <html lang="en">
@@ -72,35 +79,79 @@ const WASM_TEST_HTML = `<!DOCTYPE html>
   <script>
     (async () => {
       const el = document.getElementById('result');
+      let mod = null;
+
+      const engineError = () => {
+        if (!mod || typeof mod._fb_last_error !== 'function') return '';
+        const ptr = mod._fb_last_error();
+        return ptr ? mod.UTF8ToString(ptr) : '';
+      };
+
+      const withSql = (sql, fn) => {
+        const len = mod.lengthBytesUTF8(sql) + 1;
+        const ptr = mod._malloc(len);
+        mod.stringToUTF8(sql, ptr, len);
+        try {
+          return fn(ptr);
+        } finally {
+          mod._free(ptr);
+        }
+      };
+
       try {
         if (typeof createFirebirdModule !== 'function') {
           throw new Error('createFirebirdModule is not defined');
         }
 
-        const mod = await createFirebirdModule();
+        mod = await createFirebirdModule();
 
-        // _fb_init
         const initRc = mod._fb_init();
         el.dataset.initRc = String(initRc);
-
-        // _fb_query — allocate a SQL string on the WASM heap
-        const sql = 'SELECT 1 FROM RDB\\$DATABASE';
-        const len = mod.lengthBytesUTF8(sql) + 1;
-        const sqlPtr = mod._malloc(len);
-        mod.stringToUTF8(sql, sqlPtr, len);
-        const resultPtr = mod._fb_query(0, sqlPtr);
-        mod._free(sqlPtr);
-
-        if (resultPtr === 0) {
-          throw new Error('_fb_query returned null pointer');
+        if (initRc !== 0) {
+          throw new Error('_fb_init() failed with code ' + initRc);
         }
-        const queryJson = mod.UTF8ToString(resultPtr);
-        mod._fb_free_result(resultPtr);
-        el.dataset.queryJson = queryJson;
 
-        // Mark success
+        if (!mod.FS.analyzePath('/data').exists) {
+          mod.FS.mkdir('/data');
+        }
+        const dbPath = '/data/wasm-test.fdb';
+        if (mod.FS.analyzePath(dbPath).exists) {
+          mod.FS.unlink(dbPath);
+        }
+
+        const dbHandle = withSql(dbPath, (p) => mod._fb_create_database(p));
+        el.dataset.dbHandle = String(dbHandle);
+        if (dbHandle === 0) {
+          throw new Error('_fb_create_database() returned a null handle');
+        }
+
+        // 0 as the transaction handle means "run in your own transaction".
+        const exec = (sql) => {
+          const rc = withSql(sql, (p) => mod._fb_execute(dbHandle, 0, p));
+          if (rc !== 0) {
+            throw new Error('_fb_execute() failed with code ' + rc + ' for: ' + sql);
+          }
+        };
+
+        exec('CREATE TABLE items (id INTEGER, name VARCHAR(32))');
+        exec("INSERT INTO items VALUES (1, 'alpha')");
+        exec("INSERT INTO items VALUES (2, 'beta')");
+
+        const resultPtr = withSql(
+          'SELECT id, name FROM items ORDER BY id',
+          (p) => mod._fb_query(dbHandle, 0, p),
+        );
+        if (resultPtr === 0) {
+          throw new Error('_fb_query() returned a null pointer');
+        }
+        el.dataset.queryJson = mod.UTF8ToString(resultPtr);
+        mod._fb_free_result(resultPtr);
+
+        mod._fb_detach_database(dbHandle);
+
         el.dataset.done = 'true';
       } catch (err) {
+        el.dataset.engineError = engineError();
         el.dataset.error = err instanceof Error ? err.message : String(err);
       }
     })();

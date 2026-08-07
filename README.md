@@ -118,18 +118,19 @@ The library provides two execution backends:
 
 ### Roadmap
 
-> **Status:** the Node.js backend works.  The browser backend does **not** run
-> Firebird yet — every export in `wasm/fb_wasm_api.cpp` is still a `TODO` stub,
-> so `FirebirdBrowser` cannot open a database.  The TypeScript layer around it
-> (`FirebirdBrowser`, `IndexedDBVFS`) is implemented and tested.
+> **Status:** the Node.js backend works.  The browser backend is wired up but
+> **not yet proven to run**: the C API is a real implementation over Firebird's
+> public OO API, and the TypeScript layer around it is implemented and tested,
+> but the WASM artifact still has to be linked with the Emscripten SDK.
 
-- [x] WASM build infrastructure (Emscripten CMake + build script, targets Firebird 5.0.3)
+- [x] WASM build infrastructure (Emscripten CMake + build script, tracks Firebird `master`)
 - [x] Browser support module (`FirebirdBrowser`)
 - [x] IndexedDB persistence layer (`IndexedDBVFS`)
 - [x] Browser test suite (Playwright, real Chromium + real IndexedDB)
-- [ ] **Wire the C API to the real engine** — `fb_init`, `fb_*_database`, `fb_execute`, `fb_query`
-- [ ] Parameterised queries in the browser (currently accepted and silently ignored)
-- [ ] Transactions that bind statements to the transaction handle
+- [x] C API implemented over the Firebird OO API — attach/create, transactions, cursors, typed values, engine error text
+- [x] Transactions that bind statements to the transaction handle
+- [ ] **Link and run the WASM build** (needs emsdk) — the remaining blocker
+- [ ] Parameterised queries in the browser (currently refused rather than ignored)
 - [ ] Incremental, atomic IndexedDB persistence
 - [ ] Web Worker + multi-tab safety
 - [ ] Pre-built WASM binary published to npm

@@ -1836,28 +1836,23 @@ int main_gstat(Firebird::UtilSvc*) { return 1; }
 int NBACKUP_main(Firebird::UtilSvc*) { return 1; }
 
 /* -----------------------------------------------------------------------
- * fb_shutdown / fb_database_crypt_callback  (yvalve/why.cpp stubs)
+ * fb_shutdown / fb_database_crypt_callback  —  NO LONGER STUBBED
  *
- * jrd/svc.cpp calls fb_shutdown (graceful engine shutdown) and
- * fb_database_crypt_callback (encryption callback registration).
- * Neither yvalve/why.cpp nor the Client API is compiled into the WASM
- * build; no-op stubs are safe.
+ * These were stubbed while yvalve was absent from the build.  The WASM build
+ * now compiles src/yvalve/ (minus gds.cpp) so that fb_get_master_interface(),
+ * the plugin manager and the util interface are available to fb_wasm_api.cpp,
+ * and why.cpp supplies the real implementations of both functions:
  *
- * Signatures from src/include/firebird/ibase.h:
- *   int fb_shutdown(unsigned int timeout_millis, const int reason);
- *   ISC_STATUS fb_database_crypt_callback(ISC_STATUS*, void* callback);
+ *   src/yvalve/why.cpp:3790  int fb_shutdown(unsigned, const int)
+ *   src/yvalve/why.cpp:1537  ISC_STATUS fb_database_crypt_callback(ISC_STATUS*, void*)
+ *
+ * Keeping the stubs here would be a duplicate-symbol link error.  The gds__*
+ * stubs below are still needed: yvalve/gds.cpp is deliberately excluded from
+ * the build (it implements the legacy isc_* client API, which the OO-API
+ * bridge does not use).
  * ----------------------------------------------------------------------- */
 
 extern "C" {
-
-int fb_shutdown(unsigned int /*timeout_millis*/, const int /*reason*/)
-{ return 0; }
-
-ISC_STATUS fb_database_crypt_callback(ISC_STATUS* status, void* /*callback*/)
-{
-    if (status) status[0] = 0;
-    return 0;
-}
 
 /* -----------------------------------------------------------------------
  * gds__decode  (yvalve/gds.cpp stub)

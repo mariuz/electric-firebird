@@ -1,14 +1,21 @@
 /**
  * wasm.spec.ts – Playwright browser e2e tests for the Firebird WASM artifact.
  *
- * The tests are automatically skipped when the WASM binary has not been built
- * yet.  Run `npm run build:wasm` (from the `packages/firebird-wasm` package)
- * followed by `npm run build` before executing these tests.
+ * Unlike `browser-api.spec.ts`, which exercises the TypeScript layer against a
+ * stub C ABI, this suite drives the **real compiled engine**.  It is therefore
+ * skipped until the artifact exists — run `npm run build:wasm` (from the
+ * `packages/firebird-wasm` package) followed by `npm run build` to enable it.
  *
- * All tests navigate to the `/wasm-test` page served by `wasm-server.ts`,
- * which loads the Emscripten module and exercises the C API.  Results are
- * reported as `data-*` attributes on a DOM element so Playwright can assert
- * on them without relying on console output.
+ * The tests navigate to the `/wasm-test` page served by `wasm-server.ts`,
+ * which performs a full round-trip against the C API — initialise, create a
+ * database, run DDL and DML, read the rows back — and reports the outcome as
+ * `data-*` attributes so Playwright can assert on them without relying on
+ * console output.
+ *
+ * The assertions deliberately check *data*, not just return codes: while the
+ * C API was stubbed, `_fb_init()` returned 0 and `_fb_query()` returned a
+ * well-formed empty result set, so a shape-only check could not tell a working
+ * engine from a stub.
  */
 
 import { test, expect } from '@playwright/test';
@@ -21,7 +28,7 @@ const WASM_JS = path.resolve(
 );
 const wasmAvailable = fs.existsSync(WASM_JS);
 
-test.describe('Firebird WASM module (browser / Playwright)', () => {
+test.describe('Firebird WASM engine (browser / Playwright)', () => {
   // Skip the entire suite when the WASM binary has not been built.
   test.skip(!wasmAvailable, 'WASM binary not built – run npm run build:wasm first');
 
@@ -30,33 +37,37 @@ test.describe('Firebird WASM module (browser / Playwright)', () => {
     expect(response?.status()).toBe(200);
   });
 
-  test('WASM module initialises and _fb_init() returns 0', async ({ page }) => {
+  test('completes a full create → insert → select round-trip', async ({ page }) => {
     await page.goto('/wasm-test');
 
     const resultEl = page.locator('#result');
 
-    // Wait for the async WASM bootstrap to complete (up to 30 s).
+    // Wait for the async WASM bootstrap and SQL round-trip (up to 60 s: the
+    // engine has to create a database file on first run).
     await expect(resultEl).toHaveAttribute('data-done', 'true', {
-      timeout: 30_000,
+      timeout: 60_000,
     });
 
-    // No exception should have been thrown.
-    expect(await resultEl.getAttribute('data-error')).toBeNull();
+    // Surface the engine's own message when a step failed — a bare
+    // "expected true, got null" would say nothing about why.
+    const failure = await resultEl.getAttribute('data-error');
+    const engineError = await resultEl.getAttribute('data-engine-error');
+    expect(`${failure ?? ''} ${engineError ?? ''}`.trim()).toBe('');
 
-    // _fb_init() must return 0 (success).
     expect(await resultEl.getAttribute('data-init-rc')).toBe('0');
+
+    // A real attachment handle, not the 0 the stub used to return.
+    const dbHandle = Number(await resultEl.getAttribute('data-db-handle'));
+    expect(dbHandle).toBeGreaterThan(0);
   });
 
-  test('_fb_query() returns valid JSON with columns and rows arrays', async ({
-    page,
-  }) => {
+  test('returns the rows that were inserted', async ({ page }) => {
     await page.goto('/wasm-test');
 
     const resultEl = page.locator('#result');
     await expect(resultEl).toHaveAttribute('data-done', 'true', {
-      timeout: 30_000,
+      timeout: 60_000,
     });
-    expect(await resultEl.getAttribute('data-error')).toBeNull();
 
     const queryJsonStr = await resultEl.getAttribute('data-query-json');
     expect(queryJsonStr).not.toBeNull();
@@ -65,8 +76,12 @@ test.describe('Firebird WASM module (browser / Playwright)', () => {
       columns: string[];
       rows: unknown[][];
     };
-    expect(Array.isArray(queryResult.columns)).toBe(true);
-    expect(Array.isArray(queryResult.rows)).toBe(true);
+
+    expect(queryResult.columns).toEqual(['ID', 'NAME']);
+    expect(queryResult.rows).toEqual([
+      [1, 'alpha'],
+      [2, 'beta'],
+    ]);
   });
 
   test('WASM JS and binary are served with correct MIME types', async ({

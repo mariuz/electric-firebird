@@ -10,7 +10,7 @@
 #   - A host C++ compiler (gcc/clang) for the native bootstrap step
 #
 # The script will:
-#   1. Initialise the Firebird git submodule (pinned to v5.0.3)
+#   1. Initialise the Firebird git submodule (tracks upstream master)
 #   2. Apply WASM / ICU patches from wasm/patches/
 #   3. Bootstrap Firebird: run a native cmake configure to generate autoconfig.h
 #   4. Build the btyacc parser generator and run it to produce parse.h/parse.cpp
@@ -65,10 +65,28 @@ if [[ ! -f "${PATCH_MARKER}" ]]; then
   for p in "${PATCHES_DIR}"/00*.patch; do
     [[ -f "$p" ]] || continue
     echo "  → $(basename "$p")"
-    # Use git apply with relaxed matching; fall back to patch(1)
-    git -C "${FIREBIRD_SRC}" apply --whitespace=nowarn "$p" 2>/dev/null \
-      || patch -d "${FIREBIRD_SRC}" -p1 --forward --batch < "$p" \
-      || echo "    (already applied or not applicable – skipping)"
+
+    if git -C "${FIREBIRD_SRC}" apply --whitespace=nowarn "$p" 2>/dev/null; then
+      continue
+    fi
+
+    # Already applied?  `git apply --reverse --check` succeeding means the
+    # change is present, which is fine on a re-run.
+    if git -C "${FIREBIRD_SRC}" apply --reverse --check "$p" 2>/dev/null; then
+      echo "    (already applied)"
+      continue
+    fi
+
+    # Anything else is a genuine failure.  This used to be swallowed with a
+    # "skipping" message, which is how two of these patches went unnoticed
+    # for so long: 0002 was structurally corrupt and 0003 had drifted, so
+    # neither had ever been applied to the tree being compiled.
+    echo "Error: patch $(basename "$p") does not apply to ${FIREBIRD_SRC}." >&2
+    echo "       Firebird has moved on; regenerate the patch against the" >&2
+    echo "       current submodule revision:" >&2
+    echo "         (cd ${FIREBIRD_SRC} && \$EDITOR <file> && git diff <file>)" >&2
+    git -C "${FIREBIRD_SRC}" apply --whitespace=nowarn "$p" >&2 || true
+    exit 1
   done
   touch "${PATCH_MARKER}"
 fi

@@ -41,6 +41,8 @@
     calls: [],
 
     // Fault injection / canned responses.
+    /** Return code of `_fb_init` (non-zero = failure). */
+    initRc: 0,
     /** Return code of `_fb_execute` (non-zero = failure). */
     execRc: 0,
     /** Payload `_fb_query` serialises to the heap. */
@@ -53,6 +55,8 @@
     startTxFails: false,
     /** Return code of `_fb_commit` (non-zero = failure). */
     commitRc: 0,
+    /** Text `_fb_last_error()` reports; the real engine puts Firebird's own message here. */
+    lastError: '',
 
     // Inspection helpers (defined once the module is built).
     /** Names of the logged calls, in order. */
@@ -77,6 +81,10 @@
     // ── Heap + bump allocator ────────────────────────────────────────────
     const heap = new Uint8Array(HEAP_SIZE);
     const live = new Map(); // ptr -> size
+    // Buffers the engine allocated for itself (query results, error text).
+    // They are tracked separately so that `liveAllocations` stays a clean
+    // signal for pointers the *caller* was supposed to release.
+    const engineOwned = new Set();
     let brk = 8; // never hand out 0: NULL must stay distinguishable
     let doubleFrees = 0;
 
@@ -89,6 +97,7 @@
     }
 
     function free(ptr) {
+      engineOwned.delete(ptr);
       if (!live.delete(ptr)) doubleFrees += 1;
     }
 
@@ -117,6 +126,7 @@
       const len = lengthBytesUTF8(str) + 1;
       const ptr = malloc(len);
       stringToUTF8(str, ptr, len);
+      engineOwned.add(ptr);
       return ptr;
     }
 
@@ -176,6 +186,7 @@
     const mod = {
       _fb_init() {
         stub.calls.push({ fn: '_fb_init', args: [] });
+        if (stub.initRc !== 0) return stub.initRc;
         initialised = true;
         return 0;
       },
@@ -205,9 +216,9 @@
         return 0;
       },
 
-      _fb_execute(handle, sqlPtr) {
+      _fb_execute(handle, txHandle, sqlPtr) {
         const sql = UTF8ToString(sqlPtr);
-        stub.calls.push({ fn: '_fb_execute', args: [handle, sql] });
+        stub.calls.push({ fn: '_fb_execute', args: [handle, txHandle, sql] });
         if (stub.execRc !== 0) return stub.execRc;
         // Record the write in the database image so persistence is observable.
         const path = attachments.get(handle);
@@ -216,9 +227,9 @@
         return 0;
       },
 
-      _fb_query(handle, sqlPtr) {
+      _fb_query(handle, txHandle, sqlPtr) {
         const sql = UTF8ToString(sqlPtr);
-        stub.calls.push({ fn: '_fb_query', args: [handle, sql] });
+        stub.calls.push({ fn: '_fb_query', args: [handle, txHandle, sql] });
         if (stub.queryReturnsNull) return 0;
         const ptr = heapString(JSON.stringify(stub.queryResult));
         liveResults.add(ptr);
@@ -247,6 +258,16 @@
         return 0;
       },
 
+      /**
+       * Engine-owned message buffer.  The real implementation returns a
+       * pointer into a std::string that the next call overwrites, so the
+       * stub allocates a fresh buffer each time and never expects a free()
+       * from the caller — a caller that frees it would be double-freeing.
+       */
+      _fb_last_error() {
+        return heapString(stub.lastError);
+      },
+
       _malloc: malloc,
       _free: free,
       UTF8ToString,
@@ -258,7 +279,9 @@
 
     // ── Inspection helpers bound to this module instance ──────────────────
     stub.stats = () => ({
-      liveAllocations: live.size,
+      // Only caller-owned pointers count as leaks: the engine's own buffers
+      // (fb_last_error text) are never handed back for the caller to free.
+      liveAllocations: [...live.keys()].filter((p) => !engineOwned.has(p)).length,
       liveResults: liveResults.size,
       doubleFrees,
       initialised,

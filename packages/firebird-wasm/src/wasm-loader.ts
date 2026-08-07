@@ -38,25 +38,48 @@ export type FbHandle = number;
  */
 export interface FirebirdWasmModule {
   // ── Firebird C API ──────────────────────────────────────────────────────
-  /** Initialise the embedded engine.  Must be called once before any other call. */
+  /**
+   * Initialise the embedded engine.  Must be called once before any other
+   * call.  Returns 0 on success; on failure the reason is available from
+   * {@link FirebirdWasmModule._fb_last_error}.
+   */
   _fb_init(): number;
-  /** Create a new database file at `pathPtr` and return a db handle. */
+  /**
+   * Pointer to a NUL-terminated message describing the most recent failure,
+   * or to an empty string when the last call succeeded.
+   *
+   * The buffer is owned by the engine and is overwritten by the next call —
+   * read it with `UTF8ToString` immediately, and do not free it.
+   */
+  _fb_last_error(): number;
+  /** Create a new database file at `pathPtr` and return a db handle (0 = failed). */
   _fb_create_database(pathPtr: number): FbHandle;
-  /** Attach to an existing database at `pathPtr`. */
+  /** Attach to an existing database at `pathPtr` (0 = failed). */
   _fb_attach_database(pathPtr: number): FbHandle;
-  /** Detach from a database. */
+  /** Detach from a database, rolling back any transaction left open on it. */
   _fb_detach_database(handle: FbHandle): number;
-  /** Execute a non-query SQL statement. */
-  _fb_execute(handle: FbHandle, sqlPtr: number): number;
-  /** Execute a query and return a result-set handle. */
-  _fb_query(handle: FbHandle, sqlPtr: number): number;
+  /**
+   * Execute a statement that returns no rows.
+   *
+   * @param txHandle - transaction to run in, or 0 to run the statement in its
+   *                   own transaction (committed on success, rolled back on
+   *                   failure).
+   */
+  _fb_execute(handle: FbHandle, txHandle: FbHandle, sqlPtr: number): number;
+  /**
+   * Execute a query and return a pointer to a JSON-encoded result set, or 0
+   * on failure.  Release it with `_fb_free_result`.
+   *
+   * @param txHandle - transaction to run in, or 0 for a self-contained one.
+   */
+  _fb_query(handle: FbHandle, txHandle: FbHandle, sqlPtr: number): number;
   /** Free a result set returned by `_fb_query`. */
   _fb_free_result(resultPtr: number): void;
-  /** Start a new transaction and return a transaction handle. */
+  /** Start a new transaction and return a transaction handle (0 = failed). */
   _fb_start_transaction(handle: FbHandle): FbHandle;
-  /** Commit a transaction. */
+  /** Commit a transaction.  The handle is invalid afterwards either way. */
   _fb_commit(txHandle: FbHandle): number;
-  /** Rollback a transaction. */
+  /** Rollback a transaction.  The handle is invalid afterwards either way. */
   _fb_rollback(txHandle: FbHandle): number;
 
   // ── Emscripten memory helpers ───────────────────────────────────────────
@@ -152,6 +175,17 @@ export function allocString(mod: FirebirdWasmModule, str: string): number {
   const ptr = mod._malloc(len);
   mod.stringToUTF8(str, ptr, len);
   return ptr;
+}
+
+/**
+ * Read the engine's message for the most recent failure.
+ *
+ * Returns an empty string when the engine reported nothing, so callers should
+ * always have a fallback of their own rather than surfacing a bare "".
+ */
+export function lastError(mod: FirebirdWasmModule): string {
+  const ptr = mod._fb_last_error();
+  return ptr ? mod.UTF8ToString(ptr) : '';
 }
 
 // ---------------------------------------------------------------------------
