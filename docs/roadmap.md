@@ -196,14 +196,37 @@ codepage tables added to an artifact a browser must download, for encodings a
 web app is unlikely to need.  Databases created by this build therefore define
 only the builtin character sets — UTF8 among them.
 
+### It runs in the browser too
+
+The engine executes the same round-trip inside a Web Worker in Chromium,
+asserted by Playwright against the real rows — `wasm.spec.ts`, "runs a full
+create → insert → select round-trip inside a Worker".
+
+A Worker is not a testing convenience, it is the only workable browser
+configuration: `-pthread` means Firebird blocks on mutexes while opening a
+database, and a browser main thread may not block, so a main-thread harness
+deadlocks.  The main-thread engine tests were removed rather than left skipped
+— they described a configuration that cannot work.  Two things follow from
+this and are already in place:
+
+- The test server sets COOP/COEP, because Emscripten's pthreads need
+  SharedArrayBuffer, which browsers only expose to cross-origin isolated
+  pages.  The Worker test asserts `crossOriginIsolated` explicitly, so a
+  regression there fails on its own terms instead of as a confusing
+  instantiation error.
+- The Emscripten module needs `locateFile` inside a Worker: `importScripts()`
+  leaves the worker's own URL as the base, so the runtime would fetch
+  `firebird-embedded.wasm` from the site root and try to instantiate a JSON
+  404 body.
+
 ### What is still open
 
-- **Browsers need the engine in a Worker.**  `-pthread` means the main thread
-  can block, and a browser main thread may not.  The three engine tests in
-  `wasm.spec.ts` are skipped for this reason; the artifact/serving checks and
-  the 30 stub-ABI tests still run.  This is M4.
-- The TypeScript layer has not yet been pointed at the working engine — the
-  browser tests still drive the stub ABI.
+- **`FirebirdBrowser` does not use the Worker yet.**  The TypeScript layer
+  still calls `_fb_*` in-process, which is why its 30 tests drive the stub ABI.
+  Pointing it at the real engine means an RPC across `postMessage`, and moving
+  the MEMFS ⇄ IndexedDB persistence into the Worker with it.  The class API is
+  already async, so the shape fits.
+- Parameterised queries, and everything else in §M2 onward.
 
 ---
 

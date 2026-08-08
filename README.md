@@ -128,10 +128,10 @@ The library provides two execution backends:
 > ROWS: {"columns":["ID","NAME"],"rows":[[1,"alpha"],[2,"beta"]]}
 > ```
 >
-> Verified by 13 Node integration tests against the real artifact.  Browsers
-> need one more step: the build uses pthreads, so the engine must run in a Web
-> Worker (a browser main thread cannot block).  Databases created by this build
-> define only the built-in character sets, UTF8 among them —
+> Verified in Node (13 integration tests) **and in Chromium**, where the engine
+> runs inside a Web Worker — required because the build uses pthreads and a
+> browser main thread cannot block.  Databases created by this build define
+> only the built-in character sets, UTF8 among them —
 > see [docs/roadmap.md](./docs/roadmap.md).
 
 - [x] WASM build infrastructure (Emscripten CMake + build script, tracks Firebird `master`)
@@ -147,7 +147,8 @@ The library provides two execution backends:
 - [x] Threads (`-pthread` + a pre-spawned worker pool), real `sem_timedwait`, realistic stack sizes
 - [x] Attach threads to the libcds hazard-pointer GC, which the metadata cache requires
 - [x] **The engine runs: create database, DDL, DML, SELECT** (13 Node integration tests)
-- [ ] Run the engine in a Web Worker (a browser main thread cannot block, which `-pthread` requires)
+- [x] Run the engine in a Web Worker (verified in Chromium end to end)
+- [ ] Point `FirebirdBrowser` at the Worker instead of calling the engine in-process
 - [ ] Parameterised queries in the browser (currently refused rather than ignored)
 - [ ] Incremental, atomic IndexedDB persistence
 - [ ] Web Worker + multi-tab safety

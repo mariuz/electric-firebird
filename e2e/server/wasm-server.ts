@@ -159,6 +159,101 @@ const WASM_TEST_HTML = `<!DOCTYPE html>
 </body>
 </html>`;
 
+
+/**
+ * Worker that drives the engine.
+ *
+ * The build uses pthreads, so Firebird blocks on mutexes while opening a
+ * database — which a browser main thread is not allowed to do.  Running the
+ * module inside a Worker removes that restriction; the Emscripten runtime
+ * spawns its own pthread workers from here.
+ */
+const ENGINE_WORKER_JS = `
+importScripts('/wasm/firebird-embedded.js');
+
+const withSql = (mod, sql, fn) => {
+  const len = mod.lengthBytesUTF8(sql) + 1;
+  const ptr = mod._malloc(len);
+  mod.stringToUTF8(sql, ptr, len);
+  try { return fn(ptr); } finally { mod._free(ptr); }
+};
+
+const engineError = (mod) => {
+  const p = mod._fb_last_error();
+  return p ? mod.UTF8ToString(p) : '';
+};
+
+(async () => {
+  try {
+    // importScripts() leaves the worker's own URL as the base, so Emscripten
+    // would look for firebird-embedded.wasm at the site root rather than under
+    // /wasm/ and get the JSON 404 body instead of a module.
+    const mod = await createFirebirdModule({
+      locateFile: (file) => '/wasm/' + file,
+    });
+
+    const initRc = mod._fb_init();
+    if (initRc !== 0) throw new Error('_fb_init() failed: ' + engineError(mod));
+
+    if (!mod.FS.analyzePath('/data').exists) mod.FS.mkdir('/data');
+    const dbPath = '/data/worker-test.fdb';
+    if (mod.FS.analyzePath(dbPath).exists) mod.FS.unlink(dbPath);
+
+    const db = withSql(mod, dbPath, (p) => mod._fb_create_database(p));
+    if (!db) throw new Error('_fb_create_database() failed: ' + engineError(mod));
+
+    for (const sql of [
+      'CREATE TABLE items (id INTEGER, name VARCHAR(32))',
+      "INSERT INTO items VALUES (1, 'alpha')",
+      "INSERT INTO items VALUES (2, 'beta')",
+    ]) {
+      const rc = withSql(mod, sql, (p) => mod._fb_execute(db, 0, p));
+      if (rc !== 0) throw new Error('exec failed (' + sql + '): ' + engineError(mod));
+    }
+
+    const resultPtr = withSql(mod, 'SELECT id, name FROM items ORDER BY id',
+      (p) => mod._fb_query(db, 0, p));
+    if (!resultPtr) throw new Error('query failed: ' + engineError(mod));
+
+    const json = mod.UTF8ToString(resultPtr);
+    mod._fb_free_result(resultPtr);
+
+    const dbBytes = mod.FS.readFile(dbPath).length;
+    mod._fb_detach_database(db);
+
+    postMessage({ ok: true, dbHandle: db, json, dbBytes });
+  } catch (err) {
+    postMessage({ ok: false, error: err && err.message ? err.message : String(err) });
+  }
+})();
+`;
+
+/** Page that runs the engine worker and reports the outcome via data-*. */
+const WASM_WORKER_TEST_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Firebird WASM Worker Test</title></head>
+<body>
+  <pre id="result"></pre>
+  <script>
+    const el = document.getElementById('result');
+    el.dataset.isolated = String(self.crossOriginIsolated);
+    const w = new Worker('/wasm-engine-worker.js');
+    w.onmessage = (e) => {
+      const d = e.data;
+      if (d.ok) {
+        el.dataset.dbHandle = String(d.dbHandle);
+        el.dataset.queryJson = d.json;
+        el.dataset.dbBytes = String(d.dbBytes);
+        el.dataset.done = 'true';
+      } else {
+        el.dataset.error = d.error;
+      }
+    };
+    w.onerror = (e) => { el.dataset.error = 'worker error: ' + e.message; };
+  </script>
+</body>
+</html>`;
+
 /**
  * Blank harness page.  It only exposes the library on `window.FB`; every
  * assertion is driven from the test file via `page.evaluate()`, which keeps
@@ -320,6 +415,18 @@ const server = http.createServer((req, res) => {
   if (req.method === 'GET' && url === '/browser-harness-wasm') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(browserHarnessHtml(true));
+    return;
+  }
+
+  if (req.method === 'GET' && url === '/wasm-engine-worker.js') {
+    res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8' });
+    res.end(ENGINE_WORKER_JS);
+    return;
+  }
+
+  if (req.method === 'GET' && url === '/wasm-worker-test') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(WASM_WORKER_TEST_HTML);
     return;
   }
 
