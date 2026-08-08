@@ -1,0 +1,71 @@
+From: electric-firebird
+Subject: [PATCH] IntlManager: only the builtin character sets under Emscripten
+
+Creating a database instantiates every entry of defaultCharSets — see
+ini.epp, which loops MetadataCache::newVersion<Cached::CharSet> over the
+whole table.  A character set whose implementation is not linked in makes
+CREATE DATABASE fail with "CHARACTER SET ... is not installed".
+
+Only the sets handled by INTL_builtin_lookup_charset (src/jrd/intl_builtin.cpp)
+are compiled into the engine: NONE, OCTETS, ASCII, UNICODE_FSS, UNICODE_UCS2,
+UTF8, UTF16 and UTF32.  Everything else lives in the separately loaded fbintl
+module, and Emscripten has no dlopen to load it with.
+
+Compiling src/intl in statically would be the alternative, but it is 29 files
+of mostly codepage tables on top of an artifact a browser has to download,
+for encodings a web application is unlikely to need.  UTF8 is the one that
+matters here.
+
+Databases created by this build therefore define only the builtin character
+sets.
+---
+diff --git a/src/jrd/IntlManager.cpp b/src/jrd/IntlManager.cpp
+index 3c4c74c..8dd9f12 100644
+--- a/src/jrd/IntlManager.cpp
++++ b/src/jrd/IntlManager.cpp
+@@ -113,6 +113,14 @@ const IntlManager::CharSetDefinition IntlManager::defaultCharSets[] =
+ 	{"UTF16", CS_UTF16, 4},
+ 	{"UTF32", CS_UTF32, 4},
+ #endif	// FB_NEW_INTL_NOT_READY
++// Only the character sets implemented by INTL_builtin_lookup_charset
++// (src/jrd/intl_builtin.cpp) can exist in a build with no loadable intl
++// module.  Creating a database instantiates every entry of these tables
++// (see ini.epp: MetadataCache::newVersion<Cached::CharSet> over
++// defaultCharSets), so listing a character set whose implementation is not
++// linked in makes CREATE DATABASE fail with "CHARACTER SET ... is not
++// installed".  Emscripten has no dlopen, so the rest are compiled out.
++#ifndef __EMSCRIPTEN__
+ 	{"SJIS_0208", CS_SJIS, 2},
+ 	{"EUCJ_0208", CS_EUCJ, 2},
+ 	{"DOS437", CS_DOS_437, 1},
+@@ -160,6 +168,7 @@ const IntlManager::CharSetDefinition IntlManager::defaultCharSets[] =
+ 	{"GBK", CS_GBK, 2},
+ 	{"CP943C", CS_CP943C, 2},
+ 	{"GB18030", CS_GB18030, 4},
++#endif // !__EMSCRIPTEN__
+ 	{NULL, CS_NONE, 0}
+ };
+ 
+@@ -259,6 +268,14 @@ const IntlManager::CollationDefinition IntlManager::defaultCollations[] =
+ 	{CS_UTF32, CollId(0), "UTF32", NULL, TEXTTYPE_ATTR_PAD_SPACE, NULL},
+ 	{CS_UTF32, CollId(1), "UCS_BASIC", NULL, TEXTTYPE_ATTR_PAD_SPACE, NULL},
+ #endif	// FB_NEW_INTL_NOT_READY
++// Only the character sets implemented by INTL_builtin_lookup_charset
++// (src/jrd/intl_builtin.cpp) can exist in a build with no loadable intl
++// module.  Creating a database instantiates every entry of these tables
++// (see ini.epp: MetadataCache::newVersion<Cached::CharSet> over
++// defaultCharSets), so listing a character set whose implementation is not
++// linked in makes CREATE DATABASE fail with "CHARACTER SET ... is not
++// installed".  Emscripten has no dlopen, so the rest are compiled out.
++#ifndef __EMSCRIPTEN__
+ 	{CS_SJIS, CollId(0), "SJIS_0208", NULL, TEXTTYPE_ATTR_PAD_SPACE, NULL},
+ 	{CS_EUCJ, CollId(0), "EUCJ_0208", NULL, TEXTTYPE_ATTR_PAD_SPACE, NULL},
+ 	{CS_DOS_437, CollId(0), "DOS437", NULL, TEXTTYPE_ATTR_PAD_SPACE, NULL},
+@@ -411,6 +428,7 @@ const IntlManager::CollationDefinition IntlManager::defaultCollations[] =
+ 	{CS_CP943C, CollId(1), "CP943C_UNICODE", NULL, TEXTTYPE_ATTR_PAD_SPACE, NULL},
+ 	{CS_GB18030, CollId(0), "GB18030", NULL, TEXTTYPE_ATTR_PAD_SPACE, NULL},
+ 	{CS_GB18030, CollId(1), "GB18030_UNICODE", NULL, TEXTTYPE_ATTR_PAD_SPACE, NULL},
++#endif // !__EMSCRIPTEN__
+ 	{CS_NONE, CollId(0), NULL, NULL, 0, NULL}
+ };
+ 

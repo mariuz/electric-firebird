@@ -118,12 +118,21 @@ The library provides two execution backends:
 
 ### Roadmap
 
-> **Status:** the Node.js backend works.  The browser backend **builds and
-> runs**: the engine initialises, and `fb_create_database()` now gets deep into
-> database creation before stopping at a real metadata error —
-> `CHARACTER SET "SYSTEM"."SJIS_0208" is not installed`, because `src/intl/`
-> is not compiled in yet.  It cannot create a database, but it is executing
-> engine code and reporting Firebird's own diagnostics.
+> **Status: Firebird runs in WebAssembly.**  The engine creates a database,
+> executes DDL and DML, and returns rows:
+>
+> ```
+> create_database  -> 1
+> exec             -> CREATE TABLE items (id INTEGER, name VARCHAR(32))
+> exec             -> INSERT INTO items VALUES (1, 'alpha')
+> ROWS: {"columns":["ID","NAME"],"rows":[[1,"alpha"],[2,"beta"]]}
+> ```
+>
+> Verified by 13 Node integration tests against the real artifact.  Browsers
+> need one more step: the build uses pthreads, so the engine must run in a Web
+> Worker (a browser main thread cannot block).  Databases created by this build
+> define only the built-in character sets, UTF8 among them —
+> see [docs/roadmap.md](./docs/roadmap.md).
 
 - [x] WASM build infrastructure (Emscripten CMake + build script, tracks Firebird `master`)
 - [x] Browser support module (`FirebirdBrowser`)
@@ -137,7 +146,7 @@ The library provides two execution backends:
 - [x] Enable C++ exceptions (`-fwasm-exceptions`) — Firebird reports every error by throwing
 - [x] Threads (`-pthread` + a pre-spawned worker pool), real `sem_timedwait`, realistic stack sizes
 - [x] Attach threads to the libcds hazard-pointer GC, which the metadata cache requires
-- [ ] **Compile `src/intl/` so the non-builtin character sets exist** — the remaining blocker
+- [x] **The engine runs: create database, DDL, DML, SELECT** (13 Node integration tests)
 - [ ] Run the engine in a Web Worker (a browser main thread cannot block, which `-pthread` requires)
 - [ ] Parameterised queries in the browser (currently refused rather than ignored)
 - [ ] Incremental, atomic IndexedDB persistence

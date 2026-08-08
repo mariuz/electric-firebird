@@ -142,8 +142,10 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
       let db = 0;
       try {
         db = mod._fb_create_database(pathPtr);
-        expect(`${db} ${errorText()}`).not.toContain('0 ');
-        expect(db).toBeGreaterThan(0);
+        // Report the engine's own message when this fails, rather than a bare
+        // "expected 0 to be greater than 0".
+        expect({ handle: db > 0, error: errorText() })
+          .toEqual({ handle: true, error: '' });
       } finally {
         mod._free(pathPtr);
       }
@@ -164,7 +166,8 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
       const sqlPtr = allocString(mod, 'SELECT id, name FROM items ORDER BY id');
       try {
         const resultPtr = mod._fb_query(db, 0, sqlPtr);
-        expect(`${resultPtr} ${errorText()}`).not.toContain('0 ');
+        expect({ pointer: resultPtr > 0, error: errorText() })
+          .toEqual({ pointer: true, error: '' });
 
         const json = mod.UTF8ToString(resultPtr);
         mod._fb_free_result(resultPtr);

@@ -148,58 +148,62 @@ SharedArrayBuffer requires cross-origin isolation (COOP/COEP headers, which
 a mutex — so in a browser the engine has to run inside a Worker.  That is
 already on the roadmap as M4.
 
-### How far the engine gets
+### The engine runs
 
-`fb_create_database()` now runs deep into database creation and reports a real
-Firebird metadata error rather than crashing:
+`fb_create_database()` works, and so does a full round-trip through the C API:
 
 ```
-CHARACTER SET "SYSTEM"."SJIS_0208" is not installed
+fb_init          -> 0
+create_database  -> 1
+exec             -> 0  | CREATE TABLE items (id INTEGER, name VARCHAR(32))
+exec             -> 0  | INSERT INTO items VALUES (1, 'alpha')
+exec             -> 0  | INSERT INTO items VALUES (2, 'beta')
+ROWS: {"columns":["ID","NAME"],"rows":[[1,"alpha"],[2,"beta"]]}
+detach           -> 0
+db file bytes    -> 2367488
 ```
 
-Getting there took four more porting fixes, each uncovered by the one before:
+Firebird creates a real database in Emscripten's filesystem, executes DDL and
+DML, and returns rows decoded by the typed value mapping.
 
-| Fix | Symptom it removed |
-|---|---|
-| Compile libcds `init.cpp`, `thread_data.cpp`, `hp.cpp`, `urcu_gp.cpp` instead of stubbing | `INI_init` read the relation vector out of bounds |
-| Implement `sem_timedwait` as a real polling wait | `semaphore.h: enter: sem_wait() failed -Operation timed out` |
-| `STACK_SIZE=8MB`, `DEFAULT_PTHREAD_STACK_SIZE=4MB` | stack overflow during database creation |
-| Define the signal-RCU singleton locally | undefined symbol (`urcu_sh.cpp` needs POSIX signals) |
+Getting here took seven porting fixes, in this order:
 
-The libcds one is worth calling out.  Firebird's metadata cache is
-`CacheVector` → `SharedReadVector` → `HazardPtr`, and a hazard pointer is only
-valid on a thread **attached** to the garbage collector.  The stub for
-`cds::threading::ThreadData::init()` said plainly that it skipped attaching to
-the HP/DHP GC, on the grounds that the real files drag in URCU.  They mostly do
-not — `thread_data.cpp` includes only `_common.h`, `gc/hp.h` and `gc/dhp.h` —
-and skipping attachment left `readAccessor()` returning a bogus generation.
+| # | Fix | Symptom |
+|---|-----|---------|
+| 1 | `SIZEOF_VOID_P`/`SIZEOF_SIZE_T` patched for wasm32 | pool handed out misaligned, overlapping blocks; corrupted `JProvider` |
+| 2 | `-fwasm-exceptions` | first `throw` aborted at `___cxa_throw` |
+| 3 | `pthread_mutexattr_setpshared` overridden | `PTHREAD_PROCESS_SHARED` unsupported, treated as fatal |
+| 4 | `-pthread` + worker pool | `pthread_create failed` |
+| 5 | Real libcds thread attachment | `INI_init` read the relation vector out of bounds |
+| 6 | Real `sem_timedwait` | `sem_wait() failed -Operation timed out` |
+| 7 | Builtin-only character sets (patch 0004) | `CHARACTER SET "SYSTEM"."SJIS_0208" is not installed` |
+| — | `STACK_SIZE=8MB` | stack overflow during creation |
 
-Likewise `sem_timedwait` had been reduced to a single `sem_trywait` that
-reported `ETIMEDOUT` on failure, because "in the single-threaded WASM
-environment, blocking waits would deadlock".  That premise expired when the
-build gained real pthreads: there are now other threads to wait for, and
-refusing to wait made every wait fail instantly.
+Two of these — 5 and 6 — were stubs whose stated reasoning had quietly
+expired.  `ThreadData::init()` skipped attaching to the hazard-pointer GC that
+the metadata cache depends on; `sem_timedwait` refused to wait because the
+build "is single-threaded", which stopped being true at fix 4.  A stub written
+for one set of constraints becomes a bug when the constraints change, and it
+keeps working just well enough to hide where the real failure is.  Worth
+re-reading the remaining stubs in that light.
 
-Both are the same lesson: a stub written for one set of constraints becomes a
-bug when the constraints change, and it keeps working just well enough to hide
-where the real failure is.
+Fix 7 is a deliberate trade-off, not a workaround.  Creating a database
+instantiates every entry of `IntlManager::defaultCharSets` (see `ini.epp`),
+but only the eight sets in `INTL_builtin_lookup_charset` are compiled into the
+engine; the rest live in the separately loaded `fbintl` module, and Emscripten
+has no dlopen.  Linking `src/intl` statically would be 29 files of mostly
+codepage tables added to an artifact a browser must download, for encodings a
+web app is unlikely to need.  Databases created by this build therefore define
+only the builtin character sets — UTF8 among them.
 
-### Current barrier: character sets
+### What is still open
 
-`src/intl/` is not compiled, so `IntlManager` only registers the builtins
-(NONE, OCTETS, ASCII, UNICODE_FSS, UTF8, UTF16 — see
-`IntlManager::initialize`).  Creating a database populates
-`RDB$CHARACTER_SETS` with the full set and validates each one, so it stops at
-the first non-builtin.
-
-Options:
-
-- Compile `src/intl/` into the binary.  It is normally the separately loaded
-  `fbintl` module; a static WASM build has to link it in, the same way the
-  engine plugin itself is linked in and registered by `fb_init()`.
-- Or create the database with a reduced character-set configuration, if one
-  exists that skips the non-builtins.  Smaller, but leaves the engine unable to
-  handle those charsets later.
+- **Browsers need the engine in a Worker.**  `-pthread` means the main thread
+  can block, and a browser main thread may not.  The three engine tests in
+  `wasm.spec.ts` are skipped for this reason; the artifact/serving checks and
+  the 30 stub-ABI tests still run.  This is M4.
+- The TypeScript layer has not yet been pointed at the working engine — the
+  browser tests still drive the stub ABI.
 
 ---
 
