@@ -728,50 +728,70 @@ test.describe('FirebirdBrowser', () => {
     expect(result.statements).toBe(2);
   });
 
-  test('refuses query parameters rather than silently dropping them', async ({
-    page,
-  }) => {
+  test('encodes parameters and forwards them to the engine', async ({ page }) => {
     const result = await page.evaluate(async () => {
       window.__stub.queryResult = { columns: ['id'], rows: [[1]] };
       const db = new window.FB.FirebirdBrowser('params');
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      window.__stub.resetCalls();
 
-      const capture = async (fn: () => Promise<unknown>): Promise<string | null> => {
+      // Values cross the ABI as text for the engine to convert, so each of
+      // these should arrive in its SQL text form.
+      await db.exec('INSERT INTO t VALUES (?, ?, ?, ?)', [
+        1,
+        'alpha',
+        true,
+        null,
+      ]);
+      await db.query('SELECT id FROM t WHERE id = ?', [42n]);
+
+      // A call with no parameters must still use the plain entry point, so it
+      // does not pay for an input message it would not use.
+      await db.query('SELECT id FROM t');
+
+      // Only the statement calls; _fb_free_result and friends are noise here.
+      const calls = window.__stub.calls
+        .filter((c) => /^_fb_(execute|query)/.test(c.fn))
+        .map((c) => ({ fn: c.fn, params: c.args[3] }));
+
+      await db.close();
+      return calls;
+    });
+
+    expect(result).toEqual([
+      { fn: '_fb_execute_params', params: ['1', 'alpha', 'TRUE', null] },
+      { fn: '_fb_query_params', params: ['42'] },
+      // No parameters: the plain call, whose 4th argument does not exist.
+      { fn: '_fb_query', params: undefined },
+    ]);
+  });
+
+  test('rejects parameter values with no SQL text form', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('params-invalid');
+      await db.exec('CREATE TABLE t (id INTEGER)');
+
+      const capture = async (params: unknown[]): Promise<string | null> => {
         try {
-          await fn();
+          await db.query('SELECT id FROM t WHERE id = ?', params);
           return null;
         } catch (err) {
           return (err as Error).message;
         }
       };
 
-      const topLevel = await capture(() =>
-        db.query('SELECT * FROM t WHERE id = ?', [1]),
-      );
-
-      // An empty parameter list is the normal no-parameter call and must work.
-      const emptyArray = await capture(() => db.query('SELECT * FROM t', []));
-      const noArgument = await capture(() => db.query('SELECT * FROM t'));
-
-      const inTransaction = await capture(() =>
-        db.transaction(async (tx) => tx.query('SELECT * FROM t WHERE id = ?', [1])),
-      );
-
-      // Nothing may reach the engine on the rejected paths.
-      const queries = window.__stub.calls
-        .filter((c) => c.fn === '_fb_query')
-        .map((c) => c.args[2]);
+      const binary = await capture([new Uint8Array([1, 2, 3])]);
+      const nan = await capture([Number.NaN]);
+      const object = await capture([{ nope: true }]);
 
       await db.close();
-      return { topLevel, emptyArray, noArgument, inTransaction, queries };
+      return { binary, nan, object };
     });
 
-    expect(result.topLevel).toContain('not supported');
-    expect(result.topLevel).toContain('SELECT * FROM t WHERE id = ?');
-    expect(result.inTransaction).toContain('not supported');
-    expect(result.emptyArray).toBeNull();
-    expect(result.noArgument).toBeNull();
-    // Only the two parameterless queries were executed.
-    expect(result.queries).toEqual(['SELECT * FROM t', 'SELECT * FROM t']);
+    // Each names what is wrong rather than corrupting the value silently.
+    expect(result.binary).toContain('binary');
+    expect(result.nan).toContain('NaN');
+    expect(result.object).toContain('unsupported type');
   });
 
   test('binds statements inside a transaction to the transaction handle', async ({

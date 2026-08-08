@@ -246,12 +246,52 @@ The 30 stub-ABI tests kept passing through the refactor unchanged, which is
 what makes them worth having: they pin marshalling, pointer ownership and
 error handling independently of whether an artifact exists.
 
+### Parameterised queries
+
+`query(sql, params)` and `exec(sql, params)` bind `?` placeholders on both
+backends, closing the gap that made the browser build refuse parameters.
+
+Two decisions shape the implementation:
+
+- **Parameters cross as one packed binary buffer**, not JSON — a count, then
+  per parameter a null flag, a length and UTF-8 bytes.  The C side needs no
+  parser and there is no escaping to get wrong.  Every length is checked
+  against the remaining bytes, because this data crosses the JS/WASM boundary
+  and a malformed buffer must produce an error rather than an out-of-bounds
+  read.
+- **Values are sent as text and converted by the engine.**  The statement's
+  own input metadata is used unchanged and each value is passed through
+  `IUtil::convert` from VARCHAR to the declared type — the same conversion a
+  SQL string literal gets.  One code path therefore serves integers, decimals,
+  booleans and dates, and the rules are Firebird's rather than a
+  reimplementation of them.
+
+  The first attempt instead rebuilt the input metadata as all-VARCHAR with
+  `IMetadataBuilder`, which many drivers do.  The engine rejected the result
+  with a bare "internal error".  Bisecting with an empty parameter list showed
+  `prepare` + `IStatement::execute` was fine, so the fault was the fabricated
+  message.  Describing the message is the engine's business; converting the
+  values is ours.
+
+Consequences worth knowing:
+
+- `null` and `undefined` both bind SQL NULL — JavaScript uses them
+  interchangeably for "absent", and accepting only one would be a trap.
+- Binary parameters (`Uint8Array`) throw a clear error naming the limitation
+  rather than corrupting data: the encoding is text-based.
+- A parameter-count mismatch is reported against the prepared statement
+  ("expects 1 parameter but 2 were supplied") instead of surfacing as an
+  obscure engine failure.
+
 ### What is still open
 
-- **Parameterised queries.**  Still refused rather than ignored; needs
-  `fb_execute_params`/`fb_query_params` in the C API (§M2).
-- The rest of §M2 onward: typed result encoding, multi-statement `exec()`,
-  `affectedRows`, incremental persistence, multi-tab safety, live queries.
+- Typed result encoding (§M2): `FieldInfo` still carries only `name`, and
+  BIGINT/NUMERIC/DECFLOAT arrive as exact decimal *strings* to avoid silent
+  precision loss.
+- Multi-statement `exec()`, `affectedRows`, `tx.rollback()`.
+- Incremental and atomic persistence (§M3) — `persist()` still rewrites the
+  whole image.
+- Multi-tab safety (§M4) and live queries (§M4).
 
 ---
 
@@ -263,7 +303,7 @@ Legend: ✅ shipped · 🟡 partial · ❌ missing · n/a not applicable
 
 | Capability | PGlite | electric-firebird | Notes |
 |---|---|---|---|
-| `query(sql, params)` | ✅ | 🟡 | Works on Node; the browser build **rejects** params rather than ignoring them (M2) |
+| `query(sql, params)` | ✅ | ✅ | `?` placeholders on both backends |
 | Template-literal `` sql`…` `` tag | ✅ | ❌ | Ergonomics + injection safety |
 | `exec(sql)` multi-statement script → array of results | ✅ | ❌ | `exec()` is single-statement and returns `void`; migrations are the use case |
 | `rowMode: 'object' \| 'array'` | ✅ | ❌ | Always object mode |

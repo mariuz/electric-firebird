@@ -10,7 +10,7 @@
  * operations are part of the transport rather than being done by the caller.
  */
 
-import type { Row, QueryResult } from '../types';
+import type { Row, QueryResult, QueryParams } from '../types';
 import type { EngineHandle, EngineTransport } from './engine-transport';
 import type { EngineOp, EngineRequest, EngineResponse } from './worker-protocol';
 
@@ -137,16 +137,22 @@ export class WorkerTransport implements EngineTransport {
     return this.call<void>('detachDatabase', dbHandle);
   }
 
-  execute(dbHandle: EngineHandle, txHandle: EngineHandle, sql: string): Promise<void> {
-    return this.call<void>('execute', dbHandle, txHandle, sql);
+  execute(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    sql: string,
+    params: QueryParams = [],
+  ): Promise<void> {
+    return this.call<void>('execute', dbHandle, txHandle, sql, params);
   }
 
   query<T extends Row = Row>(
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     sql: string,
+    params: QueryParams = [],
   ): Promise<QueryResult<T>> {
-    return this.call<QueryResult<T>>('query', dbHandle, txHandle, sql);
+    return this.call<QueryResult<T>>('query', dbHandle, txHandle, sql, params);
   }
 
   startTransaction(dbHandle: EngineHandle): Promise<EngineHandle> {

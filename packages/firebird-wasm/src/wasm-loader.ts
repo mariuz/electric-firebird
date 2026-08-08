@@ -73,6 +73,30 @@ export interface FirebirdWasmModule {
    * @param txHandle - transaction to run in, or 0 for a self-contained one.
    */
   _fb_query(handle: FbHandle, txHandle: FbHandle, sqlPtr: number): number;
+  /**
+   * Execute a statement with bound parameters.
+   *
+   * `paramsPtr` points at the packed parameter buffer (see
+   * `encodeParams`), `paramsLength` is its size in bytes.  Pass 0/0 for none.
+   */
+  _fb_execute_params(
+    handle: FbHandle,
+    txHandle: FbHandle,
+    sqlPtr: number,
+    paramsPtr: number,
+    paramsLength: number,
+  ): number;
+  /**
+   * Execute a query with bound parameters.  Returns a pointer to the JSON
+   * result set, or 0 on failure.  Release it with `_fb_free_result`.
+   */
+  _fb_query_params(
+    handle: FbHandle,
+    txHandle: FbHandle,
+    sqlPtr: number,
+    paramsPtr: number,
+    paramsLength: number,
+  ): number;
   /** Free a result set returned by `_fb_query`. */
   _fb_free_result(resultPtr: number): void;
   /** Start a new transaction and return a transaction handle (0 = failed). */
@@ -85,6 +109,13 @@ export interface FirebirdWasmModule {
   // ── Emscripten memory helpers ───────────────────────────────────────────
   _malloc(size: number): number;
   _free(ptr: number): void;
+  /**
+   * The WASM heap as bytes.
+   *
+   * Re-read it after any call that might grow memory: growth replaces the
+   * backing buffer and detaches every existing view.
+   */
+  HEAPU8: Uint8Array;
 
   // ── Emscripten runtime helpers ──────────────────────────────────────────
   UTF8ToString(ptr: number, maxLength?: number): string;

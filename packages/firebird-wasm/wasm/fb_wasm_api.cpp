@@ -645,6 +645,232 @@ void appendValue(IAttachment* attachment, ITransaction* transaction,
 }
 
 // ---------------------------------------------------------------------------
+// Statement parameters
+// ---------------------------------------------------------------------------
+//
+// Parameters arrive from JavaScript as one packed buffer rather than JSON, so
+// this side needs no parser and there is no escaping to get wrong:
+//
+//     u32  count
+//     per parameter:
+//       u8   isNull
+//       u32  byteLength    (absent when isNull)
+//       ...  UTF-8 bytes   (absent when isNull)
+//
+// Every value is sent as text and the input message is described as VARCHAR
+// UTF-8, letting Firebird convert to the column's actual type.  That is what
+// makes one code path work for integers, dates and strings alike; the
+// alternative is reimplementing Firebird's conversion rules in the binding
+// layer and getting them subtly wrong.
+
+/**
+ * UTF-8's character-set id.  Firebird defines CS_UTF8 in src/intl/charsets.h,
+ * which is engine-internal and not reachable from the public API headers this
+ * file is written against.
+ */
+constexpr unsigned FB_CS_UTF8 = 4;
+
+/** One bound parameter: SQL NULL, or text for the engine to convert. */
+struct ParamValue
+{
+	bool        isNull = true;
+	std::string text;
+};
+
+/** Read a little-endian u32 without assuming alignment. */
+unsigned readU32(const unsigned char* p)
+{
+	return static_cast<unsigned>(p[0]) |
+	       (static_cast<unsigned>(p[1]) << 8) |
+	       (static_cast<unsigned>(p[2]) << 16) |
+	       (static_cast<unsigned>(p[3]) << 24);
+}
+
+/**
+ * Decode the packed parameter buffer.
+ *
+ * Every length is checked against the remaining bytes: this data crosses the
+ * JS/WASM boundary, and a malformed buffer must produce an error rather than
+ * an out-of-bounds read.
+ */
+bool parseParams(const unsigned char* data, unsigned length,
+	std::vector<ParamValue>& out)
+{
+	out.clear();
+
+	if (!data || length < 4)
+		return length == 0;   // no parameters at all is valid
+
+	unsigned pos = 0;
+	const unsigned count = readU32(data);
+	pos += 4;
+
+	out.reserve(count);
+
+	for (unsigned i = 0; i < count; i++)
+	{
+		if (pos + 1 > length)
+			return false;
+
+		ParamValue value;
+		value.isNull = data[pos++] != 0;
+
+		if (!value.isNull)
+		{
+			if (pos + 4 > length)
+				return false;
+
+			const unsigned len = readU32(data + pos);
+			pos += 4;
+
+			if (pos + len > length)
+				return false;
+
+			value.text.assign(reinterpret_cast<const char*>(data + pos), len);
+			pos += len;
+		}
+
+		out.push_back(std::move(value));
+	}
+
+	return true;
+}
+
+/**
+ * An input message built from bound parameters.
+ *
+ * Owns the metadata and the buffer, and releases them together — the engine
+ * reads both while the statement executes.
+ */
+class InputMessage
+{
+public:
+	InputMessage() = default;
+
+	~InputMessage()
+	{
+		if (metadata)
+			metadata->release();
+	}
+
+	InputMessage(const InputMessage&) = delete;
+	InputMessage& operator=(const InputMessage&) = delete;
+
+	IMessageMetadata* meta() const noexcept { return metadata; }
+	void* data() noexcept { return buffer.empty() ? nullptr : buffer.data(); }
+
+	/**
+	 * Describe `values` as VARCHAR UTF-8 and pack them into a message.
+	 *
+	 * `statement` supplies the parameter count, so a mismatch is reported
+	 * before the engine sees it.
+	 */
+	bool build(IStatement* statement, const std::vector<ParamValue>& values)
+	{
+		Status status;
+
+		// The statement's own input metadata is used unchanged, so the engine
+		// receives exactly the message format it prepared for.  An earlier
+		// attempt rebuilt the metadata as VARCHAR via IMetadataBuilder and the
+		// engine rejected the result with "internal error"; describing the
+		// message is the engine's business, converting the values is ours.
+		metadata = statement->getInputMetadata(status.ptr());
+		if (status.failed() || !metadata)
+		{
+			setErrorFromStatus("could not read parameter metadata", status.ptr());
+			return false;
+		}
+
+		const unsigned expected = metadata->getCount(status.ptr());
+		if (status.failed())
+		{
+			setErrorFromStatus("could not count parameters", status.ptr());
+			return false;
+		}
+
+		if (expected != values.size())
+		{
+			char message[128];
+			snprintf(message, sizeof(message),
+				"statement expects %u parameter(s) but %u were supplied",
+				expected, static_cast<unsigned>(values.size()));
+			setError(message);
+			return false;
+		}
+
+		if (expected == 0)
+			return true;   // nothing to bind
+
+		const unsigned messageLength = metadata->getMessageLength(status.ptr());
+		if (status.failed())
+		{
+			setErrorFromStatus("could not size the parameter message", status.ptr());
+			return false;
+		}
+
+		buffer.assign(messageLength, 0);
+
+		for (unsigned i = 0; i < expected; i++)
+		{
+			const unsigned type       = metadata->getType(status.ptr(), i);
+			const int      scale      = metadata->getScale(status.ptr(), i);
+			const unsigned length     = metadata->getLength(status.ptr(), i);
+			const unsigned offset     = metadata->getOffset(status.ptr(), i);
+			const unsigned nullOffset = metadata->getNullOffset(status.ptr(), i);
+
+			if (status.failed())
+			{
+				setErrorFromStatus("could not read a parameter descriptor", status.ptr());
+				return false;
+			}
+
+			const short nullFlag = values[i].isNull ? -1 : 0;
+			memcpy(buffer.data() + nullOffset, &nullFlag, sizeof(nullFlag));
+
+			if (values[i].isNull)
+				continue;
+
+			// Present the value as VARCHAR and let Firebird convert it to the
+			// declared type — the same conversion SQL string literals get, so
+			// integers, decimals, dates and booleans all follow the engine's
+			// own rules rather than a reimplementation of them.
+			const std::string& text = values[i].text;
+
+			if (text.size() > 0xFFFF)
+			{
+				setError("parameter is too long to bind as text");
+				return false;
+			}
+
+			std::vector<unsigned char> source(sizeof(unsigned short) + text.size());
+			const unsigned short textLength = static_cast<unsigned short>(text.size());
+			memcpy(source.data(), &textLength, sizeof(textLength));
+			memcpy(source.data() + sizeof(textLength), text.data(), text.size());
+
+			g_util->convert(status.ptr(),
+				SQL_VARYING, 0,
+				static_cast<unsigned>(source.size()), source.data(),
+				type & ~1u, scale, length, buffer.data() + offset);
+
+			if (status.failed())
+			{
+				char context[160];
+				snprintf(context, sizeof(context),
+					"could not convert parameter %u (\"%.60s\")", i, text.c_str());
+				setErrorFromStatus(context, status.ptr());
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+private:
+	IMessageMetadata*          metadata = nullptr;
+	std::vector<unsigned char> buffer;
+};
+
+// ---------------------------------------------------------------------------
 // Parameter blocks
 // ---------------------------------------------------------------------------
 
@@ -727,7 +953,123 @@ IProvider* locateProvider()
 	return g_master->getDispatcher();
 }
 
+/**
+ * Read a prepared statement's result set and serialise it to JSON.
+ *
+ * Shared by fb_query() and fb_query_params(); they differ only in whether an
+ * input message is supplied.  `cursor` is an out-parameter so the caller's
+ * cleanup owns it on every exit path, including the error ones.
+ */
+bool serialiseCursor(IAttachment* attachment, ITransaction* transaction,
+	IStatement* statement, IMessageMetadata* metadata, unsigned columnCount,
+	IMessageMetadata* inMeta, void* inBuffer,
+	IResultSet*& cursor, std::string& json)
+{
+	Status status;
+
+	json = "{\"columns\":[";
+
+	// A statement with no output columns (INSERT, DDL, …) still succeeds; it
+	// simply yields an empty result set rather than an error.
+	std::vector<unsigned> types(columnCount);
+	std::vector<int>      subTypes(columnCount);
+	std::vector<int>      scales(columnCount);
+	std::vector<unsigned> lengths(columnCount);
+	std::vector<unsigned> offsets(columnCount);
+	std::vector<unsigned> nullOffsets(columnCount);
+
+	for (unsigned i = 0; i < columnCount; i++)
+	{
+		if (i)
+			json += ',';
+
+		// Prefer the alias so `SELECT COUNT(*) AS TOTAL` reports TOTAL.
+		const char* name = metadata->getAlias(status.ptr(), i);
+		if (status.failed() || !name || !*name)
+			name = metadata->getField(status.ptr(), i);
+		jsonEscape(name ? name : "", name ? strlen(name) : 0, json);
+
+		types[i]       = metadata->getType(status.ptr(), i);
+		subTypes[i]    = metadata->getSubType(status.ptr(), i);
+		scales[i]      = metadata->getScale(status.ptr(), i);
+		lengths[i]     = metadata->getLength(status.ptr(), i);
+		offsets[i]     = metadata->getOffset(status.ptr(), i);
+		nullOffsets[i] = metadata->getNullOffset(status.ptr(), i);
+
+		if (status.failed())
+		{
+			setErrorFromStatus("could not read column metadata", status.ptr());
+			return false;
+		}
+	}
+
+	json += "],\"rows\":[";
+
+	if (columnCount)
+	{
+		const unsigned messageLength = metadata->getMessageLength(status.ptr());
+		if (status.failed())
+		{
+			setErrorFromStatus("could not size the message buffer", status.ptr());
+			return false;
+		}
+
+		cursor = statement->openCursor(status.ptr(), transaction, inMeta, inBuffer,
+			metadata, 0);
+
+		if (status.failed() || !cursor)
+		{
+			setErrorFromStatus("could not open cursor", status.ptr());
+			return false;
+		}
+
+		std::vector<unsigned char> buffer(messageLength);
+		bool firstRow = true;
+
+		for (;;)
+		{
+			const int rc = cursor->fetchNext(status.ptr(), buffer.data());
+
+			if (status.failed())
+			{
+				setErrorFromStatus("fetch failed", status.ptr());
+				return false;
+			}
+
+			if (rc != IStatus::RESULT_OK)
+				break;
+
+			if (!firstRow)
+				json += ',';
+			firstRow = false;
+
+			json += '[';
+			for (unsigned i = 0; i < columnCount; i++)
+			{
+				if (i)
+					json += ',';
+
+				short nullFlag = 0;
+				memcpy(&nullFlag, buffer.data() + nullOffsets[i], sizeof(nullFlag));
+
+				if (nullFlag == -1)
+					json += "null";
+				else
+				{
+					appendValue(attachment, transaction, types[i], subTypes[i],
+						scales[i], lengths[i], buffer.data() + offsets[i], json);
+				}
+			}
+			json += ']';
+		}
+	}
+
+	json += "]}";
+	return true;
+}
+
 } // anonymous namespace
+
 
 // ===========================================================================
 // C API
@@ -1077,108 +1419,13 @@ const char* fb_query(int db_handle, int tx_handle, const char* sql)
 		return nullptr;
 	}
 
-	std::string json = "{\"columns\":[";
-
-	// A statement with no output columns (INSERT, DDL, …) still succeeds; it
-	// simply yields an empty result set rather than an error.
-	std::vector<unsigned> types(columnCount);
-	std::vector<int>      subTypes(columnCount);
-	std::vector<int>      scales(columnCount);
-	std::vector<unsigned> lengths(columnCount);
-	std::vector<unsigned> offsets(columnCount);
-	std::vector<unsigned> nullOffsets(columnCount);
-
-	for (unsigned i = 0; i < columnCount; i++)
+	std::string json;
+	if (!serialiseCursor(attachment, transaction, statement, metadata, columnCount,
+			nullptr, nullptr, cursor, json))
 	{
-		if (i)
-			json += ',';
-
-		// Prefer the alias so `SELECT COUNT(*) AS TOTAL` reports TOTAL.
-		const char* name = metadata->getAlias(status.ptr(), i);
-		if (status.failed() || !name || !*name)
-			name = metadata->getField(status.ptr(), i);
-		jsonEscape(name ? name : "", name ? strlen(name) : 0, json);
-
-		types[i]       = metadata->getType(status.ptr(), i);
-		subTypes[i]    = metadata->getSubType(status.ptr(), i);
-		scales[i]      = metadata->getScale(status.ptr(), i);
-		lengths[i]     = metadata->getLength(status.ptr(), i);
-		offsets[i]     = metadata->getOffset(status.ptr(), i);
-		nullOffsets[i] = metadata->getNullOffset(status.ptr(), i);
-
-		if (status.failed())
-		{
-			setErrorFromStatus("fb_query: could not read column metadata", status.ptr());
-			cleanup(false);
-			return nullptr;
-		}
+		cleanup(false);
+		return nullptr;
 	}
-
-	json += "],\"rows\":[";
-
-	if (columnCount)
-	{
-		const unsigned messageLength = metadata->getMessageLength(status.ptr());
-		if (status.failed())
-		{
-			setErrorFromStatus("fb_query: could not size the message buffer", status.ptr());
-			cleanup(false);
-			return nullptr;
-		}
-
-		cursor = statement->openCursor(status.ptr(), transaction, nullptr, nullptr,
-			metadata, 0);
-
-		if (status.failed() || !cursor)
-		{
-			setErrorFromStatus("fb_query: could not open cursor", status.ptr());
-			cleanup(false);
-			return nullptr;
-		}
-
-		std::vector<unsigned char> buffer(messageLength);
-		bool firstRow = true;
-
-		for (;;)
-		{
-			const int rc = cursor->fetchNext(status.ptr(), buffer.data());
-
-			if (status.failed())
-			{
-				setErrorFromStatus("fb_query: fetch failed", status.ptr());
-				cleanup(false);
-				return nullptr;
-			}
-
-			if (rc != IStatus::RESULT_OK)
-				break;
-
-			if (!firstRow)
-				json += ',';
-			firstRow = false;
-
-			json += '[';
-			for (unsigned i = 0; i < columnCount; i++)
-			{
-				if (i)
-					json += ',';
-
-				short nullFlag = 0;
-				memcpy(&nullFlag, buffer.data() + nullOffsets[i], sizeof(nullFlag));
-
-				if (nullFlag == -1)
-					json += "null";
-				else
-				{
-					appendValue(attachment, transaction, types[i], subTypes[i],
-						scales[i], lengths[i], buffer.data() + offsets[i], json);
-				}
-			}
-			json += ']';
-		}
-	}
-
-	json += "]}";
 
 	cleanup(true);
 
@@ -1280,6 +1527,239 @@ int fb_rollback(int tx_handle)
 	}
 
 	return 0;
+}
+
+/**
+ * Execute a statement that returns no rows, binding parameters.
+ *
+ * `params` is the packed buffer described above; pass NULL/0 for none.
+ * Returns 0 on success, non-zero on failure.
+ */
+FB_WASM_EXPORT
+int fb_execute_params(int db_handle, int tx_handle, const char* sql,
+	const unsigned char* params, int params_length)
+{
+	clearError();
+
+	IAttachment* attachment = lookupAttachment(db_handle);
+	if (!attachment)
+	{
+		setError("fb_execute_params: unknown database handle");
+		return 1;
+	}
+
+	std::vector<ParamValue> values;
+	if (!parseParams(params, static_cast<unsigned>(params_length < 0 ? 0 : params_length),
+			values))
+	{
+		setError("fb_execute_params: malformed parameter buffer");
+		return 2;
+	}
+
+	ITransaction* transaction = nullptr;
+	bool ownTransaction = false;
+
+	if (tx_handle)
+	{
+		transaction = lookupTransaction(tx_handle);
+		if (!transaction)
+		{
+			setError("fb_execute_params: unknown transaction handle");
+			return 3;
+		}
+	}
+	else
+	{
+		Status status;
+		transaction = attachment->startTransaction(status.ptr(), 0, nullptr);
+		if (status.failed() || !transaction)
+		{
+			setErrorFromStatus("fb_execute_params: could not start transaction", status.ptr());
+			return 4;
+		}
+		ownTransaction = true;
+	}
+
+	Status status;
+	IStatement* statement = attachment->prepare(status.ptr(), transaction, 0, sql,
+		SQL_DIALECT_V6, IStatement::PREPARE_PREFETCH_METADATA);
+
+	if (status.failed() || !statement)
+	{
+		setErrorFromStatus("fb_execute_params: prepare failed", status.ptr());
+		if (ownTransaction)
+		{
+			Status rollbackStatus;
+			transaction->rollback(rollbackStatus.ptr());
+		}
+		return 5;
+	}
+
+	InputMessage input;
+	const bool bound = input.build(statement, values);
+
+	if (bound)
+	{
+		statement->execute(status.ptr(), transaction, input.meta(), input.data(),
+			nullptr, nullptr);
+	}
+
+	{
+		Status freeStatus;
+		statement->free(freeStatus.ptr());
+	}
+	statement->release();
+
+	if (!bound || status.failed())
+	{
+		if (status.failed())
+			setErrorFromStatus("fb_execute_params", status.ptr());
+
+		if (ownTransaction)
+		{
+			Status rollbackStatus;
+			transaction->rollback(rollbackStatus.ptr());
+		}
+		return 6;
+	}
+
+	if (ownTransaction)
+	{
+		Status commitStatus;
+		transaction->commit(commitStatus.ptr());
+		if (commitStatus.failed())
+		{
+			setErrorFromStatus("fb_execute_params: commit failed", commitStatus.ptr());
+			return 7;
+		}
+	}
+
+	return 0;
+}
+
+/**
+ * Execute a query with parameters and return a JSON-encoded result set, or
+ * null on failure.  Release the result with fb_free_result().
+ */
+FB_WASM_EXPORT
+const char* fb_query_params(int db_handle, int tx_handle, const char* sql,
+	const unsigned char* params, int params_length)
+{
+	clearError();
+
+	IAttachment* attachment = lookupAttachment(db_handle);
+	if (!attachment)
+	{
+		setError("fb_query_params: unknown database handle");
+		return nullptr;
+	}
+
+	std::vector<ParamValue> values;
+	if (!parseParams(params, static_cast<unsigned>(params_length < 0 ? 0 : params_length),
+			values))
+	{
+		setError("fb_query_params: malformed parameter buffer");
+		return nullptr;
+	}
+
+	ITransaction* transaction = nullptr;
+	bool ownTransaction = false;
+
+	if (tx_handle)
+	{
+		transaction = lookupTransaction(tx_handle);
+		if (!transaction)
+		{
+			setError("fb_query_params: unknown transaction handle");
+			return nullptr;
+		}
+	}
+	else
+	{
+		Status status;
+		transaction = attachment->startTransaction(status.ptr(), 0, nullptr);
+		if (status.failed() || !transaction)
+		{
+			setErrorFromStatus("fb_query_params: could not start transaction", status.ptr());
+			return nullptr;
+		}
+		ownTransaction = true;
+	}
+
+	IResultSet*       cursor    = nullptr;
+	IStatement*       statement = nullptr;
+	IMessageMetadata* metadata  = nullptr;
+
+	auto cleanup = [&](bool commit)
+	{
+		if (cursor)
+		{
+			Status s;
+			cursor->close(s.ptr());
+			cursor->release();
+		}
+		if (metadata)
+			metadata->release();
+		if (statement)
+		{
+			Status s;
+			statement->free(s.ptr());
+			statement->release();
+		}
+		if (ownTransaction && transaction)
+		{
+			Status s;
+			if (commit)
+				transaction->commit(s.ptr());
+			else
+				transaction->rollback(s.ptr());
+		}
+	};
+
+	Status status;
+	statement = attachment->prepare(status.ptr(), transaction, 0, sql, SQL_DIALECT_V6,
+		IStatement::PREPARE_PREFETCH_METADATA);
+
+	if (status.failed() || !statement)
+	{
+		setErrorFromStatus("fb_query_params: prepare failed", status.ptr());
+		cleanup(false);
+		return nullptr;
+	}
+
+	InputMessage input;
+	if (!input.build(statement, values))
+	{
+		cleanup(false);
+		return nullptr;
+	}
+
+	metadata = statement->getOutputMetadata(status.ptr());
+	if (status.failed())
+	{
+		setErrorFromStatus("fb_query_params: could not read output metadata", status.ptr());
+		cleanup(false);
+		return nullptr;
+	}
+
+	const unsigned columnCount = metadata ? metadata->getCount(status.ptr()) : 0;
+	if (status.failed())
+	{
+		setErrorFromStatus("fb_query_params: could not read column count", status.ptr());
+		cleanup(false);
+		return nullptr;
+	}
+
+	std::string json;
+	if (!serialiseCursor(attachment, transaction, statement, metadata, columnCount,
+			input.meta(), input.data(), cursor, json))
+	{
+		cleanup(false);
+		return nullptr;
+	}
+
+	cleanup(true);
+	return allocCString(json);
 }
 
 } /* extern "C" */

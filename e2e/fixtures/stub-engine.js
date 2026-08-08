@@ -121,6 +121,29 @@
       return decoder.decode(heap.subarray(ptr, end));
     }
 
+    /** Decode the packed parameter buffer: u32 count, then per parameter a
+     *  null flag and, unless null, a u32 length and UTF-8 bytes. */
+    function decodeParams(ptr, length) {
+      if (!ptr || length < 4) return [];
+      const view = new DataView(heap.buffer, ptr, length);
+      const count = view.getUint32(0, true);
+      const out = [];
+      let pos = 4;
+      for (let i = 0; i < count; i++) {
+        const isNull = view.getUint8(pos) !== 0;
+        pos += 1;
+        if (isNull) {
+          out.push(null);
+          continue;
+        }
+        const len = view.getUint32(pos, true);
+        pos += 4;
+        out.push(decoder.decode(heap.subarray(ptr + pos, ptr + pos + len)));
+        pos += len;
+      }
+      return out;
+    }
+
     /** Copy a JS string onto the heap and return the pointer (engine-owned). */
     function heapString(str) {
       const len = lengthBytesUTF8(str) + 1;
@@ -264,12 +287,41 @@
        * stub allocates a fresh buffer each time and never expects a free()
        * from the caller — a caller that frees it would be double-freeing.
        */
+      /**
+       * Decode the packed parameter buffer so tests can assert on the values
+       * the library sent, rather than on opaque bytes.  Mirrors the encoding
+       * in src/browser/params.ts.
+       */
+      _fb_execute_params(handle, txHandle, sqlPtr, paramsPtr, paramsLength) {
+        const sql = UTF8ToString(sqlPtr);
+        const params = decodeParams(paramsPtr, paramsLength);
+        stub.calls.push({ fn: '_fb_execute_params', args: [handle, txHandle, sql, params] });
+        if (stub.execRc !== 0) return stub.execRc;
+        const path = attachments.get(handle);
+        const img = path ? files.get(path) : undefined;
+        if (img) img[1] = (img[1] + 1) & 0xff;
+        return 0;
+      },
+
+      _fb_query_params(handle, txHandle, sqlPtr, paramsPtr, paramsLength) {
+        const sql = UTF8ToString(sqlPtr);
+        const params = decodeParams(paramsPtr, paramsLength);
+        stub.calls.push({ fn: '_fb_query_params', args: [handle, txHandle, sql, params] });
+        if (stub.queryReturnsNull) return 0;
+        const ptr = heapString(JSON.stringify(stub.queryResult));
+        liveResults.add(ptr);
+        return ptr;
+      },
+
       _fb_last_error() {
         return heapString(stub.lastError);
       },
 
       _malloc: malloc,
       _free: free,
+      // The real module exposes this via EXPORTED_RUNTIME_METHODS; the library
+      // uses it to copy packed parameters into WASM memory.
+      HEAPU8: heap,
       UTF8ToString,
       stringToUTF8,
       lengthBytesUTF8,

@@ -12,6 +12,8 @@
 export { FirebirdBrowser, FirebirdBrowserTransaction } from './firebird-browser';
 export type { FirebirdBrowserOptions } from './firebird-browser';
 
+export { encodeParams, encodeParamValue } from './params';
+
 export { DirectTransport } from './engine-transport';
 export type {
   EngineTransport,

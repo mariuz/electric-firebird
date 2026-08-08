@@ -366,7 +366,7 @@ target_compile_options(firebird-embedded PRIVATE
 set(FB_EXPORTED_FUNCTIONS
   _fb_init _fb_last_error
   _fb_create_database _fb_attach_database _fb_detach_database
-  _fb_execute _fb_query _fb_free_result
+  _fb_execute _fb_query _fb_execute_params _fb_query_params _fb_free_result
   _fb_start_transaction _fb_commit _fb_rollback
   _malloc _free
 )
@@ -390,7 +390,10 @@ set(EMSCRIPTEN_LINK_FLAGS
   "-s MODULARIZE=1"
   "-s EXPORT_NAME='createFirebirdModule'"
   "-s EXPORTED_FUNCTIONS='[${FB_EXPORTED_FUNCTIONS_JSON}]'"
-  "-s EXPORTED_RUNTIME_METHODS='[\"UTF8ToString\",\"stringToUTF8\",\"lengthBytesUTF8\",\"FS\",\"MEMFS\"]'"
+  # HEAPU8 is needed to copy the packed parameter buffer into WASM memory.
+  # Emscripten only attaches heap views listed here; without it Module.HEAPU8
+  # is undefined at runtime.
+  "-s EXPORTED_RUNTIME_METHODS='[\"UTF8ToString\",\"stringToUTF8\",\"lengthBytesUTF8\",\"FS\",\"MEMFS\",\"HEAPU8\"]'"
   # Growth is kept on: with pthreads this means a growable SharedArrayBuffer,
   # which costs some performance, but reserving a fixed heap large enough for
   # real databases would be a heavy allocation for a browser library.  Tested

@@ -21,7 +21,8 @@
 
 import type { FirebirdWasmModule } from '../wasm-loader';
 import { loadFirebirdWasm, allocString, lastError } from '../wasm-loader';
-import type { Row, QueryResult, FieldInfo } from '../types';
+import type { Row, QueryResult, FieldInfo, QueryParams } from '../types';
+import { encodeParams } from './params';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -44,11 +45,17 @@ export interface EngineTransport {
   attachDatabase(path: string): Promise<EngineHandle>;
   detachDatabase(dbHandle: EngineHandle): Promise<void>;
 
-  execute(dbHandle: EngineHandle, txHandle: EngineHandle, sql: string): Promise<void>;
+  execute(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    sql: string,
+    params?: QueryParams,
+  ): Promise<void>;
   query<T extends Row = Row>(
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     sql: string,
+    params?: QueryParams,
   ): Promise<QueryResult<T>>;
 
   startTransaction(dbHandle: EngineHandle): Promise<EngineHandle>;
@@ -181,13 +188,46 @@ export class DirectTransport implements EngineTransport {
     this.module._fb_detach_database(dbHandle);
   }
 
+  /**
+   * Run `fn` with the packed parameters on the WASM heap.
+   *
+   * An empty list is passed as a null pointer rather than an empty buffer, so
+   * the C side takes its "no parameters" path and skips preparing an input
+   * message it would not use.
+   */
+  private withParams<T>(
+    params: QueryParams,
+    fn: (ptr: number, length: number) => T,
+  ): T {
+    if (!params || params.length === 0) {
+      return fn(0, 0);
+    }
+
+    const mod = this.module;
+    const packed = encodeParams(params);
+    const ptr = mod._malloc(packed.length);
+    try {
+      mod.HEAPU8.set(packed, ptr);
+      return fn(ptr, packed.length);
+    } finally {
+      mod._free(ptr);
+    }
+  }
+
   async execute(
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     sql: string,
+    params: QueryParams = [],
   ): Promise<void> {
     const mod = this.module;
-    const rc = this.withString(sql, (p) => mod._fb_execute(dbHandle, txHandle, p));
+    const rc = this.withString(sql, (sqlPtr) =>
+      this.withParams(params, (paramPtr, paramLen) =>
+        params.length === 0
+          ? mod._fb_execute(dbHandle, txHandle, sqlPtr)
+          : mod._fb_execute_params(dbHandle, txHandle, sqlPtr, paramPtr, paramLen),
+      ),
+    );
     if (rc !== 0) {
       throw engineError(mod, `Firebird exec failed for: ${sql}`, rc);
     }
@@ -197,10 +237,15 @@ export class DirectTransport implements EngineTransport {
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     sql: string,
+    params: QueryParams = [],
   ): Promise<QueryResult<T>> {
     const mod = this.module;
-    return this.withString(sql, (p) => {
-      const resultPtr = mod._fb_query(dbHandle, txHandle, p);
+    return this.withString(sql, (sqlPtr) =>
+      this.withParams(params, (paramPtr, paramLen) => {
+      const resultPtr =
+        params.length === 0
+          ? mod._fb_query(dbHandle, txHandle, sqlPtr)
+          : mod._fb_query_params(dbHandle, txHandle, sqlPtr, paramPtr, paramLen);
       if (resultPtr === 0) {
         throw engineError(mod, `Firebird query failed for: ${sql}`);
       }
@@ -210,7 +255,8 @@ export class DirectTransport implements EngineTransport {
       mod._fb_free_result(resultPtr);
 
       return decodeResultSet<T>(json);
-    });
+      }),
+    );
   }
 
   async startTransaction(dbHandle: EngineHandle): Promise<EngineHandle> {

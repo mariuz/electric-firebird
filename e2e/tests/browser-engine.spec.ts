@@ -143,6 +143,63 @@ test.describe('FirebirdBrowser against the real engine', () => {
     expect(message).toContain('NO_SUCH_TABLE');
   });
 
+
+  test('binds query parameters', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('engine-params', {
+        worker: new Worker('/firebird-engine-worker.js'),
+      });
+
+      await db.exec(
+        'CREATE TABLE t (id INTEGER, name VARCHAR(32), amount NUMERIC(10,2), ok BOOLEAN)',
+      );
+
+      // Every value crosses as text and Firebird converts it, so this also
+      // covers integer, decimal and boolean conversion — not just strings.
+      await db.exec('INSERT INTO t VALUES (?, ?, ?, ?)', [1, 'alpha', 10.5, true]);
+      await db.exec('INSERT INTO t VALUES (?, ?, ?, ?)', [2, 'beta', 20.25, false]);
+      await db.exec('INSERT INTO t VALUES (?, ?, ?, ?)', [3, null, null, null]);
+
+      const byId = await db.query('SELECT id, name FROM t WHERE id >= ? ORDER BY id', [2]);
+      const byName = await db.query('SELECT id FROM t WHERE name = ?', ['beta']);
+      const nulls = await db.query('SELECT id FROM t WHERE name IS NULL');
+
+      await db.close();
+      return { byId: byId.rows, byName: byName.rows, nulls: nulls.rows };
+    });
+
+    expect(result.byId).toEqual([
+      { ID: 2, NAME: 'beta' },
+      { ID: 3, NAME: null },
+    ]);
+    expect(result.byName).toEqual([{ ID: 2 }]);
+    // A null parameter stored SQL NULL, not the string "null".
+    expect(result.nulls).toEqual([{ ID: 3 }]);
+  });
+
+  test('reports a parameter count mismatch instead of failing obscurely', async ({
+    page,
+  }) => {
+    const message = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('engine-param-arity', {
+        worker: new Worker('/firebird-engine-worker.js'),
+      });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+
+      try {
+        await db.query('SELECT id FROM t WHERE id = ?', [1, 2]);
+        return null;
+      } catch (err) {
+        return (err as Error).message;
+      } finally {
+        await db.close();
+      }
+    });
+
+    expect(message).toContain('expects 1 parameter');
+    expect(message).toContain('2 were supplied');
+  });
+
   test('persists to IndexedDB and reopens the database after a reload', async ({
     page,
   }) => {

@@ -46,8 +46,10 @@ const db = new FirebirdBrowser('mydb', {
 });
 
 await db.exec('CREATE TABLE items (id INTEGER, name VARCHAR(100))');
-const result = await db.query('SELECT * FROM items');
-console.log(result.rows);
+await db.exec('INSERT INTO items VALUES (?, ?)', [1, 'hello']);
+
+const result = await db.query('SELECT * FROM items WHERE id = ?', [1]);
+console.log(result.rows); // [ { ID: 1, NAME: 'hello' } ]
 
 // Persist to IndexedDB before page unload
 await db.persist();
@@ -156,7 +158,7 @@ The library provides two execution backends:
 - [x] **The engine runs: create database, DDL, DML, SELECT** (13 Node integration tests)
 - [x] Run the engine in a Web Worker (verified in Chromium end to end)
 - [x] Point `FirebirdBrowser` at the Worker (real SQL through the public API, verified in Chromium)
-- [ ] Parameterised queries in the browser (currently refused rather than ignored)
+- [x] Parameterised queries (`?` placeholders) on both backends
 - [ ] Incremental, atomic IndexedDB persistence
 - [ ] Web Worker + multi-tab safety
 - [ ] Pre-built WASM binary published to npm

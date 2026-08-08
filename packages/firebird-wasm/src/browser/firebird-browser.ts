@@ -75,24 +75,6 @@ export interface FirebirdBrowserOptions {
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Reject parameters instead of ignoring them.
- *
- * The WASM C API has no parameter-binding entry point yet (see
- * docs/roadmap.md, M2).  Dropping the parameters silently would make the same
- * call return different results in Node and in the browser, so it is refused
- * outright.
- */
-function rejectParams(params: QueryParams, sql: string): void {
-  if (params && params.length > 0) {
-    throw new Error(
-      'Parameterised queries are not supported by the browser WASM build yet. ' +
-        'Inline the values or use the Node.js FirebirdLite backend. ' +
-        `Statement: ${sql}`,
-    );
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
@@ -144,25 +126,27 @@ export class FirebirdBrowser {
    *
    * The statement runs in its own transaction, committed on success.
    */
-  async exec(sql: string): Promise<void> {
+  async exec(sql: string, params: QueryParams = []): Promise<void> {
     await this.ensureReady();
-    await this.engine.execute(this.dbHandle, 0, sql);
+    await this.engine.execute(this.dbHandle, 0, sql, params);
   }
 
   /**
    * Execute a SQL query and return the result rows.
    *
-   * > **Note:** parameterised queries are not supported by the browser WASM
-   * > build yet — passing `params` throws rather than silently ignoring them.
+   * Parameters are bound with `?` placeholders, as in the Node.js backend:
+   *
+   * ```ts
+   * await db.query('SELECT * FROM items WHERE id = ?', [1]);
+   * ```
    */
   async query<T extends Row = Row>(
     sql: string,
     params: QueryParams = [],
     _options: TransactionOptions = {},
   ): Promise<QueryResult<T>> {
-    rejectParams(params, sql);
     await this.ensureReady();
-    return this.engine.query<T>(this.dbHandle, 0, sql);
+    return this.engine.query<T>(this.dbHandle, 0, sql, params);
   }
 
   /**
@@ -271,21 +255,15 @@ export class FirebirdBrowserTransaction {
   ) {}
 
   /** Execute a DDL/DML statement inside this transaction. */
-  async exec(sql: string): Promise<void> {
-    await this.engine.execute(this.dbHandle, this.txHandle, sql);
+  async exec(sql: string, params: QueryParams = []): Promise<void> {
+    await this.engine.execute(this.dbHandle, this.txHandle, sql, params);
   }
 
-  /**
-   * Execute a SELECT inside this transaction and return rows.
-   *
-   * As with {@link FirebirdBrowser.query}, parameters are refused rather than
-   * ignored until the C API can bind them.
-   */
+  /** Execute a SELECT inside this transaction and return rows. */
   async query<T extends Row = Row>(
     sql: string,
     params: QueryParams = [],
   ): Promise<QueryResult<T>> {
-    rejectParams(params, sql);
-    return this.engine.query<T>(this.dbHandle, this.txHandle, sql);
+    return this.engine.query<T>(this.dbHandle, this.txHandle, sql, params);
   }
 }
