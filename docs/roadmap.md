@@ -46,13 +46,23 @@ not:
   below), and `build.sh` now fails loudly instead of skipping them.
 - ✅ The TypeScript layer, its 30 browser tests, and the type definitions match
   the new ABI.
-- ❌ **The WASM build has not been linked or run.**  It needs the Emscripten
-  SDK, which was not available in the environment this work was done in.  The
-  CMake change that adds `src/yvalve/` (the OO API's home) is reasoned from the
-  source, not from a successful link.
+- ✅ **The WASM artifact builds.**  `firebird-embedded.wasm` (8.2 MB) +
+  `firebird-embedded.js` (90 KB), linked with zero undefined and zero
+  duplicate symbols.  Emscripten is vendored at `third_party/emsdk`.
+- ✅ **The engine initialises in the browser.**  `_fb_init()` returns 0 against
+  the real artifact: `IMaster` acquired, the statically linked engine
+  registered with the plugin manager, an `IProvider` resolved.
+- ✅ **The metadata layer is real code, not stubs.**  `build.sh` builds
+  `gpre_boot` and preprocesses all 14 `.epp` sources under `src/jrd` and
+  `src/dsql`; `fb_wasm_stubs.cpp` shrank from 1934 to ~470 lines.
+- ❌ **`_fb_create_database()` traps.**  The call aborts with WASM's
+  `function signature mismatch` — an indirect call whose signature does not
+  match its function-table entry.  Native builds tolerate function-pointer
+  casts that WASM rejects, so this is the expected next class of problem.
 
-So: the engine is *wired up*, not yet *proven to run*.  The acceptance test for
-M1 — a Playwright run where `wasm.spec.ts` does not skip — is still open.
+So: the engine is built and starts; it does not execute SQL yet.  M1's
+acceptance test — `wasm.spec.ts` completing a create → insert → select — now
+fails on a concrete, locatable defect rather than on absence.
 
 ### Also found during this review
 
@@ -193,11 +203,17 @@ By "how much damage does this do to a user who tries the README today":
 - [x] Surface engine error text (`fb_last_error`) instead of bare integers.
 - [x] Add `src/yvalve/` to the CMake build (minus `gds.cpp`, whose `gds__*`
       helpers stay stubbed) so the OO API entry points link.
-- [ ] **Link the WASM build and make it run.**  Needs emsdk; expect to iterate
-      on undefined/duplicate symbols between `fb_wasm_stubs.cpp` and the newly
-      compiled yvalve translation units.
-- [ ] Re-check the remaining DSQL/JRD-path stubs in `fb_wasm_stubs.cpp` once
-      the engine executes a statement.
+- [x] Vendor the Emscripten SDK (`third_party/emsdk`, subtree) and link the
+      build: zero undefined, zero duplicate symbols.
+- [x] Compile the metadata layer for real via the boot gpre pass instead of
+      stubbing it out.
+- [ ] **Fix the `function signature mismatch` trap in `_fb_create_database()`.**
+      Cheapest first: rebuild with `-sASSERTIONS=2` to get the offending call
+      site; look for a function pointer cast through an incompatible type on
+      the attachment path; last resort `-sEMULATE_FUNCTION_POINTER_CASTS=1`,
+      which is correct but slow.
+- [ ] Re-check the remaining stubs in `fb_wasm_stubs.cpp` once the engine
+      executes a statement.
 - **Acceptance:** in Chromium, `CREATE TABLE` → `INSERT` → `SELECT` returns the
   inserted rows — i.e. `wasm.spec.ts` runs instead of skipping.
 

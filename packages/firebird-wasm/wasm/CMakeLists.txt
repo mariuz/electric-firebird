@@ -138,6 +138,10 @@ list(FILTER FB_JRD_SRCS EXCLUDE REGEX ".*/jrd/extds/.*")
 file(GLOB_RECURSE FB_LOCK_SRCS
   "${FIREBIRD_SRC}/src/lock/*.cpp"
 )
+# Exclude Boost unit tests – same reason as common/ above.  These only started
+# compiling once extern/boost joined the include path, and then failed at link
+# because the Boost.Test *library* is not built here.
+list(FILTER FB_LOCK_SRCS EXCLUDE REGEX ".*/lock/tests/.*")
 
 # yvalve – the "Y-valve".  fb_wasm_api.cpp drives the engine through Firebird's
 # public OO API, whose entry points all live here:
@@ -149,14 +153,60 @@ file(GLOB_RECURSE FB_LOCK_SRCS
 #                             statically linked engine provider
 #   why.cpp                   the Y-valve object model + fb_shutdown()
 #
-# gds.cpp is excluded: it implements the legacy isc_* client API, which the OO
-# API bridge does not use, and its gds__* helpers are already provided as
-# lightweight stubs in fb_wasm_stubs.cpp.  Compiling both would be a
-# duplicate-symbol error for 16 symbols (gds__alloc, gds__log, gds__prefix, …).
-file(GLOB FB_YVALVE_SRCS
+# Globbed recursively: ConfigRoot::osConfigRoot() and osConfigInstallDir()
+# live in yvalve/config/os/posix/, which a flat glob misses.
+#
+# gds.cpp *is* compiled.  It was previously excluded on the grounds that the
+# legacy isc_* API is unused, with its gds__* helpers stubbed instead — but
+# utl.cpp's IUtil implementation calls isc_encode_sql_date / isc_decode_sql_date
+# and friends, and those are the exact date routines fb_query() relies on to
+# decode DATE/TIME/TIMESTAMP columns.  Stubbing them would silently corrupt
+# every date value the engine returns.
+file(GLOB_RECURSE FB_YVALVE_SRCS
   "${FIREBIRD_SRC}/src/yvalve/*.cpp"
 )
-list(FILTER FB_YVALVE_SRCS EXCLUDE REGEX ".*/yvalve/gds\\.cpp")
+# Platform variants: keep posix only, as elsewhere in this file.
+list(FILTER FB_YVALVE_SRCS EXCLUDE REGEX ".*/yvalve/.*/os/darwin/.*")
+list(FILTER FB_YVALVE_SRCS EXCLUDE REGEX ".*/yvalve/.*/os/win32/.*")
+
+# binreloc is C, not C++, so the .cpp glob above misses it.  config_root.cpp
+# calls br_init_lib()/br_find_exe_dir() to locate the installation directory
+# at runtime; without it the link fails on two namespaced binreloc symbols.
+file(GLOB_RECURSE FB_YVALVE_C_SRCS
+  "${FIREBIRD_SRC}/src/yvalve/*.c"
+)
+list(APPEND FB_YVALVE_SRCS ${FB_YVALVE_C_SRCS})
+
+# ---------------------------------------------------------------------------
+# gpre-generated sources
+# ---------------------------------------------------------------------------
+# Firebird's metadata layer is written in embedded SQL (.epp) and preprocessed
+# into C++ by gpre.  build.sh runs the *boot* gpre pass — which resolves system
+# tables from compiled-in definitions and needs no running database — and puts
+# the results in FB_EPP_GENERATED_DIR.
+#
+# These were previously replaced by hand-written no-ops in fb_wasm_stubs.cpp.
+# That linked, but produced an engine that could not touch metadata, which
+# means it could not create a database, prepare a statement, or resolve a
+# table name.  Compiling the real generated code is what makes the engine
+# functional rather than merely linkable.
+set(FB_EPP_GENERATED_DIR "" CACHE PATH
+    "Directory holding the gpre-preprocessed .cpp sources (set by build.sh)")
+
+set(FB_EPP_SRCS)
+if(FB_EPP_GENERATED_DIR)
+  file(GLOB FB_EPP_SRCS "${FB_EPP_GENERATED_DIR}/*.cpp")
+endif()
+
+if(FB_EPP_SRCS)
+  list(LENGTH FB_EPP_SRCS FB_EPP_COUNT)
+  message(STATUS "Using ${FB_EPP_COUNT} gpre-generated source(s) from ${FB_EPP_GENERATED_DIR}")
+else()
+  message(WARNING
+    "No gpre-generated sources found. The metadata layer will fall back to the "
+    "stubs in fb_wasm_stubs.cpp, which link but fault as soon as the engine "
+    "touches metadata. Run build.sh so the boot gpre pass produces them.")
+endif()
 
 # ---------------------------------------------------------------------------
 # Include paths
@@ -210,6 +260,7 @@ add_executable(firebird-embedded
   ${FB_JRD_SRCS}
   ${FB_LOCK_SRCS}
   ${FB_YVALVE_SRCS}
+  ${FB_EPP_SRCS}
   ${LIBTOMMATH_SRCS}
   ${LIBTOMCRYPT_SRCS}
   ${DECNUMBER_SRCS}
@@ -266,6 +317,10 @@ target_compile_options(firebird-embedded PRIVATE
 # - FORCE_FILESYSTEM: include MEMFS so databases live in virtual memory
 # - EXPORTED_RUNTIME_METHODS: helper utilities passed through to JS
 set(EMSCRIPTEN_LINK_FLAGS
+  # Report every unresolved symbol, not the default first 20 — with a build
+  # this size, a truncated list means several link iterations to see one
+  # round's worth of problems.
+  "-Wl,--error-limit=0"
   "-s MODULARIZE=1"
   "-s EXPORT_NAME='createFirebirdModule'"
   "-s EXPORTED_FUNCTIONS='[\"_fb_init\",\"_fb_last_error\",\"_fb_create_database\",\"_fb_attach_database\",\"_fb_detach_database\",\"_fb_execute\",\"_fb_query\",\"_fb_free_result\",\"_fb_start_transaction\",\"_fb_commit\",\"_fb_rollback\",\"_malloc\",\"_free\"]'"

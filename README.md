@@ -118,10 +118,10 @@ The library provides two execution backends:
 
 ### Roadmap
 
-> **Status:** the Node.js backend works.  The browser backend is wired up but
-> **not yet proven to run**: the C API is a real implementation over Firebird's
-> public OO API, and the TypeScript layer around it is implemented and tested,
-> but the WASM artifact still has to be linked with the Emscripten SDK.
+> **Status:** the Node.js backend works.  The browser backend **builds and
+> starts**: `firebird-embedded.wasm` (8.2 MB) links cleanly and `fb_init()`
+> succeeds in Chromium against the real engine.  It does not execute SQL yet —
+> `fb_create_database()` hits a WASM `function signature mismatch` trap.
 
 - [x] WASM build infrastructure (Emscripten CMake + build script, tracks Firebird `master`)
 - [x] Browser support module (`FirebirdBrowser`)
@@ -129,7 +129,9 @@ The library provides two execution backends:
 - [x] Browser test suite (Playwright, real Chromium + real IndexedDB)
 - [x] C API implemented over the Firebird OO API — attach/create, transactions, cursors, typed values, engine error text
 - [x] Transactions that bind statements to the transaction handle
-- [ ] **Link and run the WASM build** (needs emsdk) — the remaining blocker
+- [x] Link the WASM build (Emscripten vendored at `third_party/emsdk`)
+- [x] Compile Firebird's metadata layer for real (gpre boot pass) instead of stubbing it
+- [ ] **Fix the `function signature mismatch` trap in `fb_create_database()`** — the remaining blocker
 - [ ] Parameterised queries in the browser (currently refused rather than ignored)
 - [ ] Incremental, atomic IndexedDB persistence
 - [ ] Web Worker + multi-tab safety

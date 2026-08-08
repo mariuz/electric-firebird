@@ -157,13 +157,27 @@ if [[ ! -f "${NATIVE_BUILD_DIR}/CMakeCache.txt" ]]; then
   # with < 3.5 and refuses to configure at all.  CMAKE_POLICY_VERSION_MINIMUM
   # tells it to assume 3.5 policies instead, which keeps the fix on our side
   # rather than patching upstream Firebird.
+  # The extra -I flags let the *native* build compile too, not just configure:
+  # Firebird's own CMake does not put its vendored extern/ headers on the
+  # include path, and TimeZoneUtil.cpp needs FB_TZDATADIR at compile time.
+  # gpre_boot (below) is a real native binary, so it needs all of this.
   cmake \
     -B "${NATIVE_BUILD_DIR}" \
     -S "${FIREBIRD_SRC}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
     -DICU_INCLUDE_DIR=/usr/include \
+    -DCMAKE_CXX_FLAGS="-I${FIREBIRD_SRC}/extern/re2 -I${FIREBIRD_SRC}/extern/libcds -I${FIREBIRD_SRC}/extern/boost -DFB_TZDATADIR=\\\"\\\"" \
     -Wno-dev 2>&1 || true
+
+  # The configure step mis-detects gettimeofday() as taking one argument on
+  # this platform, which then fails to compile.  Patch the *native*
+  # autoconfig.h; the WASM copy is taken from it further down and needs the
+  # same fix anyway.  Must run after configure, which regenerates the file.
+  if [[ -f "${AUTOCONFIG_NATIVE}" ]]; then
+    sed -i 's|^#define GETTIMEOFDAY(x) gettimeofday((x))[[:space:]]*$|#define GETTIMEOFDAY(x) gettimeofday((x), (struct timezone *)0)|' \
+      "${AUTOCONFIG_NATIVE}"
+  fi
 fi
 
 # ── Step 1: autoconfig.h ─────────────────────────────────────────────────────
@@ -214,6 +228,57 @@ if [[ ! -f "${PARSE_H_SRC}" ]]; then
     exit 1
   fi
 fi
+
+# ── Step 3: preprocess the .epp sources with the boot gpre ──────────────────
+# Firebird's metadata layer (met.epp, metd.epp, DdlNodes.epp, scl.epp, …) is
+# written in embedded SQL and preprocessed into C++ by gpre.  It used to be
+# stubbed out here on the assumption that gpre needs a running database.  It
+# does not: upstream's src/CMakeLists.txt runs a *boot* pass,
+#
+#     epp_process(boot epp_boot_gds_files ${GPRE_BOOT_CMD} -n -ids -gds_cxx)
+#
+# where gpre_boot resolves system tables from compiled-in definitions.  That
+# is exactly how Firebird bootstraps itself, and it is what makes a WASM build
+# that can actually touch metadata possible — stubs would link but fault on
+# first use.
+#
+# This must run before the WASM-specific autoconfig.h edits below: those
+# describe a 32-bit target and would break the native compile of gpre_boot.
+GPRE_BOOT="${NATIVE_BUILD_DIR}/src/bin/gpre_boot"
+EPP_OUT_DIR="${NATIVE_BUILD_DIR}/epp-generated"
+
+# Every .epp under src/jrd and src/dsql, all of which upstream preprocesses
+# with the same -n -ids -gds_cxx boot flags.
+#
+# Deliberately globbed rather than copied from epp_boot_gds_files in upstream's
+# src/CMakeLists.txt: that list is stale.  It omits jrd/Package.epp and
+# jrd/SystemTriggers.epp, both of which the engine links against (CMake is not
+# Firebird's primary build system, so its file lists lag the autotools build).
+mapfile -t EPP_GDS_FILES < <(
+  cd "${FIREBIRD_SRC}/src" && ls jrd/*.epp dsql/*.epp 2>/dev/null
+)
+
+if [[ ! -f "${GPRE_BOOT}" ]]; then
+  echo "Building gpre_boot (embedded-SQL preprocessor)…"
+  cmake --build "${NATIVE_BUILD_DIR}" --target gpre_boot -j"$(nproc)"
+fi
+
+if [[ ! -f "${GPRE_BOOT}" ]]; then
+  echo "Error: native build did not produce gpre_boot." >&2
+  exit 1
+fi
+
+echo "Preprocessing .epp sources with gpre_boot…"
+mkdir -p "${EPP_OUT_DIR}"
+for epp in "${EPP_GDS_FILES[@]}"; do
+  out="${EPP_OUT_DIR}/$(basename "${epp}" .epp).cpp"
+  if [[ -f "${out}" && "${out}" -nt "${FIREBIRD_SRC}/src/${epp}" ]]; then
+    continue
+  fi
+  echo "  → ${epp}"
+  # gpre resolves includes relative to the working directory.
+  ( cd "${FIREBIRD_SRC}/src" && "${GPRE_BOOT}" -n -ids -gds_cxx "${epp}" "${out}" )
+done
 
 # ── Patch autoconfig.h for 32-bit WASM ──────────────────────────────────────
 # autoconfig.h is generated on a 64-bit host where sizeof(long)==8, so it
@@ -295,6 +360,7 @@ emcmake cmake \
   -B "${BUILD_DIR}" \
   -S "${SCRIPT_DIR}" \
   -DFIREBIRD_SRC="${FIREBIRD_SRC}" \
+  -DFB_EPP_GENERATED_DIR="${EPP_OUT_DIR}" \
   -DCMAKE_BUILD_TYPE=Release
 
 echo "Building WASM module…"

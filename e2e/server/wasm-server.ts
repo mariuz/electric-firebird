@@ -239,6 +239,12 @@ function getBrowserBundle(): string {
     target: 'es2020',
     write: false,
     sourcemap: 'inline',
+    // wasm-loader.ts has a Node branch that require()s the Emscripten glue.
+    // The browser never takes it (it looks for createFirebirdModule on
+    // globalThis instead), but esbuild resolves string-literal requires
+    // eagerly — and once the artifact is actually built, that drags the glue's
+    // node:fs / node:crypto / ws imports into a browser bundle and fails.
+    external: ['*firebird-embedded.js'],
   });
 
   browserBundle = result.outputFiles[0]!.text;
