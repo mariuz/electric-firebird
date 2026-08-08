@@ -11,7 +11,8 @@ Regenerated against Firebird master; the previous revision of this patch
 had malformed hunk headers and never applied.
 ---
 diff --git a/src/common/unicode_util.cpp b/src/common/unicode_util.cpp
-index 05ffe21..a1544b3 100644
+diff --git a/src/common/unicode_util.cpp b/src/common/unicode_util.cpp
+index 05ffe21..638d06e 100644
 --- a/src/common/unicode_util.cpp
 +++ b/src/common/unicode_util.cpp
 @@ -480,11 +480,16 @@ private:
@@ -31,15 +32,21 @@ index 05ffe21..a1544b3 100644
  class UnicodeUtil::ICUModules
  {
  	typedef GenericMap<Pair<Left<string, ICU*> > > ModulesMap;
-@@ -510,6 +515,7 @@ public:
+@@ -507,9 +512,13 @@ public:
+ };
+ 
+ 
++#endif // !__EMSCRIPTEN__
++
  static const char* const COLL_30_VERSION = "41.128.4.4";	// ICU 3.0 collator version
  
++#ifndef __EMSCRIPTEN__
  static GlobalPtr<UnicodeUtil::ICUModules> icuModules;
 +#endif // !__EMSCRIPTEN__
  
  
  static void getVersions(const string& configInfo, ObjectsArray<string>& versions)
-@@ -1138,6 +1144,58 @@ void UnicodeUtil::utf8Normalize(UCharBuffer& data)
+@@ -1138,6 +1147,60 @@ void UnicodeUtil::utf8Normalize(UCharBuffer& data)
  	}
  }
  
@@ -62,7 +69,8 @@ index 05ffe21..a1544b3 100644
 +	// destructor handles safely.
 +
 +	// common library (libicuuc)
-+	wasmIcu->uVersionToString   = u_versionToString;
++	// ICU takes const uint8_t*; the struct field predates that.
++	wasmIcu->uVersionToString = reinterpret_cast<decltype(wasmIcu->uVersionToString)>(u_versionToString);
 +	wasmIcu->ulocCountAvailable = uloc_countAvailable;
 +	wasmIcu->ulocGetAvailable   = uloc_getAvailable;
 +	wasmIcu->usetClose          = uset_close;
@@ -72,7 +80,8 @@ index 05ffe21..a1544b3 100644
 +
 +	// i18n library (libicui18n)
 +	wasmIcu->ucolClose                        = ucol_close;
-+	wasmIcu->ucolGetContractionsAndExpansions = ucol_getContractionsAndExpansions;
++	// ICU returns void here; the struct field declares int32_t.
++	wasmIcu->ucolGetContractionsAndExpansions = reinterpret_cast<decltype(wasmIcu->ucolGetContractionsAndExpansions)>(ucol_getContractionsAndExpansions);
 +	wasmIcu->ucolGetRules                     = ucol_getRules;
 +	wasmIcu->ucolGetSortKey                   = ucol_getSortKey;
 +	wasmIcu->ucolOpen                         = ucol_open;
@@ -98,7 +107,7 @@ index 05ffe21..a1544b3 100644
  UnicodeUtil::ICU* UnicodeUtil::loadICU(const string& icuVersion, const string& configInfo)
  {
  	ObjectsArray<string> versions;
-@@ -1270,6 +1328,7 @@ UnicodeUtil::ICU* UnicodeUtil::loadICU(const string& icuVersion, const string& c
+@@ -1270,6 +1333,7 @@ UnicodeUtil::ICU* UnicodeUtil::loadICU(const string& icuVersion, const string& c
  
  	return NULL;
  }
@@ -106,7 +115,7 @@ index 05ffe21..a1544b3 100644
  
  
  void UnicodeUtil::getICUVersion(ICU* icu, int& majorVersion, int& minorVersion) noexcept
-@@ -1281,6 +1340,45 @@ void UnicodeUtil::getICUVersion(ICU* icu, int& majorVersion, int& minorVersion)
+@@ -1281,6 +1345,46 @@ void UnicodeUtil::getICUVersion(ICU* icu, int& majorVersion, int& minorVersion)
  
  UnicodeUtil::ConversionICU& UnicodeUtil::getConversionICU()
  {
@@ -139,7 +148,8 @@ index 05ffe21..a1544b3 100644
 +		wasmConv.ucalClose                     = ucal_close;
 +		wasmConv.ucalSetAttribute              = ucal_setAttribute;
 +		wasmConv.ucalSetMillis                 = ucal_setMillis;
-+		wasmConv.ucalGet                       = ucal_get;
++		// ICU takes const UCalendar*; the struct field does not.
++		wasmConv.ucalGet = reinterpret_cast<decltype(wasmConv.ucalGet)>(ucal_get);
 +		wasmConv.ucalSetDateTime               = ucal_setDateTime;
 +		wasmConv.ucalGetNow                    = ucal_getNow;
 +		wasmConv.ucalGetTimeZoneTransitionDate = ucal_getTimeZoneTransitionDate;
@@ -152,7 +162,7 @@ index 05ffe21..a1544b3 100644
  	if (convIcu)
  	{
  		return *convIcu;
-@@ -1375,6 +1473,7 @@ UnicodeUtil::ConversionICU& UnicodeUtil::getConversionICU()
+@@ -1375,6 +1479,7 @@ UnicodeUtil::ConversionICU& UnicodeUtil::getConversionICU()
  
  	// compiler warning silencer
  	return *convIcu;

@@ -112,22 +112,14 @@ void API_ROUTINE gds__log_status(const TEXT* database, const ISC_STATUS* status_
 }
 
 /* -----------------------------------------------------------------------
- * fb_get_master_interface  –  return the singleton IMaster*.
+ * fb_get_master_interface  –  NO LONGER STUBBED
  *
- * The real implementation lives in yvalve/why.cpp and bootstraps the
- * entire provider/plugin infrastructure.  In the WASM stub build we
- * return NULL; the glue layer (fb_wasm_api.cpp) will provide its own
- * initialisation path once the engine is fully wired up.
+ * This used to return NULL, which is why nothing could ever be built on top
+ * of it.  The WASM build now compiles src/yvalve/, and
+ * yvalve/MasterImplementation.cpp provides the real implementation that
+ * bootstraps the provider/plugin infrastructure — which fb_wasm_api.cpp
+ * depends on.  Keeping the stub here is a duplicate-symbol link error.
  * ----------------------------------------------------------------------- */
-namespace Firebird {
-    class IMaster;
-}
-
-extern "C"
-Firebird::IMaster* API_ROUTINE fb_get_master_interface()
-{
-    return nullptr;
-}
 
 /* -----------------------------------------------------------------------
  * fb_interpret  –  format one status-vector element into a text buffer.
@@ -290,7 +282,7 @@ int sem_timedwait(sem_t* sem, const struct timespec* abs_timeout)
 /* Supporting headers for types used *by value* in function signatures. */
 #include "jrd/MetaName.h"                  /* Jrd::MetaName (used by value) */
 #include "jrd/QualifiedName.h"             /* Jrd::QualifiedName (used by value) */
-#include "common/classes/Nullable.h"       /* Nullable<bool> (used by value) */
+#include "common/classes/TriState.h"       /* Firebird::TriState (used by value) */
 #include "common/classes/NestConst.h"      /* NestConst<T> (used by value) */
 #include "common/classes/GenericMap.h"     /* GenericMap (for MetaNamePairMap) */
 #include "common/classes/fb_pair.h"       /* MetaNamePair */
@@ -333,19 +325,24 @@ namespace Jrd {
     /* From metd_proto.h */
     typedef Firebird::GenericMap<MetaNamePair> MetaNamePairMap;
 
-    /* From met_proto.h */
-    enum IndexStatus
-    {
-        MET_object_active,
-        MET_object_deferred_active,
-        MET_object_inactive,
-        MET_object_unknown
-    };
+    /* IndexStatus used to be replicated here.  Firebird 6 defines it in
+       jrd/Relation.h (with renamed enumerators: MET_index_active,
+       MET_index_state_unknown, …), which this file includes, so a local copy
+       is now a redefinition. */
 
 }
 
 /* From dsql/sym.h – used by MET_dsql_cache_use/release. */
 #include "dsql/sym.h"
+
+/* Firebird 6 moved two types the MET_* stubs below use by value into headers
+   that this file previously only included further down:
+     ElementBase::ReturnedId  – metadata-cache element id (jrd/CacheVector.h)
+     IndexStatus              – index state enum (jrd/Relation.h)
+   They used to be hand-replicated above; using the real declarations keeps the
+   stubs in step with upstream instead of drifting again. */
+#include "jrd/CacheVector.h"
+#include "jrd/Relation.h"
 
 /* SubtypeInfo – replicated from met_proto.h (the original uses
    Firebird::UCharBuffer which needs array.h). */
@@ -426,8 +423,9 @@ void MET_lookup_cnstrt_for_index(Jrd::thread_db*, Jrd::MetaName&, const Jrd::Met
 void MET_lookup_cnstrt_for_trigger(Jrd::thread_db*, Jrd::MetaName&, Jrd::MetaName&, const Jrd::MetaName&) {}
 void MET_lookup_exception(Jrd::thread_db*, SLONG, Jrd::MetaName&, Firebird::string*) {}
 
-int MET_lookup_field(Jrd::thread_db*, Jrd::jrd_rel*, const Jrd::MetaName&)
-{ return -1; }
+Jrd::ElementBase::ReturnedId MET_lookup_field(Jrd::thread_db*, Jrd::jrd_rel*,
+    const Jrd::MetaName&)
+{ return Jrd::ElementBase::ReturnedId(); }
 
 Jrd::BlobFilter* MET_lookup_filter(Jrd::thread_db*, SSHORT, SSHORT)
 { return nullptr; }
@@ -511,15 +509,20 @@ Jrd::MetaName MET_get_relation_field(Jrd::thread_db*, MemoryPool&,
 void MET_update_partners(Jrd::thread_db*) {}
 int MET_get_linger(Jrd::thread_db*) { return 0; }
 
-Nullable<bool> MET_get_ss_definer(Jrd::thread_db*)
-{ return Nullable<bool>(); }
+/*
+ * Firebird 6 replaced Nullable<bool> with Firebird::TriState here and added a
+ * schema-name argument (schemas are new in 6.0).  The old signature no longer
+ * matches met_proto.h.
+ */
+Firebird::TriState MET_get_ss_definer(Jrd::thread_db*, const Jrd::MetaName&)
+{ return Firebird::TriState(); }
 
 /* MET_store_dependencies uses CompilerScratch::Dependency, a nested type
    from jrd/exe.h.  exe.h brings in the entire JRD header chain.  We
    include it only for this single stub. */
 #include "jrd/exe.h"
 
-void MET_store_dependencies(Jrd::thread_db*, Firebird::Array<Jrd::CompilerScratch::Dependency>&,
+void MET_store_dependencies(Jrd::thread_db*, Firebird::Array<Jrd::Dependency>&,
     const Jrd::jrd_rel*, const Jrd::MetaName&, int, Jrd::jrd_tra*) {}
 
 /* -----------------------------------------------------------------------
@@ -1151,31 +1154,27 @@ void Jrd::UserId::setRoleTrusted() {}
  * the compiler to emit the vtable for Jrd::Function in this translation
  * unit, satisfying the linker.
  *
- * Signatures match Firebird v5.0.3 jrd/Function.h.
+ * Signatures match Firebird master jrd/Function.h.
  * ----------------------------------------------------------------------- */
 
 #include "jrd/Function.h"
 
 namespace Jrd {
 
-/* Static lookup – returns nullptr (no metadata scanning in WASM). */
+/* Static lookups – return nullptr (no metadata scanning in WASM).
+ *
+ * Firebird 6 rewrote the metadata cache: lookup() now takes a MetaId /
+ * ObjectBase::Flag pair, and checkCache(), clearCache(), reload() and
+ * releaseLocks() no longer exist on Function at all, so their stubs are
+ * gone rather than updated.
+ */
+Function* Function::lookup(thread_db* /*tdbb*/, MetaId /*id*/,
+    ObjectBase::Flag /*flags*/)
+{ return nullptr; }
+
 Function* Function::lookup(thread_db* /*tdbb*/, const QualifiedName& /*name*/,
-    bool /*noscan*/)
+    ObjectBase::Flag /*flags*/)
 { return nullptr; }
-
-/* Virtual methods – no-op / safe-default implementations. */
-bool Function::checkCache(thread_db* /*tdbb*/) const { return false; }
-void Function::clearCache(thread_db* /*tdbb*/) {}
-bool Function::reload(thread_db* /*tdbb*/) { return false; }
-
-/* Second static lookup overload – by numeric ID.  Returns nullptr. */
-Function* Function::lookup(thread_db* /*tdbb*/, USHORT /*id*/,
-    bool /*return_deleted*/, bool /*noscan*/, USHORT /*flags*/)
-{ return nullptr; }
-
-/* Releases existence lock and marks function for reclamation.
-   No-op in WASM (no lock manager). */
-void Function::releaseLocks(thread_db* /*tdbb*/) {}
 
 } // namespace Jrd
 
@@ -1194,7 +1193,7 @@ void Function::releaseLocks(thread_db* /*tdbb*/) {}
  * In WASM, DDL is not supported – all execute() / checkPermission()
  * methods are no-ops.  internalPrint() returns the class name string.
  *
- * Signatures match Firebird v5.0.3 dsql/DdlNodes.h and
+ * Signatures match Firebird master dsql/DdlNodes.h and
  * dsql/PackageNodes.h.
  * ----------------------------------------------------------------------- */
 
@@ -1208,18 +1207,18 @@ namespace Jrd {
 /* Static overload: fires DDL triggers; no-op in WASM. */
 void DdlNode::executeDdlTrigger(thread_db* /*tdbb*/, jrd_tra* /*transaction*/,
     DdlNode::DdlTriggerWhen /*when*/, int /*action*/,
-    const MetaName& /*objectName*/, const MetaName& /*oldNewObjectName*/,
+    const QualifiedName& /*objectName*/, const QualifiedName& /*oldNewObjectName*/,
     const Firebird::string& /*sqlText*/) {}
 
 /* Protected instance overload (no sqlText parameter). */
 void DdlNode::executeDdlTrigger(thread_db* /*tdbb*/,
     DsqlCompilerScratch* /*dsqlScratch*/, jrd_tra* /*transaction*/,
     DdlTriggerWhen /*when*/, int /*action*/,
-    const MetaName& /*objectName*/, const MetaName& /*oldNewObjectName*/) {}
+    const QualifiedName& /*objectName*/, const QualifiedName& /*oldNewObjectName*/) {}
 
 /* Helpers used during CREATE/ALTER TABLE, CREATE PROCEDURE, etc. */
 void DdlNode::storeGlobalField(thread_db* /*tdbb*/, jrd_tra* /*transaction*/,
-    MetaName& /*name*/, const TypeClause* /*field*/,
+    QualifiedName& /*name*/, const TypeClause* /*field*/,
     const Firebird::string& /*computedSource*/,
     const BlrDebugWriter::BlrData& /*computedValue*/) {}
 
@@ -1228,10 +1227,31 @@ bool DdlNode::deleteSecurityClass(thread_db* /*tdbb*/, jrd_tra* /*transaction*/,
 { return false; }
 
 void DdlNode::storePrivileges(thread_db* /*tdbb*/, jrd_tra* /*transaction*/,
-    const MetaName& /*name*/, int /*type*/, const char* /*privileges*/) {}
+    const QualifiedName& /*name*/, int /*type*/, const char* /*privileges*/) {}
 
 void DdlNode::deletePrivilegesByRelName(thread_db* /*tdbb*/,
-    jrd_tra* /*transaction*/, const MetaName& /*name*/, int /*type*/) {}
+    jrd_tra* /*transaction*/, const QualifiedName& /*name*/, int /*type*/) {}
+
+/* ------- Firebird 6 additions ------------------------------------------- */
+/*
+ * These are new in 6.0 and have no counterpart in the previous stub set.
+ * dsqlPass() and step2() are declared non-inline on several DDL nodes, so
+ * they are also the key functions that drive vtable emission — defining
+ * RelationNode::dsqlPass() is what makes `vtable for Jrd::RelationNode`
+ * resolvable.
+ */
+
+DdlNode* CommentOnNode::dsqlPass(DsqlCompilerScratch* dsqlScratch)
+{ return DdlNode::dsqlPass(dsqlScratch); }
+
+DdlNode* CreateIndexNode::dsqlPass(DsqlCompilerScratch* dsqlScratch)
+{ return DdlNode::dsqlPass(dsqlScratch); }
+
+DdlNode* RelationNode::dsqlPass(DsqlCompilerScratch* dsqlScratch)
+{ return DdlNode::dsqlPass(dsqlScratch); }
+
+void AlterIndexNode::step2(thread_db*, jrd_tra*) {}
+void DropIndexNode::step2(thread_db*, jrd_tra*) {}
 
 /* ------- ExecInSecurityDb ------------------------------------------------ */
 
@@ -1240,7 +1260,7 @@ void ExecInSecurityDb::executeInSecurityDb(jrd_tra* /*tra*/) {}
 /* ------- ParameterClause constructor ------------------------------------- */
 
 ParameterClause::ParameterClause(Firebird::MemoryPool& /*pool*/,
-    dsql_fld* field, const MetaName& /*aCollate*/,
+    dsql_fld* field,
     ValueSourceClause* aDefaultClause, ValueExprNode* aParameterExpr)
     : type(field),
       defaultClause(aDefaultClause),
@@ -1254,19 +1274,19 @@ Firebird::string ParameterClause::internalPrint(NodePrinter& /*printer*/) const
 
 Firebird::string AlterCharSetNode::internalPrint(NodePrinter& /*p*/) const
 { return "AlterCharSetNode"; }
-void AlterCharSetNode::checkPermission(thread_db*, jrd_tra*) {}
+void AlterCharSetNode::checkPermission(thread_db*) {}
 void AlterCharSetNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- AlterEDSPoolSetNode --------------------------------------------- */
 
-void AlterEDSPoolSetNode::checkPermission(thread_db*, jrd_tra*) {}
+void AlterEDSPoolSetNode::checkPermission(thread_db*) {}
 Firebird::string AlterEDSPoolSetNode::internalPrint(NodePrinter& /*p*/) const
 { return "AlterEDSPoolSetNode"; }
 void AlterEDSPoolSetNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- AlterEDSPoolClearNode ------------------------------------------- */
 
-void AlterEDSPoolClearNode::checkPermission(thread_db*, jrd_tra*) {}
+void AlterEDSPoolClearNode::checkPermission(thread_db*) {}
 Firebird::string AlterEDSPoolClearNode::internalPrint(NodePrinter& /*p*/) const
 { return "AlterEDSPoolClearNode"; }
 void AlterEDSPoolClearNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
@@ -1275,7 +1295,7 @@ void AlterEDSPoolClearNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) 
 
 Firebird::string CommentOnNode::internalPrint(NodePrinter& /*p*/) const
 { return "CommentOnNode"; }
-void CommentOnNode::checkPermission(thread_db*, jrd_tra*) {}
+void CommentOnNode::checkPermission(thread_db*) {}
 void CommentOnNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- CreateAlterFunctionNode ----------------------------------------- */
@@ -1284,14 +1304,14 @@ Firebird::string CreateAlterFunctionNode::internalPrint(NodePrinter& /*p*/) cons
 { return "CreateAlterFunctionNode"; }
 DdlNode* CreateAlterFunctionNode::dsqlPass(DsqlCompilerScratch* s)
 { return DdlNode::dsqlPass(s); }
-void CreateAlterFunctionNode::checkPermission(thread_db*, jrd_tra*) {}
+void CreateAlterFunctionNode::checkPermission(thread_db*) {}
 void CreateAlterFunctionNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- AlterExternalFunctionNode --------------------------------------- */
 
 Firebird::string AlterExternalFunctionNode::internalPrint(NodePrinter& /*p*/) const
 { return "AlterExternalFunctionNode"; }
-void AlterExternalFunctionNode::checkPermission(thread_db*, jrd_tra*) {}
+void AlterExternalFunctionNode::checkPermission(thread_db*) {}
 void AlterExternalFunctionNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- DropFunctionNode ------------------------------------------------ */
@@ -1300,7 +1320,7 @@ Firebird::string DropFunctionNode::internalPrint(NodePrinter& /*p*/) const
 { return "DropFunctionNode"; }
 DdlNode* DropFunctionNode::dsqlPass(DsqlCompilerScratch* s)
 { return DdlNode::dsqlPass(s); }
-void DropFunctionNode::checkPermission(thread_db*, jrd_tra*) {}
+void DropFunctionNode::checkPermission(thread_db*) {}
 void DropFunctionNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- CreateAlterProcedureNode ---------------------------------------- */
@@ -1309,7 +1329,7 @@ Firebird::string CreateAlterProcedureNode::internalPrint(NodePrinter& /*p*/) con
 { return "CreateAlterProcedureNode"; }
 DdlNode* CreateAlterProcedureNode::dsqlPass(DsqlCompilerScratch* s)
 { return DdlNode::dsqlPass(s); }
-void CreateAlterProcedureNode::checkPermission(thread_db*, jrd_tra*) {}
+void CreateAlterProcedureNode::checkPermission(thread_db*) {}
 void CreateAlterProcedureNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- DropProcedureNode ----------------------------------------------- */
@@ -1318,7 +1338,7 @@ Firebird::string DropProcedureNode::internalPrint(NodePrinter& /*p*/) const
 { return "DropProcedureNode"; }
 DdlNode* DropProcedureNode::dsqlPass(DsqlCompilerScratch* s)
 { return DdlNode::dsqlPass(s); }
-void DropProcedureNode::checkPermission(thread_db*, jrd_tra*) {}
+void DropProcedureNode::checkPermission(thread_db*) {}
 void DropProcedureNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- CreateAlterTriggerNode ------------------------------------------ */
@@ -1327,7 +1347,7 @@ Firebird::string CreateAlterTriggerNode::internalPrint(NodePrinter& /*p*/) const
 { return "CreateAlterTriggerNode"; }
 DdlNode* CreateAlterTriggerNode::dsqlPass(DsqlCompilerScratch* s)
 { return DdlNode::dsqlPass(s); }
-void CreateAlterTriggerNode::checkPermission(thread_db*, jrd_tra*) {}
+void CreateAlterTriggerNode::checkPermission(thread_db*) {}
 void CreateAlterTriggerNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- DropTriggerNode ------------------------------------------------- */
@@ -1336,7 +1356,7 @@ Firebird::string DropTriggerNode::internalPrint(NodePrinter& /*p*/) const
 { return "DropTriggerNode"; }
 DdlNode* DropTriggerNode::dsqlPass(DsqlCompilerScratch* s)
 { return DdlNode::dsqlPass(s); }
-void DropTriggerNode::checkPermission(thread_db*, jrd_tra*) {}
+void DropTriggerNode::checkPermission(thread_db*) {}
 void DropTriggerNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- CreateCollationNode --------------------------------------------- */
@@ -1345,56 +1365,56 @@ Firebird::string CreateCollationNode::internalPrint(NodePrinter& /*p*/) const
 { return "CreateCollationNode"; }
 DdlNode* CreateCollationNode::dsqlPass(DsqlCompilerScratch* s)
 { return DdlNode::dsqlPass(s); }
-void CreateCollationNode::checkPermission(thread_db*, jrd_tra*) {}
+void CreateCollationNode::checkPermission(thread_db*) {}
 void CreateCollationNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- DropCollationNode ----------------------------------------------- */
 
 Firebird::string DropCollationNode::internalPrint(NodePrinter& /*p*/) const
 { return "DropCollationNode"; }
-void DropCollationNode::checkPermission(thread_db*, jrd_tra*) {}
+void DropCollationNode::checkPermission(thread_db*) {}
 void DropCollationNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- CreateDomainNode ------------------------------------------------ */
 
 Firebird::string CreateDomainNode::internalPrint(NodePrinter& /*p*/) const
 { return "CreateDomainNode"; }
-void CreateDomainNode::checkPermission(thread_db*, jrd_tra*) {}
+void CreateDomainNode::checkPermission(thread_db*) {}
 void CreateDomainNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- AlterDomainNode ------------------------------------------------- */
 
 Firebird::string AlterDomainNode::internalPrint(NodePrinter& /*p*/) const
 { return "AlterDomainNode"; }
-void AlterDomainNode::checkPermission(thread_db*, jrd_tra*) {}
+void AlterDomainNode::checkPermission(thread_db*) {}
 void AlterDomainNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- DropDomainNode -------------------------------------------------- */
 
 Firebird::string DropDomainNode::internalPrint(NodePrinter& /*p*/) const
 { return "DropDomainNode"; }
-void DropDomainNode::checkPermission(thread_db*, jrd_tra*) {}
+void DropDomainNode::checkPermission(thread_db*) {}
 void DropDomainNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- CreateAlterExceptionNode ---------------------------------------- */
 
 Firebird::string CreateAlterExceptionNode::internalPrint(NodePrinter& /*p*/) const
 { return "CreateAlterExceptionNode"; }
-void CreateAlterExceptionNode::checkPermission(thread_db*, jrd_tra*) {}
+void CreateAlterExceptionNode::checkPermission(thread_db*) {}
 void CreateAlterExceptionNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- DropExceptionNode ----------------------------------------------- */
 
 Firebird::string DropExceptionNode::internalPrint(NodePrinter& /*p*/) const
 { return "DropExceptionNode"; }
-void DropExceptionNode::checkPermission(thread_db*, jrd_tra*) {}
+void DropExceptionNode::checkPermission(thread_db*) {}
 void DropExceptionNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- CreateAlterSequenceNode ----------------------------------------- */
 
 Firebird::string CreateAlterSequenceNode::internalPrint(NodePrinter& /*p*/) const
 { return "CreateAlterSequenceNode"; }
-void CreateAlterSequenceNode::checkPermission(thread_db*, jrd_tra*) {}
+void CreateAlterSequenceNode::checkPermission(thread_db*) {}
 void CreateAlterSequenceNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 void CreateAlterSequenceNode::putErrorPrefix(Firebird::Arg::StatusVector& /*sv*/) {}
 
@@ -1402,31 +1422,31 @@ void CreateAlterSequenceNode::putErrorPrefix(Firebird::Arg::StatusVector& /*sv*/
 
 Firebird::string DropSequenceNode::internalPrint(NodePrinter& /*p*/) const
 { return "DropSequenceNode"; }
-void DropSequenceNode::checkPermission(thread_db*, jrd_tra*) {}
+void DropSequenceNode::checkPermission(thread_db*) {}
 void DropSequenceNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- CreateRelationNode ---------------------------------------------- */
 
 Firebird::string CreateRelationNode::internalPrint(NodePrinter& /*p*/) const
 { return "CreateRelationNode"; }
-void CreateRelationNode::checkPermission(thread_db*, jrd_tra*) {}
+void CreateRelationNode::checkPermission(thread_db*) {}
 void CreateRelationNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- AlterRelationNode ----------------------------------------------- */
 
 Firebird::string AlterRelationNode::internalPrint(NodePrinter& /*p*/) const
 { return "AlterRelationNode"; }
-void AlterRelationNode::checkPermission(thread_db*, jrd_tra*) {}
+void AlterRelationNode::checkPermission(thread_db*) {}
 void AlterRelationNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- DropRelationNode ------------------------------------------------ */
 
 Firebird::string DropRelationNode::internalPrint(NodePrinter& /*p*/) const
 { return "DropRelationNode"; }
-void DropRelationNode::checkPermission(thread_db*, jrd_tra*) {}
+void DropRelationNode::checkPermission(thread_db*) {}
 void DropRelationNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 void DropRelationNode::deleteGlobalField(thread_db* /*tdbb*/,
-    jrd_tra* /*transaction*/, const MetaName& /*globalName*/) {}
+    jrd_tra* /*transaction*/, const QualifiedName& /*globalName*/) {}
 
 /* ------- CreateAlterViewNode --------------------------------------------- */
 
@@ -1434,80 +1454,80 @@ Firebird::string CreateAlterViewNode::internalPrint(NodePrinter& /*p*/) const
 { return "CreateAlterViewNode"; }
 DdlNode* CreateAlterViewNode::dsqlPass(DsqlCompilerScratch* s)
 { return DdlNode::dsqlPass(s); }
-void CreateAlterViewNode::checkPermission(thread_db*, jrd_tra*) {}
+void CreateAlterViewNode::checkPermission(thread_db*) {}
 void CreateAlterViewNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- CreateIndexNode ------------------------------------------------- */
 
 Firebird::string CreateIndexNode::internalPrint(NodePrinter& /*p*/) const
 { return "CreateIndexNode"; }
-void CreateIndexNode::checkPermission(thread_db*, jrd_tra*) {}
+void CreateIndexNode::checkPermission(thread_db*) {}
 void CreateIndexNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- AlterIndexNode -------------------------------------------------- */
 
 Firebird::string AlterIndexNode::internalPrint(NodePrinter& /*p*/) const
 { return "AlterIndexNode"; }
-void AlterIndexNode::checkPermission(thread_db*, jrd_tra*) {}
+void AlterIndexNode::checkPermission(thread_db*) {}
 void AlterIndexNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- SetStatisticsNode ----------------------------------------------- */
 
 Firebird::string SetStatisticsNode::internalPrint(NodePrinter& /*p*/) const
 { return "SetStatisticsNode"; }
-void SetStatisticsNode::checkPermission(thread_db*, jrd_tra*) {}
+void SetStatisticsNode::checkPermission(thread_db*) {}
 void SetStatisticsNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- DropIndexNode --------------------------------------------------- */
 
 Firebird::string DropIndexNode::internalPrint(NodePrinter& /*p*/) const
 { return "DropIndexNode"; }
-void DropIndexNode::checkPermission(thread_db*, jrd_tra*) {}
+void DropIndexNode::checkPermission(thread_db*) {}
 void DropIndexNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 bool DropIndexNode::deleteSegmentRecords(thread_db* /*tdbb*/,
-    jrd_tra* /*transaction*/, const MetaName& /*name*/)
+    jrd_tra* /*transaction*/, const QualifiedName& /*name*/)
 { return false; }
 
 /* ------- CreateFilterNode ------------------------------------------------ */
 
 Firebird::string CreateFilterNode::internalPrint(NodePrinter& /*p*/) const
 { return "CreateFilterNode"; }
-void CreateFilterNode::checkPermission(thread_db*, jrd_tra*) {}
+void CreateFilterNode::checkPermission(thread_db*) {}
 void CreateFilterNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- DropFilterNode -------------------------------------------------- */
 
 Firebird::string DropFilterNode::internalPrint(NodePrinter& /*p*/) const
 { return "DropFilterNode"; }
-void DropFilterNode::checkPermission(thread_db*, jrd_tra*) {}
+void DropFilterNode::checkPermission(thread_db*) {}
 void DropFilterNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- CreateShadowNode ------------------------------------------------ */
 
 Firebird::string CreateShadowNode::internalPrint(NodePrinter& /*p*/) const
 { return "CreateShadowNode"; }
-void CreateShadowNode::checkPermission(thread_db*, jrd_tra*) {}
+void CreateShadowNode::checkPermission(thread_db*) {}
 void CreateShadowNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- DropShadowNode -------------------------------------------------- */
 
 Firebird::string DropShadowNode::internalPrint(NodePrinter& /*p*/) const
 { return "DropShadowNode"; }
-void DropShadowNode::checkPermission(thread_db*, jrd_tra*) {}
+void DropShadowNode::checkPermission(thread_db*) {}
 void DropShadowNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- CreateAlterRoleNode --------------------------------------------- */
 
 Firebird::string CreateAlterRoleNode::internalPrint(NodePrinter& /*p*/) const
 { return "CreateAlterRoleNode"; }
-void CreateAlterRoleNode::checkPermission(thread_db*, jrd_tra*) {}
+void CreateAlterRoleNode::checkPermission(thread_db*) {}
 void CreateAlterRoleNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- MappingNode ----------------------------------------------------- */
 
 Firebird::string MappingNode::internalPrint(NodePrinter& /*p*/) const
 { return "MappingNode"; }
-void MappingNode::checkPermission(thread_db*, jrd_tra*) {}
+void MappingNode::checkPermission(thread_db*) {}
 void MappingNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 void MappingNode::validateAdmin() {}
 void MappingNode::runInSecurityDb(SecDbContext* /*ctx*/) {}
@@ -1516,7 +1536,7 @@ void MappingNode::runInSecurityDb(SecDbContext* /*ctx*/) {}
 
 Firebird::string DropRoleNode::internalPrint(NodePrinter& /*p*/) const
 { return "DropRoleNode"; }
-void DropRoleNode::checkPermission(thread_db*, jrd_tra*) {}
+void DropRoleNode::checkPermission(thread_db*) {}
 void DropRoleNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- UserNode base --------------------------------------------------- */
@@ -1527,21 +1547,21 @@ MetaName UserNode::upper(const MetaName& str) { return str; }
 
 Firebird::string CreateAlterUserNode::internalPrint(NodePrinter& /*p*/) const
 { return "CreateAlterUserNode"; }
-void CreateAlterUserNode::checkPermission(thread_db*, jrd_tra*) {}
+void CreateAlterUserNode::checkPermission(thread_db*) {}
 void CreateAlterUserNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- DropUserNode ---------------------------------------------------- */
 
 Firebird::string DropUserNode::internalPrint(NodePrinter& /*p*/) const
 { return "DropUserNode"; }
-void DropUserNode::checkPermission(thread_db*, jrd_tra*) {}
+void DropUserNode::checkPermission(thread_db*) {}
 void DropUserNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- GrantRevokeNode ------------------------------------------------- */
 
 Firebird::string GrantRevokeNode::internalPrint(NodePrinter& /*p*/) const
 { return "GrantRevokeNode"; }
-void GrantRevokeNode::checkPermission(thread_db*, jrd_tra*) {}
+void GrantRevokeNode::checkPermission(thread_db*) {}
 void GrantRevokeNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 void GrantRevokeNode::runInSecurityDb(SecDbContext* /*ctx*/) {}
 
@@ -1549,7 +1569,7 @@ void GrantRevokeNode::runInSecurityDb(SecDbContext* /*ctx*/) {}
 
 Firebird::string AlterDatabaseNode::internalPrint(NodePrinter& /*p*/) const
 { return "AlterDatabaseNode"; }
-void AlterDatabaseNode::checkPermission(thread_db*, jrd_tra*) {}
+void AlterDatabaseNode::checkPermission(thread_db*) {}
 void AlterDatabaseNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* -----------------------------------------------------------------------
@@ -1563,14 +1583,14 @@ DdlNode* CreateAlterPackageNode::dsqlPass(DsqlCompilerScratch* s)
 { return DdlNode::dsqlPass(s); }
 Firebird::string CreateAlterPackageNode::internalPrint(NodePrinter& /*p*/) const
 { return "CreateAlterPackageNode"; }
-void CreateAlterPackageNode::checkPermission(thread_db*, jrd_tra*) {}
+void CreateAlterPackageNode::checkPermission(thread_db*) {}
 void CreateAlterPackageNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- DropPackageNode ------------------------------------------------- */
 
 Firebird::string DropPackageNode::internalPrint(NodePrinter& /*p*/) const
 { return "DropPackageNode"; }
-void DropPackageNode::checkPermission(thread_db*, jrd_tra*) {}
+void DropPackageNode::checkPermission(thread_db*) {}
 void DropPackageNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- CreatePackageBodyNode ------------------------------------------- */
@@ -1579,14 +1599,14 @@ DdlNode* CreatePackageBodyNode::dsqlPass(DsqlCompilerScratch* s)
 { return DdlNode::dsqlPass(s); }
 Firebird::string CreatePackageBodyNode::internalPrint(NodePrinter& /*p*/) const
 { return "CreatePackageBodyNode"; }
-void CreatePackageBodyNode::checkPermission(thread_db*, jrd_tra*) {}
+void CreatePackageBodyNode::checkPermission(thread_db*) {}
 void CreatePackageBodyNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- DropPackageBodyNode --------------------------------------------- */
 
 Firebird::string DropPackageBodyNode::internalPrint(NodePrinter& /*p*/) const
 { return "DropPackageBodyNode"; }
-void DropPackageBodyNode::checkPermission(thread_db*, jrd_tra*) {}
+void DropPackageBodyNode::checkPermission(thread_db*) {}
 void DropPackageBodyNode::execute(thread_db*, DsqlCompilerScratch*, jrd_tra*) {}
 
 /* ------- RelationNode constructor ---------------------------------------- */
@@ -1597,10 +1617,43 @@ RelationNode::RelationNode(MemoryPool& p, RelationSourceNode* aDsqlNode)
     : DdlNode(p),
       dsqlNode(aDsqlNode),
       name(p),
-      clauses(p)
+      clauses(p),
+      // Firebird 6 added this member; ModifyIndexList has no default
+      // constructor, so it must be initialised explicitly.
+      indexList(p)
 {}
 
 } // namespace Jrd
+
+/* -----------------------------------------------------------------------
+ * Firebird 6 metadata-cache stubs  (met.epp / Function.epp)
+ *
+ * 6.0 replaced the old metadata cache with MetadataCache + CacheElement.
+ * Its entry points live in met.epp, which is not compiled here.
+ *
+ * WARNING: MetadataCache::getCache() returning null is a placeholder that
+ * satisfies the linker, not the engine — anything that actually touches
+ * metadata will fault on it.  The real fix is to run Firebird's *boot* gpre
+ * over the .epp sources (it needs no running database) instead of stubbing
+ * them; see docs/roadmap.md.
+ * ----------------------------------------------------------------------- */
+
+#include "jrd/met.h"
+#include "jrd/Function.h"
+
+namespace Jrd {
+
+MetadataCache* MetadataCache::getCache(thread_db* /*tdbb*/) noexcept
+{ return nullptr; }
+
+Function* Function::create(thread_db* /*tdbb*/, Firebird::MemoryPool& /*pool*/,
+    Cached::Function* /*perm*/)
+{ return nullptr; }
+
+} // namespace Jrd
+
+void MET_get_domain(Jrd::thread_db*, Firebird::MemoryPool&,
+    const Jrd::QualifiedName&, dsc*, Jrd::FieldInfo*) {}
 
 /* -----------------------------------------------------------------------
  * jrd_prc::reload stub  (met.epp)
@@ -1612,9 +1665,14 @@ RelationNode::RelationNode(MemoryPool& p, RelationSourceNode* aDsqlNode)
  * to satisfy the linker; the vtable is already anchored by Routine.cpp.
  * ----------------------------------------------------------------------- */
 
+#include "jrd/met.h"   /* jrd_prc is defined here, not in a header of its own */
+
 namespace Jrd {
 
-bool jrd_prc::reload(thread_db* /*tdbb*/) { return false; }
+/* Firebird 6 changed the signature: reload() now takes the metadata-cache
+   flags and returns a ScanResult rather than a bool. */
+ScanResult jrd_prc::reload(thread_db* /*tdbb*/, ObjectBase::Flag /*fl*/)
+{ return ScanResult::MISS; }   /* no system tables to scan in the WASM build */
 
 } // namespace Jrd
 

@@ -113,10 +113,19 @@ if [[ ! -f "${FIREBIRD_SRC}/src/misc/makeHeader.cpp" ]]; then
   mkdir -p "${FIREBIRD_SRC}/src/misc"
   echo 'int main() { return 0; }' > "${FIREBIRD_SRC}/src/misc/makeHeader.cpp"
 fi
-if [[ ! -f "${FIREBIRD_SRC}/src/msgs/facilities2.sql" ]]; then
-  mkdir -p "${FIREBIRD_SRC}/src/msgs"
-  touch "${FIREBIRD_SRC}/src/msgs/facilities2.sql"
-fi
+# src/CMakeLists.txt lists the message-database SQL inputs as sources of a
+# custom target, and CMake's Generate step fails outright if any are missing.
+# Most are produced by a full Firebird build, which we do not run.  Create
+# empty placeholders for whichever are absent — the message database is not
+# built here, so their content is irrelevant.  Enumerated from the target's
+# source list rather than named one at a time, because the list grows between
+# Firebird versions (6.0 added history2.sql).
+mkdir -p "${FIREBIRD_SRC}/src/msgs"
+for msg_sql in facilities2 history2 locales messages2 msg symbols2 \
+               system_errors2 transmsgs.de_DE2 transmsgs.fr_FR2; do
+  [[ -f "${FIREBIRD_SRC}/src/msgs/${msg_sql}.sql" ]] || \
+    touch "${FIREBIRD_SRC}/src/msgs/${msg_sql}.sql"
+done
 
 NATIVE_BUILD_DIR="${SCRIPT_DIR}/build-native-config"
 AUTOCONFIG_NATIVE="${NATIVE_BUILD_DIR}/src/include/gen/autoconfig.h"
@@ -130,13 +139,29 @@ PARSE_CPP_SRC="${FIREBIRD_SRC}/src/dsql/parse.cpp"
 # generation and the parse target).  We keep `|| true` as a safety net in
 # case other optional cmake targets fail, but the stubs above should allow
 # the Generate step to succeed and produce valid Makefiles.
+#
+# A failed configure still leaves a CMakeCache.txt behind, which would make
+# every later run skip this step and fail further down with a confusing
+# "did not produce autoconfig.h".  Treat a cache without autoconfig.h as
+# evidence of a failed configure and start over.
+if [[ -f "${NATIVE_BUILD_DIR}/CMakeCache.txt" && ! -f "${AUTOCONFIG_NATIVE}" ]]; then
+  echo "Discarding incomplete native build directory…"
+  rm -rf "${NATIVE_BUILD_DIR}"
+fi
+
 if [[ ! -f "${NATIVE_BUILD_DIR}/CMakeCache.txt" ]]; then
   echo "Configuring native Firebird build (host compiler)…"
   mkdir -p "${NATIVE_BUILD_DIR}"
+  # Firebird's top-level CMakeLists.txt still declares
+  # cmake_minimum_required(VERSION 2.8.12).  CMake 4 removed compatibility
+  # with < 3.5 and refuses to configure at all.  CMAKE_POLICY_VERSION_MINIMUM
+  # tells it to assume 3.5 policies instead, which keeps the fix on our side
+  # rather than patching upstream Firebird.
   cmake \
     -B "${NATIVE_BUILD_DIR}" \
     -S "${FIREBIRD_SRC}" \
     -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
     -DICU_INCLUDE_DIR=/usr/include \
     -Wno-dev 2>&1 || true
 fi

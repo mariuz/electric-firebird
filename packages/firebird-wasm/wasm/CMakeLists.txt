@@ -15,7 +15,10 @@
 cmake_minimum_required(VERSION 3.20)
 project(firebird-wasm C CXX)
 
-set(CMAKE_CXX_STANDARD 17)
+# Firebird master requires C++20 — src/common/classes/init.h uses concepts
+# (`requires(std::invocable<...>)`), and upstream's own builds pass -std=c++20
+# on every platform.  Building it as C++17 fails in the first common/ header.
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ---------------------------------------------------------------------------
@@ -81,10 +84,12 @@ file(GLOB_RECURSE FB_COMMON_SRCS
 # unqualified #includes ("tree.h", "alloc.h") that don't resolve with our
 # include paths and are not part of the embedded engine.
 list(FILTER FB_COMMON_SRCS EXCLUDE REGEX ".*/common/classes/misc/.*")
-# Exclude Boost unit tests in classes/tests/ – they require boost/test headers
-# which are not available in the WASM build environment.
-list(FILTER FB_COMMON_SRCS EXCLUDE REGEX ".*/common/classes/tests/.*")
-# Exclude top-level common/tests/ (e.g. CommonTest.cpp) – same Boost dependency.
+# Exclude Boost unit tests anywhere under common/ – they require boost/test
+# headers which are not available in the WASM build environment.  The pattern
+# is deliberately broad: it used to name classes/tests/ and common/tests/
+# individually, and Firebird 6 added common/ipc/tests/, which then broke the
+# build.  Matching any tests/ directory keeps new ones from doing that again.
+list(FILTER FB_COMMON_SRCS EXCLUDE REGEX ".*/common/.*/tests/.*")
 list(FILTER FB_COMMON_SRCS EXCLUDE REGEX ".*/common/tests/.*")
 # Exclude Darwin (macOS) and Win32 platform-specific sources – the WASM build
 # targets Emscripten (POSIX-compatible) so only the posix/ implementations
@@ -173,6 +178,10 @@ set(FB_INCLUDE_DIRS
   # source files are compiled for the WASM build.  The few CDS symbols
   # referenced at link time are stubbed in fb_wasm_stubs.cpp.
   "${FIREBIRD_SRC}/extern/libcds"
+  # Boost headers vendored by Firebird.  Firebird 6's src/StdHelper.h (reached
+  # from the new common/ipc/ subsystem) includes <boost/type_traits/copy_cv.hpp>.
+  # Header-only — nothing from Boost is compiled.
+  "${FIREBIRD_SRC}/extern/boost"
   # ICU headers are provided by Emscripten's ICU port (-sUSE_ICU=1).
   # No stub headers are needed – the real ICU headers supply all type/enum
   # definitions AND function declarations used by unicode_util.cpp.
