@@ -306,6 +306,11 @@ target_compile_definitions(firebird-embedded PRIVATE
 target_compile_options(firebird-embedded PRIVATE
   "-Dpthread_rwlockattr_setkind_np(a,b)=0"
   "-sUSE_ICU=1"
+  # Upstream builds every platform with -fno-rtti (see builds/posix/make.defaults:
+  # PLUSPLUS_FLAGS := -fno-rtti -std=c++20 …).  Firebird's cloop interfaces
+  # implement their own dispatch and are designed against that ABI, so building
+  # them with RTTI enabled is a deviation from every tested configuration.
+  "-fno-rtti"
 )
 
 # ---------------------------------------------------------------------------
@@ -348,6 +353,40 @@ if(FB_WASM_DEBUG)
     "--profiling-funcs"
     "-g"
   )
+endif()
+
+# ---------------------------------------------------------------------------
+# Memory-error detection:  cmake -DFB_WASM_SANITIZE=safe-heap|address
+# ---------------------------------------------------------------------------
+# safe-heap  Binaryen instruments every load/store to trap on out-of-bounds or
+#            misaligned access.  Applied at link time only, so it relinks from
+#            existing objects in seconds.
+# address    Full AddressSanitizer.  Names the write that corrupts a block and
+#            the allocation it belongs to, which safe-heap cannot.  Needs every
+#            translation unit recompiled and a much larger heap for the shadow
+#            memory, so it is a slow full rebuild.
+set(FB_WASM_SANITIZE "none" CACHE STRING "Memory error detection: none|safe-heap|address")
+set_property(CACHE FB_WASM_SANITIZE PROPERTY STRINGS none safe-heap address)
+
+if(FB_WASM_SANITIZE STREQUAL "safe-heap")
+  message(STATUS "FB_WASM_SANITIZE=safe-heap: trapping on bad loads/stores")
+  list(APPEND EMSCRIPTEN_LINK_FLAGS "-s SAFE_HEAP=1")
+elseif(FB_WASM_SANITIZE STREQUAL "address")
+  message(STATUS "FB_WASM_SANITIZE=address: AddressSanitizer enabled")
+  # ASan must be on the compile line for every TU as well as the link line.
+  # target_compile_options, not add_compile_options: this block runs after
+  # add_executable(), and directory-level options would not reach the target.
+  target_compile_options(firebird-embedded PRIVATE -fsanitize=address)
+  list(APPEND EMSCRIPTEN_LINK_FLAGS
+    "-fsanitize=address"
+    # Shadow memory needs far more than the default heap, and ASan cannot be
+    # combined with a growable heap here.
+    "-s INITIAL_MEMORY=1073741824"
+    "-s ALLOW_MEMORY_GROWTH=0"
+    "-s STACK_SIZE=5242880"
+  )
+elseif(NOT FB_WASM_SANITIZE STREQUAL "none")
+  message(FATAL_ERROR "FB_WASM_SANITIZE must be one of: none, safe-heap, address")
 endif()
 
 # Compile a few files with DWARF so their frames carry line numbers.  Doing

@@ -16,8 +16,9 @@ test-results/
 *.fdb-journal
 
 # WASM build artifacts
-packages/firebird-wasm/wasm/build/
-packages/firebird-wasm/wasm/build-native-config/
+# build-* covers the debug/sanitizer trees (build-asan, build-emu, …) as well
+# as the default one, so a new variant does not get committed by accident.
+packages/firebird-wasm/wasm/build*/
 *.wasm
 
 # Misc

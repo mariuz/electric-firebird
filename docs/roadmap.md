@@ -90,18 +90,65 @@ signature mismatch`.  What is established, with evidence:
 | Not null | `RefPtr` guards `if (ptr)`, so `pConf` is non-null.  Dumping it shows `cloopVTable == 0` — a null vtable, hence "null function". |
 | Not a cloop problem | A probe calling `addRef`/`release` on the provider itself succeeds, so cloop dispatch works in general. |
 | Not plugin-set lifetime | Retaining the `IPluginSet` (as Firebird's own `GetPlugins` does) changes nothing.  The change was kept anyway — it is correct. |
-| Not a bad `this` | `JProvider::createDatabase` sees `this == 0x301e98`, the same pointer `EngineFactory::createPlugin` returned. |
+| `this` looked right | `JProvider::createDatabase` reported `this == 0x301e98`, matching what `EngineFactory::createPlugin` returned — **but that was measured in a different build** from the `pConf` reading below.  See the caveat under "next steps". |
 | The config was valid | At `createPlugin`, `factoryParameter` has a real vtable and refcount 1. |
 | **It gets overwritten** | By the time `createDatabase` runs, `JProvider::pluginConfig` reads a *static-data* address that shifts with every rebuild — not the heap pointer it was constructed with.  The `FactoryParameter` and the `JProvider` are adjacent allocations, 28 bytes apart. |
 
-So this is memory corruption, not a cast or a lifetime bug.  Next steps:
+Sanitizers then ruled corruption *out*:
 
-- Rebuild with `-sSAFE_HEAP=1` and Emscripten's ASan (`-fsanitize=address`) to
-  catch the write.  This is the direct route and should name the culprit.
-- Suspect the pool allocator: Firebird's `MemoryPool` does its own block
-  management, and `SIZEOF_LONG` is patched from 8 to 4 for the 32-bit target.
-  Any place where a size or alignment assumption survived that patch would
-  corrupt adjacent allocations exactly like this.
+| Tool | Result |
+|------|--------|
+| `-sSAFE_HEAP=1` | Segfaults on the same read, confirming the address is invalid — but it catches the faulting access, not a writer. |
+| `-fsanitize=address` | **READ of size 4 at `0x00000008`** — that is `((VTable*)nullptr)->addRef`, since cloop's VTable has `addRef` at offset 8.  So `cloopVTable` is definitively NULL.  Critically, ASan reports **no** heap-buffer-overflow and **no** use-after-free beforehand. |
+| `~FactoryParameter` instrumented | **Never called.**  The config object is alive; it was not prematurely freed. |
+
+The measurement that settles it, all within one build:
+
+```
+FactoryParameter CTOR       this=0x301e78
+post-setOwner: plugin=0x301e9c  w[5]=00301e7c   <- JProvider::pluginConfig, correct
+at Database::create           pConf=0x2da73c   <- static-data address, wrong
+```
+
+`pluginConfig` is *written* correctly at `JProvider+24` (the heap
+`FactoryParameter` plus the 4-byte interface base offset) and *read back* as an
+address in the static data segment, right next to the vtable.  Nothing freed
+it and nothing wrote over it.
+
+**That makes it a layout disagreement, not memory corruption** — the member is
+read at a different offset than it was written to.
+
+Two hypotheses have since been tested and **disproven**:
+
+- **`-fno-rtti`.**  Upstream builds every platform with it
+  (`builds/posix/make.defaults`) and the WASM CMakeLists never did, so the
+  engine was being built in a configuration upstream never tests.  The flag was
+  added — it is right on its own merits, and matches how Firebird is built
+  everywhere — but the trap is unchanged.
+- **Cross-TU ODR on the `JProvider` constructor.**  `llvm-nm` over all 861
+  objects finds *no* out-of-line definition: the constructor is trivial and
+  fully inlined.  So the write (inlined into `EngineFactory::createPlugin`) and
+  the read (`JProvider::createDatabase`) are both in `jrd.cpp`, and cannot
+  disagree about layout.
+
+**Caveat on the evidence.**  The three key values — `this`, `pluginConfig` and
+the `pConf` that reaches `initAttachment` — were never printed in a single
+build.  Addresses shift between builds, so the conclusion "the member is read
+at a different offset than it was written to" is inference across two runs, not
+a single observation.  Close that first.
+
+Next steps, in order:
+
+- Print `this`, `&this->pluginConfig - (char*)this`, and `pluginConfig` at the
+  top of `JProvider::createDatabase`, *and* the same three in
+  `EngineFactory::createPlugin`, in **one** build.  That either confirms an
+  offset mismatch or redirects to the `IPluginBase*` / `JProvider*` 4-byte base
+  adjustment seen at `createPlugin` (`JProvider=0x301e98`, as
+  `IPluginBase=0x301e9c`).
+- If that does not resolve it, print `(char*)&this->pluginConfig - (char*)this`
+  in both `EngineFactory::createPlugin` and `JProvider::createDatabase`.  Equal
+  offsets disprove the layout theory outright and point back at the
+  `IPluginBase*` / `JProvider*` 4-byte base adjustment instead.
 - Note `-sEMULATE_FUNCTION_POINTER_CASTS=1` is **not** available as a
   workaround: it fails Binaryen validation on `invoke()` in `fun.epp`, the
   legacy UDF path, which calls function pointers of varying arity.  That is a
