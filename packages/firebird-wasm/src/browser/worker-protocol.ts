@@ -37,7 +37,7 @@ export interface EngineResponse {
   id: number;
   ok: boolean;
   /** Present when `ok`. */
-  result?: EngineHandle | boolean | Uint8Array | QueryResult<Row> | null;
+  result?: EngineHandle | number | boolean | Uint8Array | QueryResult<Row> | null;
   /**
    * Present when not `ok`.  A string rather than an Error because structured
    * cloning drops the prototype and the stack is the Worker's, not the

@@ -10,7 +10,7 @@
  */
 
 export { FirebirdBrowser, FirebirdBrowserTransaction } from './firebird-browser';
-export type { FirebirdBrowserOptions } from './firebird-browser';
+export type { FirebirdBrowserOptions, ExecResult } from './firebird-browser';
 
 export { encodeParams, encodeParamValue } from './params';
 

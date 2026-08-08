@@ -97,6 +97,14 @@ export interface FirebirdWasmModule {
     paramsPtr: number,
     paramsLength: number,
   ): number;
+  /**
+   * Rows affected by the most recent execute.
+   *
+   * Like `_fb_last_error`, this is out-of-band state overwritten by the next
+   * call — read it immediately.  A double because JavaScript numbers are
+   * doubles, which keeps counts above 2^31 intact.
+   */
+  _fb_last_affected_rows(): number;
   /** Free a result set returned by `_fb_query`. */
   _fb_free_result(resultPtr: number): void;
   /** Start a new transaction and return a transaction handle (0 = failed). */

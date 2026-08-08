@@ -142,8 +142,8 @@ export class WorkerTransport implements EngineTransport {
     txHandle: EngineHandle,
     sql: string,
     params: QueryParams = [],
-  ): Promise<void> {
-    return this.call<void>('execute', dbHandle, txHandle, sql, params);
+  ): Promise<number> {
+    return this.call<number>('execute', dbHandle, txHandle, sql, params);
   }
 
   query<T extends Row = Row>(

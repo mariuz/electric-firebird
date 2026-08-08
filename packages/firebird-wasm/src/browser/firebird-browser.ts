@@ -38,6 +38,12 @@ import type {
 // Public types
 // ---------------------------------------------------------------------------
 
+/** What a statement did.  Returned by `exec()`. */
+export interface ExecResult {
+  /** Rows affected — for INSERT, UPDATE and DELETE.  0 for DDL. */
+  affectedRows: number;
+}
+
 /** Options for creating a {@link FirebirdBrowser} instance. */
 export interface FirebirdBrowserOptions {
   /** Options forwarded to the IndexedDB VFS layer. */
@@ -169,11 +175,15 @@ export class FirebirdBrowser {
    * Execute a DDL or DML statement that does not return rows.
    *
    * The statement runs in its own transaction, committed on success.
+   *
+   * @returns the number of rows affected — meaningful for INSERT, UPDATE and
+   *          DELETE, and 0 for DDL.
    */
-  async exec(sql: string, params: QueryParams = []): Promise<void> {
+  async exec(sql: string, params: QueryParams = []): Promise<ExecResult> {
     await this.ensureReady();
-    await this.engine.execute(this.dbHandle, 0, sql, params);
+    const affectedRows = await this.engine.execute(this.dbHandle, 0, sql, params);
     this.markDirty();
+    return { affectedRows };
   }
 
   /**
@@ -210,8 +220,17 @@ export class FirebirdBrowser {
     try {
       result = await fn(tx);
     } catch (err) {
-      await this.engine.rollback(txHandle);
+      if (!tx.isFinished) {
+        await this.engine.rollback(txHandle);
+      }
       throw err;
+    }
+
+    // The callback may have rolled back explicitly; committing after that
+    // would target a handle the engine has already finished with.
+    if (tx.isFinished) {
+      this.markDirty();
+      return result;
     }
 
     // A failed commit finishes the transaction too, so there is nothing left
@@ -416,15 +435,52 @@ export class FirebirdBrowser {
  * really does undo them.
  */
 export class FirebirdBrowserTransaction {
+  private finished = false;
+
   constructor(
     private readonly engine: EngineTransport,
     private readonly dbHandle: EngineHandle,
     private readonly txHandle: EngineHandle,
   ) {}
 
-  /** Execute a DDL/DML statement inside this transaction. */
-  async exec(sql: string, params: QueryParams = []): Promise<void> {
-    await this.engine.execute(this.dbHandle, this.txHandle, sql, params);
+  /** Whether this transaction has already been rolled back. */
+  get isFinished(): boolean {
+    return this.finished;
+  }
+
+  /**
+   * Roll this transaction back and stop.
+   *
+   * The enclosing `transaction()` will not commit afterwards.  Use this to
+   * abandon a transaction deliberately, rather than throwing an error you do
+   * not mean — throwing also rolls back, but it propagates to the caller.
+   */
+  async rollback(): Promise<void> {
+    if (this.finished) return;
+    this.finished = true;
+    await this.engine.rollback(this.txHandle);
+  }
+
+  private assertUsable(): void {
+    if (this.finished) {
+      throw new Error('Transaction has already been rolled back');
+    }
+  }
+
+  /**
+   * Execute a DDL/DML statement inside this transaction.
+   *
+   * @returns the number of rows affected.
+   */
+  async exec(sql: string, params: QueryParams = []): Promise<ExecResult> {
+    this.assertUsable();
+    const affectedRows = await this.engine.execute(
+      this.dbHandle,
+      this.txHandle,
+      sql,
+      params,
+    );
+    return { affectedRows };
   }
 
   /** Execute a SELECT inside this transaction and return rows. */
@@ -432,6 +488,7 @@ export class FirebirdBrowserTransaction {
     sql: string,
     params: QueryParams = [],
   ): Promise<QueryResult<T>> {
+    this.assertUsable();
     return this.engine.query<T>(this.dbHandle, this.txHandle, sql, params);
   }
 }

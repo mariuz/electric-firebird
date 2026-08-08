@@ -289,8 +289,11 @@ Consequences worth knowing:
   BIGINT/NUMERIC/DECFLOAT arrive as exact decimal *strings* to avoid silent
   precision loss.
 - Multi-statement `exec()`, `affectedRows`, `tx.rollback()`.
-- Multi-statement `exec()`, `affectedRows`, `tx.rollback()` (§M2).
-- Typed result encoding (§M2).
+- Multi-statement `exec()` for migration scripts (§M2).
+- Typed result encoding (§M2): `FieldInfo` still carries only `name`, and
+  BIGINT/NUMERIC/DECFLOAT arrive as exact decimal *strings* to avoid silent
+  precision loss.
+- Multi-tab safety and live queries (§M4).
 - Multi-tab safety (§M4) and live queries (§M4).
 
 ### Persistence is atomic and incremental
@@ -364,7 +367,7 @@ Legend: ✅ shipped · 🟡 partial · ❌ missing · n/a not applicable
 | Custom `parsers` / `serializers` | ✅ | ❌ | |
 | `describeQuery()` | ✅ | ❌ | |
 | Typed field metadata (`dataTypeID`) | ✅ | ❌ | The engine knows the type but `FieldInfo` is `{ name }` only |
-| Affected-row count | ✅ | 🟡 | `QueryResult.affectedRows` is optional and unset on the browser path |
+| Affected-row count | ✅ | ✅ | `exec()` returns `{ affectedRows }` |
 | Binary / BLOB values | ✅ | 🟡 | BLOBs are read and returned (text as string, binary as base64); a `Uint8Array` needs the typed ABI |
 
 ### Transactions
@@ -372,7 +375,7 @@ Legend: ✅ shipped · 🟡 partial · ❌ missing · n/a not applicable
 | Capability | PGlite | electric-firebird | Notes |
 |---|---|---|---|
 | `transaction(cb)` with auto commit/rollback | ✅ | ✅ | Statements are bound to the transaction handle; commit/rollback paths tested |
-| Explicit `tx.rollback()` | ✅ | ❌ | Rollback only via throwing |
+| Explicit `tx.rollback()` | ✅ | ✅ | Abandons the transaction without throwing |
 | Isolation levels | ✅ | 🟡 | `TransactionOptions` is honoured on Node, ignored in the browser |
 
 ### Storage & persistence

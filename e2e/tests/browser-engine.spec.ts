@@ -200,6 +200,77 @@ test.describe('FirebirdBrowser against the real engine', () => {
     expect(message).toContain('2 were supplied');
   });
 
+
+  test('reports affected row counts', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('engine-affected', {
+        worker: new Worker('/firebird-engine-worker.js'),
+      });
+
+      const ddl = await db.exec('CREATE TABLE t (id INTEGER, tag VARCHAR(8))');
+      const insert = await db.exec("INSERT INTO t VALUES (1, 'a')");
+      await db.exec("INSERT INTO t VALUES (2, 'a')");
+      await db.exec("INSERT INTO t VALUES (3, 'b')");
+
+      const update = await db.exec("UPDATE t SET tag = 'z' WHERE tag = ?", ['a']);
+      const del = await db.exec('DELETE FROM t WHERE id = ?', [3]);
+      const noMatch = await db.exec('DELETE FROM t WHERE id = ?', [999]);
+
+      await db.close();
+      return {
+        ddl: ddl.affectedRows,
+        insert: insert.affectedRows,
+        update: update.affectedRows,
+        del: del.affectedRows,
+        noMatch: noMatch.affectedRows,
+      };
+    });
+
+    expect(result.ddl).toBe(0); // DDL reports nothing
+    expect(result.insert).toBe(1);
+    expect(result.update).toBe(2); // both rows tagged 'a'
+    expect(result.del).toBe(1);
+    expect(result.noMatch).toBe(0);
+  });
+
+  test('rolls back explicitly without throwing', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('engine-explicit-rollback', {
+        worker: new Worker('/firebird-engine-worker.js'),
+      });
+
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      await db.exec('INSERT INTO t VALUES (1)');
+
+      // Abandoning the transaction returns normally: no error propagates.
+      const returned = await db.transaction(async (tx) => {
+        await tx.exec('INSERT INTO t VALUES (2)');
+        await tx.rollback();
+        return 'abandoned';
+      });
+
+      // Using the transaction after rollback is a mistake worth reporting.
+      let afterRollback: string | null = null;
+      await db.transaction(async (tx) => {
+        await tx.rollback();
+        try {
+          await tx.exec('INSERT INTO t VALUES (3)');
+        } catch (err) {
+          afterRollback = (err as Error).message;
+        }
+      });
+
+      const count = await db.query('SELECT COUNT(*) AS CNT FROM t');
+      await db.close();
+      return { returned, afterRollback, count: count.rows[0]!['CNT'] };
+    });
+
+    expect(result.returned).toBe('abandoned');
+    expect(result.afterRollback).toContain('already been rolled back');
+    // Only the row inserted outside the transactions survived.
+    expect(result.count).toBe(1);
+  });
+
   test('persists to IndexedDB and reopens the database after a reload', async ({
     page,
   }) => {

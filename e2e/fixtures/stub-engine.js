@@ -59,6 +59,8 @@
     lastError: '',
     /** When set to a path, FS.readFile on it throws — for persist failure paths. */
     failReadFile: null,
+    /** What `_fb_last_affected_rows()` reports. */
+    affectedRows: 0,
 
     // Inspection helpers (defined once the module is built).
     /** Names of the logged calls, in order. */
@@ -319,6 +321,10 @@
 
       _fb_last_error() {
         return heapString(stub.lastError);
+      },
+
+      _fb_last_affected_rows() {
+        return stub.affectedRows;
       },
 
       _malloc: malloc,

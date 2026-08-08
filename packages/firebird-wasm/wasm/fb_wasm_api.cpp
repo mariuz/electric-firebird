@@ -104,6 +104,15 @@ int g_nextTxHandle = 1;
 
 std::string g_lastError;
 
+/**
+ * Rows affected by the most recent execute.
+ *
+ * Reported out of band like the error text, because the C entry points return
+ * a status code and there is nowhere else to put it.  Read it immediately: the
+ * next execute overwrites it.
+ */
+ISC_INT64 g_lastAffectedRows = 0;
+
 /** Buffer returned by fb_query(); freed by fb_free_result(). */
 char* allocCString(const std::string& s)
 {
@@ -1251,69 +1260,29 @@ int fb_detach_database(int db_handle)
  *
  * Returns 0 on success, non-zero on failure.
  */
+/* Defined below; fb_execute is the no-parameter case of it. */
+FB_WASM_EXPORT
+int fb_execute_params(int db_handle, int tx_handle, const char* sql,
+	const unsigned char* params, int params_length);
+
 FB_WASM_EXPORT
 int fb_execute(int db_handle, int tx_handle, const char* sql)
 {
-	clearError();
+	return fb_execute_params(db_handle, tx_handle, sql, nullptr, 0);
+}
 
-	IAttachment* attachment = lookupAttachment(db_handle);
-	if (!attachment)
-	{
-		setError("fb_execute: unknown database handle");
-		return 1;
-	}
-
-	ITransaction* transaction = nullptr;
-	bool ownTransaction = false;
-
-	if (tx_handle)
-	{
-		transaction = lookupTransaction(tx_handle);
-		if (!transaction)
-		{
-			setError("fb_execute: unknown transaction handle");
-			return 2;
-		}
-	}
-	else
-	{
-		Status status;
-		transaction = attachment->startTransaction(status.ptr(), 0, nullptr);
-		if (status.failed() || !transaction)
-		{
-			setErrorFromStatus("fb_execute: could not start transaction", status.ptr());
-			return 3;
-		}
-		ownTransaction = true;
-	}
-
-	Status status;
-	attachment->execute(status.ptr(), transaction, 0, sql, SQL_DIALECT_V6,
-		nullptr, nullptr, nullptr, nullptr);
-
-	if (status.failed())
-	{
-		setErrorFromStatus("fb_execute", status.ptr());
-		if (ownTransaction)
-		{
-			Status rollbackStatus;
-			transaction->rollback(rollbackStatus.ptr());
-		}
-		return 4;
-	}
-
-	if (ownTransaction)
-	{
-		Status commitStatus;
-		transaction->commit(commitStatus.ptr());
-		if (commitStatus.failed())
-		{
-			setErrorFromStatus("fb_execute: commit failed", commitStatus.ptr());
-			return 5;
-		}
-	}
-
-	return 0;
+/**
+ * Rows affected by the most recent fb_execute / fb_execute_params.
+ *
+ * Meaningful for INSERT, UPDATE and DELETE; 0 for DDL and for statements that
+ * report nothing.
+ */
+FB_WASM_EXPORT
+double fb_last_affected_rows(void)
+{
+	// double, not int: JavaScript numbers are doubles anyway, and this keeps
+	// counts above 2^31 intact on the way out.
+	return static_cast<double>(g_lastAffectedRows);
 }
 
 /**
@@ -1540,6 +1509,7 @@ int fb_execute_params(int db_handle, int tx_handle, const char* sql,
 	const unsigned char* params, int params_length)
 {
 	clearError();
+	g_lastAffectedRows = 0;
 
 	IAttachment* attachment = lookupAttachment(db_handle);
 	if (!attachment)
@@ -1602,6 +1572,17 @@ int fb_execute_params(int db_handle, int tx_handle, const char* sql,
 	{
 		statement->execute(status.ptr(), transaction, input.meta(), input.data(),
 			nullptr, nullptr);
+
+		if (!status.failed())
+		{
+			Status affectedStatus;
+			const ISC_UINT64 affected = statement->getAffectedRecords(affectedStatus.ptr());
+			// A statement that does not report a count is not an error; it
+			// simply has none (DDL, for instance).
+			g_lastAffectedRows = affectedStatus.failed()
+				? 0
+				: static_cast<ISC_INT64>(affected);
+		}
 	}
 
 	{

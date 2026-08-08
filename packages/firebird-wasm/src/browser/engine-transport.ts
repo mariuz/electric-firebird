@@ -45,12 +45,13 @@ export interface EngineTransport {
   attachDatabase(path: string): Promise<EngineHandle>;
   detachDatabase(dbHandle: EngineHandle): Promise<void>;
 
+  /** Returns the number of rows the statement affected. */
   execute(
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     sql: string,
     params?: QueryParams,
-  ): Promise<void>;
+  ): Promise<number>;
   query<T extends Row = Row>(
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
@@ -219,7 +220,7 @@ export class DirectTransport implements EngineTransport {
     txHandle: EngineHandle,
     sql: string,
     params: QueryParams = [],
-  ): Promise<void> {
+  ): Promise<number> {
     const mod = this.module;
     const rc = this.withString(sql, (sqlPtr) =>
       this.withParams(params, (paramPtr, paramLen) =>
@@ -231,6 +232,7 @@ export class DirectTransport implements EngineTransport {
     if (rc !== 0) {
       throw engineError(mod, `Firebird exec failed for: ${sql}`, rc);
     }
+    return mod._fb_last_affected_rows();
   }
 
   async query<T extends Row = Row>(

@@ -364,7 +364,7 @@ target_compile_options(firebird-embedded PRIVATE
 # The exported C API.  Built as a list so optional components (the pool probe)
 # can extend it; exporting a symbol that was not compiled is a link error.
 set(FB_EXPORTED_FUNCTIONS
-  _fb_init _fb_last_error
+  _fb_init _fb_last_error _fb_last_affected_rows
   _fb_create_database _fb_attach_database _fb_detach_database
   _fb_execute _fb_query _fb_execute_params _fb_query_params _fb_free_result
   _fb_start_transaction _fb_commit _fb_rollback

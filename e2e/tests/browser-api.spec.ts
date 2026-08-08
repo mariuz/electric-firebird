@@ -35,6 +35,7 @@ interface StubControl {
   commitRc: number;
   lastError: string;
   failReadFile: string | null;
+  affectedRows: number;
   callNames(): string[];
   firstCall(fn: string): { fn: string; args: unknown[] } | null;
   countCalls(fn: string): number;
