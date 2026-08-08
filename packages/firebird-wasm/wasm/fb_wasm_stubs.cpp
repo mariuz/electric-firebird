@@ -451,3 +451,28 @@ namespace EDS {
     void ConnectionsPool::setLifeTime(unsigned long) {}
     void ConnectionsPool::setMaxCount(unsigned long) {}
 }
+
+/* -----------------------------------------------------------------------
+ * pthread_mutexattr_setpshared / pthread_condattr_setpshared
+ *
+ * Emscripten declares both but returns ENOTSUP for PTHREAD_PROCESS_SHARED:
+ * there is no second process in a WASM instance to share a mutex with.
+ * Firebird requests it while initialising the shared-memory structures its
+ * lock manager uses for inter-process database access, and treats the failure
+ * as fatal — which is what stopped fb_create_database().
+ *
+ * A single-process embedded engine has nothing to coordinate with, so
+ * reporting success is accurate rather than merely convenient.  These
+ * definitions override the libc ones at link time; a macro cannot be used
+ * because <pthread.h> declares these functions and the macro would mangle the
+ * declaration.
+ * ----------------------------------------------------------------------- */
+
+#include <pthread.h>
+
+extern "C" {
+
+int pthread_mutexattr_setpshared(pthread_mutexattr_t*, int) { return 0; }
+int pthread_condattr_setpshared(pthread_condattr_t*, int) { return 0; }
+
+} /* extern "C" */

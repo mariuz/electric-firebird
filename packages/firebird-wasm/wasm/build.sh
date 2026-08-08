@@ -291,6 +291,22 @@ done
 # The substitution is idempotent (no-op if already patched to 4).
 sed -i 's/^#define SIZEOF_LONG[[:space:]]*8/#define SIZEOF_LONG 4/' "${AUTOCONFIG_SRC}"
 
+# ── Patch SIZEOF_VOID_P / SIZEOF_SIZE_T for 32-bit WASM ─────────────────────
+# Same root problem as SIZEOF_LONG: these are measured on the 64-bit host but
+# wasm32 has 4-byte pointers and size_t.  Getting SIZEOF_VOID_P wrong is not
+# cosmetic — common/classes/alloc.cpp sizes its allocator header with
+#
+#     #elif (SIZEOF_VOID_P == 4)
+#         FB_UINT64 dummyAlign;
+#
+# so with the host's value of 8 the padding is omitted and MemHeader is 8 bytes
+# instead of 16.  Every pool allocation then comes back 8 bytes off a 16-byte
+# boundary (ALLOC_ALIGNMENT is 16) and the block arithmetic writes past the end
+# of live blocks.  That corrupted the engine's JProvider and made
+# fb_create_database() trap.  Both substitutions are idempotent.
+sed -i 's/^#define SIZEOF_VOID_P[[:space:]]*8/#define SIZEOF_VOID_P 4/' "${AUTOCONFIG_SRC}"
+sed -i 's/^#define SIZEOF_SIZE_T[[:space:]]*8/#define SIZEOF_SIZE_T 4/' "${AUTOCONFIG_SRC}"
+
 # ── Patch GETTIMEOFDAY for Emscripten ────────────────────────────────────────
 # The native cmake configure detects that gettimeofday() does NOT accept a
 # second (timezone) argument, so autoconfig.h ends up with:

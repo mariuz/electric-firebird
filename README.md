@@ -119,9 +119,11 @@ The library provides two execution backends:
 ### Roadmap
 
 > **Status:** the Node.js backend works.  The browser backend **builds and
-> starts**: `firebird-embedded.wasm` (8.2 MB) links cleanly and `fb_init()`
-> succeeds in Chromium against the real engine.  It does not execute SQL yet —
-> `fb_create_database()` hits a WASM `function signature mismatch` trap.
+> starts**: `firebird-embedded.wasm` links cleanly, `fb_init()` succeeds in
+> Chromium against the real engine, and errors now propagate properly with
+> Firebird's own messages.  It does not create a database yet — the engine
+> wants to start worker threads and the build has no pthreads:
+> `pthread_create failed -Not supported`.
 
 - [x] WASM build infrastructure (Emscripten CMake + build script, tracks Firebird `master`)
 - [x] Browser support module (`FirebirdBrowser`)
@@ -131,7 +133,9 @@ The library provides two execution backends:
 - [x] Transactions that bind statements to the transaction handle
 - [x] Link the WASM build (Emscripten vendored at `third_party/emsdk`)
 - [x] Compile Firebird's metadata layer for real (gpre boot pass) instead of stubbing it
-- [ ] **Fix the `function signature mismatch` trap in `fb_create_database()`** — the remaining blocker
+- [x] Fix the memory-pool corruption (`autoconfig.h` described the 64-bit host: `SIZEOF_VOID_P`/`SIZEOF_SIZE_T`)
+- [x] Enable C++ exceptions (`-fwasm-exceptions`) — Firebird reports every error by throwing
+- [ ] **Threads: build with `-pthread`, or stop the engine spawning them** — the remaining blocker
 - [ ] Parameterised queries in the browser (currently refused rather than ignored)
 - [ ] Incremental, atomic IndexedDB persistence
 - [ ] Web Worker + multi-tab safety

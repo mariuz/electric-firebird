@@ -250,6 +250,15 @@ set(FB_WASM_GLUE_SRCS
   "${CMAKE_CURRENT_SOURCE_DIR}/fb_wasm_stubs.cpp"
 )
 
+# Diagnostic: exercises Firebird's MemoryPool directly, with no engine
+# involved, to check whether it hands out overlapping or misaligned blocks.
+# See docs/roadmap.md, "The create-database trap".
+option(FB_WASM_POOL_PROBE "Build the MemoryPool diagnostic (_fb_pool_probe)" OFF)
+if(FB_WASM_POOL_PROBE)
+  message(STATUS "FB_WASM_POOL_PROBE=ON: building _fb_pool_probe")
+  list(APPEND FB_WASM_GLUE_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/fb_pool_probe.cpp")
+endif()
+
 # ---------------------------------------------------------------------------
 # WASM library target
 # ---------------------------------------------------------------------------
@@ -305,12 +314,20 @@ target_compile_definitions(firebird-embedded PRIVATE
 # are linked into the WASM binary.
 target_compile_options(firebird-embedded PRIVATE
   "-Dpthread_rwlockattr_setkind_np(a,b)=0"
+
   "-sUSE_ICU=1"
   # Upstream builds every platform with -fno-rtti (see builds/posix/make.defaults:
   # PLUSPLUS_FLAGS := -fno-rtti -std=c++20 …).  Firebird's cloop interfaces
   # implement their own dispatch and are designed against that ABI, so building
   # them with RTTI enabled is a deviation from every tested configuration.
   "-fno-rtti"
+  # Firebird signals every error by throwing (Arg::Gds(...).raise()), and
+  # catches internally to convert to status vectors.  Emscripten disables
+  # exception support by default, which turns any throw into an abort at
+  # ___cxa_throw — so the engine cannot report a single error without this.
+  # Native WASM exceptions rather than the JS-based emulation: smaller and
+  # much faster, supported by every browser since ~2022.
+  "-fwasm-exceptions"
 )
 
 # ---------------------------------------------------------------------------
@@ -321,6 +338,27 @@ target_compile_options(firebird-embedded PRIVATE
 # - ALLOW_MEMORY_GROWTH: database buffers can grow at runtime
 # - FORCE_FILESYSTEM: include MEMFS so databases live in virtual memory
 # - EXPORTED_RUNTIME_METHODS: helper utilities passed through to JS
+# The exported C API.  Built as a list so optional components (the pool probe)
+# can extend it; exporting a symbol that was not compiled is a link error.
+set(FB_EXPORTED_FUNCTIONS
+  _fb_init _fb_last_error
+  _fb_create_database _fb_attach_database _fb_detach_database
+  _fb_execute _fb_query _fb_free_result
+  _fb_start_transaction _fb_commit _fb_rollback
+  _malloc _free
+)
+if(FB_WASM_POOL_PROBE)
+  list(APPEND FB_EXPORTED_FUNCTIONS _fb_pool_probe)
+endif()
+
+set(FB_EXPORTED_FUNCTIONS_JSON "")
+foreach(fn ${FB_EXPORTED_FUNCTIONS})
+  if(FB_EXPORTED_FUNCTIONS_JSON)
+    string(APPEND FB_EXPORTED_FUNCTIONS_JSON ",")
+  endif()
+  string(APPEND FB_EXPORTED_FUNCTIONS_JSON "\\\"${fn}\\\"")
+endforeach()
+
 set(EMSCRIPTEN_LINK_FLAGS
   # Report every unresolved symbol, not the default first 20 — with a build
   # this size, a truncated list means several link iterations to see one
@@ -328,7 +366,7 @@ set(EMSCRIPTEN_LINK_FLAGS
   "-Wl,--error-limit=0"
   "-s MODULARIZE=1"
   "-s EXPORT_NAME='createFirebirdModule'"
-  "-s EXPORTED_FUNCTIONS='[\"_fb_init\",\"_fb_last_error\",\"_fb_create_database\",\"_fb_attach_database\",\"_fb_detach_database\",\"_fb_execute\",\"_fb_query\",\"_fb_free_result\",\"_fb_start_transaction\",\"_fb_commit\",\"_fb_rollback\",\"_malloc\",\"_free\"]'"
+  "-s EXPORTED_FUNCTIONS='[${FB_EXPORTED_FUNCTIONS_JSON}]'"
   "-s EXPORTED_RUNTIME_METHODS='[\"UTF8ToString\",\"stringToUTF8\",\"lengthBytesUTF8\",\"FS\",\"MEMFS\"]'"
   "-s ALLOW_MEMORY_GROWTH=1"
   "-s INITIAL_MEMORY=67108864"
@@ -336,6 +374,8 @@ set(EMSCRIPTEN_LINK_FLAGS
   "-s ENVIRONMENT='web,worker,node'"
   "-s SINGLE_FILE=0"
   "-s USE_ICU=1"
+  # Must match the compile side; see -fwasm-exceptions above.
+  "-fwasm-exceptions"
 )
 
 # ---------------------------------------------------------------------------

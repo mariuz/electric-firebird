@@ -79,63 +79,77 @@ fails on a concrete, locatable defect rather than on absence.
 | 9 | `build.sh` applied patches with `\|\| echo "(already applied or not applicable – skipping)"`. Patch 0002 was structurally corrupt (bad hunk headers) and 0003 had drifted, so **neither had ever been applied** to the tree being compiled. | **Fixed** — both regenerated against master, and the loop now distinguishes "already applied" from "does not apply" and exits non-zero on the latter. |
 | 10 | `wasm.spec.ts` asserted `_fb_init()` returns 0 and that `_fb_query()` yields `columns`/`rows` arrays — both of which the *stub* satisfied by construction, so it could not tell a working engine from a stub. | **Fixed** — it now drives a create → insert → select round-trip and asserts the actual rows. |
 
-### The create-database trap
+### The create-database trap — root cause found and fixed
 
-`_fb_create_database()` aborts with WASM's `null function or function
-signature mismatch`.  **Root cause located: Firebird's `MemoryPool` hands out a
-block that overlaps a live object.**
+`_fb_create_database()` used to abort with WASM's `null function or function
+signature mismatch`.  **Cause: `autoconfig.h` described the 64-bit host, not
+the 32-bit target, and Firebird's memory pool sized its allocator header from
+that.**
 
-The failing read is `Database.cpp:886` — `dbb_plugin_config(pConf)` →
-`RefPtr<IPluginConfig>::RefPtr` → `pConf->addRef()`.  ASan reports `READ of
-size 4 at 0x00000008`, which is `((VTable*)nullptr)->addRef` (cloop puts
-`addRef` at VTable offset 8), so `cloopVTable` is NULL.
+`autoconfig.h` is produced by a native x86-64 configure, so it recorded
+`SIZEOF_VOID_P 8` and `SIZEOF_SIZE_T 8`.  The artifact targets wasm32, where
+both are 4.  `build.sh` already knew this class of problem existed — it patched
+`SIZEOF_LONG` 8 → 4 — but stopped there.
 
-Watching `JProvider::pluginConfig` (offset 24) through one run pins the moment
-it changes:
+That is not cosmetic.  `common/classes/alloc.cpp` sizes its allocator header:
 
-```
-EngineFactory       JProvider=0x2b1e98  par=0x2b1e7c
-locateProvider      pluginConfig = 0x2b1e7c        ok
-fb_init end         pluginConfig = 0x2b1e7c        ok
-fb_create_database  pluginConfig = 0x2b1e7c        ok
-after Status ctor   pluginConfig = 0x2b1e7c        ok
-after getXpbBuilder pluginConfig = 0x28fadc        CORRUPTED   dpb = 0x2b1ebc
+```cpp
+#elif (SIZEOF_VOID_P == 4)
+    FB_UINT64 dummyAlign;      // padding so MemHeader is 16 bytes
+#endif
 ```
 
-`IUtil::getXpbBuilder()` allocates the DPB builder at `0x2b1ebc` while the
-`JProvider` at `0x2b1e98` is still live and referenced.  The clobbered member
-sits at `0x2b1eb0` — exactly 12 bytes below the new block — so the allocator
-wrote its block header backwards into the live object.
+With the host's 8, the padding is omitted and `MemHeader` is 8 bytes instead of
+16.  Every pool allocation then came back 8 bytes off a 16-byte boundary
+(`ALLOC_ALIGNMENT` is 16) and the block arithmetic wrote past the ends of live
+blocks.  One of those writes landed on `JProvider::pluginConfig`, whose vtable
+pointer the engine then dereferenced.
 
-Note also that neither address is 16-byte aligned (`0x2b1e98 % 16 == 8`,
-`0x2b1ebc % 16 == 12`) even though `alloc.h` declares
-`#define ALLOC_ALIGNMENT 16`.
+A standalone probe (`wasm/fb_pool_probe.cpp`, `-DFB_WASM_POOL_PROBE=ON`)
+allocates 16 blocks from the default pool with no engine involved:
 
-Ruled out along the way, each with evidence:
+| | before fix | after fix |
+|---|---|---|
+| Misaligned returns | 16 of 16 (all `ptr % 16 == 8`) | 0 |
+| Blocks clobbered while live | 7 | 0 |
+| Total problems | 23 | 0 |
 
-| Hypothesis | Verdict |
-|---|---|
-| Null `pConf` | No — `RefPtr` guards null; the pointer is non-null with a NULL vtable. |
-| Broken cloop dispatch | No — `addRef`/`release` on the provider itself works. |
-| `IPluginSet` released too early | No — retaining it changes nothing.  Kept anyway: Firebird's own `GetPlugins` holds the set, so releasing it early was wrong regardless. |
-| Argument passing to `initAttachment` | No — `pConf` arrives exactly as sent; the value is already wrong at the call site. |
-| Cross-TU ODR on the constructor | No — `llvm-nm` over 861 objects finds no out-of-line definition; it is inlined into `jrd.cpp`, the same TU that reads it. |
-| Missing `-fno-rtti` | No — added to match upstream (right on its own merits) but the trap is unchanged. |
-| Premature release of the provider | No — `~FactoryParameter` never runs, and taking our own reference does not help. |
-| ASan finding a stray write | No — ASan sees no bad write, because `FB_NEW` allocates from Firebird's `MemoryPool`, whose internal sub-allocation is invisible to it. |
+Two further porting defects surfaced immediately behind it, both fixed:
 
-Next steps:
+- **C++ exceptions were disabled.**  Firebird signals every error by throwing
+  (`Arg::Gds(...).raise()`) and catches internally to build status vectors.
+  Emscripten disables exception support by default, so the first `throw`
+  aborted at `___cxa_throw` — the engine could not report an error at all.
+  Built with `-fwasm-exceptions` (native WASM EH: smaller and faster than the
+  JS emulation, supported by all browsers since ~2022).
+- **`PTHREAD_PROCESS_SHARED` is unsupported.**  Firebird requests it when
+  setting up the shared memory its lock manager uses for inter-process access,
+  and treats failure as fatal.  A single-process WASM instance has no second
+  process to coordinate with, so `pthread_mutexattr_setpshared` and
+  `pthread_condattr_setpshared` are overridden to succeed.  A macro cannot be
+  used here (unlike `pthread_rwlockattr_setkind_np`) because `<pthread.h>`
+  declares these and the macro would mangle the declaration.
 
-- Reproduce in isolation: two `FB_NEW` allocations from the default pool, then
-  check whether the second overlaps the first.  That reduces the bug to a few
-  lines and takes the engine out of the picture.
-- Read `common/classes/alloc.cpp` for size/alignment arithmetic that assumes a
-  64-bit `long` or 8-byte pointers.  `autoconfig.h` is generated for the
-  64-bit host and then patched (`SIZEOF_LONG` 8 → 4); anything that survived
-  that patch would corrupt adjacent allocations exactly this way.
-- Check `getDefaultMemoryPool()` under WASM: if the pool differs between the
-  plugin-registration path and later calls, one pool's free list would not know
-  about the other's live blocks.
+With those three fixed, `fb_create_database()` no longer traps and reports
+errors properly through `fb_last_error()`.  The next barrier is real:
+
+```
+fb_create_database: operating system directive pthread_create failed
+-Not supported
+```
+
+Firebird starts worker threads (timer, garbage collector, cache writer).
+Options, in order of preference:
+
+- Build with `-pthread`.  Emscripten implements pthreads over Web Workers and
+  SharedArrayBuffer; it works in Node, and in browsers requires COOP/COEP
+  cross-origin isolation headers, which the e2e server can set.  Note the
+  interaction with `ALLOW_MEMORY_GROWTH`, which is currently on.
+- Or stop the engine starting threads at all.  There is no supported
+  "no threads" mode, so this means finding each `Thread::start` on the
+  attachment path and establishing whether an embedded single-user
+  configuration needs it.  Closer to how PGlite runs Postgres single-threaded,
+  but a much larger port.
 
 ---
 
