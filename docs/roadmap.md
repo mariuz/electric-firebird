@@ -79,6 +79,35 @@ fails on a concrete, locatable defect rather than on absence.
 | 9 | `build.sh` applied patches with `\|\| echo "(already applied or not applicable – skipping)"`. Patch 0002 was structurally corrupt (bad hunk headers) and 0003 had drifted, so **neither had ever been applied** to the tree being compiled. | **Fixed** — both regenerated against master, and the loop now distinguishes "already applied" from "does not apply" and exits non-zero on the latter. |
 | 10 | `wasm.spec.ts` asserted `_fb_init()` returns 0 and that `_fb_query()` yields `columns`/`rows` arrays — both of which the *stub* satisfied by construction, so it could not tell a working engine from a stub. | **Fixed** — it now drives a create → insert → select round-trip and asserts the actual rows. |
 
+### The create-database trap
+
+`_fb_create_database()` aborts with WASM's `null function or function
+signature mismatch`.  What is established, with evidence:
+
+| Step | Finding |
+|------|---------|
+| Where | `Database.cpp:886` — `dbb_plugin_config(pConf)` → `RefPtr<IPluginConfig>::RefPtr` → `pConf->addRef()` through the cloop vtable.  Pinned with `emsymbolizer` against a DWARF build. |
+| Not null | `RefPtr` guards `if (ptr)`, so `pConf` is non-null.  Dumping it shows `cloopVTable == 0` — a null vtable, hence "null function". |
+| Not a cloop problem | A probe calling `addRef`/`release` on the provider itself succeeds, so cloop dispatch works in general. |
+| Not plugin-set lifetime | Retaining the `IPluginSet` (as Firebird's own `GetPlugins` does) changes nothing.  The change was kept anyway — it is correct. |
+| Not a bad `this` | `JProvider::createDatabase` sees `this == 0x301e98`, the same pointer `EngineFactory::createPlugin` returned. |
+| The config was valid | At `createPlugin`, `factoryParameter` has a real vtable and refcount 1. |
+| **It gets overwritten** | By the time `createDatabase` runs, `JProvider::pluginConfig` reads a *static-data* address that shifts with every rebuild — not the heap pointer it was constructed with.  The `FactoryParameter` and the `JProvider` are adjacent allocations, 28 bytes apart. |
+
+So this is memory corruption, not a cast or a lifetime bug.  Next steps:
+
+- Rebuild with `-sSAFE_HEAP=1` and Emscripten's ASan (`-fsanitize=address`) to
+  catch the write.  This is the direct route and should name the culprit.
+- Suspect the pool allocator: Firebird's `MemoryPool` does its own block
+  management, and `SIZEOF_LONG` is patched from 8 to 4 for the 32-bit target.
+  Any place where a size or alignment assumption survived that patch would
+  corrupt adjacent allocations exactly like this.
+- Note `-sEMULATE_FUNCTION_POINTER_CASTS=1` is **not** available as a
+  workaround: it fails Binaryen validation on `invoke()` in `fun.epp`, the
+  legacy UDF path, which calls function pointers of varying arity.  That is a
+  separate WASM-hostile construct worth excluding independently, since UDFs
+  are meaningless in a browser.
+
 ---
 
 ## 2. Feature comparison with PGlite
@@ -207,11 +236,8 @@ By "how much damage does this do to a user who tries the README today":
       build: zero undefined, zero duplicate symbols.
 - [x] Compile the metadata layer for real via the boot gpre pass instead of
       stubbing it out.
-- [ ] **Fix the `function signature mismatch` trap in `_fb_create_database()`.**
-      Cheapest first: rebuild with `-sASSERTIONS=2` to get the offending call
-      site; look for a function pointer cast through an incompatible type on
-      the attachment path; last resort `-sEMULATE_FUNCTION_POINTER_CASTS=1`,
-      which is correct but slow.
+- [ ] **Fix the `_fb_create_database()` trap.**  Diagnosed down to the exact
+      member; see "The create-database trap" below.
 - [ ] Re-check the remaining stubs in `fb_wasm_stubs.cpp` once the engine
       executes a statement.
 - **Acceptance:** in Chromium, `CREATE TABLE` → `INSERT` → `SELECT` returns the

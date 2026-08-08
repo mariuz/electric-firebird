@@ -333,5 +333,34 @@ set(EMSCRIPTEN_LINK_FLAGS
   "-s USE_ICU=1"
 )
 
+# ---------------------------------------------------------------------------
+# Optional debug profile:  cmake -DFB_WASM_DEBUG=ON
+# ---------------------------------------------------------------------------
+# ASSERTIONS=2 turns WASM's terse aborts ("function signature mismatch") into
+# messages naming the offending call, and --profiling-funcs keeps function
+# names in stack traces without the size cost of full DWARF.
+option(FB_WASM_DEBUG "Build with Emscripten assertions and named stack frames" OFF)
+
+if(FB_WASM_DEBUG)
+  message(STATUS "FB_WASM_DEBUG=ON: assertions and named stack frames enabled")
+  list(APPEND EMSCRIPTEN_LINK_FLAGS
+    "-s ASSERTIONS=2"
+    "--profiling-funcs"
+    "-g"
+  )
+endif()
+
+# Compile a few files with DWARF so their frames carry line numbers.  Doing
+# this for the whole engine would be enormous; naming the files under
+# investigation keeps the rebuild to seconds.
+set(FB_WASM_DEBUG_SOURCES "" CACHE STRING
+    "Semicolon-separated source paths to compile with -g for line numbers")
+if(FB_WASM_DEBUG AND FB_WASM_DEBUG_SOURCES)
+  foreach(dbg_src ${FB_WASM_DEBUG_SOURCES})
+    set_source_files_properties("${dbg_src}" PROPERTIES COMPILE_OPTIONS "-g")
+    message(STATUS "  debug line info: ${dbg_src}")
+  endforeach()
+endif()
+
 string(REPLACE ";" " " EMSCRIPTEN_LINK_FLAGS_STR "${EMSCRIPTEN_LINK_FLAGS}")
 set_target_properties(firebird-embedded PROPERTIES LINK_FLAGS "${EMSCRIPTEN_LINK_FLAGS_STR}")

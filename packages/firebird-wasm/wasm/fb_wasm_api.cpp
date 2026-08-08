@@ -84,6 +84,12 @@ IMaster*   g_master   = nullptr;
 IProvider* g_provider = nullptr;
 IUtil*     g_util     = nullptr;
 
+/**
+ * The plugin set that produced g_provider, retained for the lifetime of the
+ * module.  See locateProvider() for why it must outlive the provider.
+ */
+IPluginSet* g_pluginSet = nullptr;
+
 /** An attached database plus the transaction used for auto-commit work. */
 struct DbEntry
 {
@@ -693,9 +699,14 @@ IProvider* locateProvider()
 			IPluginBase* plugin = plugins->getPlugin(status.ptr());
 			if (!status.failed() && plugin)
 			{
-				IProvider* provider = static_cast<IProvider*>(plugin);
-				plugins->release();
-				return provider;
+				// Deliberately NOT released.  Firebird's own GetPlugins<> holds
+				// the set for as long as the plugin is used: the IPluginConfig
+				// handed to the plugin is created by ConfiguredPlugin::factory()
+				// and its lifetime is tied to the set.  Releasing the set here
+				// leaves JProvider::pluginConfig dangling, and the engine
+                                // dereferences it when constructing a Database.
+				g_pluginSet = plugins;
+				return static_cast<IProvider*>(plugin);
 			}
 			plugins->release();
 		}
