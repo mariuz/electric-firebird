@@ -57,6 +57,8 @@
     commitRc: 0,
     /** Text `_fb_last_error()` reports; the real engine puts Firebird's own message here. */
     lastError: '',
+    /** When set to a path, FS.readFile on it throws — for persist failure paths. */
+    failReadFile: null,
 
     // Inspection helpers (defined once the module is built).
     /** Names of the logged calls, in order. */
@@ -166,6 +168,8 @@
         return { exists: files.has(path) || dirs.has(path) };
       },
       readFile(path) {
+        stub.calls.push({ fn: 'FS.readFile', args: [path] });
+        if (stub.failReadFile === path) throw new Error(`ENOENT: ${path} (injected)`);
         if (!files.has(path)) throw new Error(`ENOENT: ${path}`);
         return files.get(path);
       },

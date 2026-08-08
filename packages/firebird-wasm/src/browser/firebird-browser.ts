@@ -69,6 +69,34 @@ export interface FirebirdBrowserOptions {
    * seam for tests.
    */
   transport?: EngineTransport;
+  /**
+   * Persist to IndexedDB automatically after writes.
+   *
+   * Without this, a tab closed without `close()` loses everything written in
+   * that session — the common way to leave a page.  Enabled by default:
+   * silently losing committed data is a worse default than the cost of
+   * writing it.
+   *
+   * Set `false` to persist only on `close()` and explicit `persist()` calls.
+   *
+   * @default true
+   */
+  autoPersist?: boolean;
+  /**
+   * How long to wait after the last write before persisting, in
+   * milliseconds.  Bursts of statements coalesce into one persist.
+   *
+   * @default 500
+   */
+  autoPersistDebounceMs?: number;
+  /**
+   * Called when a background persist fails.
+   *
+   * Background persists cannot reject into caller code, and swallowing the
+   * error would hide data loss, so it is reported here.  Defaults to
+   * `console.error`.
+   */
+  onPersistError?: (error: Error) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -94,6 +122,16 @@ export class FirebirdBrowser {
   private closed = false;
   private initPromise: Promise<void> | null = null;
 
+  private readonly autoPersist: boolean;
+  private readonly autoPersistDebounceMs: number;
+  private readonly onPersistError: (error: Error) => void;
+  private persistTimer: ReturnType<typeof setTimeout> | null = null;
+  /** In-flight persist, so two never overlap. */
+  private persistInFlight: Promise<void> | null = null;
+  /** A write arrived while a persist was running; persist again after it. */
+  private persistAgain = false;
+  private lifecycleAttached = false;
+
   /**
    * @param dbName  Logical database name.  Used as the IndexedDB store name
    *                and the filename inside Emscripten's virtual FS.
@@ -103,6 +141,12 @@ export class FirebirdBrowser {
     this.dbName = dbName;
     this.options = options;
     this.vfs = new IndexedDBVFS(options.vfs);
+
+    this.autoPersist = options.autoPersist ?? true;
+    this.autoPersistDebounceMs = options.autoPersistDebounceMs ?? 500;
+    this.onPersistError =
+      options.onPersistError ??
+      ((error) => console.error('[firebird-wasm] background persist failed', error));
 
     this.engine =
       options.transport ??
@@ -129,6 +173,7 @@ export class FirebirdBrowser {
   async exec(sql: string, params: QueryParams = []): Promise<void> {
     await this.ensureReady();
     await this.engine.execute(this.dbHandle, 0, sql, params);
+    this.markDirty();
   }
 
   /**
@@ -172,6 +217,7 @@ export class FirebirdBrowser {
     // A failed commit finishes the transaction too, so there is nothing left
     // to roll back here.
     await this.engine.commit(txHandle);
+    this.markDirty();
     return result;
   }
 
@@ -181,8 +227,36 @@ export class FirebirdBrowser {
    */
   async persist(): Promise<void> {
     if (!this.dbHandle) return;
-    const image = await this.engine.readFile(this.dbPath);
-    await this.vfs.importDatabase(image);
+
+    // Two persists must not interleave: both read the image and write the
+    // same store, and the later one could finish first and roll the database
+    // back to an older state.
+    if (this.persistInFlight) {
+      this.persistAgain = true;
+      await this.persistInFlight;
+      return;
+    }
+
+    this.cancelScheduledPersist();
+
+    const run = (async () => {
+      const image = await this.engine.readFile(this.dbPath);
+      await this.vfs.importDatabase(image);
+    })();
+
+    this.persistInFlight = run;
+    try {
+      await run;
+    } finally {
+      this.persistInFlight = null;
+    }
+
+    // Writes that arrived mid-persist are not covered by the image just
+    // written, so go again.
+    if (this.persistAgain) {
+      this.persistAgain = false;
+      await this.persist();
+    }
   }
 
   /**
@@ -190,6 +264,21 @@ export class FirebirdBrowser {
    */
   async close(): Promise<void> {
     if (this.closed) return;
+
+    // Stop scheduling before marking closed, so nothing fires mid-teardown.
+    this.cancelScheduledPersist();
+    this.detachLifecycleListeners();
+
+    // A background persist may still be running; let it finish so it cannot
+    // write after the engine has gone.
+    if (this.persistInFlight) {
+      try {
+        await this.persistInFlight;
+      } catch {
+        // Already reported through onPersistError.
+      }
+    }
+
     this.closed = true;
 
     if (this.dbHandle) {
@@ -202,6 +291,83 @@ export class FirebirdBrowser {
     await this.vfs.close();
     await this.engine.dispose();
   }
+
+  // ── Automatic persistence ─────────────────────────────────────────────
+
+  /** Note that the database has changed and schedule a persist. */
+  private markDirty(): void {
+    if (!this.autoPersist || this.closed) return;
+
+    if (this.persistTimer !== null) {
+      clearTimeout(this.persistTimer);
+    }
+
+    this.persistTimer = setTimeout(() => {
+      this.persistTimer = null;
+      void this.persistInBackground();
+    }, this.autoPersistDebounceMs);
+  }
+
+  private cancelScheduledPersist(): void {
+    if (this.persistTimer !== null) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = null;
+    }
+  }
+
+  /**
+   * Persist without a caller to reject into.
+   *
+   * Failures are reported through `onPersistError`; letting them become
+   * unhandled rejections would hide data loss.
+   */
+  private async persistInBackground(): Promise<void> {
+    if (this.closed) return;
+    try {
+      await this.persist();
+    } catch (err) {
+      this.onPersistError(err instanceof Error ? err : new Error(String(err)));
+    }
+  }
+
+  /**
+   * Flush when the page is being hidden or unloaded.
+   *
+   * `visibilitychange` to hidden is the event to rely on: it fires on mobile
+   * when an app is backgrounded, where `beforeunload` and `unload` often do
+   * not fire at all.  `pagehide` covers the bfcache case.  Neither can await
+   * an async write, so this is best-effort — which is why writes are also
+   * persisted on a debounce rather than only here.
+   */
+  private attachLifecycleListeners(): void {
+    if (this.lifecycleAttached || !this.autoPersist) return;
+    if (typeof document === 'undefined' || typeof addEventListener !== 'function') {
+      return; // not a browser
+    }
+
+    this.lifecycleAttached = true;
+    document.addEventListener('visibilitychange', this.onVisibilityChange);
+    addEventListener('pagehide', this.onPageHide);
+  }
+
+  private detachLifecycleListeners(): void {
+    if (!this.lifecycleAttached) return;
+    this.lifecycleAttached = false;
+    document.removeEventListener('visibilitychange', this.onVisibilityChange);
+    removeEventListener('pagehide', this.onPageHide);
+  }
+
+  private readonly onVisibilityChange = (): void => {
+    if (document.visibilityState === 'hidden') {
+      this.cancelScheduledPersist();
+      void this.persistInBackground();
+    }
+  };
+
+  private readonly onPageHide = (): void => {
+    this.cancelScheduledPersist();
+    void this.persistInBackground();
+  };
 
   // ── Initialisation ────────────────────────────────────────────────────
 
@@ -234,6 +400,8 @@ export class FirebirdBrowser {
     this.dbHandle = (await this.engine.exists(this.dbPath))
       ? await this.engine.attachDatabase(this.dbPath)
       : await this.engine.createDatabase(this.dbPath);
+
+    this.attachLifecycleListeners();
   }
 }
 

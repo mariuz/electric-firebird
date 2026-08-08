@@ -34,6 +34,7 @@ interface StubControl {
   startTxFails: boolean;
   commitRc: number;
   lastError: string;
+  failReadFile: string | null;
   callNames(): string[];
   firstCall(fn: string): { fn: string; args: unknown[] } | null;
   countCalls(fn: string): number;
@@ -995,6 +996,139 @@ test.describe('FirebirdBrowser', () => {
 
     expect(message).toContain('no Firebird provider available');
     expect(message).toContain('(code 3)');
+  });
+
+
+  // ── Automatic persistence ───────────────────────────────────────────────
+
+  test('persists automatically after a write, coalescing a burst', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('autopersist', {
+        autoPersistDebounceMs: 20,
+      });
+
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      await db.exec('INSERT INTO t VALUES (1)');
+      await db.exec('INSERT INTO t VALUES (2)');
+
+      // Nothing written yet: the debounce has not elapsed.
+      const before = window.__stub.countCalls('FS.readFile');
+
+      await new Promise((r) => setTimeout(r, 120));
+      const after = window.__stub.countCalls('FS.readFile');
+
+      await db.close();
+      return { before, after };
+    });
+
+    expect(result.before).toBe(0);
+    // Three statements, one persist — the burst coalesced.
+    expect(result.after).toBe(1);
+  });
+
+  test('does not persist automatically when the option is off', async ({
+    page,
+  }) => {
+    const reads = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('autopersist-off', {
+        autoPersist: false,
+        autoPersistDebounceMs: 20,
+      });
+
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      await new Promise((r) => setTimeout(r, 120));
+
+      const count = window.__stub.countCalls('FS.readFile');
+      await db.close();
+      return count;
+    });
+
+    expect(reads).toBe(0);
+  });
+
+  test('flushes when the page is hidden, without waiting for the debounce', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('autopersist-hidden', {
+        // Long enough that only the visibility handler can explain a write.
+        autoPersistDebounceMs: 60_000,
+      });
+
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      const before = window.__stub.countCalls('FS.readFile');
+
+      // Report the document as hidden and fire the event the browser would.
+      Object.defineProperty(document, 'visibilityState', {
+        configurable: true,
+        get: () => 'hidden',
+      });
+      document.dispatchEvent(new Event('visibilitychange'));
+
+      await new Promise((r) => setTimeout(r, 50));
+      const after = window.__stub.countCalls('FS.readFile');
+
+      await db.close();
+      return { before, after };
+    });
+
+    expect(result.before).toBe(0);
+    expect(result.after).toBe(1);
+  });
+
+  test('reports a background persist failure instead of losing it', async ({
+    page,
+  }) => {
+    const message = await page.evaluate(async () => {
+      let reported: string | null = null;
+
+      const db = new window.FB.FirebirdBrowser('autopersist-error', {
+        autoPersistDebounceMs: 20,
+        onPersistError: (err) => {
+          reported = err.message;
+        },
+      });
+
+      await db.exec('CREATE TABLE t (id INTEGER)');
+
+      // Break the read the persist depends on, after the database is open.
+      const path = '/data/autopersist-error.fdb';
+      window.__stub.failReadFile = path;
+
+      await new Promise((r) => setTimeout(r, 120));
+      window.__stub.failReadFile = null;
+
+      await db.close();
+      return reported;
+    });
+
+    // Surfaced through the callback rather than becoming an unhandled
+    // rejection, which would hide data loss.
+    expect(message).toContain('ENOENT');
+  });
+
+  test('cancels a pending persist when closed', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('autopersist-close', {
+        autoPersistDebounceMs: 50,
+      });
+
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      await db.close(); // close() persists once, itself
+
+      const afterClose = window.__stub.countCalls('FS.readFile');
+      await new Promise((r) => setTimeout(r, 150));
+      const later = window.__stub.countCalls('FS.readFile');
+
+      return { afterClose, later };
+    });
+
+    // close() persisted; the scheduled one must not fire afterwards, when the
+    // engine is gone.
+    expect(result.afterClose).toBe(1);
+    expect(result.later).toBe(1);
   });
 
   test('reopens an existing database after a reload instead of recreating it', async ({

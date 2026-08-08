@@ -101,16 +101,32 @@ Calling `db.close()` automatically calls `db.persist()` before detaching:
 await db.close(); // persists, then detaches
 ```
 
-### Manual persistence
+### Automatic persistence
 
-For long-running sessions you may want to persist more frequently:
+On by default. Writes are persisted after a short debounce, and again when the
+page is hidden:
 
 ```ts
-// Every 30 seconds
-setInterval(() => db.persist(), 30_000);
+const db = new FirebirdBrowser('mydb', {
+  worker: new Worker('/firebird-engine-worker.js'),
+  autoPersist: true,            // the default
+  autoPersistDebounceMs: 500,   // coalesce bursts of statements
+  onPersistError: (err) => report(err),
+});
+```
 
-// Before page unload
-window.addEventListener('beforeunload', () => db.persist());
+`visibilitychange` is used rather than `beforeunload`, because it fires when a
+mobile browser backgrounds the app while `beforeunload` often does not. That
+path cannot await an async write, so it is best-effort — which is why the
+debounce exists as well.
+
+### Manual persistence
+
+Turn the automatic behaviour off and drive it yourself:
+
+```ts
+const db = new FirebirdBrowser('mydb', { worker, autoPersist: false });
+await db.persist();
 ```
 
 ### IndexedDB storage layout
@@ -179,7 +195,7 @@ await db.transaction(async (tx) => {
 | Pre-built WASM binary on npm | Not published — you must build it yourself with emsdk |
 | Parameterised queries (`?` placeholders) | Supported. Values are sent as text and converted by the engine, so integers, decimals, booleans and dates all work; binary (`Uint8Array`) parameters throw rather than corrupt data |
 | Concurrent tabs | **Unsafe** — two tabs open the same IndexedDB store and each `persist()` rewrites the whole image, so the last writer wins and the other tab's writes are lost |
-| Auto-persist | `persist()` runs on `close()` and when you call it; a tab closed without either loses that session's writes |
+| Auto-persist | On by default: writes persist after a 500 ms debounce, plus a best-effort flush when the page is hidden. Disable with `autoPersist: false` |
 | Typed values | Decoded from their real Firebird types, but flattened for JSON: `NUMERIC`/`DECFLOAT`/`INT128` and out-of-range `BIGINT` arrive as exact decimal **strings**, dates as ISO-8601 strings, binary BLOBs as base64. A typed ABI is planned |
 | Multi-statement `exec()` | Single statement only |
 | Multi-tab / SharedWorker | Not yet supported |

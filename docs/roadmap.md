@@ -289,8 +289,8 @@ Consequences worth knowing:
   BIGINT/NUMERIC/DECFLOAT arrive as exact decimal *strings* to avoid silent
   precision loss.
 - Multi-statement `exec()`, `affectedRows`, `tx.rollback()`.
-- Auto-persist policy (§M3): `persist()` is still only called explicitly and
-  on `close()`, so a tab closed without either loses the session's writes.
+- Multi-statement `exec()`, `affectedRows`, `tx.rollback()` (§M2).
+- Typed result encoding (§M2).
 - Multi-tab safety (§M4) and live queries (§M4).
 
 ### Persistence is atomic and incremental
@@ -315,6 +315,37 @@ Three tests pin the behaviour, and they measure rather than assume:
 - aborting the transaction partway — standing in for a tab closing
   mid-persist — leaves the *previous* image completely intact, with no page of
   the failed write visible.
+
+### Writes persist without being asked
+
+`persist()` used to run only on `close()` and when called explicitly, so
+closing a tab — the usual way to leave a page — lost everything written that
+session.  It now runs automatically after writes, debounced (500 ms by
+default) so a burst of statements costs one persist.
+
+`autoPersist` defaults to **on**: silently losing committed data is a worse
+default than the cost of writing it.  `autoPersist: false` restores the old
+behaviour.
+
+The flush also hooks `visibilitychange` → hidden and `pagehide`.
+`visibilitychange` is the one to rely on — it fires when a mobile browser
+backgrounds an app, where `beforeunload` and `unload` frequently do not fire
+at all.  Neither event can await an async write, so that path is best-effort;
+that is precisely why writes are *also* persisted on a debounce rather than
+only at the end.
+
+Two details that would otherwise bite:
+
+- Persists are serialised.  Two overlapping runs both read the image and write
+  the same store, and the later one finishing first would roll the database
+  back to an older state.  A write arriving mid-persist sets a flag so another
+  persist follows, since the image already written does not contain it.
+- Background persists have no caller to reject into.  Failures go to
+  `onPersistError` (default `console.error`) rather than becoming unhandled
+  rejections, because a silent failure here *is* data loss.
+
+`close()` cancels the pending timer, detaches the listeners and waits for any
+persist already running, so nothing can write after the engine has gone.
 
 ---
 
@@ -353,7 +384,7 @@ Legend: ✅ shipped · 🟡 partial · ❌ missing · n/a not applicable
 | IndexedDB | ✅ `idb://` | ✅ | One transaction per persist, only changed pages written |
 | OPFS | — | ❌ | The natural fit for Firebird's page I/O; see M4 |
 | Incremental / dirty-page writes | ✅ | ✅ | Pages compared against what is stored |
-| Durability tuning (`relaxedDurability`) | ✅ | ❌ | |
+| Durability tuning | ✅ `relaxedDurability` | ✅ | `autoPersist` + `autoPersistDebounceMs` |
 | `dumpDataDir()` on the DB object | ✅ | 🟡 | `IndexedDBVFS.exportDatabase()` exists but is unreachable from `FirebirdBrowser` |
 | `loadDataDir` at construction | ✅ | 🟡 | Same: `importDatabase()` is VFS-only |
 
