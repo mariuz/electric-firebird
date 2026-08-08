@@ -82,78 +82,60 @@ fails on a concrete, locatable defect rather than on absence.
 ### The create-database trap
 
 `_fb_create_database()` aborts with WASM's `null function or function
-signature mismatch`.  What is established, with evidence:
+signature mismatch`.  **Root cause located: Firebird's `MemoryPool` hands out a
+block that overlaps a live object.**
 
-| Step | Finding |
-|------|---------|
-| Where | `Database.cpp:886` — `dbb_plugin_config(pConf)` → `RefPtr<IPluginConfig>::RefPtr` → `pConf->addRef()` through the cloop vtable.  Pinned with `emsymbolizer` against a DWARF build. |
-| Not null | `RefPtr` guards `if (ptr)`, so `pConf` is non-null.  Dumping it shows `cloopVTable == 0` — a null vtable, hence "null function". |
-| Not a cloop problem | A probe calling `addRef`/`release` on the provider itself succeeds, so cloop dispatch works in general. |
-| Not plugin-set lifetime | Retaining the `IPluginSet` (as Firebird's own `GetPlugins` does) changes nothing.  The change was kept anyway — it is correct. |
-| `this` looked right | `JProvider::createDatabase` reported `this == 0x301e98`, matching what `EngineFactory::createPlugin` returned — **but that was measured in a different build** from the `pConf` reading below.  See the caveat under "next steps". |
-| The config was valid | At `createPlugin`, `factoryParameter` has a real vtable and refcount 1. |
-| **It gets overwritten** | By the time `createDatabase` runs, `JProvider::pluginConfig` reads a *static-data* address that shifts with every rebuild — not the heap pointer it was constructed with.  The `FactoryParameter` and the `JProvider` are adjacent allocations, 28 bytes apart. |
+The failing read is `Database.cpp:886` — `dbb_plugin_config(pConf)` →
+`RefPtr<IPluginConfig>::RefPtr` → `pConf->addRef()`.  ASan reports `READ of
+size 4 at 0x00000008`, which is `((VTable*)nullptr)->addRef` (cloop puts
+`addRef` at VTable offset 8), so `cloopVTable` is NULL.
 
-Sanitizers then ruled corruption *out*:
-
-| Tool | Result |
-|------|--------|
-| `-sSAFE_HEAP=1` | Segfaults on the same read, confirming the address is invalid — but it catches the faulting access, not a writer. |
-| `-fsanitize=address` | **READ of size 4 at `0x00000008`** — that is `((VTable*)nullptr)->addRef`, since cloop's VTable has `addRef` at offset 8.  So `cloopVTable` is definitively NULL.  Critically, ASan reports **no** heap-buffer-overflow and **no** use-after-free beforehand. |
-| `~FactoryParameter` instrumented | **Never called.**  The config object is alive; it was not prematurely freed. |
-
-The measurement that settles it, all within one build:
+Watching `JProvider::pluginConfig` (offset 24) through one run pins the moment
+it changes:
 
 ```
-FactoryParameter CTOR       this=0x301e78
-post-setOwner: plugin=0x301e9c  w[5]=00301e7c   <- JProvider::pluginConfig, correct
-at Database::create           pConf=0x2da73c   <- static-data address, wrong
+EngineFactory       JProvider=0x2b1e98  par=0x2b1e7c
+locateProvider      pluginConfig = 0x2b1e7c        ok
+fb_init end         pluginConfig = 0x2b1e7c        ok
+fb_create_database  pluginConfig = 0x2b1e7c        ok
+after Status ctor   pluginConfig = 0x2b1e7c        ok
+after getXpbBuilder pluginConfig = 0x28fadc        CORRUPTED   dpb = 0x2b1ebc
 ```
 
-`pluginConfig` is *written* correctly at `JProvider+24` (the heap
-`FactoryParameter` plus the 4-byte interface base offset) and *read back* as an
-address in the static data segment, right next to the vtable.  Nothing freed
-it and nothing wrote over it.
+`IUtil::getXpbBuilder()` allocates the DPB builder at `0x2b1ebc` while the
+`JProvider` at `0x2b1e98` is still live and referenced.  The clobbered member
+sits at `0x2b1eb0` — exactly 12 bytes below the new block — so the allocator
+wrote its block header backwards into the live object.
 
-**That makes it a layout disagreement, not memory corruption** — the member is
-read at a different offset than it was written to.
+Note also that neither address is 16-byte aligned (`0x2b1e98 % 16 == 8`,
+`0x2b1ebc % 16 == 12`) even though `alloc.h` declares
+`#define ALLOC_ALIGNMENT 16`.
 
-Two hypotheses have since been tested and **disproven**:
+Ruled out along the way, each with evidence:
 
-- **`-fno-rtti`.**  Upstream builds every platform with it
-  (`builds/posix/make.defaults`) and the WASM CMakeLists never did, so the
-  engine was being built in a configuration upstream never tests.  The flag was
-  added — it is right on its own merits, and matches how Firebird is built
-  everywhere — but the trap is unchanged.
-- **Cross-TU ODR on the `JProvider` constructor.**  `llvm-nm` over all 861
-  objects finds *no* out-of-line definition: the constructor is trivial and
-  fully inlined.  So the write (inlined into `EngineFactory::createPlugin`) and
-  the read (`JProvider::createDatabase`) are both in `jrd.cpp`, and cannot
-  disagree about layout.
+| Hypothesis | Verdict |
+|---|---|
+| Null `pConf` | No — `RefPtr` guards null; the pointer is non-null with a NULL vtable. |
+| Broken cloop dispatch | No — `addRef`/`release` on the provider itself works. |
+| `IPluginSet` released too early | No — retaining it changes nothing.  Kept anyway: Firebird's own `GetPlugins` holds the set, so releasing it early was wrong regardless. |
+| Argument passing to `initAttachment` | No — `pConf` arrives exactly as sent; the value is already wrong at the call site. |
+| Cross-TU ODR on the constructor | No — `llvm-nm` over 861 objects finds no out-of-line definition; it is inlined into `jrd.cpp`, the same TU that reads it. |
+| Missing `-fno-rtti` | No — added to match upstream (right on its own merits) but the trap is unchanged. |
+| Premature release of the provider | No — `~FactoryParameter` never runs, and taking our own reference does not help. |
+| ASan finding a stray write | No — ASan sees no bad write, because `FB_NEW` allocates from Firebird's `MemoryPool`, whose internal sub-allocation is invisible to it. |
 
-**Caveat on the evidence.**  The three key values — `this`, `pluginConfig` and
-the `pConf` that reaches `initAttachment` — were never printed in a single
-build.  Addresses shift between builds, so the conclusion "the member is read
-at a different offset than it was written to" is inference across two runs, not
-a single observation.  Close that first.
+Next steps:
 
-Next steps, in order:
-
-- Print `this`, `&this->pluginConfig - (char*)this`, and `pluginConfig` at the
-  top of `JProvider::createDatabase`, *and* the same three in
-  `EngineFactory::createPlugin`, in **one** build.  That either confirms an
-  offset mismatch or redirects to the `IPluginBase*` / `JProvider*` 4-byte base
-  adjustment seen at `createPlugin` (`JProvider=0x301e98`, as
-  `IPluginBase=0x301e9c`).
-- If that does not resolve it, print `(char*)&this->pluginConfig - (char*)this`
-  in both `EngineFactory::createPlugin` and `JProvider::createDatabase`.  Equal
-  offsets disprove the layout theory outright and point back at the
-  `IPluginBase*` / `JProvider*` 4-byte base adjustment instead.
-- Note `-sEMULATE_FUNCTION_POINTER_CASTS=1` is **not** available as a
-  workaround: it fails Binaryen validation on `invoke()` in `fun.epp`, the
-  legacy UDF path, which calls function pointers of varying arity.  That is a
-  separate WASM-hostile construct worth excluding independently, since UDFs
-  are meaningless in a browser.
+- Reproduce in isolation: two `FB_NEW` allocations from the default pool, then
+  check whether the second overlaps the first.  That reduces the bug to a few
+  lines and takes the engine out of the picture.
+- Read `common/classes/alloc.cpp` for size/alignment arithmetic that assumes a
+  64-bit `long` or 8-byte pointers.  `autoconfig.h` is generated for the
+  64-bit host and then patched (`SIZEOF_LONG` 8 → 4); anything that survived
+  that patch would corrupt adjacent allocations exactly this way.
+- Check `getDefaultMemoryPool()` under WASM: if the pool differs between the
+  plugin-registration path and later calls, one pool's free list would not know
+  about the other's live blocks.
 
 ---
 

@@ -706,7 +706,16 @@ IProvider* locateProvider()
 				// leaves JProvider::pluginConfig dangling, and the engine
                                 // dereferences it when constructing a Database.
 				g_pluginSet = plugins;
-				return static_cast<IProvider*>(plugin);
+
+				IProvider* provider = static_cast<IProvider*>(plugin);
+				// Take our own reference: this pointer is stored in g_provider
+				// for the lifetime of the module, well beyond the scope that
+				// produced it.  Without it the engine's provider can be
+				// released and its memory handed back to Firebird's MemoryPool,
+				// which then writes free-list bookkeeping over the object —
+				// leaving the vtable intact but corrupting later members.
+				provider->addRef();
+				return provider;
 			}
 			plugins->release();
 		}
