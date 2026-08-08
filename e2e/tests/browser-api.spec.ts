@@ -237,6 +237,116 @@ test.describe('IndexedDBVFS', () => {
     expect(image).toEqual([]);
   });
 
+
+  test('writes only the pages that changed', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const vfs = new window.FB.IndexedDBVFS({ pageSize: 4 });
+      await vfs.open('incremental');
+
+      const image = new Uint8Array([1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3]);
+      await vfs.importDatabase(image);
+
+      // Count writes by instrumenting the store, so this measures what
+      // actually reaches IndexedDB rather than trusting the implementation.
+      const original = IDBObjectStore.prototype.put;
+      let puts = 0;
+      IDBObjectStore.prototype.put = function (
+        this: IDBObjectStore,
+        ...args: unknown[]
+      ) {
+        puts++;
+        return (original as (...a: unknown[]) => IDBRequest).apply(this, args);
+      } as typeof IDBObjectStore.prototype.put;
+
+      try {
+        // Re-import an identical image: only the metadata record should move.
+        await vfs.importDatabase(image);
+        const unchangedPuts = puts;
+
+        // Change one page out of three.
+        puts = 0;
+        const edited = new Uint8Array(image);
+        edited[4] = 9;
+        await vfs.importDatabase(edited);
+        const oneChangedPuts = puts;
+
+        const after = await vfs.exportDatabase();
+        await vfs.close();
+        return { unchangedPuts, oneChangedPuts, after: Array.from(after) };
+      } finally {
+        IDBObjectStore.prototype.put = original;
+      }
+    });
+
+    // Metadata only.
+    expect(result.unchangedPuts).toBe(1);
+    // One page plus metadata — not all three pages.
+    expect(result.oneChangedPuts).toBe(2);
+    expect(result.after).toEqual([1, 1, 1, 1, 9, 2, 2, 2, 3, 3, 3, 3]);
+  });
+
+  test('drops pages past the end when the database shrinks', async ({ page }) => {
+    const image = await page.evaluate(async () => {
+      const vfs = new window.FB.IndexedDBVFS({ pageSize: 4 });
+      await vfs.open('shrink');
+
+      await vfs.importDatabase(new Uint8Array([1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3]));
+      // A smaller image must not leave the third page behind.
+      await vfs.importDatabase(new Uint8Array([7, 7, 7, 7]));
+
+      const out = await vfs.exportDatabase();
+      await vfs.close();
+      return Array.from(out);
+    });
+
+    expect(image).toEqual([7, 7, 7, 7]);
+  });
+
+  test('leaves the previous image intact when a persist is interrupted', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      const vfs = new window.FB.IndexedDBVFS({ pageSize: 4 });
+      await vfs.open('atomic');
+
+      const original = new Uint8Array([1, 1, 1, 1, 2, 2, 2, 2]);
+      await vfs.importDatabase(original);
+
+      // Abort partway through the next import, standing in for a tab closing
+      // mid-persist. Because the whole import is one transaction, IndexedDB
+      // must roll it back rather than leave a half-written database.
+      const put = IDBObjectStore.prototype.put;
+      let calls = 0;
+      IDBObjectStore.prototype.put = function (
+        this: IDBObjectStore,
+        ...args: unknown[]
+      ) {
+        const request = (put as (...a: unknown[]) => IDBRequest).apply(this, args);
+        if (++calls === 1) {
+          this.transaction.abort();
+        }
+        return request;
+      } as typeof IDBObjectStore.prototype.put;
+
+      let aborted = false;
+      try {
+        await vfs.importDatabase(new Uint8Array([9, 9, 9, 9, 8, 8, 8, 8]));
+      } catch {
+        aborted = true;
+      } finally {
+        IDBObjectStore.prototype.put = put;
+      }
+
+      const after = await vfs.exportDatabase();
+      await vfs.close();
+      return { aborted, after: Array.from(after) };
+    });
+
+    expect(result.aborted).toBe(true);
+    // The original image survived; no page of the failed write is visible.
+    expect(result.after).toEqual([1, 1, 1, 1, 2, 2, 2, 2]);
+  });
+
   test('persists pages across a full page reload', async ({ page }) => {
     await page.evaluate(async () => {
       const vfs = new window.FB.IndexedDBVFS({ pageSize: 8 });

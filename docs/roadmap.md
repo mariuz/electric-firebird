@@ -70,7 +70,7 @@ fails on a concrete, locatable defect rather than on absence.
 |---|-------|--------|
 | 1 | `FirebirdBrowser.query(sql, params)` accepted `params` and **silently discarded them**, so the same code returned different results on Node and in the browser. | **Fixed** — it now throws until the C API can bind parameters. Refusing is the only honest option while the capability is missing. |
 | 2 | `FirebirdBrowserTransaction.exec/query` passed `dbHandle`, never `txHandle`, so statements did not run in the transaction they appeared to belong to and `rollback()` could not undo them. | **Fixed** — `fb_execute`/`fb_query` take a transaction handle and the TS layer threads it through. Covered by a test. |
-| 3 | `persist()` rewrites the **whole** database: `importDatabase()` calls `clear()` then writes every page. | Open (M3). O(db size) per persist, and non-atomic — a tab closed mid-persist leaves a truncated database. |
+| 3 | `persist()` rewrote the **whole** database, one IndexedDB transaction per page. | **Fixed.** One transaction for the whole import, and only changed pages are written. An interrupted persist now rolls back instead of leaving a half-written database. |
 | 4 | Two tabs on the same origin both open `firebird_<name>` and both persist whole images. | Open (M4). Documented in [browser.md](./browser.md) as unsafe. |
 | 5 | JSON is the result ABI. | Improved, still lossy. Values are now decoded by real type: BLOBs read (text as string, binary as base64), `NUMERIC`/`DECFLOAT`/`INT128` as exact decimal strings, `BIGINT` as a string once it exceeds `Number.MAX_SAFE_INTEGER`, dates as ISO-8601. `FieldInfo` still carries only `name` — a typed ABI is M2. |
 | 6 | `loadFirebirdWasm()` caches one module in a module-level variable with no way to dispose it. | Open. `close()` does not release the WASM heap. |
@@ -289,9 +289,32 @@ Consequences worth knowing:
   BIGINT/NUMERIC/DECFLOAT arrive as exact decimal *strings* to avoid silent
   precision loss.
 - Multi-statement `exec()`, `affectedRows`, `tx.rollback()`.
-- Incremental and atomic persistence (§M3) — `persist()` still rewrites the
-  whole image.
+- Auto-persist policy (§M3): `persist()` is still only called explicitly and
+  on `close()`, so a tab closed without either loses the session's writes.
 - Multi-tab safety (§M4) and live queries (§M4).
+
+### Persistence is atomic and incremental
+
+`importDatabase()` used one IndexedDB transaction *per page*, after a `clear()`.
+For a 2.3 MB database that is roughly 289 transactions, and it is not atomic:
+a tab closed midway leaves some pages new and some old, which is a corrupt
+database with no way back.
+
+It now runs as a single transaction, which IndexedDB guarantees is
+all-or-nothing, and writes only pages whose bytes actually changed — comparing
+against what is stored rather than an in-memory copy, so the comparison is
+exact and costs no memory proportional to the database.  The common case, a
+few dirty pages in a large database, goes from O(database) to O(changes).
+
+Three tests pin the behaviour, and they measure rather than assume:
+
+- write counting instruments `IDBObjectStore.prototype.put`, so it observes
+  what reaches IndexedDB.  Re-importing an identical image performs one write
+  (the metadata record); changing one page of three performs two.
+- shrinking an image removes the pages past the new end.
+- aborting the transaction partway — standing in for a tab closing
+  mid-persist — leaves the *previous* image completely intact, with no page of
+  the failed write visible.
 
 ---
 
@@ -327,9 +350,9 @@ Legend: ✅ shipped · 🟡 partial · ❌ missing · n/a not applicable
 |---|---|---|---|
 | In-memory / ephemeral database | ✅ `memory://` | ❌ | Everything goes through IndexedDB |
 | Node filesystem | ✅ `file://` | ✅ | Via the native driver, not WASM |
-| IndexedDB | ✅ `idb://` | 🟡 | Whole-image, non-atomic (§1.3) |
+| IndexedDB | ✅ `idb://` | ✅ | One transaction per persist, only changed pages written |
 | OPFS | — | ❌ | The natural fit for Firebird's page I/O; see M4 |
-| Incremental / dirty-page writes | ✅ | ❌ | |
+| Incremental / dirty-page writes | ✅ | ✅ | Pages compared against what is stored |
 | Durability tuning (`relaxedDurability`) | ✅ | ❌ | |
 | `dumpDataDir()` on the DB object | ✅ | 🟡 | `IndexedDBVFS.exportDatabase()` exists but is unreachable from `FirebirdBrowser` |
 | `loadDataDir` at construction | ✅ | 🟡 | Same: `importDatabase()` is VFS-only |

@@ -55,6 +55,19 @@ const STORE_NAME = 'pages';
 const META_KEY = '__meta__';
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Exact byte equality.  Used to decide whether a page needs rewriting. */
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
 
@@ -175,6 +188,21 @@ export class IndexedDBVFS {
   /**
    * Import a full database image, replacing any existing content.
    * The `data` length must be a multiple of `pageSize`.
+   *
+   * The whole import runs in **one** IndexedDB transaction, and only pages
+   * whose contents actually changed are written.
+   *
+   * Both matter.  A transaction per page — which is what this used to do — is
+   * not atomic: a tab closed midway through leaves some pages new and some
+   * old, which is a corrupt database with no way back.  IndexedDB guarantees a
+   * transaction is all-or-nothing, so an interrupted persist now leaves the
+   * previous image intact.  Skipping unchanged pages then turns the common
+   * case (a few pages dirty in a large database) from O(database) into
+   * O(changes).
+   *
+   * Pages are compared against what is already stored rather than against an
+   * in-memory copy: the comparison is exact, and it costs no extra memory
+   * proportional to the database.
    */
   async importDatabase(data: Uint8Array): Promise<void> {
     if (data.byteLength % this.pageSize !== 0) {
@@ -184,19 +212,46 @@ export class IndexedDBVFS {
     }
 
     const pageCount = data.byteLength / this.pageSize;
+    const db = this.requireDb();
 
-    // Clear existing data
-    await this.clear();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      const store = tx.objectStore(STORE_NAME);
 
-    // Write pages
-    for (let i = 0; i < pageCount; i++) {
-      const offset = i * this.pageSize;
-      const page = data.slice(offset, offset + this.pageSize).buffer;
-      await this.idbPut(i, { data: page });
-    }
+      // Resolve on the transaction, not on the last request: only completion
+      // means the changes are durable.
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () =>
+        reject(tx.error ?? new Error('IndexedDB transaction aborted'));
 
-    // Update metadata
-    await this.idbPut(META_KEY, { pageSize: this.pageSize, pageCount });
+      // Previous size, so pages past the new end can be removed.
+      const metaRequest = store.get(META_KEY);
+      metaRequest.onsuccess = () => {
+        const previous = (metaRequest.result as VFSMetadata | undefined)?.pageCount ?? 0;
+        for (let i = pageCount; i < previous; i++) {
+          store.delete(i);
+        }
+      };
+
+      for (let i = 0; i < pageCount; i++) {
+        const offset = i * this.pageSize;
+        const page = data.subarray(offset, offset + this.pageSize);
+
+        const existing = store.get(i);
+        existing.onsuccess = () => {
+          const stored = (existing.result as { data: ArrayBuffer } | undefined)?.data;
+          if (stored && sameBytes(new Uint8Array(stored), page)) {
+            return; // unchanged
+          }
+          // slice() copies: `page` is a view onto the caller's buffer, which
+          // must not be captured by the store.
+          store.put({ data: page.slice().buffer }, i);
+        };
+      }
+
+      store.put({ pageSize: this.pageSize, pageCount }, META_KEY);
+    });
   }
 
   /**

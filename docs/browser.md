@@ -179,7 +179,7 @@ await db.transaction(async (tx) => {
 | Pre-built WASM binary on npm | Not published — you must build it yourself with emsdk |
 | Parameterised queries (`?` placeholders) | Supported. Values are sent as text and converted by the engine, so integers, decimals, booleans and dates all work; binary (`Uint8Array`) parameters throw rather than corrupt data |
 | Concurrent tabs | **Unsafe** — two tabs open the same IndexedDB store and each `persist()` rewrites the whole image, so the last writer wins and the other tab's writes are lost |
-| Incremental / atomic persistence | `persist()` rewrites every page; an interrupted persist can truncate the database |
+| Auto-persist | `persist()` runs on `close()` and when you call it; a tab closed without either loses that session's writes |
 | Typed values | Decoded from their real Firebird types, but flattened for JSON: `NUMERIC`/`DECFLOAT`/`INT128` and out-of-range `BIGINT` arrive as exact decimal **strings**, dates as ISO-8601 strings, binary BLOBs as base64. A typed ABI is planned |
 | Multi-statement `exec()` | Single statement only |
 | Multi-tab / SharedWorker | Not yet supported |
