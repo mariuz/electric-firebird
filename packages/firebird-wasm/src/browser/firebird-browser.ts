@@ -11,22 +11,26 @@
  * ```ts
  * import { FirebirdBrowser } from 'firebird-wasm/browser';
  *
- * const db = new FirebirdBrowser('mydb');
+ * // A browser must run the engine in a Worker — see the `worker` option.
+ * const db = new FirebirdBrowser('mydb', {
+ *   worker: new Worker('/firebird-engine-worker.js'),
+ * });
+ *
  * await db.exec('CREATE TABLE t (id INTEGER, name VARCHAR(100))');
  * const result = await db.query('SELECT * FROM t');
  * await db.close();
  * ```
  */
 
-import type { FirebirdWasmModule } from '../wasm-loader';
-import { loadFirebirdWasm, allocString, lastError } from '../wasm-loader';
 import { IndexedDBVFS } from './indexeddb-vfs';
 import type { IndexedDBVFSOptions } from './indexeddb-vfs';
+import { DirectTransport } from './engine-transport';
+import type { EngineHandle, EngineTransport } from './engine-transport';
+import { WorkerTransport } from './worker-transport';
 import type {
   QueryResult,
   Row,
   QueryParams,
-  FieldInfo,
   TransactionOptions,
 } from '../types';
 
@@ -40,7 +44,7 @@ export interface FirebirdBrowserOptions {
   vfs?: IndexedDBVFSOptions;
   /**
    * URL or `ArrayBuffer` of the `firebird-embedded.wasm` binary.
-   * Passed through to {@link loadFirebirdWasm}.
+   * Passed through to the engine loader.
    */
   wasmBinary?: ArrayBuffer | string;
   /**
@@ -48,89 +52,28 @@ export interface FirebirdBrowserOptions {
    * @see {@link import('../wasm-loader').WasmLoadOptions.locateFile}
    */
   locateFile?: (filename: string) => string;
+  /**
+   * Worker running the engine.
+   *
+   * **Browsers need this.**  The WASM build uses pthreads, so Firebird blocks
+   * on mutexes while opening a database, and a browser main thread is not
+   * allowed to block — without a Worker the page deadlocks.  Build the Worker
+   * script from `firebird-wasm/browser/worker-entry`.
+   *
+   * Omit it only where blocking the calling thread is acceptable, such as
+   * Node or a test harness driving a stub engine.
+   */
+  worker?: Worker;
+  /**
+   * Use a transport of your own.  Takes precedence over `worker`; mainly a
+   * seam for tests.
+   */
+  transport?: EngineTransport;
 }
 
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
-
-/**
- * Build an Error carrying whatever the engine reported.
- *
- * The C API returns only a numeric code; the human-readable Firebird message
- * lives behind `_fb_last_error()` and is lost unless it is read immediately,
- * before any other call overwrites it.
- */
-function engineError(
-  mod: FirebirdWasmModule,
-  context: string,
-  code?: number,
-): Error {
-  const detail = lastError(mod);
-  const suffix = code === undefined ? '' : ` (code ${code})`;
-  return new Error(detail ? `${context}${suffix}: ${detail}` : `${context}${suffix}`);
-}
-
-/**
- * Run a statement that returns no rows.
- *
- * @param txHandle - transaction to run in, or 0 for a self-contained one.
- */
-function execStatement(
-  mod: FirebirdWasmModule,
-  dbHandle: number,
-  txHandle: number,
-  sql: string,
-): void {
-  const sqlPtr = allocString(mod, sql);
-  try {
-    const rc = mod._fb_execute(dbHandle, txHandle, sqlPtr);
-    if (rc !== 0) {
-      throw engineError(mod, `Firebird exec failed for: ${sql}`, rc);
-    }
-  } finally {
-    mod._free(sqlPtr);
-  }
-}
-
-/**
- * Run a query and decode the engine's JSON result set.
- *
- * @param txHandle - transaction to run in, or 0 for a self-contained one.
- */
-function queryStatement<T extends Row>(
-  mod: FirebirdWasmModule,
-  dbHandle: number,
-  txHandle: number,
-  sql: string,
-): QueryResult<T> {
-  const sqlPtr = allocString(mod, sql);
-
-  try {
-    const resultPtr = mod._fb_query(dbHandle, txHandle, sqlPtr);
-    if (resultPtr === 0) {
-      throw engineError(mod, `Firebird query failed for: ${sql}`);
-    }
-
-    // The WASM C API packs the result into a JSON-formatted UTF-8 string.
-    const jsonStr = mod.UTF8ToString(resultPtr);
-    mod._fb_free_result(resultPtr);
-
-    const parsed = JSON.parse(jsonStr) as { columns: string[]; rows: unknown[][] };
-
-    const fields: FieldInfo[] = parsed.columns.map((c) => ({
-      name: c.toUpperCase(),
-    }));
-
-    const rows = parsed.rows.map((cols) =>
-      Object.fromEntries(fields.map((f, i) => [f.name, cols[i]])),
-    ) as T[];
-
-    return { rows, fields };
-  } finally {
-    mod._free(sqlPtr);
-  }
-}
 
 /**
  * Reject parameters instead of ignoring them.
@@ -164,8 +107,8 @@ export class FirebirdBrowser {
   private readonly dbName: string;
   private readonly options: FirebirdBrowserOptions;
   private readonly vfs: IndexedDBVFS;
-  private mod: FirebirdWasmModule | null = null;
-  private dbHandle = 0;
+  private readonly engine: EngineTransport;
+  private dbHandle: EngineHandle = 0;
   private closed = false;
   private initPromise: Promise<void> | null = null;
 
@@ -178,6 +121,20 @@ export class FirebirdBrowser {
     this.dbName = dbName;
     this.options = options;
     this.vfs = new IndexedDBVFS(options.vfs);
+
+    this.engine =
+      options.transport ??
+      (options.worker
+        ? new WorkerTransport(options.worker)
+        : new DirectTransport({
+            wasmBinary: options.wasmBinary,
+            locateFile: options.locateFile,
+          }));
+  }
+
+  /** Path of the database inside Emscripten's filesystem. */
+  private get dbPath(): string {
+    return `/data/${this.dbName}.fdb`;
   }
 
   // ── Public API (mirrors FirebirdLite) ─────────────────────────────────
@@ -189,7 +146,7 @@ export class FirebirdBrowser {
    */
   async exec(sql: string): Promise<void> {
     await this.ensureReady();
-    execStatement(this.mod!, this.dbHandle, 0, sql);
+    await this.engine.execute(this.dbHandle, 0, sql);
   }
 
   /**
@@ -205,7 +162,7 @@ export class FirebirdBrowser {
   ): Promise<QueryResult<T>> {
     rejectParams(params, sql);
     await this.ensureReady();
-    return queryStatement<T>(this.mod!, this.dbHandle, 0, sql);
+    return this.engine.query<T>(this.dbHandle, 0, sql);
   }
 
   /**
@@ -216,28 +173,21 @@ export class FirebirdBrowser {
     _options: TransactionOptions = {},
   ): Promise<T> {
     await this.ensureReady();
-    const mod = this.mod!;
-    const txHandle = mod._fb_start_transaction(this.dbHandle);
-    if (txHandle === 0) {
-      throw new Error('Failed to start transaction');
-    }
+    const txHandle = await this.engine.startTransaction(this.dbHandle);
 
-    const tx = new FirebirdBrowserTransaction(mod, this.dbHandle, txHandle);
+    const tx = new FirebirdBrowserTransaction(this.engine, this.dbHandle, txHandle);
 
     let result: T;
     try {
       result = await fn(tx);
     } catch (err) {
-      mod._fb_rollback(txHandle);
+      await this.engine.rollback(txHandle);
       throw err;
     }
 
-    const rc = mod._fb_commit(txHandle);
-    if (rc !== 0) {
-      // The engine releases the transaction whether or not the commit
-      // succeeded, so there is nothing left to roll back here.
-      throw engineError(mod, 'Transaction commit failed', rc);
-    }
+    // A failed commit finishes the transaction too, so there is nothing left
+    // to roll back here.
+    await this.engine.commit(txHandle);
     return result;
   }
 
@@ -246,14 +196,9 @@ export class FirebirdBrowser {
    * Call this periodically or before the page unloads to avoid data loss.
    */
   async persist(): Promise<void> {
-    if (!this.mod) return;
-    const dbPath = `/data/${this.dbName}.fdb`;
-    await this.vfs.syncWithEmscriptenFS(
-      'persist',
-      (path) => this.mod!.FS.readFile(path),
-      (path, data) => this.mod!.FS.writeFile(path, data),
-      dbPath,
-    );
+    if (!this.dbHandle) return;
+    const image = await this.engine.readFile(this.dbPath);
+    await this.vfs.importDatabase(image);
   }
 
   /**
@@ -263,15 +208,15 @@ export class FirebirdBrowser {
     if (this.closed) return;
     this.closed = true;
 
-    if (this.mod && this.dbHandle) {
-      // Persist before closing
+    if (this.dbHandle) {
+      // Persist before closing.
       await this.persist();
-      this.mod._fb_detach_database(this.dbHandle);
+      await this.engine.detachDatabase(this.dbHandle);
       this.dbHandle = 0;
     }
 
     await this.vfs.close();
-    this.mod = null;
+    await this.engine.dispose();
   }
 
   // ── Initialisation ────────────────────────────────────────────────────
@@ -290,50 +235,21 @@ export class FirebirdBrowser {
   }
 
   private async init(): Promise<void> {
-    // 1. Load WASM module
-    this.mod = await loadFirebirdWasm({
-      wasmBinary: this.options.wasmBinary,
-      locateFile: this.options.locateFile,
-    });
+    await this.engine.init();
 
-    const mod = this.mod;
-    const dbPath = `/data/${this.dbName}.fdb`;
+    await this.engine.mkdir('/data');
 
-    // 2. Create /data directory in Emscripten FS
-    if (!mod.FS.analyzePath('/data').exists) {
-      mod.FS.mkdir('/data');
-    }
-
-    // 3. Open IndexedDB and populate MEMFS from persisted pages
+    // Restore any previously persisted image into the engine's filesystem
+    // before attaching, so a reload reopens the same database.
     await this.vfs.open(this.dbName);
-    await this.vfs.syncWithEmscriptenFS(
-      'populate',
-      (path) => mod.FS.readFile(path),
-      (path, data) => mod.FS.writeFile(path, data),
-      dbPath,
-    );
-
-    // 4. Initialise Firebird engine
-    const initRc = mod._fb_init();
-    if (initRc !== 0) {
-      throw engineError(mod, 'Failed to initialise the Firebird engine', initRc);
+    const stored = await this.vfs.exportDatabase();
+    if (stored.byteLength > 0) {
+      await this.engine.writeFile(this.dbPath, stored);
     }
 
-    // 5. Attach or create database
-    const pathPtr = allocString(mod, dbPath);
-    try {
-      if (mod.FS.analyzePath(dbPath).exists) {
-        this.dbHandle = mod._fb_attach_database(pathPtr);
-      } else {
-        this.dbHandle = mod._fb_create_database(pathPtr);
-      }
-    } finally {
-      mod._free(pathPtr);
-    }
-
-    if (this.dbHandle === 0) {
-      throw engineError(mod, `Failed to open database "${this.dbName}"`);
-    }
+    this.dbHandle = (await this.engine.exists(this.dbPath))
+      ? await this.engine.attachDatabase(this.dbPath)
+      : await this.engine.createDatabase(this.dbPath);
   }
 }
 
@@ -349,14 +265,14 @@ export class FirebirdBrowser {
  */
 export class FirebirdBrowserTransaction {
   constructor(
-    private readonly mod: FirebirdWasmModule,
-    private readonly dbHandle: number,
-    private readonly txHandle: number,
+    private readonly engine: EngineTransport,
+    private readonly dbHandle: EngineHandle,
+    private readonly txHandle: EngineHandle,
   ) {}
 
   /** Execute a DDL/DML statement inside this transaction. */
   async exec(sql: string): Promise<void> {
-    execStatement(this.mod, this.dbHandle, this.txHandle, sql);
+    await this.engine.execute(this.dbHandle, this.txHandle, sql);
   }
 
   /**
@@ -370,6 +286,6 @@ export class FirebirdBrowserTransaction {
     params: QueryParams = [],
   ): Promise<QueryResult<T>> {
     rejectParams(params, sql);
-    return queryStatement<T>(this.mod, this.dbHandle, this.txHandle, sql);
+    return this.engine.query<T>(this.dbHandle, this.txHandle, sql);
   }
 }

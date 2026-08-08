@@ -297,6 +297,15 @@ const BROWSER_SRC = path.resolve(
 let browserBundle: string | null = null;
 let browserBundleStamp = -1;
 
+let workerBundle: string | null = null;
+let workerBundleStamp = -1;
+
+// The library's Worker entry point, bundled the way an application would.
+const WORKER_ENTRY = path.resolve(
+  __dirname,
+  '../../packages/firebird-wasm/src/browser/worker-entry.ts',
+);
+
 /** Most recent mtime across the library sources, used as a cache key. */
 function sourceStamp(dir: string): number {
   let newest = 0;
@@ -345,6 +354,42 @@ function getBrowserBundle(): string {
   browserBundle = result.outputFiles[0]!.text;
   browserBundleStamp = stamp;
   return browserBundle;
+}
+
+/**
+ * Build the engine Worker script.
+ *
+ * Three things have to happen before the bundled entry point runs:
+ *   1. the Emscripten glue is loaded, since `loadFirebirdWasm()` looks for
+ *      `createFirebirdModule` on the global scope;
+ *   2. `locateFile` is set, because `importScripts()` leaves the worker's own
+ *      URL as the base and the runtime would otherwise fetch the .wasm from
+ *      the site root;
+ *   3. only then the entry point, which starts answering messages.
+ */
+function getWorkerBundle(): string {
+  const stamp = sourceStamp(BROWSER_SRC);
+  if (workerBundle !== null && stamp === workerBundleStamp) {
+    return workerBundle;
+  }
+
+  const result = buildSync({
+    entryPoints: [WORKER_ENTRY],
+    bundle: true,
+    format: 'iife',
+    platform: 'browser',
+    target: 'es2020',
+    write: false,
+    sourcemap: 'inline',
+    external: ['*firebird-embedded.js'],
+  });
+
+  workerBundle =
+    "importScripts('/wasm/firebird-embedded.js');\n" +
+    "self.FIREBIRD_WORKER_OPTIONS = { locateFile: (f) => '/wasm/' + f };\n" +
+    result.outputFiles[0]!.text;
+  workerBundleStamp = stamp;
+  return workerBundle;
 }
 
 // ---------------------------------------------------------------------------
@@ -400,6 +445,19 @@ const server = http.createServer((req, res) => {
     } catch (err) {
       sendJson(res, 500, {
         error: 'Failed to bundle src/browser',
+        detail: err instanceof Error ? err.message : String(err),
+      });
+    }
+    return;
+  }
+
+  if (req.method === 'GET' && url === '/firebird-engine-worker.js') {
+    try {
+      res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8' });
+      res.end(getWorkerBundle());
+    } catch (err) {
+      sendJson(res, 500, {
+        error: 'Failed to bundle the engine worker',
         detail: err instanceof Error ? err.message : String(err),
       });
     }

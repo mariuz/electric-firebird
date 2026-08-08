@@ -12,6 +12,24 @@
 export { FirebirdBrowser, FirebirdBrowserTransaction } from './firebird-browser';
 export type { FirebirdBrowserOptions } from './firebird-browser';
 
+export { DirectTransport } from './engine-transport';
+export type {
+  EngineTransport,
+  EngineHandle,
+  DirectTransportOptions,
+} from './engine-transport';
+
+export { WorkerTransport } from './worker-transport';
+export type { WorkerTransportOptions } from './worker-transport';
+
+export { serveEngine } from './worker-entry';
+export type { EngineWorkerScope } from './worker-entry';
+export type {
+  EngineOp,
+  EngineRequest,
+  EngineResponse,
+} from './worker-protocol';
+
 export { IndexedDBVFS } from './indexeddb-vfs';
 export type { IndexedDBVFSOptions, VFSMetadata } from './indexeddb-vfs';
 

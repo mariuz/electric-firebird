@@ -37,7 +37,13 @@ await db.close();
 ```ts
 import { FirebirdBrowser } from 'firebird-wasm/browser';
 
-const db = new FirebirdBrowser('mydb');
+// The engine runs in a Worker: the build uses pthreads and a browser main
+// thread cannot block.  Build the worker script from
+// `firebird-wasm/browser/worker-entry`.  The page must be cross-origin
+// isolated (COOP/COEP) for SharedArrayBuffer.
+const db = new FirebirdBrowser('mydb', {
+  worker: new Worker('/firebird-engine-worker.js'),
+});
 
 await db.exec('CREATE TABLE items (id INTEGER, name VARCHAR(100))');
 const result = await db.query('SELECT * FROM items');
@@ -128,11 +134,12 @@ The library provides two execution backends:
 > ROWS: {"columns":["ID","NAME"],"rows":[[1,"alpha"],[2,"beta"]]}
 > ```
 >
-> Verified in Node (13 integration tests) **and in Chromium**, where the engine
-> runs inside a Web Worker — required because the build uses pthreads and a
-> browser main thread cannot block.  Databases created by this build define
-> only the built-in character sets, UTF8 among them —
-> see [docs/roadmap.md](./docs/roadmap.md).
+> Verified in Node (13 integration tests) **and in Chromium** through the
+> public `FirebirdBrowser` API — including transactions and data surviving a
+> page reload via IndexedDB.  The engine runs inside a Web Worker, which is
+> required because the build uses pthreads and a browser main thread cannot
+> block.  Databases created by this build define only the built-in character
+> sets, UTF8 among them — see [docs/roadmap.md](./docs/roadmap.md).
 
 - [x] WASM build infrastructure (Emscripten CMake + build script, tracks Firebird `master`)
 - [x] Browser support module (`FirebirdBrowser`)
@@ -148,7 +155,7 @@ The library provides two execution backends:
 - [x] Attach threads to the libcds hazard-pointer GC, which the metadata cache requires
 - [x] **The engine runs: create database, DDL, DML, SELECT** (13 Node integration tests)
 - [x] Run the engine in a Web Worker (verified in Chromium end to end)
-- [ ] Point `FirebirdBrowser` at the Worker instead of calling the engine in-process
+- [x] Point `FirebirdBrowser` at the Worker (real SQL through the public API, verified in Chromium)
 - [ ] Parameterised queries in the browser (currently refused rather than ignored)
 - [ ] Incremental, atomic IndexedDB persistence
 - [ ] Web Worker + multi-tab safety

@@ -219,14 +219,39 @@ this and are already in place:
   `firebird-embedded.wasm` from the site root and try to instantiate a JSON
   404 body.
 
+### The public API drives the real engine
+
+`FirebirdBrowser` now reaches the engine through an `EngineTransport`, with two
+implementations:
+
+- `DirectTransport` calls the WASM exports in the current thread.  Node uses
+  it, the Worker uses it internally, and the stub-ABI tests use it.
+- `WorkerTransport` forwards over `postMessage` to a Worker built from
+  `browser/worker-entry`.  Browsers must use it, so `FirebirdBrowser` takes a
+  `worker` option.
+
+The Worker owns Emscripten's filesystem, which is why filesystem access is part
+of the transport rather than something the caller does — persistence copies the
+database image between that filesystem and IndexedDB, and only the Worker can
+read it.
+
+Five tests exercise the public API against the real engine
+(`browser-engine.spec.ts`): a `CREATE TABLE`/`INSERT`/`SELECT` round-trip,
+transaction commit, transaction rollback actually undoing a write, Firebird's
+own diagnostic reaching the caller for invalid SQL, and — the one that matters
+for a browser database — **data surviving a page reload** via IndexedDB, read
+back on a fresh WASM instance with an empty filesystem.
+
+The 30 stub-ABI tests kept passing through the refactor unchanged, which is
+what makes them worth having: they pin marshalling, pointer ownership and
+error handling independently of whether an artifact exists.
+
 ### What is still open
 
-- **`FirebirdBrowser` does not use the Worker yet.**  The TypeScript layer
-  still calls `_fb_*` in-process, which is why its 30 tests drive the stub ABI.
-  Pointing it at the real engine means an RPC across `postMessage`, and moving
-  the MEMFS ⇄ IndexedDB persistence into the Worker with it.  The class API is
-  already async, so the shape fits.
-- Parameterised queries, and everything else in §M2 onward.
+- **Parameterised queries.**  Still refused rather than ignored; needs
+  `fb_execute_params`/`fb_query_params` in the C API (§M2).
+- The rest of §M2 onward: typed result encoding, multi-statement `exec()`,
+  `affectedRows`, incremental persistence, multi-tab safety, live queries.
 
 ---
 
