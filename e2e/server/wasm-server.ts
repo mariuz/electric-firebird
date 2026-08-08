@@ -273,8 +273,24 @@ function sendJson(
 // Server
 // ---------------------------------------------------------------------------
 
+/**
+ * The WASM build uses pthreads, which Emscripten implements over Web Workers
+ * and SharedArrayBuffer.  Browsers only expose SharedArrayBuffer to
+ * cross-origin isolated pages, so without these two headers the module fails
+ * to instantiate at all — the harness page then reports nothing, rather than
+ * an error.
+ */
+function setCrossOriginIsolation(res: http.ServerResponse): void {
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+  // Same-origin subresources (the .wasm, the glue) must opt in to being
+  // embedded by an isolated document.
+  res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+}
+
 const server = http.createServer((req, res) => {
   const url = req.url ?? '/';
+  setCrossOriginIsolation(res);
 
   if (req.method === 'GET' && url === '/health') {
     sendJson(res, 200, { status: 'ok' });

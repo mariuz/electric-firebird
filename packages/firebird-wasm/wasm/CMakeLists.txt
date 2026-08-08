@@ -328,6 +328,15 @@ target_compile_options(firebird-embedded PRIVATE
   # Native WASM exceptions rather than the JS-based emulation: smaller and
   # much faster, supported by every browser since ~2022.
   "-fwasm-exceptions"
+  # Firebird starts worker threads (timer, garbage collector, cache writer) and
+  # treats a pthread_create failure as fatal.  Emscripten implements pthreads
+  # over Web Workers + SharedArrayBuffer.
+  #
+  # Browser caveat: SharedArrayBuffer needs cross-origin isolation (COOP/COEP),
+  # and a browser main thread cannot block on a mutex — so in a browser the
+  # engine has to run inside a Worker.  Node has neither restriction, which is
+  # why the Node harness is the fast iteration loop.
+  "-pthread"
 )
 
 # ---------------------------------------------------------------------------
@@ -368,14 +377,22 @@ set(EMSCRIPTEN_LINK_FLAGS
   "-s EXPORT_NAME='createFirebirdModule'"
   "-s EXPORTED_FUNCTIONS='[${FB_EXPORTED_FUNCTIONS_JSON}]'"
   "-s EXPORTED_RUNTIME_METHODS='[\"UTF8ToString\",\"stringToUTF8\",\"lengthBytesUTF8\",\"FS\",\"MEMFS\"]'"
+  # Growth is kept on: with pthreads this means a growable SharedArrayBuffer,
+  # which costs some performance, but reserving a fixed heap large enough for
+  # real databases would be a heavy allocation for a browser library.  Tested
+  # against the INI_init fault below — growth is not implicated.
   "-s ALLOW_MEMORY_GROWTH=1"
   "-s INITIAL_MEMORY=67108864"
   "-s FORCE_FILESYSTEM=1"
   "-s ENVIRONMENT='web,worker,node'"
   "-s SINGLE_FILE=0"
   "-s USE_ICU=1"
-  # Must match the compile side; see -fwasm-exceptions above.
+  # Must match the compile side; see -fwasm-exceptions and -pthread above.
   "-fwasm-exceptions"
+  "-pthread"
+  # Pre-spawn workers.  Creating one on demand while the requesting thread
+  # blocks waiting for it to start is a deadlock; a pool avoids that.
+  "-s PTHREAD_POOL_SIZE=8"
 )
 
 # ---------------------------------------------------------------------------

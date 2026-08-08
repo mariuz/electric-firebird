@@ -138,18 +138,40 @@ fb_create_database: operating system directive pthread_create failed
 -Not supported
 ```
 
-Firebird starts worker threads (timer, garbage collector, cache writer).
-Options, in order of preference:
+Fixed by building with `-pthread` (Emscripten implements pthreads over Web
+Workers and SharedArrayBuffer) plus `PTHREAD_POOL_SIZE=8`, so a thread is never
+created on demand while its creator blocks waiting for it.
 
-- Build with `-pthread`.  Emscripten implements pthreads over Web Workers and
-  SharedArrayBuffer; it works in Node, and in browsers requires COOP/COEP
-  cross-origin isolation headers, which the e2e server can set.  Note the
-  interaction with `ALLOW_MEMORY_GROWTH`, which is currently on.
-- Or stop the engine starting threads at all.  There is no supported
-  "no threads" mode, so this means finding each `Thread::start` on the
-  attachment path and establishing whether an embedded single-user
-  configuration needs it.  Closer to how PGlite runs Postgres single-threaded,
-  but a much larger port.
+Two browser consequences to design around, neither affecting Node:
+SharedArrayBuffer requires cross-origin isolation (COOP/COEP headers, which
+`e2e/server/wasm-server.ts` can set), and a browser main thread cannot block on
+a mutex — so in a browser the engine has to run inside a Worker.  That is
+already on the roadmap as M4.
+
+### Current barrier: INI_init
+
+With threads available the engine gets as far as actually creating the
+database, and faults building the system tables:
+
+```
+Jrd::CacheVector<Jrd::CacheElement<Jrd::jrd_rel, Jrd::RelationPermanent>,
+                 8u, Jrd::NoData>::getDataPointer(unsigned short) const
+Jrd::CacheVector<...>::getVersioned(Jrd::thread_db*, unsigned short, unsigned)
+INI_init(Jrd::thread_db*)
+Jrd::JProvider::createDatabase(...)
+```
+
+`INI_init` (from `ini.epp`) populates the RDB$ system relations on a fresh
+database, and the metadata cache vector is read out of bounds for a relation
+id.  `ALLOW_MEMORY_GROWTH` is not implicated — the fault is identical with a
+fixed heap, so growth stays on rather than reserving a fixed 256 MB in a
+browser.
+
+Worth checking first, given the last two bugs were both 64-bit assumptions
+leaking into a 32-bit target: whether `CacheVector`'s sizing or its `8u`
+subarray shift depends on pointer or `size_t` width.  Then whether `INI_init`
+needs metadata cache state that a step we stubbed or skipped would normally
+have established.
 
 ---
 
