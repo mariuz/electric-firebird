@@ -119,11 +119,11 @@ The library provides two execution backends:
 ### Roadmap
 
 > **Status:** the Node.js backend works.  The browser backend **builds and
-> starts**: `firebird-embedded.wasm` links cleanly, `fb_init()` succeeds in
-> Chromium against the real engine, and errors now propagate properly with
-> Firebird's own messages.  It does not create a database yet — the engine
-> wants to start worker threads and the build has no pthreads:
-> `pthread_create failed -Not supported`.
+> runs**: the engine initialises, and `fb_create_database()` now gets deep into
+> database creation before stopping at a real metadata error —
+> `CHARACTER SET "SYSTEM"."SJIS_0208" is not installed`, because `src/intl/`
+> is not compiled in yet.  It cannot create a database, but it is executing
+> engine code and reporting Firebird's own diagnostics.
 
 - [x] WASM build infrastructure (Emscripten CMake + build script, tracks Firebird `master`)
 - [x] Browser support module (`FirebirdBrowser`)
@@ -135,7 +135,10 @@ The library provides two execution backends:
 - [x] Compile Firebird's metadata layer for real (gpre boot pass) instead of stubbing it
 - [x] Fix the memory-pool corruption (`autoconfig.h` described the 64-bit host: `SIZEOF_VOID_P`/`SIZEOF_SIZE_T`)
 - [x] Enable C++ exceptions (`-fwasm-exceptions`) — Firebird reports every error by throwing
-- [ ] **Threads: build with `-pthread`, or stop the engine spawning them** — the remaining blocker
+- [x] Threads (`-pthread` + a pre-spawned worker pool), real `sem_timedwait`, realistic stack sizes
+- [x] Attach threads to the libcds hazard-pointer GC, which the metadata cache requires
+- [ ] **Compile `src/intl/` so the non-builtin character sets exist** — the remaining blocker
+- [ ] Run the engine in a Web Worker (a browser main thread cannot block, which `-pthread` requires)
 - [ ] Parameterised queries in the browser (currently refused rather than ignored)
 - [ ] Incremental, atomic IndexedDB persistence
 - [ ] Web Worker + multi-tab safety

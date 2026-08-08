@@ -148,30 +148,58 @@ SharedArrayBuffer requires cross-origin isolation (COOP/COEP headers, which
 a mutex — so in a browser the engine has to run inside a Worker.  That is
 already on the roadmap as M4.
 
-### Current barrier: INI_init
+### How far the engine gets
 
-With threads available the engine gets as far as actually creating the
-database, and faults building the system tables:
+`fb_create_database()` now runs deep into database creation and reports a real
+Firebird metadata error rather than crashing:
 
 ```
-Jrd::CacheVector<Jrd::CacheElement<Jrd::jrd_rel, Jrd::RelationPermanent>,
-                 8u, Jrd::NoData>::getDataPointer(unsigned short) const
-Jrd::CacheVector<...>::getVersioned(Jrd::thread_db*, unsigned short, unsigned)
-INI_init(Jrd::thread_db*)
-Jrd::JProvider::createDatabase(...)
+CHARACTER SET "SYSTEM"."SJIS_0208" is not installed
 ```
 
-`INI_init` (from `ini.epp`) populates the RDB$ system relations on a fresh
-database, and the metadata cache vector is read out of bounds for a relation
-id.  `ALLOW_MEMORY_GROWTH` is not implicated — the fault is identical with a
-fixed heap, so growth stays on rather than reserving a fixed 256 MB in a
-browser.
+Getting there took four more porting fixes, each uncovered by the one before:
 
-Worth checking first, given the last two bugs were both 64-bit assumptions
-leaking into a 32-bit target: whether `CacheVector`'s sizing or its `8u`
-subarray shift depends on pointer or `size_t` width.  Then whether `INI_init`
-needs metadata cache state that a step we stubbed or skipped would normally
-have established.
+| Fix | Symptom it removed |
+|---|---|
+| Compile libcds `init.cpp`, `thread_data.cpp`, `hp.cpp`, `urcu_gp.cpp` instead of stubbing | `INI_init` read the relation vector out of bounds |
+| Implement `sem_timedwait` as a real polling wait | `semaphore.h: enter: sem_wait() failed -Operation timed out` |
+| `STACK_SIZE=8MB`, `DEFAULT_PTHREAD_STACK_SIZE=4MB` | stack overflow during database creation |
+| Define the signal-RCU singleton locally | undefined symbol (`urcu_sh.cpp` needs POSIX signals) |
+
+The libcds one is worth calling out.  Firebird's metadata cache is
+`CacheVector` → `SharedReadVector` → `HazardPtr`, and a hazard pointer is only
+valid on a thread **attached** to the garbage collector.  The stub for
+`cds::threading::ThreadData::init()` said plainly that it skipped attaching to
+the HP/DHP GC, on the grounds that the real files drag in URCU.  They mostly do
+not — `thread_data.cpp` includes only `_common.h`, `gc/hp.h` and `gc/dhp.h` —
+and skipping attachment left `readAccessor()` returning a bogus generation.
+
+Likewise `sem_timedwait` had been reduced to a single `sem_trywait` that
+reported `ETIMEDOUT` on failure, because "in the single-threaded WASM
+environment, blocking waits would deadlock".  That premise expired when the
+build gained real pthreads: there are now other threads to wait for, and
+refusing to wait made every wait fail instantly.
+
+Both are the same lesson: a stub written for one set of constraints becomes a
+bug when the constraints change, and it keeps working just well enough to hide
+where the real failure is.
+
+### Current barrier: character sets
+
+`src/intl/` is not compiled, so `IntlManager` only registers the builtins
+(NONE, OCTETS, ASCII, UNICODE_FSS, UTF8, UTF16 — see
+`IntlManager::initialize`).  Creating a database populates
+`RDB$CHARACTER_SETS` with the full set and validates each one, so it stops at
+the first non-builtin.
+
+Options:
+
+- Compile `src/intl/` into the binary.  It is normally the separately loaded
+  `fbintl` module; a static WASM build has to link it in, the same way the
+  engine plugin itself is linked in and registered by `fb_init()`.
+- Or create the database with a reduced character-set configuration, if one
+  exists that skips the non-builtins.  Smaller, but leaves the engine unable to
+  handle those charsets later.
 
 ---
 

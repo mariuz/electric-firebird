@@ -59,15 +59,29 @@ set(RE2_UTIL_SRCS
 )
 set(RE2_SRCS ${RE2_LIB_SRCS} ${RE2_UTIL_SRCS})
 
-# libcds DHP (Dynamic Hazard Pointer) GC – dhp.cpp provides the SMR
-# (Safe Memory Reclamation) implementation: smr::construct, smr::destruct,
-# smr::set_memory_allocator, smr::tls, and related helpers.
-# dhp.cpp compiles cleanly under Emscripten (uses only standard C++ and
-# POSIX pthreads).  init.cpp and thread_data.cpp are NOT compiled here
-# because their symbols are provided as lightweight stubs in
-# fb_wasm_stubs.cpp (those files pull in heavy URCU dependencies).
+# libcds – hazard-pointer garbage collection.
+#
+# Firebird's metadata cache is built on it: CacheVector's storage is a
+# SharedReadVector, whose readAccessor() hands out a HazardPtr.  A hazard
+# pointer is only valid on a thread that has been *attached* to the GC.
+#
+# init.cpp and thread_data.cpp used to be replaced by stubs here, on the
+# grounds that they drag in URCU.  They do not — thread_data.cpp includes only
+# _common.h, gc/hp.h and gc/dhp.h — and the stub for ThreadData::init() said as
+# much: "The real init() attaches to HP/DHP GC and RCU, which we skip."
+# Skipping it left every thread unattached, so readAccessor() returned a bogus
+# generation and INI_init() read the relation vector out of bounds while
+# creating the system tables.
+#
+# urcu_gp.cpp is included only because thread_data.cpp references the RCU
+# singleton instance pointers; nothing in the engine's path actually uses RCU.
+# urcu_sh.cpp (signal-handler RCU) stays out — Emscripten has no POSIX signals.
 set(FB_CDS_DHP_SRCS
+  "${FIREBIRD_SRC}/extern/libcds/src/init.cpp"
+  "${FIREBIRD_SRC}/extern/libcds/src/thread_data.cpp"
+  "${FIREBIRD_SRC}/extern/libcds/src/hp.cpp"
   "${FIREBIRD_SRC}/extern/libcds/src/dhp.cpp"
+  "${FIREBIRD_SRC}/extern/libcds/src/urcu_gp.cpp"
 )
 
 # ---------------------------------------------------------------------------
@@ -391,8 +405,16 @@ set(EMSCRIPTEN_LINK_FLAGS
   "-fwasm-exceptions"
   "-pthread"
   # Pre-spawn workers.  Creating one on demand while the requesting thread
-  # blocks waiting for it to start is a deadlock; a pool avoids that.
-  "-s PTHREAD_POOL_SIZE=8"
+  # blocks waiting for it to start is a deadlock; a pool avoids that.  The
+  # pool must cover every thread the engine starts at once — if it runs dry,
+  # a thread that another is waiting on never starts, which surfaces as
+  # sem_wait() timing out rather than as an obvious pthread failure.
+  "-s PTHREAD_POOL_SIZE=32"
+  # Emscripten's default stack is 64 KB.  Firebird's engine recurses deeply
+  # through DSQL and metadata initialisation and overflows it while creating a
+  # database, so give the main thread and each worker a realistic stack.
+  "-s STACK_SIZE=8388608"
+  "-s DEFAULT_PTHREAD_STACK_SIZE=4194304"
 )
 
 # ---------------------------------------------------------------------------

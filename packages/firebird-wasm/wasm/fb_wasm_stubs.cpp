@@ -52,9 +52,20 @@ int fallocate(int fd, int mode, off_t offset, off_t len)
 /* -----------------------------------------------------------------------
  * sem_timedwait  –  POSIX semaphore wait with timeout.
  *
- * Emscripten does not provide sem_timedwait.  In the single-threaded
- * WASM environment, blocking waits would deadlock, so we attempt a
- * non-blocking sem_trywait and return ETIMEDOUT on failure.
+ * Emscripten does not provide it, so it is implemented here by polling
+ * sem_trywait until the caller's absolute deadline.
+ *
+ * This used to try sem_trywait exactly once and then report ETIMEDOUT,
+ * on the grounds that "in the single-threaded WASM environment, blocking
+ * waits would deadlock".  That premise died when the build gained real
+ * pthreads: the engine now has other threads that will post the semaphore,
+ * and refusing to wait for them made every wait fail instantly.  It surfaced
+ * as "semaphore.h: enter: sem_wait() failed -Operation timed out" during
+ * database creation.
+ *
+ * Polling rather than a futex wait keeps this portable across Emscripten's
+ * threading modes; the interval is short enough not to add noticeable latency
+ * and long enough not to spin a core.
  * ----------------------------------------------------------------------- */
 #include <semaphore.h>
 #include <errno.h>
@@ -63,14 +74,32 @@ int fallocate(int fd, int mode, off_t offset, off_t len)
 extern "C"
 int sem_timedwait(sem_t* sem, const struct timespec* abs_timeout)
 {
-    (void)abs_timeout;
-    /* Try a non-blocking decrement first. If that fails, return
-       ETIMEDOUT rather than blocking (which would deadlock the
-       single-threaded WASM runtime). */
-    if (sem_trywait(sem) == 0)
-        return 0;
-    errno = ETIMEDOUT;
-    return -1;
+    for (;;)
+    {
+        if (sem_trywait(sem) == 0)
+            return 0;
+
+        /* Anything other than "would block" is a real error. */
+        if (errno != EAGAIN)
+            return -1;
+
+        if (abs_timeout)
+        {
+            struct timespec now;
+            clock_gettime(CLOCK_REALTIME, &now);
+
+            if (now.tv_sec > abs_timeout->tv_sec ||
+                (now.tv_sec == abs_timeout->tv_sec &&
+                 now.tv_nsec >= abs_timeout->tv_nsec))
+            {
+                errno = ETIMEDOUT;
+                return -1;
+            }
+        }
+
+        struct timespec nap = { 0, 200000 };   /* 0.2 ms */
+        nanosleep(&nap, nullptr);
+    }
 }
 
 /* -----------------------------------------------------------------------
@@ -169,92 +198,32 @@ struct SubtypeInfo
 };
 
 /* -----------------------------------------------------------------------
- * Stubs for libcds (Concurrent Data Structures) symbols.
+ * libcds  —  NO LONGER STUBBED
  *
- * The full libcds source files (init.cpp, thread_data.cpp, hp.cpp, …)
- * pull in a deep dependency chain (hazard-pointer GC, RCU, …) that is
- * not meaningful in the single-threaded WASM environment.  We define
- * only the symbols that the Firebird engine references at link time.
+ * The stubs here replaced cds::threading::ThreadData::init()/fini() and the
+ * init_first_call()/fini_last_call() pair, on the assumption that the real
+ * files pull in URCU.  They do not, and the stubbed init() skipped attaching
+ * the thread to the hazard-pointer GC — which Firebird's metadata cache
+ * (CacheVector -> SharedReadVector -> HazardPtr) requires.  extern/libcds
+ * init.cpp, thread_data.cpp, hp.cpp and dhp.cpp are compiled instead; see
+ * CMakeLists.txt.
  *
- * The headers below mirror the conditional includes from libcds/src/init.cpp.
+ * One symbol still needs defining here.  thread_data.cpp references the RCU
+ * singleton instance pointers, and the signal-handler variant lives in
+ * urcu_sh.cpp, which cannot be compiled under Emscripten — it is built on
+ * POSIX signals.  Nothing in the engine's path uses RCU, so a null singleton
+ * is accurate: the pointer is only ever read to find an RCU instance that was
+ * never created.  urcu_gp.cpp (the non-signal variant) is compiled normally.
  * ----------------------------------------------------------------------- */
-#include <cds/threading/details/_common.h>
-#if CDS_COMPILER == CDS_COMPILER_GCC || CDS_COMPILER == CDS_COMPILER_CLANG || CDS_COMPILER == CDS_COMPILER_INTEL
-#   include <cds/threading/details/gcc_manager.h>
-#endif
-#include <cds/threading/details/pthread_manager.h>
-#ifdef CDS_CXX11_THREAD_LOCAL_SUPPORT
-#   include <cds/threading/details/cxx11_manager.h>
-#endif
-#include <cds/algo/backoff_strategy.h>
 
-namespace cds {
+#include <cds/urcu/details/sh.h>
 
-    /* Static pthread TLS key used by the pthread threading manager. */
-    pthread_key_t threading::pthread::Manager::Holder::m_key;
+namespace cds { namespace urcu { namespace details {
 
-    /* GCC/Clang __thread thread-local storage variables. */
-#if CDS_COMPILER == CDS_COMPILER_GCC || CDS_COMPILER == CDS_COMPILER_CLANG
-    __thread threading::gcc_internal::ThreadDataPlaceholder CDS_DATA_ALIGNMENT(8) threading::gcc_internal::s_threadData;
-    __thread threading::ThreadData * threading::gcc_internal::s_pThreadData = nullptr;
-#endif
+template<> CDS_EXPORT_API singleton_vtbl*
+    sh_singleton_instance<signal_buffered_tag>::s_pRCU = nullptr;
 
-    /* C++11 thread_local storage variables. */
-#ifdef CDS_CXX11_THREAD_LOCAL_SUPPORT
-    thread_local threading::cxx11_internal::ThreadDataPlaceholder CDS_DATA_ALIGNMENT(8) threading::cxx11_internal::s_threadData;
-    thread_local threading::ThreadData * threading::cxx11_internal::s_pThreadData = nullptr;
-#endif
-
-    namespace threading {
-        /* Static data members of ThreadData */
-        CDS_EXPORT_API atomics::atomic<size_t> ThreadData::s_nLastUsedProcNo(0);
-        CDS_EXPORT_API size_t ThreadData::s_nProcCount = 1;
-
-        /* Thread lifecycle – simplified for single-threaded WASM.
-         * The real init() attaches to HP/DHP GC and RCU, which we skip. */
-        CDS_EXPORT_API void ThreadData::init()
-        {
-            ++m_nAttachCount;
-        }
-
-        CDS_EXPORT_API bool ThreadData::fini()
-        {
-            if (--m_nAttachCount == 0)
-                return true;
-            return false;
-        }
-    } // namespace threading
-
-    namespace details {
-        static atomics::atomic<size_t> s_nInitCallCount(0);
-
-        bool CDS_EXPORT_API init_first_call()
-        {
-            return s_nInitCallCount.fetch_add(1, atomics::memory_order_relaxed) == 0;
-        }
-
-        bool CDS_EXPORT_API fini_last_call()
-        {
-            if (s_nInitCallCount.fetch_sub(1, atomics::memory_order_relaxed) == 1) {
-                atomics::atomic_thread_fence(atomics::memory_order_release);
-                return true;
-            }
-            return false;
-        }
-
-        /* Called from cds::Initialize() (inline in cds/init.h) to record
-           whether HP statistics collection was compiled in.  No-op in WASM. */
-        void CDS_EXPORT_API check_hpstat_enabled(bool /*enabled*/) {}
-
-    } // namespace details
-
-    namespace backoff {
-        /*static*/ size_t exponential_runtime_traits::lower_bound = 16;
-        /*static*/ size_t exponential_runtime_traits::upper_bound = 16 * 1024;
-        /*static*/ unsigned delay_runtime_traits::timeout = 5;
-    } // namespace backoff
-
-} // namespace cds
+}}} // namespace cds::urcu::details
 
 /* -----------------------------------------------------------------------
  * EDS (External Data Sources) stubs
