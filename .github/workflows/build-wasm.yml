@@ -54,12 +54,15 @@ jobs:
           # Each `run` block is a fresh shell, so export the activated
           # environment rather than sourcing emsdk_env.sh in every step.
           source ./emsdk_env.sh
-          {
-            echo "PATH=$PATH"
-            echo "EMSDK=$EMSDK"
-            echo "EM_CONFIG=$EM_CONFIG"
-            echo "EMSDK_NODE=$EMSDK_NODE"
-          } >> "$GITHUB_ENV"
+          # Which variables emsdk_env.sh sets varies by version — this one
+          # leaves EM_CONFIG unset — so forward only what is actually there.
+          # Naming one unconditionally trips `set -u` and fails the build.
+          echo "PATH=$PATH" >> "$GITHUB_ENV"
+          for var in EMSDK EMSDK_NODE EM_CONFIG EMSDK_PYTHON; do
+            if [ -n "${!var:-}" ]; then
+              echo "$var=${!var}" >> "$GITHUB_ENV"
+            fi
+          done
 
       - name: Confirm the toolchain
         run: emcc --version | head -1
