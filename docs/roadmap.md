@@ -289,10 +289,9 @@ Consequences worth knowing:
   BIGINT/NUMERIC/DECFLOAT arrive as exact decimal *strings* to avoid silent
   precision loss.
 - Multi-statement `exec()`, `affectedRows`, `tx.rollback()`.
-- Typed result encoding (§M2): `FieldInfo` still carries only `name`, and
-  BIGINT/NUMERIC/DECFLOAT arrive as exact decimal *strings* to avoid silent
-  precision loss.
 - Multi-tab safety and live queries (§M4).
+- A typed *binary* result encoding, so exact numerics need not travel as
+  strings at all.
 - Multi-tab safety (§M4) and live queries (§M4).
 
 ### Persistence is atomic and incremental
@@ -375,6 +374,27 @@ commit earlier.  It matches PGlite, where `.exec()` is the script runner and
 `.query()` is the parameterised one; callers that ignore the return value are
 unaffected.
 
+### Result columns are described
+
+`FieldInfo` used to carry only `name`, which left a real ambiguity: a
+`NUMERIC(10,2)` arrives as the string `"20.25"` — deliberately, to keep it
+exact — and that is indistinguishable from a `VARCHAR` containing digits.  The
+engine knew the difference and threw it away.
+
+Each column now reports `type`, `typeName`, `subType`, `scale`, `length` and
+`nullable`.
+
+`typeName` is not just a lookup table.  Firebird stores `NUMERIC` and `DECIMAL`
+as scaled `SMALLINT`/`INTEGER`/`BIGINT`/`INT128`, so the raw type code for a
+`NUMERIC(10,2)` says BIGINT.  Reporting `NUMERIC` when the scale is non-zero is
+what actually tells a caller that `"20.25"` is an exact number rather than
+text.  The engine test asserts exactly that distinction: `PRICE` is `NUMERIC`
+with scale −2, while a `BIGINT` past 2^53 — which also arrives as a string —
+is `BIGINT` with scale 0.
+
+The fields on `FieldInfo` are optional because the Node.js native driver does
+not expose them; the WASM backend fills them in.
+
 ---
 
 ## 2. Feature comparison with PGlite
@@ -391,7 +411,7 @@ Legend: ✅ shipped · 🟡 partial · ❌ missing · n/a not applicable
 | `rowMode: 'object' \| 'array'` | ✅ | ❌ | Always object mode |
 | Custom `parsers` / `serializers` | ✅ | ❌ | |
 | `describeQuery()` | ✅ | ❌ | |
-| Typed field metadata (`dataTypeID`) | ✅ | ❌ | The engine knows the type but `FieldInfo` is `{ name }` only |
+| Typed field metadata (`dataTypeID`) | ✅ | ✅ | `FieldInfo` carries type, typeName, subType, scale, length, nullable |
 | Affected-row count | ✅ | ✅ | `exec()` returns `{ affectedRows }` |
 | Binary / BLOB values | ✅ | 🟡 | BLOBs are read and returned (text as string, binary as base64); a `Uint8Array` needs the typed ABI |
 

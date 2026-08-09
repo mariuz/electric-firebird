@@ -60,11 +60,16 @@ test.describe('Firebird WASM engine (browser / Playwright)', () => {
     // A real attachment handle from the engine.
     expect(Number(await resultEl.getAttribute('data-db-handle'))).toBeGreaterThan(0);
 
-    const queryResult = JSON.parse(
-      (await resultEl.getAttribute('data-query-json')) as string,
-    ) as { columns: string[]; rows: unknown[][] };
+    const queryJson = await resultEl.getAttribute('data-query-json');
+    expect(queryJson).not.toBeNull();
 
-    expect(queryResult.columns).toEqual(['ID', 'NAME']);
+    const queryResult = JSON.parse(queryJson as string) as {
+      columns: Array<{ name: string; type: number }>;
+      rows: unknown[][];
+    };
+
+    // The engine describes each column, so compare the names.
+    expect(queryResult.columns.map((c) => c.name)).toEqual(['ID', 'NAME']);
     expect(queryResult.rows).toEqual([
       [1, 'alpha'],
       [2, 'beta'],

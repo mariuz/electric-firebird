@@ -23,6 +23,7 @@ import type { FirebirdWasmModule } from '../wasm-loader';
 import { loadFirebirdWasm, allocString, lastError } from '../wasm-loader';
 import type { Row, QueryResult, FieldInfo, QueryParams } from '../types';
 import { encodeParams } from './params';
+import { firebirdTypeName } from './field-types';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -100,11 +101,32 @@ function engineError(
   return new Error(detail ? `${context}${suffix}: ${detail}` : `${context}${suffix}`);
 }
 
+/** How the engine describes one column. */
+interface EncodedColumn {
+  name: string;
+  type: number;
+  subType: number;
+  scale: number;
+  length: number;
+  nullable: boolean;
+}
+
 /** Decode the engine's JSON result set into rows keyed by column name. */
 export function decodeResultSet<T extends Row>(json: string): QueryResult<T> {
-  const parsed = JSON.parse(json) as { columns: string[]; rows: unknown[][] };
+  const parsed = JSON.parse(json) as {
+    columns: EncodedColumn[];
+    rows: unknown[][];
+  };
 
-  const fields: FieldInfo[] = parsed.columns.map((c) => ({ name: c.toUpperCase() }));
+  const fields: FieldInfo[] = parsed.columns.map((c) => ({
+    name: c.name.toUpperCase(),
+    type: c.type,
+    typeName: firebirdTypeName(c.type, c.scale),
+    subType: c.subType,
+    scale: c.scale,
+    length: c.length,
+    nullable: c.nullable,
+  }));
 
   const rows = parsed.rows.map((cols) =>
     Object.fromEntries(fields.map((f, i) => [f.name, cols[i]])),

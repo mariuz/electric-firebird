@@ -45,7 +45,13 @@
     initRc: 0,
     /** Return code of `_fb_execute` (non-zero = failure). */
     execRc: 0,
-    /** Payload `_fb_query` serialises to the heap. */
+    /**
+     * Payload `_fb_query` serialises to the heap.
+     *
+     * Columns may be written as plain names for readability; they are
+     * expanded to the described form the engine actually emits before being
+     * serialised, so the library still parses the real shape.
+     */
     queryResult: { columns: [], rows: [] },
     /** When true, `_fb_query` returns a NULL pointer. */
     queryReturnsNull: false,
@@ -123,6 +129,28 @@
       let end = ptr;
       while (heap[end] !== 0) end += 1;
       return decoder.decode(heap.subarray(ptr, end));
+    }
+
+    /**
+     * Render `stub.queryResult` the way the engine does: every column
+     * described, not just named.  A test may set columns as strings; those
+     * get plausible defaults here so the ABI shape stays honest without
+     * every test having to spell it out.
+     */
+    function serialiseQueryResult() {
+      const described = (stub.queryResult.columns ?? []).map((c) =>
+        typeof c === 'string'
+          ? {
+              name: c,
+              type: 448, // SQL_VARYING
+              subType: 0,
+              scale: 0,
+              length: 32,
+              nullable: true,
+            }
+          : c,
+      );
+      return JSON.stringify({ columns: described, rows: stub.queryResult.rows ?? [] });
     }
 
     /** Decode the packed parameter buffer: u32 count, then per parameter a
@@ -260,7 +288,7 @@
         const sql = UTF8ToString(sqlPtr);
         stub.calls.push({ fn: '_fb_query', args: [handle, txHandle, sql] });
         if (stub.queryReturnsNull) return 0;
-        const ptr = heapString(JSON.stringify(stub.queryResult));
+        const ptr = heapString(serialiseQueryResult());
         liveResults.add(ptr);
         return ptr;
       },
@@ -314,7 +342,7 @@
         const params = decodeParams(paramsPtr, paramsLength);
         stub.calls.push({ fn: '_fb_query_params', args: [handle, txHandle, sql, params] });
         if (stub.queryReturnsNull) return 0;
-        const ptr = heapString(JSON.stringify(stub.queryResult));
+        const ptr = heapString(serialiseQueryResult());
         liveResults.add(ptr);
         return ptr;
       },

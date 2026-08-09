@@ -14,6 +14,8 @@ export type { FirebirdBrowserOptions, ExecResult } from './firebird-browser';
 
 export { encodeParams, encodeParamValue } from './params';
 
+export { firebirdTypeName } from './field-types';
+
 export { splitStatements } from './sql-script';
 export type { ScriptStatement } from './sql-script';
 
@@ -52,6 +54,7 @@ export type {
   QueryParams,
   Row,
   FieldInfo,
+  FirebirdTypeName,
   TransactionOptions,
   IsolationLevel,
 } from '../types';

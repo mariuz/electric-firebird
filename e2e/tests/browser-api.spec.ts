@@ -584,10 +584,12 @@ test.describe('FirebirdBrowser', () => {
       return { res, stats };
     });
 
-    expect(result.res.fields).toEqual([
-      { name: 'ID' },
-      { name: 'NAME' },
-      { name: 'CREATED_AT' },
+    // Fields now carry the column description too; the names are what this
+    // test is about.
+    expect(result.res.fields.map((f) => f.name)).toEqual([
+      'ID',
+      'NAME',
+      'CREATED_AT',
     ]);
     expect(result.res.rows).toEqual([
       { ID: 1, NAME: 'alpha', CREATED_AT: '2024-01-01' },
@@ -609,7 +611,7 @@ test.describe('FirebirdBrowser', () => {
     });
 
     expect(res.rows).toEqual([]);
-    expect(res.fields).toEqual([{ name: 'ID' }]);
+    expect(res.fields.map((f) => f.name)).toEqual(['ID']);
   });
 
   test('query() throws when the engine returns a NULL result pointer', async ({

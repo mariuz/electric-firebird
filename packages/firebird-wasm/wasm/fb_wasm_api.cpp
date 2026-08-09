@@ -996,7 +996,6 @@ bool serialiseCursor(IAttachment* attachment, ITransaction* transaction,
 		const char* name = metadata->getAlias(status.ptr(), i);
 		if (status.failed() || !name || !*name)
 			name = metadata->getField(status.ptr(), i);
-		jsonEscape(name ? name : "", name ? strlen(name) : 0, json);
 
 		types[i]       = metadata->getType(status.ptr(), i);
 		subTypes[i]    = metadata->getSubType(status.ptr(), i);
@@ -1005,11 +1004,27 @@ bool serialiseCursor(IAttachment* attachment, ITransaction* transaction,
 		offsets[i]     = metadata->getOffset(status.ptr(), i);
 		nullOffsets[i] = metadata->getNullOffset(status.ptr(), i);
 
+		const FB_BOOLEAN nullable = metadata->isNullable(status.ptr(), i);
+
 		if (status.failed())
 		{
 			setErrorFromStatus("could not read column metadata", status.ptr());
 			return false;
 		}
+
+		// Each column is described, not just named.  Without the type a
+		// caller cannot tell a NUMERIC rendered as "20.25" from a VARCHAR
+		// that happens to contain digits — the JSON encoding makes them
+		// identical, and only the declared type separates them.
+		json += "{\"name\":";
+		jsonEscape(name ? name : "", name ? strlen(name) : 0, json);
+
+		char described[128];
+		snprintf(described, sizeof(described),
+			",\"type\":%u,\"subType\":%d,\"scale\":%d,\"length\":%u,\"nullable\":%s}",
+			types[i], subTypes[i], scales[i], lengths[i],
+			nullable ? "true" : "false");
+		json += described;
 	}
 
 	json += "],\"rows\":[";

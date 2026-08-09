@@ -66,7 +66,9 @@ test.describe('FirebirdBrowser against the real engine', () => {
       return res;
     });
 
-    expect(result.fields).toEqual([{ name: 'ID' }, { name: 'NAME' }]);
+    expect(result.fields.map((f) => f.name)).toEqual(['ID', 'NAME']);
+    // Columns are described, not just named — see the field-metadata test.
+    expect(result.fields.map((f) => f.typeName)).toEqual(['INTEGER', 'VARYING']);
     expect(result.rows).toEqual([
       { ID: 1, NAME: 'alpha' },
       { ID: 2, NAME: 'beta' },
@@ -313,6 +315,57 @@ test.describe('FirebirdBrowser against the real engine', () => {
     ]);
     // The procedure was created and runs, so its body survived splitting.
     expect(result.viaProc).toEqual([{ TOTAL: 2 }]);
+  });
+
+
+  test('describes result columns, not just their names', async ({ page }) => {
+    const fields = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('engine-fields', {
+        worker: new Worker('/firebird-engine-worker.js'),
+      });
+
+      await db.exec(`
+        CREATE TABLE shapes (
+          id INTEGER NOT NULL,
+          name VARCHAR(16),
+          price NUMERIC(10,2),
+          big BIGINT,
+          ok BOOLEAN,
+          made TIMESTAMP
+        );
+      `);
+      await db.exec(
+        "INSERT INTO shapes VALUES (1, 'cube', 20.25, 9007199254740993, TRUE, '2024-01-02 03:04:05')",
+      );
+
+      const res = await db.query(
+        'SELECT id, name, price, big, ok, made FROM shapes',
+      );
+      await db.close();
+      return { fields: res.fields, row: res.rows[0] };
+    });
+
+    const byName = Object.fromEntries(fields.fields.map((f) => [f.name, f]));
+
+    expect(byName['ID']!.typeName).toBe('INTEGER');
+    expect(byName['ID']!.nullable).toBe(false); // declared NOT NULL
+    expect(byName['NAME']!.typeName).toBe('VARYING');
+    expect(byName['NAME']!.nullable).toBe(true);
+    expect(byName['OK']!.typeName).toBe('BOOLEAN');
+    expect(byName['MADE']!.typeName).toBe('TIMESTAMP');
+
+    // The point of the exercise: NUMERIC is stored as a scaled integer, so the
+    // raw type code says BIGINT. Reporting NUMERIC is what tells a caller the
+    // string "20.25" is an exact number rather than text.
+    expect(byName['PRICE']!.typeName).toBe('NUMERIC');
+    expect(byName['PRICE']!.scale).toBe(-2);
+    expect(fields.row!['PRICE']).toBe('20.25');
+
+    // A BIGINT past 2^53 also arrives as a string, but is typed differently —
+    // which is exactly what a caller needs to distinguish them.
+    expect(byName['BIG']!.typeName).toBe('BIGINT');
+    expect(byName['BIG']!.scale).toBe(0);
+    expect(fields.row!['BIG']).toBe('9007199254740993');
   });
 
   test('persists to IndexedDB and reopens the database after a reload', async ({

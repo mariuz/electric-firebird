@@ -33,11 +33,57 @@ export interface QueryResult<T = Row> {
 
 /**
  * Information about a result set column.
+ *
+ * Everything beyond `name` is optional because the Node.js native driver does
+ * not expose it; the WASM backend fills it in.
  */
 export interface FieldInfo {
   /** Column name (alias if provided, otherwise the field name). */
   name: string;
+  /**
+   * Firebird SQL type code — `SQL_LONG` (496), `SQL_VARYING` (448) and so on.
+   *
+   * Worth having because the JSON encoding is lossy about types: a
+   * `NUMERIC(10,2)` arrives as the string `"20.25"` to preserve its exactness,
+   * and without this it is indistinguishable from a `VARCHAR` containing
+   * digits.
+   */
+  type?: number;
+  /** A readable form of {@link FieldInfo.type}, e.g. `'NUMERIC'`. */
+  typeName?: FirebirdTypeName;
+  /** Type-specific subtype; for BLOBs, 1 means text. */
+  subType?: number;
+  /** Decimal scale.  Non-zero means the value is exact and arrives as a string. */
+  scale?: number;
+  /** Declared length in bytes. */
+  length?: number;
+  /** Whether the column may be NULL. */
+  nullable?: boolean;
 }
+
+/** Readable names for the Firebird SQL type codes this library reports. */
+export type FirebirdTypeName =
+  | 'TEXT'
+  | 'VARYING'
+  | 'SMALLINT'
+  | 'INTEGER'
+  | 'BIGINT'
+  | 'INT128'
+  | 'FLOAT'
+  | 'DOUBLE'
+  | 'DECFLOAT16'
+  | 'DECFLOAT34'
+  | 'NUMERIC'
+  | 'DATE'
+  | 'TIME'
+  | 'TIMESTAMP'
+  | 'TIME_TZ'
+  | 'TIMESTAMP_TZ'
+  | 'BOOLEAN'
+  | 'BLOB'
+  | 'ARRAY'
+  | 'NULL'
+  | 'UNKNOWN';
 
 /**
  * A single row from a query result, keyed by column name.
