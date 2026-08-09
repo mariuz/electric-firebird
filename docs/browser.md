@@ -197,7 +197,7 @@ await db.transaction(async (tx) => {
 | Concurrent tabs | **Unsafe** — two tabs open the same IndexedDB store and each `persist()` rewrites the whole image, so the last writer wins and the other tab's writes are lost |
 | Auto-persist | On by default: writes persist after a 500 ms debounce, plus a best-effort flush when the page is hidden. Disable with `autoPersist: false` |
 | Typed values | Decoded from their real Firebird types, but flattened for JSON: `NUMERIC`/`DECFLOAT`/`INT128` and out-of-range `BIGINT` arrive as exact decimal **strings**, dates as ISO-8601 strings, binary BLOBs as base64. A typed ABI is planned |
-| Multi-statement `exec()` | Single statement only |
+| Multi-statement `exec()` | Supported — splitting respects strings, identifiers, comments and `SET TERM`. Parameters are rejected for scripts, since no value can be attributed to a statement |
 | Multi-tab / SharedWorker | Not yet supported |
 | Web Worker offloading | Planned |
 

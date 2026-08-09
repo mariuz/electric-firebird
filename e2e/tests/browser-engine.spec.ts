@@ -217,12 +217,14 @@ test.describe('FirebirdBrowser against the real engine', () => {
       const noMatch = await db.exec('DELETE FROM t WHERE id = ?', [999]);
 
       await db.close();
+      // exec() returns one result per statement; these are all single
+      // statements, so each has exactly one.
       return {
-        ddl: ddl.affectedRows,
-        insert: insert.affectedRows,
-        update: update.affectedRows,
-        del: del.affectedRows,
-        noMatch: noMatch.affectedRows,
+        ddl: ddl[0]!.affectedRows,
+        insert: insert[0]!.affectedRows,
+        update: update[0]!.affectedRows,
+        del: del[0]!.affectedRows,
+        noMatch: noMatch[0]!.affectedRows,
       };
     });
 
@@ -269,6 +271,48 @@ test.describe('FirebirdBrowser against the real engine', () => {
     expect(result.afterRollback).toContain('already been rolled back');
     // Only the row inserted outside the transactions survived.
     expect(result.count).toBe(1);
+  });
+
+
+  test('runs a migration script, including a procedure body', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('engine-script', {
+        worker: new Worker('/firebird-engine-worker.js'),
+      });
+
+      // The shape a real migration takes: several statements, a comment, and
+      // a PSQL body whose internal semicolons must not split it.
+      const results = await db.exec(`
+        CREATE TABLE items (id INTEGER, name VARCHAR(32));
+        -- seed data; note the semicolon in this comment
+        INSERT INTO items VALUES (1, 'alpha');
+        INSERT INTO items VALUES (2, 'a;b');
+
+        SET TERM ^ ;
+        CREATE PROCEDURE count_items RETURNS (total INTEGER) AS
+        BEGIN
+          SELECT COUNT(*) FROM items INTO :total;
+          SUSPEND;
+        END^
+        SET TERM ; ^
+      `);
+
+      const rows = await db.query('SELECT id, name FROM items ORDER BY id');
+      const viaProc = await db.query('SELECT total FROM count_items');
+
+      await db.close();
+      return { statements: results.length, rows: rows.rows, viaProc: viaProc.rows };
+    });
+
+    // Four statements: two DDL, two inserts. The SET TERM directives are not
+    // statements, and the procedure body stayed in one piece.
+    expect(result.statements).toBe(4);
+    expect(result.rows).toEqual([
+      { ID: 1, NAME: 'alpha' },
+      { ID: 2, NAME: 'a;b' },
+    ]);
+    // The procedure was created and runs, so its body survived splitting.
+    expect(result.viaProc).toEqual([{ TOTAL: 2 }]);
   });
 
   test('persists to IndexedDB and reopens the database after a reload', async ({

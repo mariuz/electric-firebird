@@ -27,6 +27,7 @@ import type { IndexedDBVFSOptions } from './indexeddb-vfs';
 import { DirectTransport } from './engine-transport';
 import type { EngineHandle, EngineTransport } from './engine-transport';
 import { WorkerTransport } from './worker-transport';
+import { splitStatements } from './sql-script';
 import type {
   QueryResult,
   Row,
@@ -172,18 +173,50 @@ export class FirebirdBrowser {
   // ── Public API (mirrors FirebirdLite) ─────────────────────────────────
 
   /**
-   * Execute a DDL or DML statement that does not return rows.
+   * Execute one or more statements that do not return rows.
    *
-   * The statement runs in its own transaction, committed on success.
+   * A script may contain several statements, which is what makes this usable
+   * for migrations.  Statement boundaries respect string literals, quoted
+   * identifiers, comments and `SET TERM`, so a stored procedure body full of
+   * semicolons survives intact.  Each statement runs in its own transaction,
+   * committed on success — a failure part-way leaves the statements before it
+   * committed, as it would in `isql`.
    *
-   * @returns the number of rows affected — meaningful for INSERT, UPDATE and
-   *          DELETE, and 0 for DDL.
+   * Parameters may only be supplied for a single statement: there is no way to
+   * say which statement a value belongs to otherwise.  Use `query()` for
+   * parameterised statements that return rows.
+   *
+   * @returns one result per statement, in order.
    */
-  async exec(sql: string, params: QueryParams = []): Promise<ExecResult> {
+  async exec(sql: string, params: QueryParams = []): Promise<ExecResult[]> {
     await this.ensureReady();
-    const affectedRows = await this.engine.execute(this.dbHandle, 0, sql, params);
-    this.markDirty();
-    return { affectedRows };
+
+    const statements = splitStatements(sql);
+
+    if (params.length > 0 && statements.length > 1) {
+      throw new Error(
+        `Parameters cannot be used with a multi-statement script ` +
+          `(${statements.length} statements found); run the statements separately`,
+      );
+    }
+
+    const results: ExecResult[] = [];
+
+    for (const statement of statements) {
+      const affectedRows = await this.engine.execute(
+        this.dbHandle,
+        0,
+        statement.sql,
+        params,
+      );
+      results.push({ affectedRows });
+    }
+
+    if (results.length > 0) {
+      this.markDirty();
+    }
+
+    return results;
   }
 
   /**

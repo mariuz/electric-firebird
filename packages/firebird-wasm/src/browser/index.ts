@@ -14,6 +14,9 @@ export type { FirebirdBrowserOptions, ExecResult } from './firebird-browser';
 
 export { encodeParams, encodeParamValue } from './params';
 
+export { splitStatements } from './sql-script';
+export type { ScriptStatement } from './sql-script';
+
 export { DirectTransport } from './engine-transport';
 export type {
   EngineTransport,

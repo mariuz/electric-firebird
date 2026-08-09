@@ -1000,6 +1000,121 @@ test.describe('FirebirdBrowser', () => {
   });
 
 
+
+  // ── SQL script splitting ────────────────────────────────────────────────
+  //
+  // A pure function, so these assert the awkward cases directly rather than
+  // through the engine.  Splitting on ";" alone corrupts scripts rather than
+  // merely failing, which is why each of these is worth pinning.
+
+  test('splits scripts on real statement boundaries', async ({ page }) => {
+    const cases = await page.evaluate(() => {
+      const split = (sql: string) =>
+        window.FB.splitStatements(sql).map((s) => s.sql);
+
+      return {
+        plain: split('CREATE TABLE a (id INT); INSERT INTO a VALUES (1)'),
+        trailing: split('SELECT 1;'),
+        blankBetween: split('SELECT 1;\n\n;\nSELECT 2;'),
+        semicolonInString: split("INSERT INTO t VALUES ('a;b'); SELECT 1"),
+        escapedQuote: split("INSERT INTO t VALUES ('it''s; fine'); SELECT 1"),
+        quotedIdent: split('CREATE TABLE "od;d" (id INT); SELECT 1'),
+        lineComment: split('SELECT 1; -- a comment; with a semicolon\nSELECT 2'),
+        blockComment: split('SELECT 1; /* a; b */ SELECT 2'),
+      };
+    });
+
+    expect(cases.plain).toEqual([
+      'CREATE TABLE a (id INT)',
+      'INSERT INTO a VALUES (1)',
+    ]);
+    expect(cases.trailing).toEqual(['SELECT 1']);
+    // Empty statements are dropped rather than sent to the engine.
+    expect(cases.blankBetween).toEqual(['SELECT 1', 'SELECT 2']);
+    expect(cases.semicolonInString).toEqual([
+      "INSERT INTO t VALUES ('a;b')",
+      'SELECT 1',
+    ]);
+    expect(cases.escapedQuote).toEqual([
+      "INSERT INTO t VALUES ('it''s; fine')",
+      'SELECT 1',
+    ]);
+    expect(cases.quotedIdent).toEqual(['CREATE TABLE "od;d" (id INT)', 'SELECT 1']);
+    expect(cases.lineComment).toEqual(['SELECT 1', 'SELECT 2']);
+    expect(cases.blockComment).toEqual(['SELECT 1', 'SELECT 2']);
+  });
+
+  test('honours SET TERM so procedure bodies survive', async ({ page }) => {
+    const result = await page.evaluate(() => {
+      const script = [
+        'SET TERM ^ ;',
+        'CREATE PROCEDURE p RETURNS (n INTEGER) AS',
+        'BEGIN',
+        '  n = 1;',
+        '  SUSPEND;',
+        'END^',
+        'SET TERM ; ^',
+        'SELECT 1 FROM RDB$DATABASE;',
+      ].join('\n');
+
+      return window.FB.splitStatements(script).map((s) => s.sql);
+    });
+
+    // The body's internal semicolons must not split it, and the SET TERM
+    // directives themselves are not statements to execute.
+    expect(result).toHaveLength(2);
+    expect(result[0]).toContain('CREATE PROCEDURE p');
+    expect(result[0]).toContain('SUSPEND;');
+    expect(result[1]).toBe('SELECT 1 FROM RDB$DATABASE');
+  });
+
+  test('reports the line each statement starts on', async ({ page }) => {
+    const lines = await page.evaluate(() =>
+      window.FB
+        .splitStatements('SELECT 1;\n\nSELECT 2;\n-- note\nSELECT 3;')
+        .map((s) => s.line),
+    );
+
+    // So a failure can name where in the script it happened.
+    expect(lines).toEqual([1, 3, 5]);
+  });
+
+  test('runs every statement of a script and refuses params for scripts', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('script');
+      window.__stub.affectedRows = 1;
+
+      const results = await db.exec(
+        "CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)",
+      );
+
+      const executed = window.__stub.calls
+        .filter((c) => c.fn === '_fb_execute')
+        .map((c) => c.args[2]);
+
+      let paramsError: string | null = null;
+      try {
+        await db.exec('INSERT INTO t VALUES (?); INSERT INTO t VALUES (?)', [1, 2]);
+      } catch (err) {
+        paramsError = (err as Error).message;
+      }
+
+      await db.close();
+      return { count: results.length, executed, paramsError };
+    });
+
+    expect(result.count).toBe(3);
+    expect(result.executed).toEqual([
+      'CREATE TABLE t (id INTEGER)',
+      'INSERT INTO t VALUES (1)',
+      'INSERT INTO t VALUES (2)',
+    ]);
+    // Ambiguous rather than merely unsupported: which statement owns which value?
+    expect(result.paramsError).toContain('2 statements found');
+  });
+
   // ── Automatic persistence ───────────────────────────────────────────────
 
   test('persists automatically after a write, coalescing a burst', async ({

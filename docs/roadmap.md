@@ -289,7 +289,6 @@ Consequences worth knowing:
   BIGINT/NUMERIC/DECFLOAT arrive as exact decimal *strings* to avoid silent
   precision loss.
 - Multi-statement `exec()`, `affectedRows`, `tx.rollback()`.
-- Multi-statement `exec()` for migration scripts (§M2).
 - Typed result encoding (§M2): `FieldInfo` still carries only `name`, and
   BIGINT/NUMERIC/DECFLOAT arrive as exact decimal *strings* to avoid silent
   precision loss.
@@ -350,6 +349,32 @@ Two details that would otherwise bite:
 `close()` cancels the pending timer, detaches the listeners and waits for any
 persist already running, so nothing can write after the engine has gone.
 
+### exec() runs scripts
+
+`exec()` takes a script and returns one result per statement, which is what
+makes it usable for migrations.  Each statement runs in its own transaction,
+so a failure part-way leaves earlier statements committed — the same as
+`isql`.
+
+Splitting is the whole problem.  Cutting on `;` corrupts scripts rather than
+merely failing them, so the splitter tracks string literals (including `''`
+escapes), quoted identifiers, line and block comments, and `SET TERM`.
+
+`SET TERM` matters more than it looks: it is how Firebird lets a PSQL body
+contain its own semicolons, so a splitter that ignores it cuts every stored
+procedure and trigger in half — which is most of what a real migration
+contains.  A test creates a procedure through `exec()` and then calls it, so
+the body is proven to have survived rather than merely looking intact.
+
+Parameters are rejected for a multi-statement script.  It is not that binding
+would be hard; it is that there is no way to say which statement a value
+belongs to, and guessing would be worse than refusing.
+
+`exec()` returning an array is a change from the single `ExecResult` added a
+commit earlier.  It matches PGlite, where `.exec()` is the script runner and
+`.query()` is the parameterised one; callers that ignore the return value are
+unaffected.
+
 ---
 
 ## 2. Feature comparison with PGlite
@@ -362,7 +387,7 @@ Legend: ✅ shipped · 🟡 partial · ❌ missing · n/a not applicable
 |---|---|---|---|
 | `query(sql, params)` | ✅ | ✅ | `?` placeholders on both backends |
 | Template-literal `` sql`…` `` tag | ✅ | ❌ | Ergonomics + injection safety |
-| `exec(sql)` multi-statement script → array of results | ✅ | ❌ | `exec()` is single-statement and returns `void`; migrations are the use case |
+| `exec(sql)` multi-statement script → array of results | ✅ | ✅ | Splitting respects strings, identifiers, comments and `SET TERM` |
 | `rowMode: 'object' \| 'array'` | ✅ | ❌ | Always object mode |
 | Custom `parsers` / `serializers` | ✅ | ❌ | |
 | `describeQuery()` | ✅ | ❌ | |
