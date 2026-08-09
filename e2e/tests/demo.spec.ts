@@ -32,7 +32,10 @@ const BOOT_TIMEOUT = 180_000;
  * waits for the state the second load reaches rather than for navigation.
  */
 async function openDemo(page: Page): Promise<void> {
-  await page.goto('/');
+  // './' not '/'.  A leading slash resolves against the *origin*, which on a
+  // GitHub project site (https://user.github.io/repo/) lands on the user's own
+  // page rather than the demo.
+  await page.goto('./');
   await expect(page.locator('#status')).toHaveAttribute('data-state', 'ready', {
     timeout: BOOT_TIMEOUT,
   });
@@ -89,7 +92,7 @@ test.describe('Demo site', () => {
     // Prove the premise before relying on it: if the test server started
     // sending the headers itself, every other test here would pass without
     // the service worker doing anything.
-    const response = await page.request.get('/');
+    const response = await page.request.get('./');
     expect(response.headers()['cross-origin-opener-policy']).toBeUndefined();
     expect(response.headers()['cross-origin-embedder-policy']).toBeUndefined();
 
@@ -316,6 +319,12 @@ test.describe('Demo site', () => {
     await page.waitForTimeout(1500);
 
     await page.locator('#reset').click();
+
+    // Wait for the delete to start before waiting for it to finish.  "ready"
+    // is already true from before the click, so waiting on it alone passes
+    // instantly and the next query races the reload — which is exactly how
+    // this test passed locally while the site was untested.
+    await expect(page.locator('#status')).toHaveAttribute('data-state', 'booting');
     await expect(page.locator('#status')).toHaveAttribute('data-state', 'ready', {
       timeout: BOOT_TIMEOUT,
     });

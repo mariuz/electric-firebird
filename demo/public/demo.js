@@ -496,17 +496,30 @@ els.sql.addEventListener('keydown', (event) => {
 
 els.reset.addEventListener('click', async () => {
   els.reset.disabled = true;
+  els.run.disabled = true;
+  // Say what is happening, and give anything watching a state to wait for:
+  // the page is about to reload, and "ready" from before the click is
+  // indistinguishable from "ready" after it.
+  setStatus('booting', 'Deleting the database…');
+
   try {
     // Close first: the connection holds the cross-tab lock and an open
     // IndexedDB handle, and deleting a database with a live connection blocks
     // until every one of them is gone.
     if (db) await db.close();
+    db = null;
+
     await new Promise((resolve, reject) => {
       const request = indexedDB.deleteDatabase(`firebird_${DB_NAME}`);
       request.onsuccess = () => resolve();
       request.onerror = () => reject(request.error);
-      request.onblocked = () => resolve(); // gone on the next reload regardless
+      // `blocked` means another connection is still open, so the delete is
+      // queued rather than done.  Waiting is right — but not forever, or a
+      // stray tab would strand the page on this screen.
+      request.onblocked = () => setTimeout(resolve, 3000);
     });
+  } catch (err) {
+    console.error('[firebird-demo] could not delete the database', err);
   } finally {
     location.reload();
   }
