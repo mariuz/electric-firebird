@@ -16,6 +16,13 @@ export { encodeParams, encodeParamValue } from './params';
 
 export { firebirdTypeName } from './field-types';
 
+export {
+  acquireDatabaseLock,
+  databaseLockName,
+  DatabaseLockedError,
+} from './db-lock';
+export type { DatabaseLock, DatabaseLockOptions } from './db-lock';
+
 export { splitStatements } from './sql-script';
 export type { ScriptStatement } from './sql-script';
 

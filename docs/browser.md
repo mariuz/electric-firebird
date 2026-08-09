@@ -194,12 +194,74 @@ await db.transaction(async (tx) => {
 |---------|--------|
 | Pre-built WASM binary on npm | Not published — you must build it yourself with emsdk |
 | Parameterised queries (`?` placeholders) | Supported. Values are sent as text and converted by the engine, so integers, decimals, booleans and dates all work; binary (`Uint8Array`) parameters throw rather than corrupt data |
-| Concurrent tabs | **Unsafe** — two tabs open the same IndexedDB store and each `persist()` rewrites the whole image, so the last writer wins and the other tab's writes are lost |
+| Concurrent tabs | **Safe by default** — the second tab is refused with `DatabaseLockedError` rather than silently overwriting the first. Opt out with `multiTab: 'allow-unsafe'`. See [Concurrent tabs](#concurrent-tabs) |
 | Auto-persist | On by default: writes persist after a 500 ms debounce, plus a best-effort flush when the page is hidden. Disable with `autoPersist: false` |
 | Typed values | Decoded from their real Firebird types, but flattened for JSON: `NUMERIC`/`DECFLOAT`/`INT128` and out-of-range `BIGINT` arrive as exact decimal **strings**, dates as ISO-8601 strings, binary BLOBs as base64. A typed ABI is planned |
 | Multi-statement `exec()` | Supported — splitting respects strings, identifiers, comments and `SET TERM`. Parameters are rejected for scripts, since no value can be attributed to a statement |
-| Multi-tab / SharedWorker | Not yet supported |
-| Web Worker offloading | Planned |
+| Concurrent tabs sharing one engine | Not yet — a second tab is refused, not served by the first. A SharedWorker leader would lift that |
+| Web Worker offloading | Supported — pass `worker`; browsers require it |
+
+### Concurrent tabs
+
+Opening the same database in two tabs used to lose data silently.  It is now
+refused by default.
+
+The reason it cannot simply be allowed: every tab runs its own engine with its
+own complete copy of the database in memory, and `persist()` writes that
+**whole image** to IndexedDB.  Two tabs are therefore not two writers to be
+interleaved — the later persist replaces everything the other tab did.
+
+```
+tab A: open (v1) ── write x ─────────────────── persist (v1+x)
+tab B: open (v1) ── write y ── persist (v1+y)
+```
+
+`y` survives; `x` is gone.  Nothing reports an error: tab A committed
+successfully, and IndexedDB wrote exactly what it was given.  Making
+`importDatabase()` atomic — which it is — does not help, because each write is
+individually correct and still wrong.
+
+So the second tab is stopped at the door:
+
+```ts
+try {
+  await db.exec('SELECT 1 FROM RDB$DATABASE');
+} catch (err) {
+  if (err instanceof DatabaseLockedError) {
+    showBanner(`Already open in another tab.`);
+  }
+}
+```
+
+The exclusion uses the [Web Locks API][weblocks], for one property in
+particular: locks are released when the holding context dies.  A tab that
+crashes, is killed, or is closed without running any handler releases the
+database immediately.  A lock kept as a record in IndexedDB would instead have
+to guess whether a holder that stopped updating 40 seconds ago is dead or
+merely busy — and every possible answer is either a deadlock or a corruption
+window.
+
+A tab that is waiting is also queued, not polling: it is granted the database
+the moment the holder closes it, and it reads the stored image only *after*
+acquiring the lock, so it can never resume from a snapshot the departing tab
+has since replaced.
+
+| Option | Meaning |
+|--------|---------|
+| `multiTab: 'exclusive'` | Default. Refuse if another tab holds the database |
+| `multiTab: 'allow-unsafe'` | Skip the lock. Only sound if at most one tab writes |
+| `lockTimeoutMs` | How long to wait for the other tab, default `5000`. `Infinity` waits forever |
+
+Where the Web Locks API is unavailable — Node, jsdom, a page served over plain
+HTTP — there is nothing to enforce with, so the library warns and proceeds.
+Any browser able to run the engine at all supports it, since the engine
+already requires cross-origin isolation.
+
+What this does **not** do is let two tabs use one database at once.  That needs
+a single engine in a SharedWorker with the other tabs as clients, which is
+[roadmap.md](./roadmap.md) §M4.
+
+[weblocks]: https://developer.mozilla.org/en-US/docs/Web/API/Web_Locks_API
 
 ### Transaction-scoped statements
 

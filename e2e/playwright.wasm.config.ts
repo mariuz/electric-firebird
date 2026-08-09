@@ -22,6 +22,7 @@ export default defineConfig({
     '**/wasm.spec.ts',
     '**/browser-api.spec.ts',
     '**/browser-engine.spec.ts',
+    '**/browser-multitab.spec.ts',
   ],
   fullyParallel: false,
   forbidOnly: !!process.env['CI'],

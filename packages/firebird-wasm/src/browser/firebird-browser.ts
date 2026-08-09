@@ -28,6 +28,8 @@ import { DirectTransport } from './engine-transport';
 import type { EngineHandle, EngineTransport } from './engine-transport';
 import { WorkerTransport } from './worker-transport';
 import { splitStatements } from './sql-script';
+import { acquireDatabaseLock } from './db-lock';
+import type { DatabaseLock } from './db-lock';
 import type {
   QueryResult,
   Row,
@@ -104,6 +106,28 @@ export interface FirebirdBrowserOptions {
    * `console.error`.
    */
   onPersistError?: (error: Error) => void;
+  /**
+   * What to do when the same database is already open in another tab.
+   *
+   * Every tab keeps its own complete copy of the database and persists the
+   * whole image, so two writers do not interleave — the later persist discards
+   * the earlier tab's work entirely, with both tabs reporting success.
+   *
+   * - `'exclusive'` (default) takes a cross-tab lock and fails with
+   *   {@link DatabaseLockedError} if another tab will not release it in time.
+   * - `'allow-unsafe'` skips the lock.  Only sound when at most one of the
+   *   tabs writes.
+   *
+   * @default 'exclusive'
+   */
+  multiTab?: 'exclusive' | 'allow-unsafe';
+  /**
+   * How long to wait for another tab to release the database, in
+   * milliseconds.  `Infinity` waits indefinitely.
+   *
+   * @default 5000
+   */
+  lockTimeoutMs?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -139,6 +163,11 @@ export class FirebirdBrowser {
   private persistAgain = false;
   private lifecycleAttached = false;
 
+  private readonly multiTab: 'exclusive' | 'allow-unsafe';
+  private readonly lockTimeoutMs: number;
+  /** Held for the connection's lifetime; released by close(). */
+  private lock: DatabaseLock | null = null;
+
   /**
    * @param dbName  Logical database name.  Used as the IndexedDB store name
    *                and the filename inside Emscripten's virtual FS.
@@ -148,6 +177,9 @@ export class FirebirdBrowser {
     this.dbName = dbName;
     this.options = options;
     this.vfs = new IndexedDBVFS(options.vfs);
+
+    this.multiTab = options.multiTab ?? 'exclusive';
+    this.lockTimeoutMs = options.lockTimeoutMs ?? 5_000;
 
     this.autoPersist = options.autoPersist ?? true;
     this.autoPersistDebounceMs = options.autoPersistDebounceMs ?? 500;
@@ -340,8 +372,21 @@ export class FirebirdBrowser {
       this.dbHandle = 0;
     }
 
-    await this.vfs.close();
-    await this.engine.dispose();
+    try {
+      await this.vfs.close();
+      await this.engine.dispose();
+    } finally {
+      // Last, and unconditionally: a lock still held after a failed teardown
+      // locks the database out of every future tab until the page is gone.
+      await this.releaseLock();
+    }
+  }
+
+  /** Release the cross-tab lock, if this instance holds one. */
+  private async releaseLock(): Promise<void> {
+    const lock = this.lock;
+    this.lock = null;
+    await lock?.release();
   }
 
   // ── Automatic persistence ─────────────────────────────────────────────
@@ -437,6 +482,15 @@ export class FirebirdBrowser {
   }
 
   private async init(): Promise<void> {
+    // Before anything reads the stored image.  A tab that loaded the database
+    // and then waited for the lock would resume with a snapshot the departing
+    // tab has since replaced — the very overwrite the lock prevents.
+    if (this.multiTab === 'exclusive') {
+      this.lock = await acquireDatabaseLock(this.dbName, {
+        timeoutMs: this.lockTimeoutMs,
+      });
+    }
+
     await this.engine.init();
 
     await this.engine.mkdir('/data');
