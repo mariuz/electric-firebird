@@ -8,6 +8,12 @@
   "scripts": {
     "build": "npm run build --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
-    "lint": "npm run lint --workspaces --if-present"
+    "lint": "npm run lint --workspaces --if-present",
+    "build:demo": "node demo/build.mjs",
+    "demo": "node demo/build.mjs --serve",
+    "test:demo": "npm --prefix e2e exec -- playwright test --config playwright.demo.config.ts"
+  },
+  "devDependencies": {
+    "esbuild": "^0.23.1"
   }
 }

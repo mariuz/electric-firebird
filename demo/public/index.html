@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Firebird in the browser — WebAssembly demo</title>
+    <meta
+      name="description"
+      content="Run the Firebird embedded database engine entirely in your browser, compiled to WebAssembly. No server."
+    />
+    <link rel="stylesheet" href="./demo.css" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔥</text></svg>"
+    />
+    <!--
+      Must run before anything that needs SharedArrayBuffer, and must be a
+      classic script: it reads document.currentScript to find its own URL.
+    -->
+    <script src="./coi-serviceworker.js"></script>
+  </head>
+  <body>
+    <header class="masthead">
+      <div class="masthead-text">
+        <h1>Firebird, in your browser</h1>
+        <p>
+          The Firebird embedded engine compiled to WebAssembly. Everything below
+          runs on this page — there is no database server, and nothing you type
+          leaves your machine.
+        </p>
+      </div>
+      <div class="status" id="status" data-state="booting">
+        <span class="status-dot"></span>
+        <span class="status-text" id="status-text">Starting the engine…</span>
+      </div>
+    </header>
+
+    <main>
+      <aside class="examples">
+        <h2>Examples</h2>
+        <p class="examples-hint">
+          Start at the top — the first one creates the tables the others query.
+        </p>
+        <ol id="example-list"></ol>
+
+        <div class="persistence">
+          <h3>It persists</h3>
+          <p>
+            The database is stored in IndexedDB, so it survives a reload. Try
+            it: run the first example, refresh the page, then run
+            <em>Filter and sort</em>.
+          </p>
+          <button type="button" id="reset" class="ghost">
+            Delete the database
+          </button>
+        </div>
+      </aside>
+
+      <section class="console">
+        <div class="editor-wrap">
+          <label class="field-label" for="sql">SQL</label>
+          <textarea
+            id="sql"
+            spellcheck="false"
+            aria-label="SQL to run"
+            placeholder="SELECT 'hello' FROM RDB$DATABASE"
+          ></textarea>
+
+          <div class="params-row">
+            <label class="field-label" for="params">
+              Parameters
+              <span class="field-hint">JSON array, bound to <code>?</code></span>
+            </label>
+            <input
+              id="params"
+              type="text"
+              spellcheck="false"
+              placeholder="[]"
+              aria-label="Query parameters as a JSON array"
+            />
+          </div>
+
+          <div class="actions">
+            <button type="button" id="run" class="primary" disabled>
+              Run <kbd>Ctrl</kbd>+<kbd>Enter</kbd>
+            </button>
+            <span class="timing" id="timing"></span>
+          </div>
+        </div>
+
+        <div class="result" id="result" aria-live="polite">
+          <p class="placeholder">Results appear here.</p>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <p>
+        <a href="https://github.com/mariuz/electric-firebird">Source on GitHub</a>
+        · Built from
+        <a href="https://github.com/FirebirdSQL/firebird">Firebird</a>
+        with Emscripten
+      </p>
+      <p class="footnote" id="isolation-note"></p>
+    </footer>
+
+    <script type="module" src="./demo.js"></script>
+  </body>
+</html>

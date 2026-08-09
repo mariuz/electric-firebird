@@ -1,0 +1,445 @@
+/* demo.css – styling for the Firebird WASM demo.
+ *
+ * Theme-aware: the palette is defined once in custom properties and swapped by
+ * `prefers-color-scheme`, so there is no second copy of the rules to keep in
+ * step.
+ */
+
+:root {
+  color-scheme: light dark;
+
+  --bg: #fbfaf9;
+  --panel: #ffffff;
+  --panel-2: #f4f2f0;
+  --ink: #1c1917;
+  --ink-soft: #57534e;
+  --ink-faint: #8b8681;
+  --line: #e3dfdb;
+  --accent: #c2410c;
+  --accent-ink: #ffffff;
+  --ok: #15803d;
+  --bad: #b91c1c;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #17150f;
+    --panel: #211e17;
+    --panel-2: #2b2720;
+    --ink: #f5f0e8;
+    --ink-soft: #c4bcae;
+    --ink-faint: #8d8577;
+    --line: #3a352c;
+    --accent: #f97316;
+    --accent-ink: #1a1710;
+    --ok: #4ade80;
+    --bad: #f87171;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: var(--accent);
+}
+
+/* ── Masthead ──────────────────────────────────────────────────────────── */
+
+.masthead {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem 2rem;
+  align-items: flex-start;
+  justify-content: space-between;
+  padding: 2rem clamp(1rem, 4vw, 3rem) 1.5rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.masthead h1 {
+  margin: 0 0 0.35rem;
+  font-size: clamp(1.5rem, 3.5vw, 2.1rem);
+  letter-spacing: -0.02em;
+}
+
+.masthead p {
+  margin: 0;
+  max-width: 60ch;
+  color: var(--ink-soft);
+}
+
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.45rem 0.85rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel);
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+
+.status-dot {
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 50%;
+  background: var(--ink-faint);
+  flex: none;
+}
+
+.status[data-state="booting"] .status-dot {
+  background: var(--accent);
+  animation: pulse 1.1s ease-in-out infinite;
+}
+.status[data-state="ready"] .status-dot {
+  background: var(--ok);
+}
+.status[data-state="error"] .status-dot {
+  background: var(--bad);
+}
+.status[data-state="busy"] .status-dot {
+  background: var(--accent);
+  animation: pulse 0.7s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.25;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .status-dot {
+    animation: none !important;
+  }
+}
+
+/* ── Layout ────────────────────────────────────────────────────────────── */
+
+main {
+  display: grid;
+  grid-template-columns: minmax(240px, 21rem) minmax(0, 1fr);
+  gap: clamp(1rem, 3vw, 2.5rem);
+  padding: clamp(1rem, 3vw, 2rem) clamp(1rem, 4vw, 3rem) 3rem;
+  align-items: start;
+}
+
+@media (max-width: 860px) {
+  main {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* ── Examples ──────────────────────────────────────────────────────────── */
+
+.examples h2 {
+  margin: 0 0 0.25rem;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ink-faint);
+}
+
+.examples-hint {
+  margin: 0 0 1rem;
+  font-size: 0.85rem;
+  color: var(--ink-soft);
+}
+
+.examples ol {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.5rem;
+}
+
+.example {
+  width: 100%;
+  text-align: left;
+  padding: 0.7rem 0.85rem;
+  border: 1px solid var(--line);
+  border-radius: 0.6rem;
+  background: var(--panel);
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  transition: border-color 0.12s ease, transform 0.12s ease;
+}
+
+.example:hover {
+  border-color: var(--accent);
+}
+
+.example:active {
+  transform: translateY(1px);
+}
+
+.example[aria-current="true"] {
+  border-color: var(--accent);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.example strong {
+  display: block;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.example span {
+  display: block;
+  margin-top: 0.15rem;
+  font-size: 0.82rem;
+  color: var(--ink-soft);
+}
+
+.persistence {
+  margin-top: 1.75rem;
+  padding: 0.9rem 1rem;
+  border: 1px dashed var(--line);
+  border-radius: 0.6rem;
+  background: var(--panel-2);
+}
+
+.persistence h3 {
+  margin: 0 0 0.35rem;
+  font-size: 0.9rem;
+}
+
+.persistence p {
+  margin: 0 0 0.7rem;
+  font-size: 0.85rem;
+  color: var(--ink-soft);
+}
+
+/* ── Console ───────────────────────────────────────────────────────────── */
+
+.console {
+  display: grid;
+  gap: 1.25rem;
+  min-width: 0;
+}
+
+.editor-wrap {
+  border: 1px solid var(--line);
+  border-radius: 0.7rem;
+  background: var(--panel);
+  padding: 0.9rem 1rem 1rem;
+}
+
+.field-label {
+  display: block;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--ink-faint);
+  margin-bottom: 0.35rem;
+}
+
+.field-hint {
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--ink-faint);
+  font-weight: 400;
+}
+
+textarea#sql {
+  width: 100%;
+  min-height: 11rem;
+  resize: vertical;
+  padding: 0.75rem 0.85rem;
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+  background: var(--bg);
+  color: var(--ink);
+  font: 13.5px/1.6 var(--mono);
+  tab-size: 2;
+}
+
+input#params {
+  width: 100%;
+  padding: 0.5rem 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+  background: var(--bg);
+  color: var(--ink);
+  font: 13px/1.5 var(--mono);
+}
+
+textarea#sql:focus,
+input#params:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.params-row {
+  margin-top: 0.85rem;
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-top: 0.95rem;
+}
+
+button.primary {
+  padding: 0.55rem 1.1rem;
+  border: 0;
+  border-radius: 0.5rem;
+  background: var(--accent);
+  color: var(--accent-ink);
+  font: 600 0.95rem/1.2 inherit;
+  cursor: pointer;
+}
+
+button.primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+button.ghost {
+  padding: 0.4rem 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 0.45rem;
+  background: transparent;
+  color: var(--ink-soft);
+  font: 0.85rem/1.2 inherit;
+  cursor: pointer;
+}
+
+button.ghost:hover {
+  border-color: var(--bad);
+  color: var(--bad);
+}
+
+kbd {
+  font: 0.75rem var(--mono);
+  opacity: 0.75;
+  padding: 0 0.15rem;
+}
+
+.timing {
+  font: 0.85rem var(--mono);
+  color: var(--ink-faint);
+}
+
+/* ── Results ───────────────────────────────────────────────────────────── */
+
+.result {
+  border: 1px solid var(--line);
+  border-radius: 0.7rem;
+  background: var(--panel);
+  min-height: 8rem;
+  overflow: hidden;
+}
+
+.placeholder,
+.message {
+  margin: 0;
+  padding: 1.1rem 1.15rem;
+  color: var(--ink-soft);
+  font-size: 0.92rem;
+}
+
+.message.error {
+  color: var(--bad);
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.message.ok {
+  color: var(--ok);
+}
+
+/* Wide result sets scroll inside the panel; the page itself never does. */
+.table-scroll {
+  overflow-x: auto;
+  max-height: 26rem;
+  overflow-y: auto;
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  font: 13px/1.5 var(--mono);
+}
+
+thead th {
+  position: sticky;
+  top: 0;
+  background: var(--panel-2);
+  text-align: left;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+thead th .coltype {
+  display: block;
+  font-size: 0.72rem;
+  font-weight: 400;
+  color: var(--ink-faint);
+  letter-spacing: 0.03em;
+}
+
+tbody td {
+  padding: 0.4rem 0.75rem;
+  border-bottom: 1px solid var(--line);
+  white-space: pre;
+  vertical-align: top;
+}
+
+tbody tr:nth-child(even) {
+  background: color-mix(in srgb, var(--panel-2) 45%, transparent);
+}
+
+td.null {
+  color: var(--ink-faint);
+  font-style: italic;
+}
+
+.result-meta {
+  padding: 0.55rem 1.15rem;
+  border-top: 1px solid var(--line);
+  font-size: 0.82rem;
+  color: var(--ink-faint);
+  background: var(--panel-2);
+}
+
+/* ── Footer ────────────────────────────────────────────────────────────── */
+
+footer {
+  border-top: 1px solid var(--line);
+  padding: 1.25rem clamp(1rem, 4vw, 3rem) 2.5rem;
+  color: var(--ink-faint);
+  font-size: 0.85rem;
+}
+
+footer p {
+  margin: 0.2rem 0;
+}
+
+.footnote {
+  font-size: 0.8rem;
+}

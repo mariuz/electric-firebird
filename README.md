@@ -10,6 +10,20 @@ This monorepo contains:
 |---------|-------------|
 | [`packages/firebird-wasm`](./packages/firebird-wasm) | TypeScript library — PGlite-style async API for Firebird |
 | [`e2e`](./e2e) | Playwright end-to-end tests |
+| [`demo`](./demo) | The playground published to GitHub Pages |
+
+## Try it
+
+**[Open the demo →](https://mariuz.github.io/electric-firebird/)**
+
+A SQL console running the real engine in your browser — no server, nothing
+uploaded. It ships worked examples for joins and aggregates, bound parameters,
+a recursive CTE, `EXECUTE BLOCK`, transaction rollback, and exact `BIGINT` and
+`NUMERIC` values that a JavaScript number could not hold. The database lives in
+IndexedDB, so it is still there after a reload.
+
+To run it locally, see [`demo/`](./demo) — you will need the WASM artifact
+first.
 
 ## Quick start
 
@@ -91,6 +105,18 @@ npm run test:browser
 # Node.js suite — needs a running Firebird server
 FIREBIRD_PASSWORD=<password> npx playwright test
 ```
+
+### Run the demo site
+
+```bash
+npm run build:wasm -w packages/firebird-wasm   # once; slow
+npm run demo                                    # http://localhost:4173
+npm run test:demo                               # 16 Playwright tests
+```
+
+The local server sends no COOP/COEP headers, exactly like GitHub Pages, so the
+demo's service worker has to supply cross-origin isolation itself. See
+[`demo/README.md`](./demo/README.md).
 
 ### Build the WASM module (optional)
 

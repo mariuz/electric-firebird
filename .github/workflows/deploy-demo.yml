@@ -1,0 +1,87 @@
+name: Deploy demo to GitHub Pages
+
+# Runs after "Build WASM" succeeds on main, and reuses the artifact that
+# workflow already uploaded.  Compiling Firebird with Emscripten takes the
+# better part of an hour, so building it a second time just to publish a 9 MB
+# file would double the cost of every push for nothing.
+on:
+  workflow_run:
+    workflows: ['Build WASM']
+    types: [completed]
+    branches: [main]
+  # Publishing on demand, e.g. after editing only the demo's HTML.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read   # to fetch the engine artifact from the build workflow's run
+  pages: write
+  id-token: write
+
+# Let a running deploy finish rather than cancelling it: a half-published site
+# is worse than a slightly stale one.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build and publish the demo
+    runs-on: ubuntu-latest
+    # `workflow_run` fires on failure too, and publishing a demo built from a
+    # failed engine build is exactly what should not happen.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install
+
+      # The artifact belongs to the build run, not to this one.  On a manual
+      # dispatch there is no triggering run at all, so fall back to the most
+      # recent successful build rather than failing.
+      - name: Download the compiled engine
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TRIGGERING_RUN: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          run_id="${TRIGGERING_RUN:-}"
+          if [ -z "$run_id" ]; then
+            run_id=$(gh run list --workflow 'Build WASM' --branch main \
+              --status success --limit 1 --json databaseId \
+              --jq '.[0].databaseId')
+          fi
+          if [ -z "$run_id" ]; then
+            echo "No successful 'Build WASM' run to take the engine from." >&2
+            exit 1
+          fi
+          echo "Using engine from run $run_id"
+          gh run download "$run_id" --name firebird-wasm \
+            --dir packages/firebird-wasm/dist/wasm
+          ls -la packages/firebird-wasm/dist/wasm
+
+      - name: Build the demo site
+        run: npm run build:demo
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: demo/dist
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -79,6 +79,23 @@ jobs:
           CI: 'true'
         run: npx playwright test --config playwright.wasm.config.ts
 
+      - name: Run demo site (Playwright) e2e tests
+        working-directory: e2e
+        env:
+          CI: 'true'
+        # Serves the built site with no COOP/COEP, exactly as GitHub Pages
+        # does, so a demo that only works behind a helpful dev server fails
+        # here rather than after it is published.
+        run: npx playwright test --config playwright.demo.config.ts
+
+      - name: Upload demo Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-demo
+          path: e2e/playwright-report-demo/
+          retention-days: 30
+
       - name: Upload WASM Playwright report
         if: always()
         uses: actions/upload-artifact@v4
