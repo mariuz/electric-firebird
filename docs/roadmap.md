@@ -285,14 +285,18 @@ Consequences worth knowing:
 
 ### What is still open
 
-- Typed result encoding (§M2): `FieldInfo` still carries only `name`, and
-  BIGINT/NUMERIC/DECFLOAT arrive as exact decimal *strings* to avoid silent
-  precision loss.
-- Multi-statement `exec()`, `affectedRows`, `tx.rollback()`.
-- Multi-tab safety and live queries (§M4).
+Typed results, multi-statement `exec()`, `affectedRows`, `tx.rollback()` and
+multi-tab safety have all landed since this list was written; what remains:
+
+- Live queries (§M4). Firebird's `POST_EVENT` is the natural fit and is unused.
+- Two tabs cannot *share* a database — the second is refused, not served (§M4).
 - A typed *binary* result encoding, so exact numerics need not travel as
   strings at all.
-- Multi-tab safety (§M4) and live queries (§M4).
+- `loadFirebirdWasm()` caches one module process-wide with no way to dispose
+  it; `close()` does not release the WASM heap.
+- Only the built-in character sets are compiled in; loadable ones need
+  `dlopen`.
+- ElectricSQL sync (§M5) — the project's namesake.
 
 ### Persistence is atomic and incremental
 
@@ -395,6 +399,46 @@ is `BIGINT` with scale 0.
 The fields on `FieldInfo` are optional because the Node.js native driver does
 not expose them; the WASM backend fills them in.
 
+### It is on npm
+
+`firebird-wasm@0.1.0` is published, and `v0.1.0` is tagged on GitHub with the
+engine attached as a release asset.
+
+```bash
+npm install firebird-wasm
+```
+
+The package ships the compiled engine, so nobody has to run Emscripten to try
+it: 66 files, 3.1 MB packed, 9.0 MB unpacked, almost all of it
+`firebird-embedded.wasm`.
+
+Two things about the packaging are worth recording, because both would have
+shipped broken.
+
+Without a `files` field npm walks the package directory, and the first
+`npm pack --dry-run` measured **13,545 files and 458 MB** — the entire Firebird
+source submodule and every build tree. It is now restricted to `dist`, the
+README and the licence.
+
+More subtly, `npm run build` compiles TypeScript but does *not* produce
+`firebird-embedded.wasm`, which comes from a separate hour-long Emscripten
+build. Publishing after a plain build yields a package that installs perfectly
+and then 404s the engine in every consumer's browser, with no signal at publish
+time. `scripts/check-publish.mjs` runs from `prepublishOnly` and refuses that,
+and it prints the build order — which is not the obvious one, since `clean`
+deletes `dist` and so must run *before* `build:wasm`.
+
+The native driver moved to `optionalDependencies` in the same pass. It was a
+hard dependency, so anyone installing this for the *browser* engine was made to
+install a native module needing Firebird's client library. `npm install
+firebird-wasm --omit=optional` now pulls four packages, builds nothing, and the
+browser entry point works.
+
+Verified against the real registry rather than a local tarball: installed into
+an empty project, created a database, and read back `NUMERIC(10,2)` as the
+exact string `"20.25"`. The published shasum matches the tarball that was
+tested before release.
+
 ---
 
 ## 2. Feature comparison with PGlite
@@ -450,13 +494,13 @@ Legend: ✅ shipped · 🟡 partial · ❌ missing · n/a not applicable
 
 | Capability | PGlite | electric-firebird | Notes |
 |---|---|---|---|
-| Prebuilt WASM on npm | ✅ | ❌ | Users must run Emscripten themselves |
-| CDN distribution | ✅ | ❌ | |
-| Bundler guides (Vite/webpack) | ✅ | 🟡 | Documented in `browser.md`, unverified against a real bundler |
+| Prebuilt WASM on npm | ✅ | ✅ | `npm install firebird-wasm` ships the engine |
+| CDN distribution | ✅ | 🟡 | Reachable via unpkg/jsDelivr by virtue of being on npm, but untested and there is no `locateFile` default for it |
+| Bundler guides (Vite/webpack) | ✅ | 🟡 | Vite, webpack, esbuild and Next.js in [integration.md](./integration.md); still not built by a real example app in CI |
 | Framework hooks (React/Vue) | ✅ | ❌ | |
 | ORM / query-builder support | ✅ | ❌ | |
 | Extensions / plugin API | ✅ | n/a | Firebird UDRs are a different model; not a near-term goal |
-| REPL component | ✅ | ❌ | Cheap and very good for demos |
+| REPL component | ✅ | 🟡 | The [demo](https://mariuz.github.io/electric-firebird/) is one, but it is a page, not a reusable component |
 
 ### Where Firebird can beat the comparison
 
@@ -476,19 +520,37 @@ Worth stating, because "catch up with PGlite" is not the only axis:
 
 ## 3. Gaps ranked
 
-By "how much damage does this do to a user who tries the README today":
+By "how much damage does this do to a user who tries the README today".
 
-1. **The engine doesn't run** (§1). Everything else is theoretical until this
-   lands.
-2. **Silently-ignored query parameters** (§1.1). Wrong answers with no error.
-   Until `fb_query_params` exists, `query()` should *throw* when handed
-   parameters rather than pretend.
-3. **Transactions that don't transact** (§1.2). Needs a C ABI change.
-4. **Multi-tab data loss** (§1.4). At minimum document it; properly, needs a
-   worker + leader election.
-5. **Whole-image, non-atomic persistence** (§1.3). Fine for a demo, not for a
-   database.
-6. **Lossy JSON ABI** (§1.5). Caps the maximum achievable correctness.
+### Resolved
+
+Every gap this section originally listed as damaging has been closed, in the
+order it was ranked:
+
+| # | Gap | Resolution |
+|---|-----|------------|
+| 1 | The engine doesn't run | Seven porting fixes; see [porting.md](./porting.md) |
+| 2 | Silently-ignored query parameters | `fb_query_params` / `fb_execute_params`, bound via the statement's declared metadata |
+| 3 | Transactions that don't transact | `fb_start_transaction` / `commit` / `rollback`, with statements bound to the handle |
+| 4 | Multi-tab data loss | An exclusive Web Lock refuses the second tab |
+| 5 | Whole-image, non-atomic persistence | One IndexedDB transaction, changed pages only |
+| 6 | Lossy JSON ABI | Still JSON, but every column is now described and exact numerics survive as strings |
+
+### Current
+
+Nothing here produces a wrong answer. Ranked by how much they limit what can
+be built:
+
+1. **No live queries.** An application has no way to learn that data changed
+   except by polling. `POST_EVENT` is the natural fit and is unused.
+2. **Two tabs cannot share a database.** Safe, but a second tab is refused
+   rather than served, which rules out ordinary multi-window use.
+3. **9 MB artifact, unbudgeted.** Compresses to about a third, but it is the
+   first thing anyone notices.
+4. **The module cannot be disposed.** `loadFirebirdWasm()` caches one instance
+   process-wide and `close()` does not release the heap.
+5. **Only built-in character sets.** Loadable ones need `dlopen`.
+6. **No sync.** The "electric" in the project name is still aspirational.
 7. Everything in §2 marked ❌ — real gaps, but none of them mislead a user.
 
 ---
@@ -560,12 +622,18 @@ By "how much damage does this do to a user who tries the README today":
 
 ### M4 — Concurrency, distribution, reactivity
 
-- [ ] Run the engine in a Web Worker; keep the main thread free.
-- [ ] `SharedWorker` + leader election for multi-tab safety.
+- [x] Run the engine in a Web Worker; keep the main thread free. Not an
+      optimisation — Firebird blocks on mutexes while opening a database and a
+      browser main thread may not block, so the main-thread path deadlocked.
+- [x] Multi-tab *safety*: an exclusive Web Lock per database refuses a second
+      tab rather than letting it overwrite the first.
+- [ ] Multi-tab *sharing*: `SharedWorker` + leader election, so a second tab is
+      served rather than refused.
 - [ ] OPFS backend with sync access handles — a much better match for
       page-oriented I/O than IndexedDB.
-- [ ] Publish the prebuilt artifact to npm (+ CDN), with a size budget and a
-      default `locateFile`.
+- [x] Publish the prebuilt artifact to npm. Shipped in `firebird-wasm@0.1.0`.
+- [ ] A size budget and a default `locateFile` for CDN use; the 9 MB artifact
+      is currently unbudgeted and every consumer wires `locateFile` by hand.
 - [ ] Live queries built on `POST_EVENT`; a `listen()` / `notify()` API.
 - [ ] Verified Vite and webpack example apps in CI.
 

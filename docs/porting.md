@@ -518,7 +518,6 @@ helpfully set them would pass while the published site failed.
 
 ## 12. What is not done
 
-- **No pre-built WASM on npm.** You must build the artifact yourself.
 - **Loadable character sets are unavailable** (§3, fix 7).
 - **Two tabs cannot share one database** — the second is refused, not served.
   Sharing needs a SharedWorker leader with the other tabs as clients.

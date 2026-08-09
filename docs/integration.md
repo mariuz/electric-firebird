@@ -9,37 +9,62 @@ before you meet them.
 - Want to know how the port works? See [porting.md](./porting.md).
 - Full type-by-type reference: [api.md](./api.md).
 
-> **Status.** The package is not on npm yet and there is no pre-built WASM
-> artifact to download — you build it yourself (§1). Everything described here
-> works and is covered by tests, but treat the packaging as pre-release.
+> **Status.** `firebird-wasm@0.1.0` is on npm and ships the compiled engine.
+> Everything described here works and is covered by tests, but it is a 0.x
+> release — the API may still move.
 
 ---
 
-## 1. Getting the artifact
+## 1. Installing
+
+```bash
+npm install firebird-wasm
+```
+
+The package ships the compiled engine, so there is nothing to build:
+
+```
+node_modules/firebird-wasm/dist/wasm/firebird-embedded.js     ~108 KB
+node_modules/firebird-wasm/dist/wasm/firebird-embedded.wasm   ~9.1 MB
+```
+
+Copy those two next to your Worker script, or point `locateFile` at them —
+see §3. Serve the `.wasm` compressed; Brotli takes it to roughly a third, and
+expect it to dominate first load. It caches normally afterwards.
+
+The Node backend needs `node-firebird-driver-native`, which is an
+**optional** dependency because it wants Firebird's client library installed.
+If you only use the browser engine, skip it:
+
+```bash
+npm install firebird-wasm --omit=optional
+```
+
+You can also take the engine straight from a [GitHub release][releases] if you
+would rather not add a dependency at all.
+
+### Building it yourself
+
+Only needed to modify the engine. Expect about an hour.
 
 ```bash
 git clone --recurse-submodules https://github.com/mariuz/electric-firebird
-cd electric-firebird
-npm install
+cd electric-firebird && npm install
 
 EMSDK_VERSION=$(cat packages/firebird-wasm/wasm/emsdk-version.txt)
 (cd third_party/emsdk && ./emsdk install "$EMSDK_VERSION" \
   && ./emsdk activate "$EMSDK_VERSION")
 source third_party/emsdk/emsdk_env.sh
 
-npm run build:wasm -w packages/firebird-wasm   # ~1 hour, once
+npm run build:wasm -w packages/firebird-wasm
 npm run build -w packages/firebird-wasm
 ```
 
-This produces two files you will copy into your application:
+The build refuses to run against an Emscripten other than the pinned one. A
+mismatched toolchain links cleanly and then aborts inside the engine at
+runtime, so the check has to happen at build time.
 
-```
-packages/firebird-wasm/dist/wasm/firebird-embedded.js     ~108 KB
-packages/firebird-wasm/dist/wasm/firebird-embedded.wasm   ~9.1 MB
-```
-
-The `.wasm` is 9 MB. Serve it compressed — Brotli takes it to roughly a third
-of that — and expect it to dominate first load. It caches normally afterwards.
+[releases]: https://github.com/mariuz/electric-firebird/releases
 
 ---
 

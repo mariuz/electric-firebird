@@ -201,7 +201,7 @@ The library provides two execution backends:
 - [x] Parameterised queries (`?` placeholders) on both backends
 - [ ] Incremental, atomic IndexedDB persistence
 - [ ] Web Worker + multi-tab safety
-- [ ] Pre-built WASM binary published to npm
+- [x] Pre-built WASM binary published to npm — `npm install firebird-wasm`
 - [ ] Live queries / `POST_EVENT`-based notifications
 
 See [docs/roadmap.md](./docs/roadmap.md) for the full status audit, a

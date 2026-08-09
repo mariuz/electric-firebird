@@ -104,7 +104,6 @@ The whole account is in [docs/porting.md](./docs/porting.md).
 
 Stated plainly, because a release announcement is the wrong place to be coy:
 
-- **Not on npm.** You build the WASM artifact yourself; it takes about an hour.
 - **The `.wasm` is 9 MB.** Compresses to roughly a third, but it is a real
   first-load cost.
 - **Your page must be cross-origin isolated** (COOP/COEP), because the engine

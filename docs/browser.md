@@ -192,7 +192,7 @@ await db.transaction(async (tx) => {
 
 | Feature | Status |
 |---------|--------|
-| Pre-built WASM binary on npm | Not published — you must build it yourself with emsdk |
+| Pre-built WASM binary on npm | Published — `npm install firebird-wasm` ships the engine; build it yourself only to modify it |
 | Parameterised queries (`?` placeholders) | Supported. Values are sent as text and converted by the engine, so integers, decimals, booleans and dates all work; binary (`Uint8Array`) parameters throw rather than corrupt data |
 | Concurrent tabs | **Safe by default** — the second tab is refused with `DatabaseLockedError` rather than silently overwriting the first. Opt out with `multiTab: 'allow-unsafe'`. See [Concurrent tabs](#concurrent-tabs) |
 | Auto-persist | On by default: writes persist after a 500 ms debounce, plus a best-effort flush when the page is hidden. Disable with `autoPersist: false` |
