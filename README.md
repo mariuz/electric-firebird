@@ -173,7 +173,7 @@ The library provides two execution backends:
 > create_database  -> 1
 > exec             -> CREATE TABLE items (id INTEGER, name VARCHAR(32))
 > exec             -> INSERT INTO items VALUES (1, 'alpha')
-> ROWS: {"columns":["ID","NAME"],"rows":[[1,"alpha"],[2,"beta"]]}
+> ROWS: {"columns":[{"name":"ID","type":496,"subType":0,"scale":0,"length":4,"nullable":true},{"name":"NAME","type":448,"subType":0,"scale":0,"length":128,"nullable":true}],"rows":[[1,"alpha"],[2,"beta"]]}
 > ```
 >
 > Verified in Node (13 integration tests) **and in Chromium** through the

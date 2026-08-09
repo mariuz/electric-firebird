@@ -158,7 +158,7 @@ create_database  -> 1
 exec             -> 0  | CREATE TABLE items (id INTEGER, name VARCHAR(32))
 exec             -> 0  | INSERT INTO items VALUES (1, 'alpha')
 exec             -> 0  | INSERT INTO items VALUES (2, 'beta')
-ROWS: {"columns":["ID","NAME"],"rows":[[1,"alpha"],[2,"beta"]]}
+ROWS: {"columns":[{"name":"ID","type":496,"subType":0,"scale":0,"length":4,"nullable":true},{"name":"NAME","type":448,"subType":0,"scale":0,"length":128,"nullable":true}],"rows":[[1,"alpha"],[2,"beta"]]}
 detach           -> 0
 db file bytes    -> 2367488
 ```
@@ -641,9 +641,10 @@ be built:
 
 - [ ] React/Vue hooks; REPL component.
 - [ ] ElectricSQL sync integration (the project's namesake).
-- [ ] Firebird 4 vs 5 build matrix — note that the build script already targets
-      **5.0.3**, so the old roadmap line was stale; what is actually missing is
-      *testing across versions*, not initial support.
+- [ ] A Firebird version build matrix. The submodule tracks `master` and the
+      shipped engine reports `ENGINE_VERSION 6.0.0`, so the recurring "Firebird
+      4 & 5 support" line was always mis-stated: what is missing is *testing
+      across versions*, not initial support for them.
 
 ---
 

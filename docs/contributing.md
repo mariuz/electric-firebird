@@ -108,8 +108,10 @@ electric-firebird/
 
 When the WASM build requires symbols from `.epp`-generated files (e.g.
 `met.epp`, `scl.epp`) that are not compiled, add stub implementations to
-`wasm/fb_wasm_stubs.cpp`.  Make sure all signatures match the **Firebird
-5.0.3** headers (the build is pinned to that version).
+`wasm/fb_wasm_stubs.cpp`.  Make sure all signatures match the headers of the
+Firebird revision the submodule is on — currently **`master`, 6.0.0**, not the
+5.0.3 this once said. Signature drift between Firebird versions is the main
+source of stub breakage, so check against the tree you are building.
 
 ---
 

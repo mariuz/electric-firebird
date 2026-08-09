@@ -7,10 +7,54 @@
 ## Installation
 
 ```bash
-npm install firebird-wasm node-firebird-driver-native
+npm install firebird-wasm
 ```
 
-`node-firebird-driver-native` requires the Firebird client library (`libfbclient.so` on Linux / `fbclient.dll` on Windows) to be installed on the host. See [Firebird installation](https://firebirdsql.org/en/server-packages/) for details.
+The package ships the compiled WASM engine, so the browser backend needs
+nothing else — no Emscripten, no Firebird installation, no server.
+
+The **Node backend** (`FirebirdLite`, below) is different: it talks to a real
+Firebird through `node-firebird-driver-native`, which needs the Firebird client
+library (`libfbclient.so` / `fbclient.dll`) on the host. That is an *optional*
+dependency, so if you only want the browser engine, skip it:
+
+```bash
+npm install firebird-wasm --omit=optional
+```
+
+See [Firebird installation](https://firebirdsql.org/en/server-packages/) if you
+do want the native path.
+
+## Two backends
+
+| Import | Engine | Needs |
+|--------|--------|-------|
+| `firebird-wasm` | Native driver → a real Firebird server | Firebird client library |
+| `firebird-wasm/browser` | Firebird 6.0 compiled to WebAssembly | A browser, or Node |
+
+The rest of this file documents the Node backend. For the browser engine —
+which is what the package is named after — see
+**[the integration guide](../../docs/integration.md)**, or try
+**[the live demo](https://mariuz.github.io/electric-firebird/)**.
+
+```ts
+import { FirebirdBrowser } from 'firebird-wasm/browser';
+
+const db = new FirebirdBrowser('mydb', {
+  worker: new Worker('/firebird-engine-worker.js'),
+});
+
+await db.exec('CREATE TABLE notes (id INTEGER, title VARCHAR(200))');
+await db.exec('INSERT INTO notes VALUES (?, ?)', [1, 'Hello']);
+
+const { rows } = await db.query('SELECT * FROM notes');
+// [{ ID: 1, TITLE: 'Hello' }]
+```
+
+Two constraints are structural rather than incidental: the page must be
+[cross-origin isolated](../../docs/integration.md#2-the-two-hard-requirements),
+and the engine must run in a Worker — it blocks on mutexes, and a browser main
+thread may not block.
 
 ## Quick start
 
@@ -100,7 +144,7 @@ const db = new FirebirdLite('/tmp/my.fdb', {
 });
 ```
 
-Requires `libEngine12.so` (Firebird 3) to be present alongside `libfbclient.so`.
+Requires the engine plugin alongside `libfbclient.so` — `libEngine12.so` on Firebird 3, `libEngine13.so` on Firebird 4 and 5. This is the *native* embedded engine; for the WASM one, no Firebird install is involved at all.
 
 ## Testing
 
@@ -110,10 +154,36 @@ FIREBIRD_PASSWORD=masterkey npm test
 
 ## Roadmap
 
-- [ ] True WASM build (Emscripten compilation of `libfbembed`)
-- [ ] Browser support via the WASM bundle
-- [ ] IndexedDB-backed persistence in the browser
-- [ ] Firebird 4 & 5 support
+Shipped in 0.1.0 — every item the previous roadmap listed as pending, except
+the last:
+
+- [x] True WASM build — Firebird 6.0 compiled with Emscripten
+- [x] Browser support via the WASM bundle, with the engine in a Web Worker
+- [x] IndexedDB-backed persistence — atomic, incremental, and automatic
+- [x] Parameterised queries, transactions, and multi-statement scripts
+- [x] Typed column metadata; exact `BIGINT`/`NUMERIC`/`DECFLOAT` as decimal strings
+- [x] Multi-tab safety — a cross-tab lock refuses a second writer rather than
+      letting it overwrite the first
+- [x] The prebuilt engine on npm, so using it needs no Emscripten
+
+Next:
+
+- [ ] Live queries built on Firebird's `POST_EVENT`
+- [ ] Multi-tab *sharing* — a `SharedWorker` leader, so a second tab is served
+      rather than refused
+- [ ] OPFS backend — a better match for page-oriented I/O than IndexedDB
+- [ ] A typed binary result ABI, so exact numerics need not travel as strings
+- [ ] Module disposal — `close()` does not currently release the WASM heap
+- [ ] Loadable character sets; only the built-ins are compiled in today
+- [ ] ElectricSQL sync
+
+**"Firebird 4 & 5 support" is gone from this list because it was never the
+gap.** The build tracks Firebird `master` and the shipped engine reports
+`ENGINE_VERSION 6.0.0`. What is actually missing is a build *matrix* across
+versions, not initial support for them.
+
+Fuller status, and a feature-by-feature comparison with PGlite, in
+[docs/roadmap.md](../../docs/roadmap.md).
 
 ## License
 
