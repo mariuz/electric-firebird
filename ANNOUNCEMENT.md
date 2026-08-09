@@ -1,10 +1,6 @@
 # Firebird now runs in the browser
 
-**electric-firebird 0.1.0 — first working release** *(pre-release)*
-
-Marked a pre-release deliberately: the engine and the test suites are in
-good shape, but the packaging is not settled — it is not on npm yet, and
-the API may still move. See [What is not done](#what-is-not-done).
+**electric-firebird 0.1.0 — first working release**
 
 The [Firebird](https://firebirdsql.org) relational engine, compiled to
 WebAssembly, running entirely inside a web page. No server, no network, no
