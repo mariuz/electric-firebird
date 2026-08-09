@@ -1,0 +1,12 @@
+{
+  // Build configuration for the published package.
+  //
+  // Separate from tsconfig.json because that one is also what ts-jest reads:
+  // the tests must stay visible to the type checker while staying out of the
+  // tarball.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "tsBuildInfoFile": "dist/.tsbuildinfo.build"
+  },
+  "exclude": ["node_modules", "dist", "src/**/__tests__/**"]
+}

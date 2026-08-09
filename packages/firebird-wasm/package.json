@@ -1,7 +1,7 @@
 {
   "name": "firebird-wasm",
   "version": "0.1.0",
-  "description": "Firebird embedded in WASM, similar to PGlite for PostgreSQL",
+  "description": "Firebird embedded database in WebAssembly \u2014 runs in the browser and Node, like PGlite for PostgreSQL",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "browser": "dist/browser/index.js",
@@ -16,11 +16,12 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.build.json",
     "build:wasm": "bash wasm/build.sh",
     "test": "jest --forceExit",
     "lint": "eslint src --ext .ts",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "prepublishOnly": "node scripts/check-publish.mjs"
   },
   "keywords": [
     "firebird",
@@ -34,7 +35,7 @@
   "author": "mariuz",
   "license": "Apache-2.0",
   "dependencies": {
-    "node-firebird-driver-native": "^3.5.0"
+    "node-firebird-driver": "^3.5.0"
   },
   "devDependencies": {
     "@types/jest": "^29.5.12",
@@ -49,8 +50,37 @@
   "jest": {
     "preset": "ts-jest",
     "testEnvironment": "node",
-    "testMatch": ["**/src/**/*.test.ts", "**/src/**/__tests__/**/*.test.ts"],
+    "testMatch": [
+      "**/src/**/*.test.ts",
+      "**/src/**/__tests__/**/*.test.ts"
+    ],
     "testTimeout": 30000,
-    "testPathIgnorePatterns": ["/node_modules/", "/src/browser/"]
+    "testPathIgnorePatterns": [
+      "/node_modules/",
+      "/src/browser/"
+    ]
+  },
+  "homepage": "https://mariuz.github.io/electric-firebird/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mariuz/electric-firebird.git",
+    "directory": "packages/firebird-wasm"
+  },
+  "bugs": {
+    "url": "https://github.com/mariuz/electric-firebird/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "optionalDependencies": {
+    "node-firebird-driver-native": "^3.5.0"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
