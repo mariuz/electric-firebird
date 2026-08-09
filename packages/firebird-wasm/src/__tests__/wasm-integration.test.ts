@@ -172,8 +172,19 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
         const json = mod.UTF8ToString(resultPtr);
         mod._fb_free_result(resultPtr);
 
-        const parsed = JSON.parse(json) as { columns: string[]; rows: unknown[][] };
-        expect(parsed.columns).toEqual(['ID', 'NAME']);
+        const parsed = JSON.parse(json) as {
+          columns: Array<{ name: string; type: number; nullable: boolean }>;
+          rows: unknown[][];
+        };
+
+        // This test reads the C ABI's own JSON, so it asserts the wire shape
+        // directly: the engine describes each column rather than just naming
+        // it.  ID is a plain INTEGER, NAME a VARCHAR — 496 and 448 are
+        // Firebird's SQL_LONG and SQL_VARYING.
+        expect(parsed.columns).toEqual([
+          { name: 'ID', type: 496, subType: 0, scale: 0, length: 4, nullable: true },
+          { name: 'NAME', type: 448, subType: 0, scale: 0, length: 128, nullable: true },
+        ]);
         expect(parsed.rows).toEqual([[1, 'alpha']]);
       } finally {
         mod._free(sqlPtr);
