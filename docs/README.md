@@ -9,6 +9,8 @@
 | [Installation](./installation.md) | Installing the library and its native prerequisites |
 | [API Reference](./api.md) | Full API reference for `FirebirdLite`, `FirebirdBrowser`, and all types |
 | [Browser / WASM](./browser.md) | Running Firebird in the browser with IndexedDB persistence |
+| [Integration Guide](./integration.md) | Putting the engine into your own app: bundlers, hosting, pitfalls |
+| [How it was ported](./porting.md) | The engineering account: what broke, and how it was found |
 | [Architecture](./architecture.md) | How the two backends (native driver & WASM) are structured |
 | [Roadmap](./roadmap.md) | Current status, PGlite feature comparison, and the staged plan |
 | [Contributing](./contributing.md) | How to build, test, and contribute to the project |

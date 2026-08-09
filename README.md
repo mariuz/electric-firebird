@@ -23,7 +23,9 @@ a recursive CTE, `EXECUTE BLOCK`, transaction rollback, and exact `BIGINT` and
 IndexedDB, so it is still there after a reload.
 
 To run it locally, see [`demo/`](./demo) — you will need the WASM artifact
-first.
+first. For the release notes, see [ANNOUNCEMENT.md](./ANNOUNCEMENT.md); to
+put the engine in your own app, see the
+[integration guide](./docs/integration.md).
 
 ## Quick start
 
