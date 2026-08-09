@@ -47,6 +47,37 @@ fi
 
 echo "Using Emscripten: $(emcc --version | head -1)"
 
+# ── Verify the Emscripten version ────────────────────────────────────────────
+# The toolchain version is not a detail here.  CI once built against a
+# different Emscripten from the vendored one and produced an artifact that
+# compiled and linked cleanly, passed every check that did not touch the
+# engine, and then aborted inside fb_create_database.  A mismatch does not
+# announce itself at build time, so it is checked here instead.
+EMSDK_VERSION_FILE="${SCRIPT_DIR}/emsdk-version.txt"
+if [[ -f "${EMSDK_VERSION_FILE}" ]]; then
+  EXPECTED_EMSDK="$(tr -d '[:space:]' < "${EMSDK_VERSION_FILE}")"
+  ACTUAL_EMSDK="$(emcc --version | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+
+  if [[ "${ACTUAL_EMSDK}" != "${EXPECTED_EMSDK}" ]]; then
+    if [[ "${FB_WASM_ALLOW_EMSDK_MISMATCH:-0}" == "1" ]]; then
+      echo "Warning: Emscripten ${ACTUAL_EMSDK} != pinned ${EXPECTED_EMSDK};" >&2
+      echo "         continuing because FB_WASM_ALLOW_EMSDK_MISMATCH=1." >&2
+    else
+      echo "Error: Emscripten ${ACTUAL_EMSDK} does not match the pinned" >&2
+      echo "       version ${EXPECTED_EMSDK} (${EMSDK_VERSION_FILE})." >&2
+      echo >&2
+      echo "       Use the vendored SDK:" >&2
+      echo "         cd third_party/emsdk" >&2
+      echo "         ./emsdk install ${EXPECTED_EMSDK}" >&2
+      echo "         ./emsdk activate ${EXPECTED_EMSDK}" >&2
+      echo "         source ./emsdk_env.sh" >&2
+      echo >&2
+      echo "       Or set FB_WASM_ALLOW_EMSDK_MISMATCH=1 to build anyway." >&2
+      exit 1
+    fi
+  fi
+fi
+
 # ── Initialise Firebird submodule if needed ──────────────────────────────────
 if [[ ! -d "${FIREBIRD_SRC}/src" ]]; then
   echo "Initialising Firebird submodule…"

@@ -65,8 +65,12 @@ Compiling Firebird to WebAssembly requires the
 [Emscripten SDK](https://emscripten.org/docs/getting_started/downloads.html):
 
 ```bash
-# Activate Emscripten (adjust path to your emsdk installation)
-source <emsdk>/emsdk_env.sh
+# Activate the vendored Emscripten, at the pinned version.  The build rejects
+# any other version: a mismatch links fine and aborts inside the engine later.
+EMSDK_VERSION=$(cat packages/firebird-wasm/wasm/emsdk-version.txt)
+(cd third_party/emsdk && ./emsdk install "$EMSDK_VERSION" \
+  && ./emsdk activate "$EMSDK_VERSION")
+source third_party/emsdk/emsdk_env.sh
 
 # Build the WASM artefacts
 npm run build:wasm -w packages/firebird-wasm

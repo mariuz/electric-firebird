@@ -120,12 +120,24 @@ demo's service worker has to supply cross-origin isolation itself. See
 
 ### Build the WASM module (optional)
 
-Requires the [Emscripten SDK](https://emscripten.org/docs/getting_started/downloads.html):
+The Emscripten SDK is vendored at `third_party/emsdk`, and the version is
+pinned in `packages/firebird-wasm/wasm/emsdk-version.txt`:
 
 ```bash
-source <emsdk>/emsdk_env.sh
+cd third_party/emsdk
+./emsdk install $(cat ../../packages/firebird-wasm/wasm/emsdk-version.txt)
+./emsdk activate $(cat ../../packages/firebird-wasm/wasm/emsdk-version.txt)
+source ./emsdk_env.sh
+cd ../..
+
 npm run build:wasm -w packages/firebird-wasm
 ```
+
+The build refuses to run against a different Emscripten. That is not
+fussiness: a mismatched toolchain compiles and links this engine perfectly
+well and then aborts inside `fb_create_database` at runtime, so the check has
+to happen at build time. Override with `FB_WASM_ALLOW_EMSDK_MISMATCH=1` if you
+are deliberately testing another version.
 
 ## Architecture
 

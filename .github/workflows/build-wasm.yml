@@ -24,11 +24,45 @@ jobs:
           node-version: '20'
           cache: 'npm'
 
-      - name: Set up Emscripten SDK
-        uses: mymindstorm/setup-emsdk@v14
+      # The vendored SDK, not a separately installed one.  Building the engine
+      # against a different Emscripten than the pinned version produces an
+      # artifact that links cleanly and then aborts inside the engine at
+      # runtime, so the toolchain is part of the source, not of the runner.
+      - name: Read the pinned Emscripten version
+        id: emsdk
+        run: |
+          echo "version=$(tr -d '[:space:]' \
+            < packages/firebird-wasm/wasm/emsdk-version.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache the Emscripten toolchain
+        uses: actions/cache@v4
         with:
-          version: '3.1.64'
-          actions-cache-folder: 'emsdk-cache'
+          # `upstream/` holds the downloaded clang and binaryen — around a
+          # gigabyte, and identical for a given version.
+          path: |
+            third_party/emsdk/upstream
+            third_party/emsdk/node
+            third_party/emsdk/.emscripten
+          key: emsdk-${{ runner.os }}-${{ steps.emsdk.outputs.version }}
+
+      - name: Set up the vendored Emscripten SDK
+        working-directory: third_party/emsdk
+        run: |
+          set -euo pipefail
+          ./emsdk install "${{ steps.emsdk.outputs.version }}"
+          ./emsdk activate "${{ steps.emsdk.outputs.version }}"
+          # Each `run` block is a fresh shell, so export the activated
+          # environment rather than sourcing emsdk_env.sh in every step.
+          source ./emsdk_env.sh
+          {
+            echo "PATH=$PATH"
+            echo "EMSDK=$EMSDK"
+            echo "EM_CONFIG=$EM_CONFIG"
+            echo "EMSDK_NODE=$EMSDK_NODE"
+          } >> "$GITHUB_ENV"
+
+      - name: Confirm the toolchain
+        run: emcc --version | head -1
 
       - name: Install build tools for Firebird native configure
         run: |
