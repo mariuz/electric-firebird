@@ -2,13 +2,16 @@ import { defineConfig } from '@playwright/test';
 
 export default defineConfig({
   testDir: './tests',
-  // Browser-only suites have their own server and run under
-  // playwright.wasm.config.ts; they must not be picked up here.
-  testIgnore: [
-    '**/wasm.spec.ts',
-    '**/browser-api.spec.ts',
-    '**/browser-engine.spec.ts',
-  ],
+  // An allow-list, not a deny-list.  This config's server is the one that
+  // talks to a real Firebird server on :3000; the browser suites need the
+  // COOP/COEP static server on :3001 and the demo needs its own on :4173.
+  //
+  // It used to name the suites to *exclude*, which meant every new browser
+  // suite had to be added here or it would silently run against the wrong
+  // server and fail.  Two of them were, and did.  With an allow-list the
+  // worst case of forgetting is a suite that does not run, which
+  // `npm run check:suites` then catches.
+  testMatch: ['**/firebird.spec.ts'],
   fullyParallel: false,
   forbidOnly: !!process.env['CI'],
   retries: process.env['CI'] ? 2 : 0,

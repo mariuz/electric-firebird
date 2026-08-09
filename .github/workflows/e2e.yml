@@ -95,6 +95,10 @@ jobs:
         working-directory: e2e
         run: npx playwright install --with-deps chromium
 
+      - name: Check every Playwright suite is claimed by one config
+        working-directory: e2e
+        run: npm run check:suites
+
       - name: Run Playwright e2e tests
         working-directory: e2e
         env:

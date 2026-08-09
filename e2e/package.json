@@ -6,7 +6,8 @@
     "test": "playwright test",
     "test:headed": "playwright test --headed",
     "test:browser": "playwright test --config playwright.wasm.config.ts",
-    "test:browser:headed": "playwright test --config playwright.wasm.config.ts --headed"
+    "test:browser:headed": "playwright test --config playwright.wasm.config.ts --headed",
+    "check:suites": "node scripts/check-suite-coverage.mjs"
   },
   "dependencies": {
     "firebird-wasm": "*"
