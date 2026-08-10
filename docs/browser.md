@@ -250,6 +250,7 @@ has since replaced.
 | Option | Meaning |
 |--------|---------|
 | `multiTab: 'exclusive'` | Default. Refuse if another tab holds the database |
+| `multiTab: 'shared'` | Elect one tab to run the engine and serve the others from it, so every tab sees the same live database |
 | `multiTab: 'allow-unsafe'` | Skip the lock. Only sound if at most one tab writes |
 | `lockTimeoutMs` | How long to wait for the other tab, default `5000`. `Infinity` waits forever |
 
@@ -258,9 +259,40 @@ HTTP — there is nothing to enforce with, so the library warns and proceeds.
 Any browser able to run the engine at all supports it, since the engine
 already requires cross-origin isolation.
 
-What this does **not** do is let two tabs use one database at once.  That needs
-a single engine in a SharedWorker with the other tabs as clients, which is
-[roadmap.md](./roadmap.md) §M4.
+### Sharing one database between tabs
+
+`multiTab: 'shared'` serves the second tab instead of refusing it:
+
+```ts
+const db = new FirebirdBrowser('mydb', {
+  multiTab: 'shared',
+  // A factory, not an instance: a follower must not build an engine it will
+  // never use.
+  worker: () => new Worker('/firebird-engine-worker.js'),
+});
+
+if (db.isLeader) {
+  // Work that should happen once per application, not once per tab.
+  await runMigrations(db);
+}
+```
+
+One tab wins the same Web Lock and runs the engine; the others send their
+calls to it over a `BroadcastChannel` and never instantiate an engine at all.
+Every tab attaches separately through that one engine, so they see each
+other's committed data.
+
+When the leading tab goes away the lock releases, a follower is promoted,
+starts its own engine from the last persisted image, and every tab re-attaches
+to it. Two consequences worth knowing:
+
+- Writes made in the departed leader's final debounce window are lost. That is
+  the exposure a single tab has always had, not a new one.
+- A call in flight at that moment is treated by what it is. A read is
+  re-issued, because running a query twice is indistinguishable from running it
+  once. A write is **rejected** with an error saying its outcome is unknown —
+  the old leader may have committed it and died before replying, so retrying
+  could apply it twice.
 
 [weblocks]: https://developer.mozilla.org/en-US/docs/Web/API/Web_Locks_API
 

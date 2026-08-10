@@ -35,6 +35,12 @@ export type {
   DirectTransportOptions,
 } from './engine-transport';
 
+export { SharedEngineTransport } from './shared-transport';
+export type { SharedEngineTransportOptions } from './shared-transport';
+
+export { electLeader } from './leader-election';
+export type { LeaderElection, LeaderElectionOptions } from './leader-election';
+
 export { WorkerTransport } from './worker-transport';
 export type { WorkerTransportOptions } from './worker-transport';
 

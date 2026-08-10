@@ -30,6 +30,7 @@ import { WorkerTransport } from './worker-transport';
 import { splitStatements } from './sql-script';
 import { hasTransactionOptions } from './isolation';
 import { acquireDatabaseLock } from './db-lock';
+import { SharedEngineTransport } from './shared-transport';
 import type { DatabaseLock } from './db-lock';
 import type {
   QueryResult,
@@ -72,8 +73,12 @@ export interface FirebirdBrowserOptions {
    *
    * Omit it only where blocking the calling thread is acceptable, such as
    * Node or a test harness driving a stub engine.
+   *
+   * With `multiTab: 'shared'` this must be a **factory**.  It is called only
+   * if this tab wins the election, so a follower never downloads and
+   * instantiates a 9 MB engine to sit idle beside the one already running.
    */
-  worker?: Worker;
+  worker?: Worker | (() => Worker);
   /**
    * Use a transport of your own.  Takes precedence over `worker`; mainly a
    * seam for tests.
@@ -116,12 +121,16 @@ export interface FirebirdBrowserOptions {
    *
    * - `'exclusive'` (default) takes a cross-tab lock and fails with
    *   {@link DatabaseLockedError} if another tab will not release it in time.
+   * - `'shared'` elects one tab to run the engine and serves the others from
+   *   it, so every tab sees the same live database.  Needs `worker` to be a
+   *   factory rather than an instance — a follower must not build an engine it
+   *   will never use.
    * - `'allow-unsafe'` skips the lock.  Only sound when at most one of the
    *   tabs writes.
    *
    * @default 'exclusive'
    */
-  multiTab?: 'exclusive' | 'allow-unsafe';
+  multiTab?: 'exclusive' | 'shared' | 'allow-unsafe';
   /**
    * How long to wait for another tab to release the database, in
    * milliseconds.  `Infinity` waits indefinitely.
@@ -164,10 +173,12 @@ export class FirebirdBrowser {
   private persistAgain = false;
   private lifecycleAttached = false;
 
-  private readonly multiTab: 'exclusive' | 'allow-unsafe';
+  private readonly multiTab: 'exclusive' | 'shared' | 'allow-unsafe';
   private readonly lockTimeoutMs: number;
   /** Held for the connection's lifetime; released by close(). */
   private lock: DatabaseLock | null = null;
+  /** Set only in shared mode; owns the election and the channel. */
+  private shared: SharedEngineTransport | null = null;
 
   /**
    * @param dbName  Logical database name.  Used as the IndexedDB store name
@@ -188,14 +199,55 @@ export class FirebirdBrowser {
       options.onPersistError ??
       ((error) => console.error('[firebird-wasm] background persist failed', error));
 
-    this.engine =
-      options.transport ??
-      (options.worker
-        ? new WorkerTransport(options.worker)
-        : new DirectTransport({
-            wasmBinary: options.wasmBinary,
-            locateFile: options.locateFile,
-          }));
+    this.engine = options.transport ?? this.createEngine();
+  }
+
+  /** Build the real engine for this tab: a Worker if given one, else direct. */
+  private createLocalEngine(): EngineTransport {
+    const worker = this.options.worker;
+    if (worker) {
+      return new WorkerTransport(typeof worker === 'function' ? worker() : worker);
+    }
+    return new DirectTransport({
+      wasmBinary: this.options.wasmBinary,
+      locateFile: this.options.locateFile,
+    });
+  }
+
+  private createEngine(): EngineTransport {
+    if (this.multiTab !== 'shared') {
+      return this.createLocalEngine();
+    }
+
+    if (typeof BroadcastChannel === 'undefined') {
+      throw new Error(
+        "multiTab: 'shared' needs BroadcastChannel, which this environment " +
+          "does not have. Use 'exclusive' instead.",
+      );
+    }
+
+    const shared = new SharedEngineTransport({
+      dbName: this.dbName,
+      createEngine: () => this.createLocalEngine(),
+      // A follower's writes run on the leader's engine, so the leader is the
+      // only one that can know its image went stale.
+      onServedMutation: () => this.markDirty(),
+      onEngineReplaced: () => this.reopenAfterEngineChange(),
+    });
+    this.shared = shared;
+    return shared;
+  }
+
+  /**
+   * Whether this tab is the one actually running the engine.
+   *
+   * Always true unless `multiTab: 'shared'`, where exactly one tab owns the
+   * engine and the rest are served by it. Useful for deciding which tab should
+   * do work that must happen once — an import, a migration, a scheduled
+   * cleanup — rather than once per open tab.
+   */
+  get isLeader(): boolean {
+    return this.shared === null || this.shared.isLeader;
   }
 
   /** Path of the database inside Emscripten's filesystem. */
@@ -335,7 +387,7 @@ export class FirebirdBrowser {
    * Call this periodically or before the page unloads to avoid data loss.
    */
   async persist(): Promise<void> {
-    if (!this.dbHandle) return;
+    if (!this.dbHandle || !this.mayPersist) return;
 
     // Two persists must not interleave: both read the image and write the
     // same store, and the later one could finish first and roll the database
@@ -416,9 +468,21 @@ export class FirebirdBrowser {
 
   // ── Automatic persistence ─────────────────────────────────────────────
 
+  /**
+   * Whether this tab may write the database image to IndexedDB.
+   *
+   * In shared mode only the leader may: a follower has no engine, and its
+   * `readFile` would fetch the image across the channel only to race the
+   * leader writing the same store — reintroducing the whole-image overwrite
+   * that multi-tab safety exists to prevent.
+   */
+  private get mayPersist(): boolean {
+    return this.shared === null || this.shared.isLeader;
+  }
+
   /** Note that the database has changed and schedule a persist. */
   private markDirty(): void {
-    if (!this.autoPersist || this.closed) return;
+    if (!this.autoPersist || this.closed || !this.mayPersist) return;
 
     if (this.persistTimer !== null) {
       clearTimeout(this.persistTimer);
@@ -515,24 +579,61 @@ export class FirebirdBrowser {
         timeoutMs: this.lockTimeoutMs,
       });
     }
+    // 'shared' deliberately takes no lock here: the transport's election holds
+    // it, and a second request from the same tab would queue behind itself.
 
     await this.engine.init();
+    await this.vfs.open(this.dbName);
+    await this.openDatabase();
+    this.attachLifecycleListeners();
+  }
 
+  /**
+   * Restore the stored image if this tab owns the engine, then attach.
+   *
+   * Separate from init() because it has to run again whenever the engine
+   * changes underneath us — in shared mode a leadership change replaces the
+   * engine, and every handle it issued dies with it.
+   *
+   * The restore is guarded by {@link mayPersist} for the same reason
+   * persistence is: a follower writing its IndexedDB snapshot into the
+   * filesystem would be overwriting the leader's *live* database with a
+   * possibly older image.
+   */
+  private async openDatabase(): Promise<void> {
     await this.engine.mkdir('/data');
 
-    // Restore any previously persisted image into the engine's filesystem
-    // before attaching, so a reload reopens the same database.
-    await this.vfs.open(this.dbName);
-    const stored = await this.vfs.exportDatabase();
-    if (stored.byteLength > 0) {
-      await this.engine.writeFile(this.dbPath, stored);
+    if (this.mayPersist) {
+      const stored = await this.vfs.exportDatabase();
+      if (stored.byteLength > 0) {
+        await this.engine.writeFile(this.dbPath, stored);
+      }
     }
 
     this.dbHandle = (await this.engine.exists(this.dbPath))
       ? await this.engine.attachDatabase(this.dbPath)
       : await this.engine.createDatabase(this.dbPath);
+  }
 
-    this.attachLifecycleListeners();
+  /**
+   * The engine behind this connection was replaced; attach to the new one.
+   *
+   * Called on every tab after a leadership change, promoted or not. Silence
+   * here would leave the caller holding a handle from an engine that no longer
+   * exists, and writes through it would go nowhere — visibly succeeding.
+   */
+  private async reopenAfterEngineChange(): Promise<void> {
+    if (this.closed) return;
+    this.dbHandle = 0;
+    try {
+      await this.openDatabase();
+    } catch (err) {
+      this.onPersistError(
+        err instanceof Error
+          ? err
+          : new Error(`could not reopen after a leadership change: ${String(err)}`),
+      );
+    }
   }
 }
 

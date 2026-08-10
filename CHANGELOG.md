@@ -4,6 +4,36 @@ All notable changes to `firebird-wasm`. This project follows
 [semantic versioning](https://semver.org/); while the major version is 0 the
 API may still move between minor releases.
 
+## Unreleased
+
+### Added
+
+- **`multiTab: 'shared'` — many tabs, one engine.** Previously a second tab on
+  the same database was refused; it can now be served. One tab wins the same
+  Web Lock that already provided multi-tab safety and runs the engine; the
+  others proxy their calls to it over a `BroadcastChannel` and never
+  instantiate an engine at all. `worker` accepts a factory for this reason —
+  a follower must not download and start a 9 MB engine it will never use.
+
+  Chosen over a `SharedWorker` owning the engine: this reuses machinery already
+  built and works anywhere Web Locks do, without depending on a SharedWorker
+  being able to spawn the nested Workers that pthreads require.
+
+- **`FirebirdBrowser.isLeader`** — whether this tab runs the engine. Useful for
+  work that should happen once per application rather than once per tab, such
+  as a migration.
+
+### Notes on failover
+
+When the leading tab disappears the lock releases, a follower is promoted and
+starts its own engine from the last persisted image, and every tab re-attaches
+to it. A call in flight at that moment is treated according to what it is: a
+read is re-issued, since running a query twice is indistinguishable from
+running it once; a write is rejected with an error stating its outcome is
+unknown, because the old leader may have committed it and died before replying.
+Retrying it could apply it twice, and an error a caller can see beats a
+duplicate row it cannot.
+
 ## 0.1.1
 
 ### Fixed

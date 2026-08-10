@@ -614,8 +614,9 @@ be built:
    `events-wip` branch and Firebird's event manager starts, but delivery stops
    after the first event under Emscripten. See §1 for exactly where it stops
    and what to try next.
-2. **Two tabs cannot share a database.** Safe, but a second tab is refused
-   rather than served, which rules out ordinary multi-window use.
+2. ~~**Two tabs cannot share a database.**~~ Fixed: `multiTab: 'shared'` elects
+   one tab to run the engine and serves the rest from it. What remains is that
+   the default is still `'exclusive'`, so sharing is opt-in.
 3. **9 MB artifact, unbudgeted.** Compresses to about a third, but it is the
    first thing anyone notices.
 4. **The module cannot be disposed.** `loadFirebirdWasm()` caches one instance
@@ -698,8 +699,11 @@ be built:
       browser main thread may not block, so the main-thread path deadlocked.
 - [x] Multi-tab *safety*: an exclusive Web Lock per database refuses a second
       tab rather than letting it overwrite the first.
-- [ ] Multi-tab *sharing*: `SharedWorker` + leader election, so a second tab is
-      served rather than refused.
+- [x] Multi-tab *sharing*: leader election over the existing Web Lock, with
+      followers proxying to the leader over `BroadcastChannel`. Chosen over a
+      `SharedWorker` holding the engine because it reuses the lock already
+      built and works anywhere Web Locks do, without depending on a
+      SharedWorker being able to spawn the nested Workers pthreads needs.
 - [ ] OPFS backend with sync access handles — a much better match for
       page-oriented I/O than IndexedDB.
 - [x] Publish the prebuilt artifact to npm. Shipped in `firebird-wasm@0.1.0`.
