@@ -21,7 +21,14 @@
 
 import type { FirebirdWasmModule } from '../wasm-loader';
 import { loadFirebirdWasm, allocString, lastError } from '../wasm-loader';
-import type { Row, QueryResult, FieldInfo, QueryParams } from '../types';
+import type {
+  Row,
+  QueryResult,
+  FieldInfo,
+  QueryParams,
+  TransactionOptions,
+} from '../types';
+import { isolationCode } from './isolation';
 import { encodeParams } from './params';
 import { firebirdTypeName } from './field-types';
 
@@ -60,7 +67,17 @@ export interface EngineTransport {
     params?: QueryParams,
   ): Promise<QueryResult<T>>;
 
-  startTransaction(dbHandle: EngineHandle): Promise<EngineHandle>;
+  /**
+   * Begin a transaction.
+   *
+   * `options` is honoured, not accepted and dropped: the Node backend has
+   * always applied isolationLevel and readOnly, and a browser caller
+   * writing the same code deserves the same transaction.
+   */
+  startTransaction(
+    dbHandle: EngineHandle,
+    options?: TransactionOptions,
+  ): Promise<EngineHandle>;
   commit(txHandle: EngineHandle): Promise<void>;
   rollback(txHandle: EngineHandle): Promise<void>;
 
@@ -283,9 +300,16 @@ export class DirectTransport implements EngineTransport {
     );
   }
 
-  async startTransaction(dbHandle: EngineHandle): Promise<EngineHandle> {
+  async startTransaction(
+    dbHandle: EngineHandle,
+    options: TransactionOptions = {},
+  ): Promise<EngineHandle> {
     const mod = this.module;
-    const txHandle = mod._fb_start_transaction(dbHandle);
+    const txHandle = mod._fb_start_transaction_ex(
+      dbHandle,
+      isolationCode(options),
+      options.readOnly === true ? 1 : 0,
+    );
     if (txHandle === 0) {
       throw engineError(mod, 'Failed to start transaction');
     }

@@ -10,7 +10,7 @@
  * operations are part of the transport rather than being done by the caller.
  */
 
-import type { Row, QueryResult, QueryParams } from '../types';
+import type { Row, QueryResult, QueryParams, TransactionOptions } from '../types';
 import type { EngineHandle, EngineTransport } from './engine-transport';
 import type { EngineOp, EngineRequest, EngineResponse } from './worker-protocol';
 
@@ -155,8 +155,12 @@ export class WorkerTransport implements EngineTransport {
     return this.call<QueryResult<T>>('query', dbHandle, txHandle, sql, params);
   }
 
-  startTransaction(dbHandle: EngineHandle): Promise<EngineHandle> {
-    return this.call<EngineHandle>('startTransaction', dbHandle);
+  startTransaction(
+    dbHandle: EngineHandle,
+    options: TransactionOptions = {},
+  ): Promise<EngineHandle> {
+    // Plain data, so it survives structured cloning to the Worker as-is.
+    return this.call<EngineHandle>('startTransaction', dbHandle, options);
   }
 
   commit(txHandle: EngineHandle): Promise<void> {

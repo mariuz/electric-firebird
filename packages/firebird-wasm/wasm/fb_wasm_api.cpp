@@ -105,6 +105,20 @@ int g_nextTxHandle = 1;
 std::string g_lastError;
 
 /**
+ * Isolation levels, mirroring the TypeScript `IsolationLevel` union.
+ *
+ * Integers rather than strings because they cross the WASM boundary, where a
+ * string means an allocation and a parse on every transaction.
+ */
+enum FbIsolation
+{
+	FB_ISOLATION_DEFAULT                  = 0,
+	FB_ISOLATION_READ_COMMITTED           = 1,
+	FB_ISOLATION_SNAPSHOT                 = 2,
+	FB_ISOLATION_SNAPSHOT_TABLE_STABILITY = 3
+};
+
+/**
  * Rows affected by the most recent execute.
  *
  * Reported out of band like the error text, because the C entry points return
@@ -1428,7 +1442,28 @@ void fb_free_result(const char* ptr)
  * Returns a transaction handle (>0) on success, 0 on failure.
  */
 FB_WASM_EXPORT
+int fb_start_transaction_ex(int db_handle, int isolation, int read_only);
+
 int fb_start_transaction(int db_handle)
+{
+	// The engine's own defaults, which is what this used to do unconditionally.
+	return fb_start_transaction_ex(db_handle, FB_ISOLATION_DEFAULT, 0);
+}
+
+/**
+ * Start a transaction with an explicit isolation level and access mode.
+ *
+ * @param isolation  One of the FB_ISOLATION_* values.
+ * @param read_only  Non-zero for a read-only transaction.
+ *
+ * Passing a null transaction parameter buffer — which fb_start_transaction()
+ * did for every transaction — silently gives the engine's defaults. That is
+ * fine as a default and wrong as the *only* behaviour: the Node backend has
+ * always honoured isolationLevel and readOnly, so the same call through the
+ * browser backend quietly did something different.
+ */
+FB_WASM_EXPORT
+int fb_start_transaction_ex(int db_handle, int isolation, int read_only)
 {
 	clearError();
 
@@ -1440,7 +1475,63 @@ int fb_start_transaction(int db_handle)
 	}
 
 	Status status;
-	ITransaction* transaction = attachment->startTransaction(status.ptr(), 0, nullptr);
+	ITransaction* transaction = nullptr;
+
+	if (isolation == FB_ISOLATION_DEFAULT && !read_only)
+	{
+		// Nothing to say, so say nothing: a null TPB is not the same as an
+		// empty one, and the engine's default is what the caller asked for.
+		transaction = attachment->startTransaction(status.ptr(), 0, nullptr);
+	}
+	else
+	{
+		IXpbBuilder* tpb = g_util->getXpbBuilder(status.ptr(), IXpbBuilder::TPB,
+			nullptr, 0);
+		if (status.failed() || !tpb)
+		{
+			setErrorFromStatus("fb_start_transaction: could not build a TPB",
+				status.ptr());
+			return 0;
+		}
+
+		switch (isolation)
+		{
+		case FB_ISOLATION_READ_COMMITTED:
+			tpb->insertTag(status.ptr(), isc_tpb_read_committed);
+			// Without a version tag the engine picks one, and which one it
+			// picks has changed across releases.  Record versions is the
+			// behaviour callers expect from READ COMMITTED.
+			tpb->insertTag(status.ptr(), isc_tpb_rec_version);
+			break;
+		case FB_ISOLATION_SNAPSHOT:
+			tpb->insertTag(status.ptr(), isc_tpb_concurrency);
+			break;
+		case FB_ISOLATION_SNAPSHOT_TABLE_STABILITY:
+			tpb->insertTag(status.ptr(), isc_tpb_consistency);
+			break;
+		case FB_ISOLATION_DEFAULT:
+			break;   // read_only alone brought us here
+		default:
+			tpb->dispose();
+			setError("fb_start_transaction: unknown isolation level");
+			return 0;
+		}
+
+		tpb->insertTag(status.ptr(), read_only ? isc_tpb_read : isc_tpb_write);
+
+		if (status.failed())
+		{
+			tpb->dispose();
+			setErrorFromStatus("fb_start_transaction: could not fill the TPB",
+				status.ptr());
+			return 0;
+		}
+
+		transaction = attachment->startTransaction(status.ptr(),
+			tpb->getBufferLength(status.ptr()), tpb->getBuffer(status.ptr()));
+
+		tpb->dispose();
+	}
 
 	if (status.failed() || !transaction)
 	{

@@ -197,6 +197,7 @@ await db.transaction(async (tx) => {
 | Concurrent tabs | **Safe by default** — the second tab is refused with `DatabaseLockedError` rather than silently overwriting the first. Opt out with `multiTab: 'allow-unsafe'`. See [Concurrent tabs](#concurrent-tabs) |
 | Auto-persist | On by default: writes persist after a 500 ms debounce, plus a best-effort flush when the page is hidden. Disable with `autoPersist: false` |
 | Typed values | Decoded from their real Firebird types, but flattened for JSON: `NUMERIC`/`DECFLOAT`/`INT128` and out-of-range `BIGINT` arrive as exact decimal **strings**, dates as ISO-8601 strings, binary BLOBs as base64. A typed ABI is planned |
+| Transaction options | Honoured — `isolationLevel` and `readOnly` are applied, the same as the Node backend. Until recently they were accepted and silently ignored here |
 | Multi-statement `exec()` | Supported — splitting respects strings, identifiers, comments and `SET TERM`. Parameters are rejected for scripts, since no value can be attributed to a statement |
 | Concurrent tabs sharing one engine | Not yet — a second tab is refused, not served by the first. A SharedWorker leader would lift that |
 | Web Worker offloading | Supported — pass `worker`; browsers require it |

@@ -330,6 +330,26 @@ not then try to commit.
 Statements issued on `tx` are bound to that transaction. Statements on `db`
 are not, so a rollback will not undo them.
 
+`isolationLevel` and `readOnly` are honoured:
+
+```ts
+await db.transaction(async (tx) => {
+  const { rows } = await tx.query('SELECT SUM(amount) AS total FROM ledger');
+  await tx.exec('INSERT INTO audit (total) VALUES (?)', [rows[0].TOTAL]);
+}, { isolationLevel: 'SNAPSHOT' });
+
+// A read-only transaction is enforced by the engine, not merely advisory.
+await db.query('SELECT * FROM ledger', [], { readOnly: true });
+```
+
+`SNAPSHOT` gives the transaction a stable view: work another transaction
+commits after it starts is invisible to it. `READ_COMMITTED` sees such commits.
+`SNAPSHOT_TABLE_STABILITY` maps to Firebird's `CONSISTENCY`.
+
+Passing options to `query()` runs the statement inside its own transaction
+carrying them, which costs one extra round trip to the Worker. Without options
+the engine's auto-commit transaction is used instead.
+
 ### Multi-statement scripts
 
 `exec()` splits on statement boundaries, respecting string literals, quoted

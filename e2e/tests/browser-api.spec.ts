@@ -465,6 +465,101 @@ test.describe('IndexedDBVFS', () => {
 // FirebirdBrowser — driven against the stub C ABI
 // ===========================================================================
 
+test.describe('Transaction options', () => {
+  test('passes the isolation level and access mode to the engine', async ({
+    page,
+  }) => {
+    // The bug this replaces: FirebirdBrowser accepted TransactionOptions and
+    // dropped them, so a browser caller asking for SNAPSHOT silently got the
+    // engine default while the same code on Node got SNAPSHOT.  Asserting the
+    // arguments that reach the ABI is what makes that impossible to reintroduce.
+    const calls = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('tx-options', {
+        autoPersist: false,
+      });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      window.__stub.resetCalls();
+
+      await db.transaction(async () => {}, { isolationLevel: 'SNAPSHOT' });
+      await db.transaction(async () => {}, {
+        isolationLevel: 'READ_COMMITTED',
+        readOnly: true,
+      });
+      await db.transaction(async () => {});
+
+      const started = window.__stub.calls
+        .filter((c) => c.fn === '_fb_start_transaction_ex')
+        .map((c) => c.args.slice(1));
+
+      await db.close();
+      return started;
+    });
+
+    // [isolation, readOnly] — 2 is SNAPSHOT, 1 is READ_COMMITTED, 0 is default.
+    expect(calls).toEqual([
+      [2, 0],
+      [1, 1],
+      [0, 0],
+    ]);
+  });
+
+  test('runs a query with options inside its own transaction', async ({
+    page,
+  }) => {
+    const names = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('tx-options-query', {
+        autoPersist: false,
+      });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      window.__stub.resetCalls();
+
+      await db.query('SELECT * FROM t', [], { readOnly: true });
+
+      const withOptions = window.__stub.callNames();
+      window.__stub.resetCalls();
+
+      await db.query('SELECT * FROM t');
+      const without = window.__stub.callNames();
+
+      await db.close();
+      return { withOptions, without };
+    });
+
+    // With options the statement has to run inside a transaction carrying
+    // them, as it does on Node.  Without them the engine's own auto-commit
+    // transaction is used, which saves a round trip to the Worker.
+    expect(names.withOptions).toContain('_fb_start_transaction_ex');
+    expect(names.withOptions).toContain('_fb_commit');
+    expect(names.without).not.toContain('_fb_start_transaction_ex');
+  });
+
+  test('rejects an isolation level the engine does not have', async ({
+    page,
+  }) => {
+    const message = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('tx-options-bad', {
+        autoPersist: false,
+      });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      try {
+        // JavaScript callers have no compiler to stop them, so this has to
+        // fail at runtime rather than silently becoming the default.
+        await db.transaction(async () => {}, {
+          isolationLevel: 'TOTALLY_ISOLATED',
+        } as never);
+        return null;
+      } catch (err) {
+        return (err as Error).message;
+      } finally {
+        await db.close();
+      }
+    });
+
+    expect(message).toContain('Unknown isolation level');
+    expect(message).toContain('TOTALLY_ISOLATED');
+  });
+});
+
 test.describe('FirebirdBrowser', () => {
   test('does not load the WASM module until the first statement', async ({
     page,
@@ -658,7 +753,7 @@ test.describe('FirebirdBrowser', () => {
 
     expect(result.value).toBe(2);
     expect(result.names).toEqual([
-      '_fb_start_transaction',
+      '_fb_start_transaction_ex',
       '_fb_execute',
       '_fb_query',
       '_fb_free_result',
@@ -922,7 +1017,7 @@ test.describe('FirebirdBrowser', () => {
         await tx.query('SELECT COUNT(*) AS cnt FROM t');
       });
 
-      const started = window.__stub.firstCall('_fb_start_transaction');
+      const started = window.__stub.firstCall('_fb_start_transaction_ex');
       const exec = window.__stub.firstCall('_fb_execute');
       const query = window.__stub.firstCall('_fb_query');
       const commit = window.__stub.firstCall('_fb_commit');

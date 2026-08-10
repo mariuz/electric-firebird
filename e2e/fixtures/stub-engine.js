@@ -305,6 +305,21 @@
         return nextTxHandle++;
       },
 
+      /**
+       * The real engine builds a TPB from these; the stub only has to record
+       * them, so a test can assert that the isolation a caller asked for
+       * actually reached the ABI.  That is the whole bug this replaced: the
+       * options were accepted by the API and never travelled any further.
+       */
+      _fb_start_transaction_ex(handle, isolation, readOnly) {
+        stub.calls.push({
+          fn: '_fb_start_transaction_ex',
+          args: [handle, isolation, readOnly],
+        });
+        if (stub.startTxFails) return 0;
+        return nextTxHandle++;
+      },
+
       _fb_commit(txHandle) {
         stub.calls.push({ fn: '_fb_commit', args: [txHandle] });
         return stub.commitRc;

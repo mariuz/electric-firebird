@@ -109,6 +109,18 @@ export interface FirebirdWasmModule {
   _fb_free_result(resultPtr: number): void;
   /** Start a new transaction and return a transaction handle (0 = failed). */
   _fb_start_transaction(handle: FbHandle): FbHandle;
+  /**
+   * Start a transaction with an explicit isolation level.
+   *
+   * `isolation` is an {@link IsolationCode}; `readOnly` is 0 or 1.
+   * Integers rather than strings: this crosses the WASM boundary on
+   * every transaction, and a string would mean an allocation each time.
+   */
+  _fb_start_transaction_ex(
+    handle: FbHandle,
+    isolation: number,
+    readOnly: number,
+  ): FbHandle;
   /** Commit a transaction.  The handle is invalid afterwards either way. */
   _fb_commit(txHandle: FbHandle): number;
   /** Rollback a transaction.  The handle is invalid afterwards either way. */

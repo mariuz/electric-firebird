@@ -16,6 +16,8 @@ export { encodeParams, encodeParamValue } from './params';
 
 export { firebirdTypeName } from './field-types';
 
+export { isolationCode, hasTransactionOptions } from './isolation';
+
 export {
   acquireDatabaseLock,
   databaseLockName,

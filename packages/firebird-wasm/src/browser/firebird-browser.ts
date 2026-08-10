@@ -28,6 +28,7 @@ import { DirectTransport } from './engine-transport';
 import type { EngineHandle, EngineTransport } from './engine-transport';
 import { WorkerTransport } from './worker-transport';
 import { splitStatements } from './sql-script';
+import { hasTransactionOptions } from './isolation';
 import { acquireDatabaseLock } from './db-lock';
 import type { DatabaseLock } from './db-lock';
 import type {
@@ -263,10 +264,34 @@ export class FirebirdBrowser {
   async query<T extends Row = Row>(
     sql: string,
     params: QueryParams = [],
-    _options: TransactionOptions = {},
+    options: TransactionOptions = {},
   ): Promise<QueryResult<T>> {
     await this.ensureReady();
-    return this.engine.query<T>(this.dbHandle, 0, sql, params);
+
+    // Without options the engine's own auto-commit transaction is used, which
+    // is one fewer round trip to the Worker.  With them, the statement has to
+    // run inside a transaction that carries them — matching the Node backend,
+    // which starts one for every query.
+    if (!hasTransactionOptions(options)) {
+      return this.engine.query<T>(this.dbHandle, 0, sql, params);
+    }
+
+    const txHandle = await this.engine.startTransaction(this.dbHandle, options);
+    try {
+      const result = await this.engine.query<T>(
+        this.dbHandle,
+        txHandle,
+        sql,
+        params,
+      );
+      await this.engine.commit(txHandle);
+      return result;
+    } catch (err) {
+      // A failed commit finishes the transaction itself, so only a failure
+      // from the query leaves anything to roll back.
+      await this.engine.rollback(txHandle).catch(() => undefined);
+      throw err;
+    }
   }
 
   /**
@@ -274,10 +299,10 @@ export class FirebirdBrowser {
    */
   async transaction<T>(
     fn: (tx: FirebirdBrowserTransaction) => Promise<T>,
-    _options: TransactionOptions = {},
+    options: TransactionOptions = {},
   ): Promise<T> {
     await this.ensureReady();
-    const txHandle = await this.engine.startTransaction(this.dbHandle);
+    const txHandle = await this.engine.startTransaction(this.dbHandle, options);
 
     const tx = new FirebirdBrowserTransaction(this.engine, this.dbHandle, txHandle);
 
