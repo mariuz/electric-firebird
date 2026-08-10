@@ -174,7 +174,10 @@ Next:
 - [ ] OPFS backend — a better match for page-oriented I/O than IndexedDB
 - [ ] A typed binary result ABI, so exact numerics need not travel as strings
 - [ ] Module disposal — `close()` does not currently release the WASM heap
-- [ ] Loadable character sets; only the built-ins are compiled in today
+- [ ] Loadable character sets. `src/intl` compiles under Emscripten and costs
+      +245 KB gzipped, measured; what is missing is a way for `IntlManager`
+      to reach it without `dlopen`. See
+      [docs/roadmap.md](../../docs/roadmap.md)
 - [ ] ElectricSQL sync
 
 **"Firebird 4 & 5 support" is gone from this list because it was never the

@@ -295,7 +295,8 @@ multi-tab safety have all landed since this list was written; what remains:
 - `loadFirebirdWasm()` caches one module process-wide with no way to dispose
   it; `close()` does not release the WASM heap.
 - Only the built-in character sets are compiled in; loadable ones need
-  `dlopen`.
+  `dlopen`. Investigated — see below; the size question is answered and the
+  wiring is not.
 - ElectricSQL sync (§M5) — the project's namesake.
 
 ### Persistence is atomic and incremental
@@ -622,6 +623,39 @@ be built:
 4. **The module cannot be disposed.** `loadFirebirdWasm()` caches one instance
    process-wide and `close()` does not release the heap.
 5. **Only built-in character sets.** Loadable ones need `dlopen`.
+   Groundwork done:
+
+      `src/intl` **compiles and links cleanly under Emscripten** — all 29 files,
+      no errors. Cost, measured rather than estimated: **+616 KB raw, +245 KB
+      gzipped (+8.3%)** for all 47 charsets and their collations.
+      `-DFB_WASM_FULL_INTL=ON` builds it; the option warns that it currently
+      enables nothing.
+
+      Measuring it took three attempts and the first two both reported *zero
+      bytes*. Nothing references the module's entry points when it is linked in
+      rather than `dlopen`ed, so the linker discarded the whole subsystem; and
+      an anchor array holding their addresses is not itself a root, so that was
+      discarded too, taking them with it. Only an exported function reaching
+      the array made the code survive — `wasm/fb_wasm_intl_anchor.cpp`. A size
+      measurement of dead-stripped code measures nothing.
+
+      What remains was never the size problem:
+
+      1. `IntlManager` reaches the module through
+         `ModuleLoader::fixAndLoadModule` and `findSymbol`, both of which assume
+         `dlopen`. Something must resolve `LD_lookup_charset`,
+         `LD_lookup_texttype`, `LD_lookup_texttype_with_status`,
+         `LD_setup_attributes` and `LD_version` to the statically linked
+         definitions — a `ModuleLoader` shim for Emscripten, or an
+         `IntlManager` patch registering a builtin module.
+      2. `fbintl.conf` (`builds/install/misc/`) maps charsets to modules and
+         has to exist in Emscripten's filesystem, or be compiled in.
+      3. Patch 0004 trims `defaultCharSets` so `CREATE DATABASE` does not fail
+         on a charset with no implementation; it would become conditional on
+         the option rather than on `__EMSCRIPTEN__`.
+
+      Whether 245 KB on every download is worth encodings most web applications
+      never touch is a judgement, not an obstacle. `UTF8` is a built-in.
 6. **No sync.** The "electric" in the project name is still aspirational.
 7. Everything in §2 marked ❌ — real gaps, but none of them mislead a user.
 

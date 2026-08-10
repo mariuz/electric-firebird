@@ -149,6 +149,38 @@ list(FILTER FB_JRD_SRCS EXCLUDE REGEX ".*/jrd/extds/.*")
 # Emscripten exposes pread/pwrite via its MEMFS virtual filesystem, giving the
 # WASM engine real in-memory page storage without any native disk dependency.
 
+# ---------------------------------------------------------------------------
+# International text: charsets and collations beyond the built-ins
+# ---------------------------------------------------------------------------
+#
+# Normally these live in a separately loaded `fbintl` module, and Emscripten
+# has no dlopen to load it with.  Compiling them in is the only way to have
+# them at all, so it is an option rather than a given: they are mostly codepage
+# tables, on an artifact a browser has to download, for encodings many
+# applications never touch.  Measure before enabling — see docs/roadmap.md.
+option(FB_WASM_FULL_INTL "Compile the loadable character sets and collations into the engine" OFF)
+
+if(FB_WASM_FULL_INTL)
+  # Enabling this today buys size and nothing else.  The sources compile and
+  # link, but IntlManager still reaches the module through ModuleLoader, which
+  # needs a dlopen Emscripten does not have — so the charsets are present in
+  # the binary and unreachable from SQL.  Measured cost: +616 KB raw,
+  # +245 KB gzipped.  See docs/roadmap.md for what is left to wire up.
+  message(WARNING
+    "FB_WASM_FULL_INTL compiles src/intl in, but the charsets are not yet "
+    "reachable: IntlManager has no way to load the module without dlopen. "
+    "This adds ~616 KB and enables nothing. See docs/roadmap.md.")
+  file(GLOB FB_INTL_SRCS "${FIREBIRD_SRC}/src/intl/*.cpp")
+  # Nothing calls the module's entry points when it is linked in rather than
+  # dlopen()ed, so without this anchor the linker discards the whole subsystem
+  # and the build silently gains nothing.
+  list(APPEND FB_INTL_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/fb_wasm_intl_anchor.cpp")
+  # cs_icu/cv_icu reach ICU through the same static build the engine uses.
+  message(STATUS "Full INTL enabled: ${FIREBIRD_SRC}/src/intl")
+else()
+  set(FB_INTL_SRCS "")
+endif()
+
 file(GLOB_RECURSE FB_LOCK_SRCS
   "${FIREBIRD_SRC}/src/lock/*.cpp"
 )
@@ -281,6 +313,7 @@ add_executable(firebird-embedded
   ${FB_COMMON_SRCS}
   ${FB_DSQL_SRCS}
   ${FB_JRD_SRCS}
+  ${FB_INTL_SRCS}
   ${FB_LOCK_SRCS}
   ${FB_YVALVE_SRCS}
   ${FB_EPP_SRCS}
