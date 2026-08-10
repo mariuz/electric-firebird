@@ -680,6 +680,27 @@ be built:
 
       So the realistic choice is between compiling the charsets in for everyone
       and leaving them out for everyone, not between bundling and lazy-loading.
+
+      **And the cost of leaving them out is larger than "no SJIS".** Measured
+      against the current build: `UNICODE`, `UNICODE_CI` and `UNICODE_CI_AI`
+      are *listed* in `RDB$COLLATIONS` but fail on use —
+
+      ```
+      CREATE TABLE t (name VARCHAR(50) CHARACTER SET UTF8 COLLATE UNICODE_CI)
+      -> COLLATION UNICODE for CHARACTER SET "SYSTEM"."UTF8" is not installed
+      ```
+
+      So today there is no case-insensitive comparison, no accent-insensitive
+      search, and no locale-aware ordering — `ORDER BY` on UTF8 text sorts by
+      code point. Those are ordinary requirements, not exotic ones, and being
+      listed-but-broken is worse than being absent: it looks supported until it
+      is used.
+
+      Taking only the ICU collations and dropping the legacy codepages would be
+      the ideal trade, and does not work: `ld.cpp` holds a single static table
+      naming all 89 charsets, and a subset build leaves 175 undefined symbols.
+      Trimming that table is possible but buys 616 KB in exchange for a new
+      invasive patch to rebase onto every Firebird release.
 6. **No sync.** The "electric" in the project name is still aspirational.
 7. Everything in §2 marked ❌ — real gaps, but none of them mislead a user.
 

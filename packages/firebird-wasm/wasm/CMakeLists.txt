@@ -170,6 +170,10 @@ if(FB_WASM_FULL_INTL)
     "FB_WASM_FULL_INTL compiles src/intl in, but the charsets are not yet "
     "reachable: IntlManager has no way to load the module without dlopen. "
     "This adds ~616 KB and enables nothing. See docs/roadmap.md.")
+  # All of it, or none: ld.cpp holds a single static table naming all 89
+  # charsets, so dropping the legacy codepages to keep only the ICU collations
+  # leaves 175 undefined symbols. Trimming that table is possible but means a
+  # new patch to rebase onto every Firebird release, for 616 KB.
   file(GLOB FB_INTL_SRCS "${FIREBIRD_SRC}/src/intl/*.cpp")
   # Nothing calls the module's entry points when it is linked in rather than
   # dlopen()ed, so without this anchor the linker discards the whole subsystem
