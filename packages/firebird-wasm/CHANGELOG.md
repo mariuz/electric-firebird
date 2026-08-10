@@ -4,7 +4,7 @@ All notable changes to `firebird-wasm`. This project follows
 [semantic versioning](https://semver.org/); while the major version is 0 the
 API may still move between minor releases.
 
-## Unreleased
+## 0.2.0
 
 ### Added
 
@@ -22,6 +22,11 @@ API may still move between minor releases.
 - **`FirebirdBrowser.isLeader`** — whether this tab runs the engine. Useful for
   work that should happen once per application rather than once per tab, such
   as a migration.
+
+### Unchanged
+
+- The compiled engine is byte-identical to 0.1.1 — every change in this release
+  is TypeScript. Nothing under `wasm/` was touched.
 
 ### Notes on failover
 
