@@ -662,14 +662,40 @@ be built:
       Emscripten's ICU port does not carry their converter data. The other 43
       are table-driven and work.
 
-      **What still does not work, and it is the part worth having.** `UNICODE`,
-      `UNICODE_CI` and `UNICODE_CI_AI` on UTF8 remain "not installed". They
-      are not served by the module this wiring fixed: they are registered as
-      *builtin* collations, so the lookup goes to `INTL_builtin_lookup_texttype`
-      in `jrd/intl_builtin.cpp` rather than through `ModuleLoader` at all. So
-      there is still no case-insensitive comparison, no accent-insensitive
-      search and no locale-aware ordering. That is a separate mechanism from
-      the one this work fixed, and the next thing to look at.
+      **What still does not work, and why it cannot be wired.** `UNICODE`,
+      `UNICODE_CI` and `UNICODE_CI_AI` on UTF8 remain "not installed", and
+      chasing it down ended somewhere no amount of wiring reaches.
+
+      They are not served by the module this fixed. They are registered as
+      *builtin* collations — `IntlManager::initialize()` calls
+      `registerCharSetCollation(UTF8, "UNICODE", ...)` explicitly — so the
+      lookup goes to `INTL_builtin_lookup_texttype_status` and never touches
+      `ModuleLoader`. Every step of that path works: the map lookup finds both
+      entries, the dispatch finds `ttype_unicode8_init`, and it calls
+      `IntlUtil::initUnicodeCollation`.
+
+      It fails one level lower, in ICU itself:
+
+      ```
+      loadICU(icuVersion='68.2', collVersion='0.0', locale='')
+      ucolOpen failed
+      initUnicodeCollation: Utf16Collation::create returned null
+      ```
+
+      `ucol_open` on the root locale returns null. **Emscripten's ICU port
+      (`-sUSE_ICU=1`) is built without collation data.** The engine is asking
+      correctly and ICU has nothing to answer with.
+
+      So this is not a Firebird integration problem and cannot be fixed by
+      registering something differently. It needs an ICU built for wasm *with*
+      collation data — either a custom build with a data filter that keeps
+      `coll`, or shipping `icudt*.dat` and pointing ICU at it with
+      `u_setDataDirectory`. Both mean owning an ICU build rather than using
+      Emscripten's port, and collation data is not small: this is a comparable
+      piece of work to everything above it, with its own size question.
+
+      Until then: no case-insensitive comparison, no accent-insensitive search,
+      and `ORDER BY` on UTF8 text sorts by code point.
 
       The option stays **off by default** for that reason: it costs 616 KB and
       buys legacy codepages, not the collations most applications would want it
