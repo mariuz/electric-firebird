@@ -53,6 +53,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -880,6 +881,215 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// Events
+// ---------------------------------------------------------------------------
+
+/**
+ * A subscription to one or more Firebird events.
+ *
+ * Firebird delivers events by calling back on one of its own threads.  That
+ * thread knows nothing about this file's handle tables, the JavaScript heap,
+ * or Emscripten's main-thread invariants, so the callback does the least work
+ * that is correct: copy the counts under a mutex and set a flag.  Everything
+ * else — reporting to JavaScript, re-arming the queue — happens later, on the
+ * thread that calls fb_events_poll().
+ *
+ * Two details of Firebird's event API drive the shape of this, and the first
+ * one cost an event before a test caught it:
+ *
+ *  - The counts in the block passed to queEvents() are the counts the caller
+ *    has *already seen*, and the engine calls back when its own count moves
+ *    past them.  Re-arming with zeros would therefore re-deliver everything
+ *    immediately, forever.  eventBlock() encodes the last seen counts.
+ *  - Registration does **not** produce a baseline callback here.  The first
+ *    delivery is a real event — measured: one POST_EVENT produced exactly one
+ *    callback carrying a count of 1.  Treating it as a baseline, which is what
+ *    this code did first, silently discarded the first event of every
+ *    subscription.
+ *
+ *  A delivery also disarms the queue: until queEvents() is called again,
+ *  further posts are counted but not delivered.  Re-arming from inside the
+ *  callback would mean calling into the engine from the engine's own callback
+ *  thread, so fb_events_poll() does it instead.
+ */
+class EventSubscription final :
+	public IEventCallbackImpl<EventSubscription, CheckStatusWrapper>
+{
+public:
+	explicit EventSubscription(std::vector<std::string> names)
+		: m_names(std::move(names)),
+		  m_seen(m_names.size(), 0),
+		  m_reported(m_names.size(), 0)
+	{
+	}
+
+	// ── IReferenceCounted ──────────────────────────────────────────────
+	void addRef() override
+	{
+		std::lock_guard<std::mutex> guard(m_mutex);
+		++m_refs;
+	}
+
+	int release() override
+	{
+		int remaining;
+		{
+			std::lock_guard<std::mutex> guard(m_mutex);
+			remaining = --m_refs;
+		}
+		if (remaining == 0)
+			delete this;
+		return remaining;
+	}
+
+	/**
+	 * Called by the engine, on an engine thread.
+	 *
+	 * `events` is an event block in the same layout as the one passed to
+	 * queEvents, with each event's count updated.  The counts are cumulative
+	 * since the database was attached, so a delta against the baseline is what
+	 * says how many times something actually fired.
+	 */
+	void eventCallbackFunction(unsigned length, const unsigned char* events) override
+	{
+		if (!events || length == 0)
+			return;
+
+		std::lock_guard<std::mutex> guard(m_mutex);
+		parseCounts(events, length, m_seen);
+		fprintf(stderr, "[DIAG] callback:");
+		for (size_t i = 0; i < m_seen.size(); ++i)
+			fprintf(stderr, " %s=%u", m_names[i].c_str(), m_seen[i]);
+		fprintf(stderr, "\n");
+		m_disarmed = true;
+	}
+
+	/** Names, in the order their counts appear in the event block. */
+	const std::vector<std::string>& names() const { return m_names; }
+
+	/** Take the counts that have arrived since the last call. */
+	void takeDeltas(std::vector<unsigned>& out, bool& needsRearm)
+	{
+		std::lock_guard<std::mutex> guard(m_mutex);
+
+		needsRearm = m_disarmed;
+		m_disarmed = false;
+
+		out.resize(m_names.size());
+		for (size_t i = 0; i < m_names.size(); ++i)
+		{
+			// Unsigned subtraction is correct across wraparound, which is the
+			// only way a count can appear to go backwards.
+			out[i] = m_seen[i] - m_reported[i];
+			m_reported[i] = m_seen[i];
+		}
+	}
+
+	/**
+	 * Build the event block queEvents() expects.
+	 *
+	 *   [version=1] then, per event: [name length][name bytes][count: 4 bytes LE]
+	 *
+	 * The counts are the ones already seen, not zeros: the engine treats them
+	 * as "I know about this many" and calls back when it has more.
+	 *
+	 * Built here rather than with isc_event_block(), whose varargs signature is
+	 * awkward to call safely with a runtime-sized list.
+	 */
+	std::vector<unsigned char> eventBlock() const
+	{
+		std::lock_guard<std::mutex> guard(m_mutex);
+
+		std::vector<unsigned char> block;
+		block.push_back(1);   // EPB_version1
+
+		for (size_t i = 0; i < m_names.size(); ++i)
+		{
+			const std::string& name = m_names[i];
+			block.push_back(static_cast<unsigned char>(name.size()));
+			block.insert(block.end(), name.begin(), name.end());
+
+			const unsigned count = m_seen[i];
+			block.push_back(static_cast<unsigned char>(count & 0xff));
+			block.push_back(static_cast<unsigned char>((count >> 8) & 0xff));
+			block.push_back(static_cast<unsigned char>((count >> 16) & 0xff));
+			block.push_back(static_cast<unsigned char>((count >> 24) & 0xff));
+		}
+		return block;
+	}
+
+private:
+	static void parseCounts(const unsigned char* buffer, unsigned length,
+	                        std::vector<unsigned>& counts)
+	{
+		unsigned pos = 1;   // skip the version byte
+		size_t index = 0;
+
+		while (pos < length && index < counts.size())
+		{
+			const unsigned nameLength = buffer[pos];
+			pos += 1 + nameLength;
+			if (pos + 4 > length)
+				break;
+
+			counts[index++] = static_cast<unsigned>(buffer[pos]) |
+			                  (static_cast<unsigned>(buffer[pos + 1]) << 8) |
+			                  (static_cast<unsigned>(buffer[pos + 2]) << 16) |
+			                  (static_cast<unsigned>(buffer[pos + 3]) << 24);
+			pos += 4;
+		}
+	}
+
+	mutable std::mutex        m_mutex;
+	int                       m_refs = 1;
+	std::vector<std::string>  m_names;
+	std::vector<unsigned>     m_seen;       // latest counts from the engine
+	std::vector<unsigned>     m_reported;   // counts already handed to JS
+	bool                      m_disarmed  = false;
+};
+
+/** A live subscription: the callback, its queue handle, and its attachment. */
+struct EventEntry
+{
+	EventSubscription* subscription = nullptr;
+	IEvents*           queue        = nullptr;
+	IAttachment*       attachment   = nullptr;
+};
+
+std::map<int, EventEntry> g_events;
+int g_nextEventHandle = 1;
+
+/** (Re-)arm the queue for a subscription.  Returns false and sets the error. */
+bool armEvents(EventEntry& entry)
+{
+	if (entry.queue)
+	{
+		// Released, not cancelled.  A delivered queue is already spent; asking
+		// the engine to cancel it as well is what stopped every delivery after
+		// the first.
+		entry.queue->release();
+		entry.queue = nullptr;
+	}
+
+	Status status;
+	const std::vector<unsigned char> block = entry.subscription->eventBlock();
+	fprintf(stderr, "[DIAG] arming, block bytes:");
+	for (size_t i = 0; i < block.size(); ++i) fprintf(stderr, " %02x", block[i]);
+	fprintf(stderr, "\n");
+
+	entry.queue = entry.attachment->queEvents(
+		status.ptr(), entry.subscription,
+		static_cast<unsigned>(block.size()), block.data());
+
+	if (status.failed() || !entry.queue)
+	{
+		setErrorFromStatus("fb_events: could not queue events", status.ptr());
+		return false;
+	}
+	return true;
+}
+
+// ---------------------------------------------------------------------------
 // Parameter blocks
 // ---------------------------------------------------------------------------
 
@@ -1254,8 +1464,32 @@ int fb_detach_database(int db_handle)
 		tx = g_transactions.erase(tx);
 	}
 
+	// Subscriptions hold a queue against this attachment.  Detaching with one
+	// outstanding leaves the engine holding a callback into memory that is
+	// about to go, so they are cancelled here rather than left to the caller.
+	IAttachment* attachment = it->second.attachment;
+	for (auto ev = g_events.begin(); ev != g_events.end(); )
+	{
+		if (ev->second.attachment != attachment)
+		{
+			++ev;
+			continue;
+		}
+
+		if (ev->second.queue)
+		{
+			Status cancelStatus;
+			ev->second.queue->cancel(cancelStatus.ptr());
+			ev->second.queue->release();
+		}
+		if (ev->second.subscription)
+			ev->second.subscription->release();
+
+		ev = g_events.erase(ev);
+	}
+
 	Status status;
-	it->second.attachment->detach(status.ptr());
+	attachment->detach(status.ptr());
 	g_databases.erase(it);
 
 	if (status.failed())
@@ -1421,6 +1655,185 @@ FB_WASM_EXPORT
 void fb_free_result(const char* ptr)
 {
 	free(const_cast<char*>(ptr));
+}
+
+/**
+ * Subscribe to one or more Firebird events.
+ *
+ * @param names  Comma-separated event names, e.g. "notes_changed,tags_changed".
+ * @return       A subscription handle, or 0 on failure.
+ *
+ * Firebird events are posted by the database itself — `POST_EVENT 'name'` in a
+ * trigger or stored procedure — and delivered after the posting transaction
+ * commits. That is what makes them usable for change notification: a
+ * subscriber hears about committed data, never about a write that later rolled
+ * back.
+ *
+ * Delivery is coalescing, not a queue of messages. Ten posts between two polls
+ * arrive as a count of ten, and the count is all there is — an event carries no
+ * payload. The intended use is "something you care about changed, go look".
+ */
+FB_WASM_EXPORT
+int fb_events_subscribe(int db_handle, const char* names)
+{
+	g_lastError.clear();
+
+	IAttachment* attachment = lookupAttachment(db_handle);
+	if (!attachment)
+	{
+		setError("fb_events_subscribe: unknown database handle");
+		return 0;
+	}
+
+	if (!names || !*names)
+	{
+		setError("fb_events_subscribe: no event names given");
+		return 0;
+	}
+
+	std::vector<std::string> parsed;
+	{
+		std::string current;
+		for (const char* p = names; ; ++p)
+		{
+			if (*p == ',' || *p == '\0')
+			{
+				if (!current.empty())
+				{
+					// Firebird's event block encodes each name's length in one
+					// byte, so a longer name cannot be represented at all.
+					if (current.size() > 255)
+					{
+						setError("fb_events_subscribe: event name longer than 255 bytes");
+						return 0;
+					}
+					parsed.push_back(current);
+					current.clear();
+				}
+				if (*p == '\0')
+					break;
+			}
+			else
+			{
+				current.push_back(*p);
+			}
+		}
+	}
+
+	if (parsed.empty())
+	{
+		setError("fb_events_subscribe: no event names given");
+		return 0;
+	}
+
+	EventEntry entry;
+	entry.attachment   = attachment;
+	entry.subscription = new EventSubscription(std::move(parsed));
+
+	if (!armEvents(entry))
+	{
+		entry.subscription->release();
+		return 0;
+	}
+
+	const int handle = g_nextEventHandle++;
+	g_events[handle] = entry;
+	return handle;
+}
+
+/**
+ * Collect the events that have arrived since the last poll, and re-arm.
+ *
+ * @return  A JSON object of name → count, owned by the caller until
+ *          fb_free_result(); or nullptr on failure.
+ *
+ * An empty object means nothing fired, which is the common case and is cheap.
+ * Re-arming happens here rather than in the callback because the callback runs
+ * on an engine thread, and calling back into the engine from it is not
+ * something this build should rely on.
+ */
+FB_WASM_EXPORT
+char* fb_events_poll(int event_handle)
+{
+	g_lastError.clear();
+
+	const auto it = g_events.find(event_handle);
+	if (it == g_events.end())
+	{
+		setError("fb_events_poll: unknown subscription handle");
+		return nullptr;
+	}
+
+	EventEntry& entry = it->second;
+
+	std::vector<unsigned> deltas;
+	bool needsRearm = false;
+	entry.subscription->takeDeltas(deltas, needsRearm);
+
+	// Re-arm before reporting.  The other order leaves a window in which an
+	// event posts, is counted by the engine, and is not delivered because the
+	// queue is still disarmed — the caller would see it only on the poll after
+	// next, or not at all if nothing else ever fires.
+	if (needsRearm && !armEvents(entry))
+		return nullptr;   // armEvents set the error
+
+	std::string json = "{";
+	const std::vector<std::string>& names = entry.subscription->names();
+	bool first = true;
+	for (size_t i = 0; i < names.size(); ++i)
+	{
+		if (deltas[i] == 0)
+			continue;   // report what fired, not the whole subscription
+
+		if (!first)
+			json += ',';
+		first = false;
+
+		jsonEscape(names[i].c_str(), names[i].size(), json);
+		json += ':';
+		json += std::to_string(deltas[i]);
+	}
+	json += '}';
+
+	return allocCString(json);
+}
+
+/**
+ * Cancel a subscription and release it.
+ *
+ * Safe to call once per handle; a second call reports an unknown handle rather
+ * than tearing down an unrelated subscription that reused the number.
+ */
+FB_WASM_EXPORT
+int fb_events_cancel(int event_handle)
+{
+	g_lastError.clear();
+
+	const auto it = g_events.find(event_handle);
+	if (it == g_events.end())
+	{
+		setError("fb_events_cancel: unknown subscription handle");
+		return 1;
+	}
+
+	EventEntry& entry = it->second;
+
+	if (entry.queue)
+	{
+		Status status;
+		entry.queue->cancel(status.ptr());
+		entry.queue->release();
+		entry.queue = nullptr;
+	}
+
+	if (entry.subscription)
+	{
+		entry.subscription->release();
+		entry.subscription = nullptr;
+	}
+
+	g_events.erase(it);
+	return 0;
 }
 
 /**

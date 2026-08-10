@@ -368,6 +368,7 @@ set(FB_EXPORTED_FUNCTIONS
   _fb_create_database _fb_attach_database _fb_detach_database
   _fb_execute _fb_query _fb_execute_params _fb_query_params _fb_free_result
   _fb_start_transaction _fb_commit _fb_rollback
+  _fb_events_subscribe _fb_events_poll _fb_events_cancel
   _malloc _free
 )
 if(FB_WASM_POOL_PROBE)
