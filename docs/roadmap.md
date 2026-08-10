@@ -439,6 +439,74 @@ an empty project, created a database, and read back `NUMERIC(10,2)` as the
 exact string `"20.25"`. The published shasum matches the tarball that was
 tested before release.
 
+### Live queries: what is actually blocking them
+
+Attempted, and stopped at a specific engine-side wall.  The work is on the
+`events-wip` branch (`fedbd8e`) rather than `main`, because the C API is
+complete and correct and still cannot fire.
+
+The intended design is unchanged and still right: Firebird posts events with
+`POST_EVENT` from a trigger, delivered **after the posting transaction
+commits**, so a subscriber only ever hears about data that survived.  A C API
+of `fb_events_subscribe` / `fb_events_poll` / `fb_events_cancel` sits over
+`IAttachment::queEvents`, with the callback doing the least work that is
+correct on an engine thread — copy counts under a mutex, set a flag — and the
+poll doing the re-arming, because re-arming from inside the callback means
+calling into the engine from the engine's own callback thread.
+
+What was measured, in order:
+
+| Step | Result |
+|------|--------|
+| Event manager initialisation | **Works.** Creates its shared-memory region in MEMFS (`fb_event_0100…`, 64 KB) |
+| `queEvents` registration | **Works.** The hand-built event block is accepted; layout verified byte by byte |
+| Watcher thread start | **Works.** `EventManager::watcher_thread` starts |
+| First delivery | **Works.** One loop iteration, `PRB_pending` seen, `deliver()` called, callback invoked |
+| Every delivery after the first | **Never happens.** The watcher never iterates again |
+
+The watcher is stuck inside `SharedMemoryBase::eventWait`, whose internal loop
+exits only when the event counter changes.  The counter never changes, so
+`eventPost` is not reaching the watcher's event after the first delivery.
+
+Shared memory itself is not the problem: the watcher observed `PRB_pending`
+set by a different thread, so the mapping is genuinely shared.  That narrows
+the fault to the wakeup path rather than to Emscripten's `mmap`.
+
+Two findings worth keeping even if the approach changes:
+
+- **The baseline count is 1, not 0.**  An event that had never been posted
+  reported a count of 1 on the first delivery.  Any implementation must treat
+  the first delivery as a baseline and subtract it; reading it as a real event
+  — which an earlier revision of this code did — reports a phantom event per
+  subscription at startup.
+- **Bounding the indefinite wait does not help.**  `eventWait` calls
+  `pthread_cond_wait` with no timeout, which looks exactly like the
+  `sem_timedwait` problem fix 6 solved during the port.  Giving it a 50 ms
+  timeout instead changes nothing, because `eventWait` loops internally on the
+  same condition: the timeout spins there rather than returning to the
+  watcher.  Reverted.
+
+#### To pick this up again
+
+1. **The one open question:** why does `eventPost` not advance the counter that
+   `eventWait` blocks on?  Everything above it is in place.  Start in
+   `src/common/isc_sync.cpp` — `eventPost`, `eventClear` and `event_blocked` —
+   and instrument the poster, not the waiter; the waiter's behaviour is
+   already understood.
+2. **The feedback loop is slow.**  Each hypothesis costs an incremental
+   rebuild of the engine, a few minutes with a warm build tree and about an
+   hour without one.  Batch the diagnostics: print from the poster and the
+   waiter in one build rather than one question per rebuild.
+3. **The JavaScript layer is unwritten but unblocked.**  Once delivery works,
+   what remains is a Worker that polls `fb_events_poll` and pushes to the main
+   thread, plus a `live()` API that re-runs a query when named events fire.
+   None of it depends on the unknown above.
+4. **There is a fallback that works today.**  Re-running registered queries on
+   a timer, or after any local write, covers a single tab reacting to its own
+   writes — the common case — without any engine event at all.  It is not
+   `POST_EVENT` integration and would not see changes made by another
+   connection, but nothing here blocks it.
+
 ---
 
 ## 2. Feature comparison with PGlite
@@ -486,8 +554,8 @@ Legend: ✅ shipped · 🟡 partial · ❌ missing · n/a not applicable
 |---|---|---|---|
 | Multi-tab sharing (worker + leader election) | ✅ `PGliteWorker` | ❌ | Two tabs corrupt each other today (§1.4) |
 | Web Worker offloading | ✅ | ❌ | The engine runs on the main thread and blocks it |
-| Live / reactive queries | ✅ `live` extension | ❌ | |
-| `listen()` / `notify()` | ✅ | ❌ | Firebird has a native fit here: `POST_EVENT` + event alerts |
+| Live / reactive queries | ✅ `live` extension | ❌ | Attempted; blocked on event delivery, see §1. A polling fallback is possible without it |
+| `listen()` / `notify()` | ✅ | ❌ | `POST_EVENT` is the right fit and the C API is written, but the engine delivers only the first event under Emscripten — see §1 |
 | Sync with a server | ✅ (ElectricSQL) | ❌ | This is the "electric" in the project name |
 
 ### Packaging & ecosystem
@@ -542,7 +610,10 @@ Nothing here produces a wrong answer. Ranked by how much they limit what can
 be built:
 
 1. **No live queries.** An application has no way to learn that data changed
-   except by polling. `POST_EVENT` is the natural fit and is unused.
+   except by polling. Not for want of trying: the C API exists on the
+   `events-wip` branch and Firebird's event manager starts, but delivery stops
+   after the first event under Emscripten. See §1 for exactly where it stops
+   and what to try next.
 2. **Two tabs cannot share a database.** Safe, but a second tab is refused
    rather than served, which rules out ordinary multi-window use.
 3. **9 MB artifact, unbudgeted.** Compresses to about a third, but it is the
@@ -635,6 +706,10 @@ be built:
 - [ ] A size budget and a default `locateFile` for CDN use; the 9 MB artifact
       is currently unbudgeted and every consumer wires `locateFile` by hand.
 - [ ] Live queries built on `POST_EVENT`; a `listen()` / `notify()` API.
+      **Blocked**, not merely unstarted — the subscription C API is written
+      (`events-wip`) and the engine delivers exactly one event and then stops.
+      §1 records what was measured and where to resume. A polling
+      implementation is unblocked if the push one stays stuck.
 - [ ] Verified Vite and webpack example apps in CI.
 
 ### M5 — Ecosystem
