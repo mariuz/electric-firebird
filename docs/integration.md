@@ -520,8 +520,7 @@ server do not apply to a preview build.
 Pass a `worker`.
 
 **`CHARACTER SET "SYSTEM"."SJIS_0208" is not installed`.** Only the built-in
-character sets are compiled in; loadable ones need `dlopen`, which WASM does
-not have. Use `UTF8`.
+character sets are compiled in. Use `UTF8`, which is.
 
 **Arithmetic on a money column produces string concatenation.** See §5.
 

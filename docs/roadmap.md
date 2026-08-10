@@ -622,8 +622,7 @@ be built:
    first thing anyone notices.
 4. **The module cannot be disposed.** `loadFirebirdWasm()` caches one instance
    process-wide and `close()` does not release the heap.
-5. **Only built-in character sets.** Loadable ones need `dlopen`.
-   Groundwork done:
+5. **Only built-in character sets.** Groundwork done:
 
       `src/intl` **compiles and links cleanly under Emscripten** — all 29 files,
       no errors. Cost, measured rather than estimated: **+616 KB raw, +245 KB
@@ -656,6 +655,31 @@ be built:
 
       Whether 245 KB on every download is worth encodings most web applications
       never touch is a judgement, not an obstacle. `UTF8` is a built-in.
+
+      **How PGlite handles the same problem, and why it does not transfer.**
+      PGlite bundles no ICU data at all; locale support is a separate npm
+      package, `@electric-sql/pglite-icu-full`, passed at startup as
+      `icuDataDir`. Its own docs say that package "loads the entire locale set
+      provided by libicu, which might be quite large", and point users at
+      libicu's build tools to cut a smaller one.
+
+      That works because ICU locale data is *data*, designed to be loaded from
+      outside the binary, and it is large relative to the engine — large enough
+      to be worth a second download and an API to opt into. Firebird's charsets
+      are *code*: conversion routines and tables in a module the engine
+      normally `dlopen`s, and they are **616 KB on a 9.1 MB artifact**. Paying
+      for a separate package, a second artifact, or runtime dynamic linking to
+      avoid 245 KB compressed is a worse trade than simply including it.
+
+      Emscripten *can* do the PGlite-shaped thing: `dlopen` works for side
+      modules. But `MAIN_MODULE=1` disables dead-code elimination outright and
+      `MAIN_MODULE=2` needs every symbol maintained by hand, and Emscripten
+      documents dynamic linking with pthreads as experimental — which this
+      build is entirely built on. The cost of that route exceeds what it would
+      save.
+
+      So the realistic choice is between compiling the charsets in for everyone
+      and leaving them out for everyone, not between bundling and lazy-loading.
 6. **No sync.** The "electric" in the project name is still aspirational.
 7. Everything in §2 marked ❌ — real gaps, but none of them mislead a user.
 

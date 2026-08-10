@@ -23,9 +23,11 @@ international text subsystem, and a plugin architecture that loads its own
 providers at runtime. All of it assumes a POSIX host with threads, shared
 memory, semaphores, dynamic loading and a real filesystem.
 
-WebAssembly offers a 32-bit address space, no `dlopen`, cooperative threads
-that are really Web Workers over `SharedArrayBuffer`, and a filesystem that
-exists only because Emscripten emulates one.
+WebAssembly offers a 32-bit address space, cooperative threads that are really
+Web Workers over `SharedArrayBuffer`, and a filesystem that exists only because
+Emscripten emulates one. Dynamic loading it does have — Emscripten implements
+`dlopen` for side modules — but not in a build like this one, and Emscripten's
+own documentation calls dynamic linking with pthreads experimental.
 
 The work divides into three parts, and it is worth naming them separately
 because they fail in completely different ways:
