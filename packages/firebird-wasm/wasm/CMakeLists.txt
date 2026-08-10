@@ -122,6 +122,11 @@ file(GLOB_RECURSE FB_JRD_SRCS
 # Exclude standalone test utilities in jrd/misc/ (e.g. evl_string_test.cpp) –
 # they are not part of the embedded engine and reference constructors/types
 # that may not compile in the WASM context.
+# common/os/posix/mod_loader.cpp is dlopen.  fb_wasm_mod_loader.cpp replaces it:
+# nothing is loadable at runtime here, and the intl module needs to be reachable
+# by name even though it is linked in.  Both cannot define ModuleLoader.
+list(FILTER FB_COMMON_SRCS EXCLUDE REGEX ".*/common/os/posix/mod_loader\\.cpp$")
+
 list(FILTER FB_JRD_SRCS EXCLUDE REGEX ".*/jrd/misc/.*")
 # Exclude Boost-dependent test files in jrd/tests/ (CompressorTest.cpp,
 # EngineTest.cpp) – they require Boost test headers unavailable in WASM.
@@ -175,10 +180,17 @@ if(FB_WASM_FULL_INTL)
   # leaves 175 undefined symbols. Trimming that table is possible but means a
   # new patch to rebase onto every Firebird release, for 616 KB.
   file(GLOB FB_INTL_SRCS "${FIREBIRD_SRC}/src/intl/*.cpp")
-  # Nothing calls the module's entry points when it is linked in rather than
-  # dlopen()ed, so without this anchor the linker discards the whole subsystem
-  # and the build silently gains nothing.
-  list(APPEND FB_INTL_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/fb_wasm_intl_anchor.cpp")
+  # The module loader shim references the entry points by address, which is
+  # what keeps the subsystem from being dead-stripped.
+  add_compile_definitions(FB_WASM_STATIC_INTL)
+
+  # IntlManager scans <root>/intl for *.conf to learn which charsets live in
+  # which module.  There is no installation to read one from, so the stock
+  # config is embedded in the artifact and fb_init() points the root at it.
+  set(FB_INTL_CONF "${FIREBIRD_SRC}/builds/install/misc/fbintl.conf")
+  if(NOT EXISTS "${FB_INTL_CONF}")
+    message(FATAL_ERROR "FB_WASM_FULL_INTL needs ${FB_INTL_CONF}, which is missing")
+  endif()
   # cs_icu/cv_icu reach ICU through the same static build the engine uses.
   message(STATUS "Full INTL enabled: ${FIREBIRD_SRC}/src/intl")
 else()
@@ -298,6 +310,7 @@ set(FB_INCLUDE_DIRS
 set(FB_WASM_GLUE_SRCS
   "${CMAKE_CURRENT_SOURCE_DIR}/fb_wasm_api.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/fb_wasm_stubs.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/fb_wasm_mod_loader.cpp"
 )
 
 # Diagnostic: exercises Firebird's MemoryPool directly, with no engine
@@ -506,6 +519,14 @@ elseif(FB_WASM_SANITIZE STREQUAL "address")
   )
 elseif(NOT FB_WASM_SANITIZE STREQUAL "none")
   message(FATAL_ERROR "FB_WASM_SANITIZE must be one of: none, safe-heap, address")
+endif()
+
+if(FB_WASM_FULL_INTL)
+  # Embedded rather than written at runtime: the config must exist before the
+  # engine initialises, and baking it into the artifact means no host setup and
+  # no way to ship the engine without it.  fb_init() points the root here.
+  list(APPEND EMSCRIPTEN_LINK_FLAGS
+    "--embed-file ${FB_INTL_CONF}@/firebird/intl/fbintl.conf")
 endif()
 
 # Compile a few files with DWARF so their frames carry line numbers.  Doing

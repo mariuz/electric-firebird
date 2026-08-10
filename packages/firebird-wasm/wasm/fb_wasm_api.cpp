@@ -1127,6 +1127,14 @@ int fb_init(void)
 	if (g_provider)
 		return 0;
 
+#ifdef FB_WASM_STATIC_INTL
+	// IntlManager scans <root>/intl for *.conf.  The artifact embeds one at
+	// /firebird/intl/fbintl.conf, so the root has to be /firebird before the
+	// engine initialises.  Set without overwriting: a host that has already
+	// chosen a root means it deliberately.
+	setenv("FIREBIRD", "/firebird", 0);
+#endif
+
 	g_master = fb_get_master_interface();
 	if (!g_master)
 	{

@@ -638,6 +638,43 @@ be built:
       the array made the code survive — `wasm/fb_wasm_intl_anchor.cpp`. A size
       measurement of dead-stripped code measures nothing.
 
+      **Update — most of it now works.** `-DFB_WASM_FULL_INTL=ON` builds an
+      engine with **48 character sets instead of 5**: WIN1251, the ISO8859
+      family, the DOS codepages, SJIS, EUC-J and the rest, with their
+      collations. `CREATE DATABASE` succeeds and `CREATE TABLE ... CHARACTER
+      SET WIN1251` works. Three pieces made that happen:
+
+      - `wasm/fb_wasm_mod_loader.cpp` replaces `common/os/posix/mod_loader.cpp`.
+        `IntlManager` still looks its entry points up by name through
+        `ModuleLoader`, and now gets back a module whose `findSymbol` knows the
+        five `LD_*` symbols. The engine goes on believing it loaded something,
+        so nothing in `jrd/` needs to know WebAssembly is different. Everything
+        else stays unloadable, which is what it already was.
+      - `fbintl.conf` is embedded into the artifact with `--embed-file` at
+        `/firebird/intl/`, and `fb_init()` sets `FIREBIRD=/firebird` so the
+        engine looks there. 181 charset/collation registrations succeed.
+      - Patch 0004 became conditional on the build option instead of on
+        `__EMSCRIPTEN__`, and is renamed to say what it now does.
+
+      Four entries had to stay excluded either way. TIS620, GBK, CP943C and
+      GB18030 are absent from `ld.cpp`'s own table, so `LD_lookup_charset()`
+      falls through to `CSICU_charset_init()` — an ICU converter — and
+      Emscripten's ICU port does not carry their converter data. The other 43
+      are table-driven and work.
+
+      **What still does not work, and it is the part worth having.** `UNICODE`,
+      `UNICODE_CI` and `UNICODE_CI_AI` on UTF8 remain "not installed". They
+      are not served by the module this wiring fixed: they are registered as
+      *builtin* collations, so the lookup goes to `INTL_builtin_lookup_texttype`
+      in `jrd/intl_builtin.cpp` rather than through `ModuleLoader` at all. So
+      there is still no case-insensitive comparison, no accent-insensitive
+      search and no locale-aware ordering. That is a separate mechanism from
+      the one this work fixed, and the next thing to look at.
+
+      The option stays **off by default** for that reason: it costs 616 KB and
+      buys legacy codepages, not the collations most applications would want it
+      for.
+
       What remains was never the size problem:
 
       1. `IntlManager` reaches the module through
