@@ -476,11 +476,22 @@ export class SharedEngineTransport implements EngineTransport {
     sql: string,
     params: QueryParams = [],
     rowMode: RowMode = 'object',
+    binaryBlobs = false,
   ): Promise<QueryResult<T>> {
-    // Decoding happens on the far side, so the mode has to travel with the
-    // call rather than being applied to what comes back. It is a string, so
-    // it survives structured cloning like the rest of the arguments.
-    return this.call<QueryResult<T>>('query', dbHandle, txHandle, sql, params, rowMode);
+    // Decoding happens on the far side, so both of these have to travel with
+    // the call rather than being applied to what comes back. They are a string
+    // and a boolean, so they survive structured cloning like the rest of the
+    // arguments — and the Uint8Arrays that come back from a side-channelled
+    // BLOB survive it too, which is what made this placement possible.
+    return this.call<QueryResult<T>>(
+      'query',
+      dbHandle,
+      txHandle,
+      sql,
+      params,
+      rowMode,
+      binaryBlobs,
+    );
   }
 
   describe(

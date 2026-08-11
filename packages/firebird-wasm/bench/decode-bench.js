@@ -54,10 +54,11 @@ const os = require('node:os');
 const path = require('node:path');
 
 let decodeResultSet;
+let attachBlobs;
 let applyTypes;
 let firebirdTypeName;
 try {
-  ({ decodeResultSet } = require('../dist/browser/engine-transport.js'));
+  ({ decodeResultSet, attachBlobs } = require('../dist/browser/engine-transport.js'));
   ({ applyTypes } = require('../dist/browser/value-types.js'));
   ({ firebirdTypeName } = require('../dist/browser/field-types.js'));
 } catch (err) {
@@ -362,6 +363,88 @@ function runRowModeScenario() {
 }
 
 // ---------------------------------------------------------------------------
+// Scenario: the binary BLOB side channel
+// ---------------------------------------------------------------------------
+
+/** Rows of one binary BLOB each, the workload the side channel exists for. */
+const BLOB_ROWS = 500;
+const BLOB_BYTES = 4096;
+
+/**
+ * What the side channel saves on a blob-heavy result set.
+ *
+ * Reported, never asserted on. The plan predicted a win "proportional to how
+ * binary the workload is" and measured none, because the fixed result set the
+ * rest of this file uses has no BLOBs at all — this is the measurement that
+ * was missing.
+ *
+ * Both paths are timed from the JSON the engine would send, so what is
+ * compared is the whole JavaScript-side cost: base64 inflates the JSON by a
+ * third and then needs `atob` plus a per-byte loop, while the side channel
+ * parses a short placeholder and takes the bytes as they are.
+ */
+function runBlobScenario() {
+  const bytes = new Uint8Array(BLOB_BYTES);
+  for (let i = 0; i < BLOB_BYTES; i++) bytes[i] = i & 0xff;
+
+  const base64 = Buffer.from(bytes).toString('base64');
+
+  const blobColumns = [
+    { name: 'ID', type: 496, subType: 0, scale: 0, length: 4, nullable: false },
+    { name: 'DATA', type: 520, subType: 0, scale: 0, length: 8, nullable: true },
+  ];
+
+  const base64Json = JSON.stringify({
+    columns: blobColumns,
+    rows: Array.from({ length: BLOB_ROWS }, (_, i) => [i, base64]),
+  });
+  const placeholderJson = JSON.stringify({
+    columns: blobColumns,
+    rows: Array.from({ length: BLOB_ROWS }, (_, i) => [i, { $blob: i }]),
+  });
+
+  // The decode the base64 path needs, as value-types.ts implements it.
+  const decodeBase64 = (value) => {
+    const text = atob(value);
+    const out = new Uint8Array(text.length);
+    for (let i = 0; i < text.length; i++) out[i] = text.charCodeAt(i);
+    return out;
+  };
+
+  const viaBase64 = fastest(() => {
+    const result = decodeResultSet(base64Json, 'object');
+    for (const row of result.rows) row.DATA = decodeBase64(row.DATA);
+    sink = result;
+  });
+
+  // What the engine would have published: every blob's bytes in one buffer.
+  const sideBuffer = new Uint8Array(BLOB_ROWS * BLOB_BYTES);
+  for (let i = 0; i < BLOB_ROWS; i++) sideBuffer.set(bytes, i * BLOB_BYTES);
+
+  const viaSideChannel = fastest(() => {
+    // The slice() is not skippable and is counted here: readBlobs copies each
+    // blob out of the WASM heap, because a view into it would alias memory the
+    // next query reuses and that heap growth can detach. Measuring without it
+    // would be measuring a version that does not exist.
+    const blobs = new Array(BLOB_ROWS);
+    for (let i = 0; i < BLOB_ROWS; i++) {
+      blobs[i] = sideBuffer.slice(i * BLOB_BYTES, (i + 1) * BLOB_BYTES);
+    }
+    sink = attachBlobs(decodeResultSet(placeholderJson, 'object'), blobs, 'object');
+  });
+
+  return {
+    name: 'blobs',
+    description: `${BLOB_ROWS} rows × ${BLOB_BYTES}-byte binary BLOB`,
+    base64Bytes: Buffer.byteLength(base64Json),
+    sideChannelBytes: Buffer.byteLength(placeholderJson) + BLOB_ROWS * BLOB_BYTES,
+    base64Ms: viaBase64.best,
+    sideChannelMs: viaSideChannel.best,
+    speedup: viaBase64.best / viaSideChannel.best,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Scenario: opt-in typed values
 // ---------------------------------------------------------------------------
 
@@ -412,7 +495,7 @@ function verdict(passed) {
   return passed ? 'ok' : 'REGRESSED';
 }
 
-function report(results, cache, rowMode, typed) {
+function report(results, cache, rowMode, blobs, typed) {
   const rows = [
     ['scenario', 'current', 'baseline', 'JSON.parse', 'speedup', 'floor', ''],
     ...results.map((r) => [
@@ -461,6 +544,12 @@ function report(results, cache, rowMode, typed) {
       + `${ms(rowMode.arrayMs)} as arrays (${times(rowMode.speedup)} faster)\n`,
   );
   process.stdout.write(
+    `blobs: ${blobs.description} — ${ms(blobs.base64Ms)} via base64, `
+      + `${ms(blobs.sideChannelMs)} via the side channel (${times(blobs.speedup)} faster); `
+      + `${(blobs.base64Bytes / 1048576).toFixed(2)} MB of JSON becomes `
+      + `${(blobs.sideChannelBytes / 1048576).toFixed(2)} MB across both\n`,
+  );
+  process.stdout.write(
     `typed: ${typed.description} — ${ms(typed.decodeMs)} to decode, `
       + `${ms(typed.conversionMs)} to convert, ${typed.overheadPercent.toFixed(0)}% on top\n`,
   );
@@ -495,8 +584,9 @@ function main(argv) {
   const results = SCENARIOS.map(runScenario);
   const cache = runCacheScenario();
   const rowMode = runRowModeScenario();
+  const blobs = runBlobScenario();
   const typed = runTypedScenario();
-  report(results, cache, rowMode, typed);
+  report(results, cache, rowMode, blobs, typed);
 
   if (jsonPath) {
     // Timings are rounded on the way out. Full float precision in a file meant
@@ -514,6 +604,7 @@ function main(argv) {
       scenarios: results,
       cache,
       rowMode,
+      blobs,
       typed,
     };
     fs.mkdirSync(path.dirname(path.resolve(jsonPath)), { recursive: true });

@@ -165,7 +165,7 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
 
       const sqlPtr = allocString(mod, 'SELECT id, name FROM items ORDER BY id');
       try {
-        const resultPtr = mod._fb_query(db, 0, sqlPtr);
+        const resultPtr = mod._fb_query(db, 0, sqlPtr, 0);
         expect({ pointer: resultPtr > 0, error: errorText() })
           .toEqual({ pointer: true, error: '' });
 
@@ -225,7 +225,7 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
       // The insert ran inside the transaction, so the rollback must undo it.
       const sqlPtr = allocString(mod, 'SELECT COUNT(*) AS CNT FROM t');
       try {
-        const resultPtr = mod._fb_query(db, 0, sqlPtr);
+        const resultPtr = mod._fb_query(db, 0, sqlPtr, 0);
         const parsed = JSON.parse(mod.UTF8ToString(resultPtr)) as {
           rows: unknown[][];
         };
@@ -261,7 +261,7 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
       const countIn = (tx: number): number => {
         const ptr = allocString(mod, 'SELECT COUNT(*) AS CNT FROM t');
         try {
-          const resultPtr = mod._fb_query(db, tx, ptr);
+          const resultPtr = mod._fb_query(db, tx, ptr, 0);
           expect(resultPtr).toBeGreaterThan(0);
           const parsed = JSON.parse(mod.UTF8ToString(resultPtr)) as {
             rows: number[][];
@@ -350,7 +350,7 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
 
       const sqlPtr = allocString(mod, 'SELECT * FROM no_such_table');
       try {
-        expect(mod._fb_query(db, 0, sqlPtr)).toBe(0);
+        expect(mod._fb_query(db, 0, sqlPtr, 0)).toBe(0);
         // Not just a numeric code — the engine's own text must reach the caller.
         expect(errorText().length).toBeGreaterThan(0);
         expect(errorText().toUpperCase()).toContain('NO_SUCH_TABLE');

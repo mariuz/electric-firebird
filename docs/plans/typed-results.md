@@ -143,6 +143,32 @@ added *beside* JSON rather than replacing it:
 - **Do this only when there is a workload asking for it.** Nothing in the
   demo, the tests, or any reported use touches binary BLOBs today.
 
+> **Done**, and one thing above is wrong.
+>
+> - **"No copy" is not available.** The sketch has the JS side wrapping the
+>   side buffer in `Uint8Array` views with no copy. It cannot: a view over
+>   `HEAPU8.buffer` aliases memory the next query reuses, and
+>   `ALLOW_MEMORY_GROWTH` detaches every existing view when the heap grows, so
+>   such a view breaks later and somewhere else. `readBlobs` copies each blob
+>   out of the heap — once — and that copy is counted in the measurement below.
+> - **Measured at last.** The plan said the win was zero for its own benchmark,
+>   which was true and unhelpful, because that result set has no BLOBs. On 500
+>   rows × 4 KB: **11.3 ms via base64 against 1.8 ms via the side channel, 6.3×**,
+>   and 2.61 MB of JSON becomes 1.96 MB across both channels. The base64 path
+>   pays 33% inflation, a longer `JSON.parse`, an `atob`, and a per-byte loop;
+>   the side channel pays one `slice`.
+> - **The transfer half works as described.** The Worker posts the blob buffers
+>   in the transfer list rather than cloning them — which a base64 string could
+>   never do — de-duplicated, because transferring one buffer twice throws.
+> - **Two pointers were not needed.** The bytes are reported like the error
+>   text and the affected-row count: engine-owned out-of-band state, read
+>   immediately, replaced by the next query. That is one more accessor rather
+>   than a change to what `fb_query` returns, so every existing caller of the
+>   result pointer is untouched.
+> - **Opting in is `types: { binary: true }`**, which already meant "give me
+>   `Uint8Array`". The side channel is how those bytes travel now; callers who
+>   never asked still get base64, byte for byte as before.
+
 ---
 
 ## What not to do

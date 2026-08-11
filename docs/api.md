@@ -584,6 +584,27 @@ Browser backend only.  The Node backend's native driver returns real JavaScript
 types already and does not report column type codes — `FieldInfo` there carries
 only `name` — so there is nothing for a parser to key on.
 
+#### `binary`
+
+Binary `BLOB` values as `Uint8Array` rather than base64.
+
+```ts
+new FirebirdBrowser('mydb', { worker, types: { binary: true } });
+```
+
+The bytes travel **beside** the JSON rather than inside it: the result carries
+a `{"$blob": N}` reference and the engine publishes the bytes in one side
+buffer, which the library copies out of the WASM heap once and slices per
+value.  Base64 costs 33% inflation on the wire, a longer `JSON.parse`, an
+`atob` and a per-byte loop — measured at **11.3 ms against 1.8 ms** on 500 rows
+of 4 KB, with 2.61 MB of JSON becoming 1.96 MB across both channels.
+
+Across a Worker the buffers are **transferred** rather than structured-cloned,
+which a base64 string could never be.
+
+Text BLOBs are unaffected — the engine already returns those as strings — and
+a caller who does not set this still gets base64, byte for byte as before.
+
 #### `parsers`
 
 Convert incoming values, keyed by the type code `FieldInfo.type` reports

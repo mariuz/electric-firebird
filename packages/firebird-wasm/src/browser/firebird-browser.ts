@@ -401,6 +401,9 @@ export class FirebirdBrowser {
     // run inside a transaction that carries them — matching the Node backend,
     // which starts one for every query.
     const rowMode = (options as QueryOptions).rowMode ?? 'object';
+    // `types.binary` asks for Uint8Array values; the side channel is how they
+    // travel. Same result for the caller, without the base64 round trip.
+    const binaryBlobs = this.options.types?.binary === true;
 
     if (!hasTransactionOptions(options)) {
       return applyTypes(
@@ -410,6 +413,7 @@ export class FirebirdBrowser {
           statement.sql,
           this.serialize(statement.params),
           rowMode,
+          binaryBlobs,
         ),
         this.options.types,
         rowMode,
@@ -424,6 +428,7 @@ export class FirebirdBrowser {
         statement.sql,
         this.serialize(statement.params),
         rowMode,
+        binaryBlobs,
       );
       await this.engine.commit(txHandle);
       return applyTypes(result, this.options.types, rowMode);
@@ -844,6 +849,7 @@ export class FirebirdBrowserTransaction {
         statement.sql,
         applySerializers(statement.params, this.types?.serializers),
         rowMode,
+        this.types?.binary === true,
       ),
       this.types,
       rowMode,

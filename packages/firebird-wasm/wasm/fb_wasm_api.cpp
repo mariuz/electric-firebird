@@ -127,6 +127,75 @@ enum FbIsolation
  */
 ISC_INT64 g_lastAffectedRows = 0;
 
+/**
+ * Binary BLOB bytes collected during one query, for the side channel.
+ *
+ * Base64 inside the JSON costs 33% inflation on the wire and a decode pass in
+ * JavaScript, on data that is already bytes.  With the side channel the JSON
+ * carries `{"$blob":N}` and the bytes travel beside it, so the only copy left
+ * is the one out of the WASM heap.
+ *
+ * Off unless the caller asks — `fb_query`'s flags — because the base64 form is
+ * what every existing caller decodes today.
+ */
+/** `flags` bit for fb_query/fb_query_params: binary BLOBs out of band. */
+#define FB_QUERY_BINARY_BLOBS 1
+
+struct BlobSink
+{
+	bool enabled = false;
+	/** Every blob's bytes, concatenated in the order they were read. */
+	std::vector<unsigned char> data;
+	/** Byte length of each blob, in the same order.  Offsets are the running sum. */
+	std::vector<unsigned> lengths;
+};
+
+/** Set by `fb_query` when the side channel is on; owned here, freed on the next query. */
+unsigned char* g_lastBlobBuffer = nullptr;
+unsigned       g_lastBlobSize   = 0;
+
+/**
+ * Publish a sink as the side buffer for the query just finished.
+ *
+ * Layout, all little-endian, which is what WebAssembly is:
+ *
+ *     u32  count
+ *     u32  length × count
+ *     ...  bytes, concatenated in order
+ *
+ * Lengths rather than offsets: the offsets are the running sum, so storing
+ * both would be storing the same information twice and inviting them to
+ * disagree.
+ *
+ * The engine owns this until the next query replaces it, like the error text.
+ * That is what lets the JavaScript side read it without a free() of its own —
+ * and why it has to read it immediately.
+ */
+void publishBlobs(const BlobSink& sink)
+{
+	free(g_lastBlobBuffer);
+	g_lastBlobBuffer = nullptr;
+	g_lastBlobSize = 0;
+
+	if (sink.lengths.empty())
+		return;
+
+	const unsigned count  = static_cast<unsigned>(sink.lengths.size());
+	const unsigned header = static_cast<unsigned>(sizeof(unsigned) * (1 + count));
+	const unsigned total  = header + static_cast<unsigned>(sink.data.size());
+
+	auto* buffer = static_cast<unsigned char*>(malloc(total));
+	if (!buffer)
+		return;
+
+	memcpy(buffer, &count, sizeof(count));
+	memcpy(buffer + sizeof(unsigned), sink.lengths.data(), sizeof(unsigned) * count);
+	memcpy(buffer + header, sink.data.data(), sink.data.size());
+
+	g_lastBlobBuffer = buffer;
+	g_lastBlobSize = total;
+}
+
 /** Buffer returned by fb_query(); freed by fb_free_result(). */
 char* allocCString(const std::string& s)
 {
@@ -369,7 +438,7 @@ void appendDateText(unsigned year, unsigned month, unsigned day, std::string& ou
 
 /** Read a text or binary BLOB in full and append it as a JSON string. */
 void appendBlob(IAttachment* attachment, ITransaction* transaction,
-	ISC_QUAD* blobId, int subType, std::string& out)
+	ISC_QUAD* blobId, int subType, std::string& out, BlobSink* sink)
 {
 	Status status;
 	IBlob* blob = attachment->openBlob(status.ptr(), transaction, blobId, 0, nullptr);
@@ -403,13 +472,29 @@ void appendBlob(IAttachment* attachment, ITransaction* transaction,
 
 	// SUB_TYPE 1 is TEXT; everything else is opaque binary.
 	if (subType == 1)
-		jsonEscape(reinterpret_cast<const char*>(bytes.data()), bytes.size(), out);
-	else
 	{
-		out += '"';
-		base64Encode(bytes, out);
-		out += '"';
+		jsonEscape(reinterpret_cast<const char*>(bytes.data()), bytes.size(), out);
+		return;
 	}
+
+	if (sink && sink->enabled)
+	{
+		// Out of band: the JSON keeps a reference and the bytes go beside it.
+		// The index is the blob's position in the side buffer, which is simply
+		// how many have been collected so far.
+		char placeholder[32];
+		snprintf(placeholder, sizeof(placeholder), "{\"$blob\":%u}",
+			static_cast<unsigned>(sink->lengths.size()));
+		out += placeholder;
+
+		sink->lengths.push_back(static_cast<unsigned>(bytes.size()));
+		sink->data.insert(sink->data.end(), bytes.begin(), bytes.end());
+		return;
+	}
+
+	out += '"';
+	base64Encode(bytes, out);
+	out += '"';
 }
 
 /**
@@ -418,7 +503,7 @@ void appendBlob(IAttachment* attachment, ITransaction* transaction,
  */
 void appendValue(IAttachment* attachment, ITransaction* transaction,
 	unsigned type, int subType, int scale, unsigned length,
-	const unsigned char* data, std::string& out)
+	const unsigned char* data, std::string& out, BlobSink* sink)
 {
 	switch (type)
 	{
@@ -655,7 +740,7 @@ void appendValue(IAttachment* attachment, ITransaction* transaction,
 		{
 			ISC_QUAD blobId;
 			memcpy(&blobId, data, sizeof(blobId));
-			appendBlob(attachment, transaction, &blobId, subType, out);
+			appendBlob(attachment, transaction, &blobId, subType, out, sink);
 			break;
 		}
 
@@ -1046,7 +1131,7 @@ bool describeMetadata(IMessageMetadata* meta, std::string& json)
 bool serialiseCursor(IAttachment* attachment, ITransaction* transaction,
 	IStatement* statement, IMessageMetadata* metadata, unsigned columnCount,
 	IMessageMetadata* inMeta, void* inBuffer,
-	IResultSet*& cursor, std::string& json)
+	IResultSet*& cursor, std::string& json, BlobSink* sink)
 {
 	Status status;
 
@@ -1180,7 +1265,7 @@ bool serialiseCursor(IAttachment* attachment, ITransaction* transaction,
 				else
 				{
 					appendValue(attachment, transaction, types[i], subTypes[i],
-						scales[i], lengths[i], buffer.data() + offsets[i], json);
+						scales[i], lengths[i], buffer.data() + offsets[i], json, sink);
 				}
 			}
 			json += ']';
@@ -1545,7 +1630,7 @@ const char* fb_describe(int db_handle, int tx_handle, const char* sql)
 }
 
 FB_WASM_EXPORT
-const char* fb_query(int db_handle, int tx_handle, const char* sql)
+const char* fb_query(int db_handle, int tx_handle, const char* sql, int flags)
 {
 	clearError();
 
@@ -1639,17 +1724,41 @@ const char* fb_query(int db_handle, int tx_handle, const char* sql)
 		return nullptr;
 	}
 
+	BlobSink sink;
+	sink.enabled = (flags & FB_QUERY_BINARY_BLOBS) != 0;
+
 	std::string json;
 	if (!serialiseCursor(attachment, transaction, statement, metadata, columnCount,
-			nullptr, nullptr, cursor, json))
+			nullptr, nullptr, cursor, json, &sink))
 	{
 		cleanup(false);
 		return nullptr;
 	}
 
 	cleanup(true);
+	publishBlobs(sink);
 
 	return allocCString(json);
+}
+
+/**
+ * Pointer to the binary BLOB side buffer for the most recent query, or 0.
+ *
+ * Owned by the engine and replaced by the next query, exactly like the error
+ * text — read it immediately, and do not free it.  See {@link publishBlobs}
+ * for the layout.
+ */
+FB_WASM_EXPORT
+const unsigned char* fb_last_blobs()
+{
+	return g_lastBlobBuffer;
+}
+
+/** Byte length of the buffer {@link fb_last_blobs} points at; 0 when there is none. */
+FB_WASM_EXPORT
+unsigned fb_last_blobs_size()
+{
+	return g_lastBlobSize;
 }
 
 /** Release a result set returned by fb_query(). */
@@ -1952,7 +2061,7 @@ int fb_execute_params(int db_handle, int tx_handle, const char* sql,
  */
 FB_WASM_EXPORT
 const char* fb_query_params(int db_handle, int tx_handle, const char* sql,
-	const unsigned char* params, int params_length)
+	const unsigned char* params, int params_length, int flags)
 {
 	clearError();
 
@@ -2059,15 +2168,19 @@ const char* fb_query_params(int db_handle, int tx_handle, const char* sql,
 		return nullptr;
 	}
 
+	BlobSink sink;
+	sink.enabled = (flags & FB_QUERY_BINARY_BLOBS) != 0;
+
 	std::string json;
 	if (!serialiseCursor(attachment, transaction, statement, metadata, columnCount,
-			input.meta(), input.data(), cursor, json))
+			input.meta(), input.data(), cursor, json, &sink))
 	{
 		cleanup(false);
 		return nullptr;
 	}
 
 	cleanup(true);
+	publishBlobs(sink);
 	return allocCString(json);
 }
 

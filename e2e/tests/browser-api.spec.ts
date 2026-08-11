@@ -51,6 +51,7 @@ interface StubControl {
     statementType?: number;
   };
   describeReturnsNull: boolean;
+  blobs: Uint8Array[];
   createFails: boolean;
   startTxFails: boolean;
   commitRc: number;
@@ -713,6 +714,157 @@ test.describe('sql`…` tag', () => {
 // ===========================================================================
 // Custom parsers and serializers
 // ===========================================================================
+
+test.describe('Binary BLOB side channel', () => {
+  const SQL_BLOB = 520;
+  const blobColumn = (name: string) => ({
+    name,
+    type: SQL_BLOB,
+    subType: 0,
+    scale: 0,
+    length: 8,
+    nullable: true,
+  });
+
+  test('asks for the side channel only when binary values were requested', async ({
+    page,
+  }) => {
+    const flags = await page.evaluate(async () => {
+      window.__stub.queryResult = { columns: ['DATA'], rows: [['aGk=']] };
+
+      const off = new window.FB.FirebirdBrowser('blob-flag-off', {
+        autoPersist: false,
+      });
+      await off.exec('CREATE TABLE t (data BLOB)');
+      window.__stub.resetCalls();
+      await off.query('SELECT data FROM t');
+      const without = window.__stub.firstCall('_fb_query')?.args[3];
+      await off.close();
+
+      const on = new window.FB.FirebirdBrowser('blob-flag-on', {
+        autoPersist: false,
+        types: { binary: true },
+      });
+      await on.exec('CREATE TABLE t (data BLOB)');
+      window.__stub.resetCalls();
+      await on.query('SELECT data FROM t');
+      const with_ = window.__stub.firstCall('_fb_query')?.args[3];
+      await on.close();
+
+      return { without, with_ };
+    });
+
+    // Bit 0 is the side channel. Off by default, so every existing caller
+    // keeps getting base64 and nothing about their rows changes.
+    expect(flags.without).toBe(0);
+    expect(flags.with_).toBe(1);
+  });
+
+  test('replaces placeholders with the bytes beside them', async ({ page }) => {
+    const result = await page.evaluate(
+      async ([blobType]) => {
+        // What the engine sends with the side channel on: a reference in the
+        // JSON, and the bytes in the side buffer.
+        window.__stub.queryResult = {
+          columns: [
+            { name: 'ID', type: 496, subType: 0, scale: 0, length: 4, nullable: false },
+            { name: 'DATA', type: blobType, subType: 0, scale: 0, length: 8, nullable: true },
+          ],
+          rows: [
+            [1, { $blob: 0 }],
+            [2, { $blob: 1 }],
+            [3, null],
+          ],
+        };
+        window.__stub.blobs = [
+          new Uint8Array([1, 2, 3]),
+          new Uint8Array([255, 0, 128, 42]),
+        ];
+
+        const db = new window.FB.FirebirdBrowser('blob-bytes', {
+          autoPersist: false,
+          types: { binary: true },
+        });
+        await db.exec('CREATE TABLE t (data BLOB)');
+        const rows = (await db.query('SELECT id, data FROM t')).rows as Array<
+          Record<string, unknown>
+        >;
+        await db.close();
+
+        return rows.map((row) => ({
+          id: row['ID'],
+          isBytes: row['DATA'] instanceof Uint8Array,
+          bytes: row['DATA'] instanceof Uint8Array ? [...(row['DATA'] as Uint8Array)] : row['DATA'],
+        }));
+      },
+      [SQL_BLOB],
+    );
+
+    expect(result).toEqual([
+      { id: 1, isBytes: true, bytes: [1, 2, 3] },
+      { id: 2, isBytes: true, bytes: [255, 0, 128, 42] },
+      // A NULL blob has no bytes and no placeholder — it stays null rather
+      // than becoming an empty array.
+      { id: 3, isBytes: false, bytes: null },
+    ]);
+  });
+
+  test('works in array rowMode, where values have no names', async ({ page }) => {
+    const bytes = await page.evaluate(
+      async ([blobType]) => {
+        window.__stub.queryResult = {
+          columns: [
+            { name: 'DATA', type: blobType, subType: 0, scale: 0, length: 8, nullable: true },
+          ],
+          rows: [[{ $blob: 0 }]],
+        };
+        window.__stub.blobs = [new Uint8Array([9, 8, 7])];
+
+        const db = new window.FB.FirebirdBrowser('blob-array-mode', {
+          autoPersist: false,
+          types: { binary: true },
+        });
+        await db.exec('CREATE TABLE t (data BLOB)');
+        const rows = (await db.query('SELECT data FROM t', [], { rowMode: 'array' }))
+          .rows as unknown[][];
+        await db.close();
+
+        const value = rows[0]![0];
+        return value instanceof Uint8Array ? [...value] : null;
+      },
+      [SQL_BLOB],
+    );
+
+    expect(bytes).toEqual([9, 8, 7]);
+  });
+
+  test('leaves base64 alone when the side channel is off', async ({ page }) => {
+    const value = await page.evaluate(
+      async ([blobType]) => {
+        // 'hi' in base64 — what the engine sends without the flag.
+        window.__stub.queryResult = {
+          columns: [
+            { name: 'DATA', type: blobType, subType: 0, scale: 0, length: 8, nullable: true },
+          ],
+          rows: [['aGk=']],
+        };
+        window.__stub.blobs = [new Uint8Array([1, 2, 3])];
+
+        const db = new window.FB.FirebirdBrowser('blob-base64', { autoPersist: false });
+        await db.exec('CREATE TABLE t (data BLOB)');
+        const rows = (await db.query('SELECT data FROM t')).rows as Array<
+          Record<string, unknown>
+        >;
+        await db.close();
+        return rows[0]!['DATA'];
+      },
+      [SQL_BLOB],
+    );
+
+    // Unchanged for a caller who never asked for bytes.
+    expect(value).toBe('aGk=');
+  });
+});
 
 test.describe('describeQuery', () => {
   test('decodes parameters, columns and the statement kind', async ({ page }) => {
@@ -1762,9 +1914,15 @@ test.describe('FirebirdBrowser', () => {
       await db.query('SELECT id FROM t');
 
       // Only the statement calls; _fb_free_result and friends are noise here.
+      // The parameters are argument 3 of the *_params entry points; on plain
+      // _fb_query that position is the flags word, so it is read by name
+      // rather than by index.
       const calls = window.__stub.calls
         .filter((c) => /^_fb_(execute|query)/.test(c.fn))
-        .map((c) => ({ fn: c.fn, params: c.args[3] }));
+        .map((c) => ({
+          fn: c.fn,
+          params: c.fn.endsWith('_params') ? c.args[3] : undefined,
+        }));
 
       await db.close();
       return calls;
@@ -1773,7 +1931,7 @@ test.describe('FirebirdBrowser', () => {
     expect(result).toEqual([
       { fn: '_fb_execute_params', params: ['1', 'alpha', 'TRUE', null] },
       { fn: '_fb_query_params', params: ['42'] },
-      // No parameters: the plain call, whose 4th argument does not exist.
+      // No parameters: the plain entry point, which takes none.
       { fn: '_fb_query', params: undefined },
     ]);
   });

@@ -8,6 +8,17 @@ API may still move between minor releases.
 
 ### Added
 
+- **Binary BLOBs travel beside the JSON, not inside it.** With
+  `types: { binary: true }` the engine now publishes binary `BLOB` bytes in a
+  side buffer and leaves a `{"$blob": N}` reference in the result, instead of
+  base64 inside the JSON. Same `Uint8Array` values a caller already got; 6.3×
+  faster to decode on a blob-heavy result set (11.3 ms → 1.8 ms on 500 rows of
+  4 KB), with the JSON shrinking from 2.61 MB to 1.96 MB across both channels.
+  Across a Worker the buffers are transferred rather than cloned, which a
+  base64 string could never be. Nothing changes for callers who did not opt in:
+  the side channel is a flag on the query, off by default, and they still get
+  base64.
+
 - **`describeQuery()`.** Reports a statement's shape without running it:
   result columns, parameters, and what kind of statement it is
   (`'SELECT' | 'INSERT' | 'DDL' | …`). The statement is prepared and dropped,

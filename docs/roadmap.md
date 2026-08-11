@@ -530,7 +530,7 @@ Legend: ✅ shipped · 🟡 partial · ❌ missing · n/a not applicable
 | `describeQuery()` | ✅ | ✅ | Prepares and drops the statement, executing nothing. WASM reports parameter *and* column types plus the statement kind; Node reports column names and the kind, and `params` is `undefined` there because the native driver exposes no input metadata |
 | Typed field metadata (`dataTypeID`) | ✅ | ✅ | `FieldInfo` carries type, typeName, subType, scale, length, nullable |
 | Affected-row count | ✅ | ✅ | `exec()` returns `{ affectedRows }` |
-| Binary / BLOB values | ✅ | 🟡 | BLOBs are read and returned (text as string, binary as base64); a `Uint8Array` needs the typed ABI |
+| Binary / BLOB values | ✅ | ✅ | Text BLOBs as strings; binary as base64 by default, or `Uint8Array` with `types: { binary: true }`, which carries the bytes beside the JSON rather than through it — 6.3× faster to decode on a blob-heavy result set, and transferred rather than cloned across a Worker |
 
 ### Transactions
 

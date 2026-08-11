@@ -478,6 +478,72 @@ test.describe('FirebirdBrowser against the real engine', () => {
     expect(result.numUnchanged).toBe('1234.5678');
   });
 
+  test('carries binary BLOBs beside the JSON, not inside it', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('blob-side-channel', {
+        worker: new Worker('/firebird-engine-worker.js'),
+        autoPersist: false,
+        types: { binary: true },
+      });
+
+      await db.exec(
+        'CREATE TABLE payloads (id INTEGER, bytes BLOB SUB_TYPE BINARY, note BLOB SUB_TYPE TEXT)',
+      );
+      // Every byte value, so nothing survives by looking like text: a NUL, a
+      // 0xFF, and everything between.
+      await db.exec(
+        "INSERT INTO payloads VALUES (1, x'00FF10203040506070', 'still text')",
+      );
+      await db.exec("INSERT INTO payloads VALUES (2, NULL, 'no bytes')");
+
+      const rows = (
+        await db.query('SELECT id, bytes, note FROM payloads ORDER BY id')
+      ).rows as Array<Record<string, unknown>>;
+
+      // Through a Worker, so these Uint8Arrays crossed postMessage — the
+      // buffers are transferred rather than cloned, and a transferred buffer
+      // is still perfectly readable here.
+      const first = rows[0]!['BYTES'];
+      await db.close();
+
+      return {
+        isBytes: first instanceof Uint8Array,
+        bytes: first instanceof Uint8Array ? [...first] : null,
+        // A text BLOB is not binary and must be untouched by any of this.
+        note: rows[0]!['NOTE'],
+        nullBlob: rows[1]!['BYTES'],
+      };
+    });
+
+    expect(result.isBytes).toBe(true);
+    expect(result.bytes).toEqual([0x00, 0xff, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70]);
+    expect(result.note).toBe('still text');
+    expect(result.nullBlob).toBeNull();
+  });
+
+  test('still base64s binary BLOBs when bytes were not asked for', async ({ page }) => {
+    const value = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('blob-default', {
+        worker: new Worker('/firebird-engine-worker.js'),
+        autoPersist: false,
+      });
+
+      await db.exec('CREATE TABLE plain (bytes BLOB SUB_TYPE BINARY)');
+      await db.exec("INSERT INTO plain VALUES (x'00FF10')");
+
+      const row = (await db.query('SELECT bytes FROM plain')).rows[0] as Record<
+        string,
+        unknown
+      >;
+      await db.close();
+      return row['BYTES'];
+    });
+
+    // Unchanged for a caller who never opted in.
+    expect(typeof value).toBe('string');
+    expect(value).toBe(btoa(String.fromCharCode(0x00, 0xff, 0x10)));
+  });
+
   test('describes a statement without running it', async ({ page }) => {
     const result = await page.evaluate(async () => {
       const db = new window.FB.FirebirdBrowser('describe-engine', {
