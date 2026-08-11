@@ -10,6 +10,7 @@ coverage/
 playwright-report/
 playwright-report-wasm/
 test-results/
+bench-results/
 
 # Firebird database files
 *.fdb

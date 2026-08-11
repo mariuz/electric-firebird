@@ -67,3 +67,20 @@ jobs:
           name: unit-test-results
           path: packages/firebird-wasm/coverage/
           if-no-files-found: ignore
+
+      # Decode-time regression guard — see docs/plans/typed-results.md.
+      # Runs here rather than in a job of its own because it needs the build
+      # this job already did, and asserts only on ratios measured within the
+      # run, so a slow or shared runner changes the numbers without changing
+      # the verdict.
+      - name: Decode benchmark
+        working-directory: packages/firebird-wasm
+        run: npm run bench -- bench-results/decode.json
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: decode-benchmark
+          path: packages/firebird-wasm/bench-results/
+          if-no-files-found: ignore

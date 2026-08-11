@@ -168,8 +168,47 @@ database.
    a patch release.
 2. **Benchmark in CI**, so the numbers above stop being a one-off. A regression
    test on decode time for a fixed result set.
+
+   > **Done** — `packages/firebird-wasm/bench/decode-bench.js`, run by CI after
+   > the build and uploaded as an artifact. Three things this needed that "a
+   > regression test on decode time" does not suggest:
+   >
+   > - **Decode time cannot be asserted on.** A shared runner is several times
+   >   slower than a developer machine and varies between runs, so any wall-clock
+   >   limit is either too loose to catch a regression or too tight to survive a
+   >   noisy neighbour. Every check is a ratio between two measurements taken in
+   >   the same process — the current decoder against a copy of the
+   >   `Object.fromEntries` construction it replaced. Absolute times are recorded
+   >   for reading a trend and never gate the build.
+   > - **One measurement cannot see both failure modes.** Losing the generated
+   >   constructor collapses the large and paged scenarios to ~1.0×. Losing the
+   >   *cache* does not touch them — one compile amortised over a result set
+   >   costs nothing, and both still measured 2.2–2.4× with the cache disabled.
+   >   That failure is caught by a separate scenario timing one column signature
+   >   against 200 of them: 2.0–2.3× when builders are reused, ~1.2× when they
+   >   are not. Both modes were verified by breaking the built code and watching
+   >   the right guard fire, and the floors hold on Node 20 through 25 — the
+   >   spread between versions is wider than the spread between runs, and CI's
+   >   Node 20 is the most favourable of them.
+   > - **At one row the win is invisible end-to-end.** `JSON.parse` of the column
+   >   metadata is about three quarters of a single-row decode, so the whole
+   >   decode measures 0.99–1.23× against the old construction — the 12× is real
+   >   but lands on a quarter of the time. That scenario is reported, not
+   >   asserted: no floor fits between it and noise. It earns its place by
+   >   dropping to 0.69× when the cache breaks, which is the regression for small
+   >   queries §1 warns about, made visible.
 3. **Typed values behind `types:`**, defaulting off. Ship in a minor.
 4. **Flip the defaults** in the next major, once the options have been exercised.
+
+   > The benchmark now reports what this would cost, which the plan never
+   > estimated: converting two of five columns — `BIGINT` to `bigint`,
+   > `TIMESTAMP` to `Date` — adds **175–190% on top of a 10,000-row decode**,
+   > steady across Node 20 through 25.
+   > Conversion is more expensive than the entire decode it follows, because
+   > `BigInt()` and `new Date()` per cell are both dearer than reading a value
+   > out of parsed JSON. That does not settle the question — ergonomics may well
+   > be worth tripling a 3 ms decode — but "flip the defaults" is no longer a
+   > free change, and whoever makes it should quote the number.
 5. **Binary BLOBs** only when a workload needs them.
 
 ## Open questions
