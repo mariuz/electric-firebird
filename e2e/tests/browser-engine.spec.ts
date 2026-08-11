@@ -397,4 +397,84 @@ test.describe('FirebirdBrowser against the real engine', () => {
 
     expect(rows).toEqual([{ ID: 1, NAME: 'persisted' }]);
   });
+
+  test('converts values to richer types only when asked', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const setup = `CREATE TABLE typed (
+        d DATE, ts TIMESTAMP, tm TIME,
+        big BIGINT, num NUMERIC(18,4),
+        bin BLOB SUB_TYPE BINARY, txt BLOB SUB_TYPE TEXT
+      )`;
+      const insert = `INSERT INTO typed VALUES (
+        DATE '2026-08-11', TIMESTAMP '2026-08-11 11:22:33.4567', TIME '11:22:33.4567',
+        9007199254740993, 1234.5678, 'hello bytes', 'some text'
+      )`;
+
+      const plain = new window.FB.FirebirdBrowser('typed-off', {
+        worker: new Worker('/firebird-engine-worker.js'),
+        autoPersist: false,
+      });
+      await plain.exec(setup);
+      await plain.exec(insert);
+      const before = (await plain.query('SELECT * FROM typed')).rows[0] as Record<string, unknown>;
+      await plain.close();
+
+      const typed = new window.FB.FirebirdBrowser('typed-on', {
+        worker: new Worker('/firebird-engine-worker.js'),
+        autoPersist: false,
+        types: { bigint: true, dates: true, binary: true },
+      });
+      await typed.exec(setup);
+      await typed.exec(insert);
+      const after = (await typed.query('SELECT * FROM typed')).rows[0] as Record<string, unknown>;
+      await typed.close();
+
+      const describe = (v: unknown) =>
+        v instanceof Date ? 'Date' : v instanceof Uint8Array ? 'Uint8Array' : typeof v;
+
+      return {
+        beforeTypes: Object.fromEntries(
+          Object.entries(before).map(([k, v]) => [k, describe(v)]),
+        ),
+        afterTypes: Object.fromEntries(
+          Object.entries(after).map(([k, v]) => [k, describe(v)]),
+        ),
+        bigExact: after['BIG'] === 9007199254740993n,
+        // UTC-anchored, so this is the same on any machine running the test.
+        tsIso: (after['TS'] as Date).toISOString(),
+        dIso: (after['D'] as Date).toISOString(),
+        binText: new TextDecoder().decode(after['BIN'] as Uint8Array),
+        numUnchanged: after['NUM'],
+        beforeBig: before['BIG'],
+      };
+    });
+
+    // Default: every value is a primitive, exactly as before.
+    expect(result.beforeTypes).toEqual({
+      D: 'string', TS: 'string', TM: 'string',
+      BIG: 'string', NUM: 'string', BIN: 'string', TXT: 'string',
+    });
+    expect(result.beforeBig).toBe('9007199254740993');
+
+    expect(result.afterTypes).toEqual({
+      D: 'Date',
+      TS: 'Date',
+      // TIME has no Date representation — new Date('11:22:33') is invalid — so
+      // it is deliberately left alone.
+      TM: 'string',
+      BIG: 'bigint',
+      // NUMERIC shares BIGINT's storage; converting would drop the scale.
+      NUM: 'string',
+      BIN: 'Uint8Array',
+      TXT: 'string',
+    });
+
+    expect(result.bigExact).toBe(true);
+    // 100 microseconds truncated to milliseconds, and anchored to UTC rather
+    // than to whatever zone the machine running this happens to be in.
+    expect(result.tsIso).toBe('2026-08-11T11:22:33.456Z');
+    expect(result.dIso).toBe('2026-08-11T00:00:00.000Z');
+    expect(result.binText).toBe('hello bytes');
+    expect(result.numUnchanged).toBe('1234.5678');
+  });
 });

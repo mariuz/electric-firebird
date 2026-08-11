@@ -8,6 +8,14 @@ API may still move between minor releases.
 
 ### Added
 
+- **Opt-in typed result values.** `types: { bigint, dates, binary }` on
+  `FirebirdBrowser` converts values on the way out: `BIGINT` → `bigint`,
+  binary `BLOB` → `Uint8Array`, and `DATE`/`TIMESTAMP` → `Date`. Off by
+  default; each conversion trades something away and the defaults are
+  unchanged. `dates` loses 100 µs of precision and anchors to UTC, which is
+  documented rather than discovered. `TIME` and the time-zone-carrying types
+  are never converted, because `Date` cannot represent them.
+
 - **`tx.rollback()` on the Node backend.** The browser backend has had it since
   0.1.0; the Node one had only `exec` and `query`, so abandoning a transaction
   there meant throwing an error you did not mean and catching it again. Both

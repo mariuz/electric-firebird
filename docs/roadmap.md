@@ -835,8 +835,10 @@ be built:
       at all. See [plans/typed-results.md](./plans/typed-results.md) for the
       numbers and what to do instead: fast row construction, opt-in typed
       values, and a binary path for BLOBs only where base64 actually costs
-      something. **Step 1 is done**: row construction is 5.5x faster on large
-      results and 17x on repeated small ones.
+      something. **Steps 1 and 2 are done**: row construction is 5.5x faster on
+      large results and 17x on repeated small ones, and `types:` converts
+      `BIGINT`, binary `BLOB` and `DATE`/`TIMESTAMP` on request. Only the
+      binary BLOB side-channel remains, and only if a workload wants it.
 - [x] `exec()` accepts multi-statement scripts and returns one result per
       statement. Splitting respects strings, quoted identifiers, comments and
       `SET TERM`.

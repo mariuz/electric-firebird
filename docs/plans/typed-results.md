@@ -104,6 +104,24 @@ anybody should trust.
 - **Win:** ergonomics. No correctness change — the current path is lossless,
   just awkward.
 
+> **Done.** Three things the table above had wrong, found by looking at what
+> the engine actually emits:
+>
+> - **`TIME` cannot be a `Date` at all.** `new Date('11:22:33.4567')` is
+>   `Invalid Date`. The plan listed only the time-zone types as unconvertible.
+> - **`TIMESTAMP WITH TIME ZONE` arrives as `...4567 Europe/Bucharest`** — a
+>   named zone, which `Date` cannot parse either, so it is `Invalid Date` rather
+>   than merely lossy.
+> - **`DATE` and `TIMESTAMP` disagree about zones under JavaScript's own
+>   parsing.** A bare date is UTC; a bare date-time is local. Two types that
+>   should behave alike would not have. The implementation appends `Z` and
+>   documents UTC, so a stored value gives the same `Date` on every machine.
+>
+> Conversion happens in `FirebirdBrowser`, not in the transport, so it works
+> the same through `DirectTransport`, `WorkerTransport` and
+> `SharedEngineTransport` — `bigint`, `Date` and `Uint8Array` all survive
+> structured cloning, which was the thing that made this placement possible.
+
 ### 3. Binary BLOBs — the only place framing genuinely pays
 
 Base64 costs 33% inflation on the wire and a decode pass, on data that is

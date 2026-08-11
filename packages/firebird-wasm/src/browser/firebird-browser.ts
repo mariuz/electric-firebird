@@ -29,6 +29,8 @@ import type { EngineHandle, EngineTransport } from './engine-transport';
 import { WorkerTransport } from './worker-transport';
 import { splitStatements } from './sql-script';
 import { hasTransactionOptions } from './isolation';
+import { applyTypes } from './value-types';
+import type { TypeOptions } from './value-types';
 import { acquireDatabaseLock } from './db-lock';
 import { SharedEngineTransport } from './shared-transport';
 import type { DatabaseLock } from './db-lock';
@@ -138,6 +140,20 @@ export interface FirebirdBrowserOptions {
    * @default 5000
    */
   lockTimeoutMs?: number;
+  /**
+   * Convert result values to richer JavaScript types.
+   *
+   * Off by default: every conversion trades something away, and values as
+   * returned today are correct, just awkward. See {@link TypeOptions} for what
+   * each one costs — `dates` in particular loses precision and has to choose a
+   * time zone Firebird did not store.
+   *
+   * @example
+   * ```ts
+   * new FirebirdBrowser('mydb', { worker, types: { bigint: true, binary: true } })
+   * ```
+   */
+  types?: TypeOptions;
 }
 
 // ---------------------------------------------------------------------------
@@ -325,7 +341,10 @@ export class FirebirdBrowser {
     // run inside a transaction that carries them — matching the Node backend,
     // which starts one for every query.
     if (!hasTransactionOptions(options)) {
-      return this.engine.query<T>(this.dbHandle, 0, sql, params);
+      return applyTypes(
+        await this.engine.query<T>(this.dbHandle, 0, sql, params),
+        this.options.types,
+      );
     }
 
     const txHandle = await this.engine.startTransaction(this.dbHandle, options);
@@ -337,7 +356,7 @@ export class FirebirdBrowser {
         params,
       );
       await this.engine.commit(txHandle);
-      return result;
+      return applyTypes(result, this.options.types);
     } catch (err) {
       // A failed commit finishes the transaction itself, so only a failure
       // from the query leaves anything to roll back.
@@ -356,7 +375,12 @@ export class FirebirdBrowser {
     await this.ensureReady();
     const txHandle = await this.engine.startTransaction(this.dbHandle, options);
 
-    const tx = new FirebirdBrowserTransaction(this.engine, this.dbHandle, txHandle);
+    const tx = new FirebirdBrowserTransaction(
+      this.engine,
+      this.dbHandle,
+      txHandle,
+      this.options.types,
+    );
 
     let result: T;
     try {
@@ -654,6 +678,7 @@ export class FirebirdBrowserTransaction {
     private readonly engine: EngineTransport,
     private readonly dbHandle: EngineHandle,
     private readonly txHandle: EngineHandle,
+    private readonly types?: TypeOptions,
   ) {}
 
   /** Whether this transaction has already been rolled back. */
@@ -702,6 +727,9 @@ export class FirebirdBrowserTransaction {
     params: QueryParams = [],
   ): Promise<QueryResult<T>> {
     this.assertUsable();
-    return this.engine.query<T>(this.dbHandle, this.txHandle, sql, params);
+    return applyTypes(
+      await this.engine.query<T>(this.dbHandle, this.txHandle, sql, params),
+      this.types,
+    );
   }
 }
