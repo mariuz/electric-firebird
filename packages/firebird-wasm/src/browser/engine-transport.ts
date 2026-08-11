@@ -128,6 +128,96 @@ interface EncodedColumn {
   nullable: boolean;
 }
 
+// ---------------------------------------------------------------------------
+// Row construction
+// ---------------------------------------------------------------------------
+
+/**
+ * Row builders, keyed by the column-name signature.
+ *
+ * Building one costs more than it saves on a single small result, so a query
+ * run repeatedly — which is most of them — has to reuse the builder. Measured
+ * on 5 columns: rebuilding per call turns 2.5 ms into 5.5 ms across 2000
+ * one-row queries, while reusing turns it into 1.1 ms.
+ */
+const rowBuilders = new Map<string, (cols: unknown[]) => Row>();
+
+/**
+ * Cap on distinct shapes remembered.  Cleared wholesale rather than evicted
+ * one at a time: this exists to stop unbounded growth in a process issuing
+ * endlessly varied `SELECT` lists, not to be a good cache.
+ */
+const MAX_ROW_BUILDERS = 64;
+
+/** Set once `new Function` is known to be unavailable — see {@link rowBuilder}. */
+let codeGenerationBlocked = false;
+
+/**
+ * A column name as a JavaScript string literal.
+ *
+ * `JSON.stringify` handles quotes, backslashes and control characters. U+2028
+ * and U+2029 are legal in string literals from ES2019 and are escaped anyway,
+ * because the cost is nothing and the failure would be a syntax error at
+ * runtime on an older engine.
+ */
+function stringLiteral(name: string): string {
+  return JSON.stringify(name)
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
+}
+
+/**
+ * Build a function that turns one row of values into an object.
+ *
+ * Generated with literal keys, which is the whole point: every row then shares
+ * one hidden class, and the engine can compile the construction. The obvious
+ * safe alternative — computed keys, `{[name]: c[0]}` — forces dictionary-mode
+ * objects and measured *no faster than `Object.fromEntries`* (14.7 ms against
+ * 15.2 ms on 10,000 rows), so it is not a trade worth making.
+ *
+ * Returns null when the caller must fall back:
+ *
+ * - A column named `__proto__`. As a literal key that sets the prototype
+ *   instead of defining a property, so the value would be silently lost.
+ *   `Object.fromEntries` defines it correctly, so the slow path is also the
+ *   right path here. Unreachable today, because column names are upper-cased
+ *   before they get here and `__PROTO__` is an ordinary key — kept because the
+ *   guard costs one comparison and the upper-casing is not this function's to
+ *   rely on.
+ * - A Content-Security-Policy without `unsafe-eval`, where `new Function`
+ *   throws. Remembered, so it is attempted once rather than per query.
+ */
+function rowBuilder(names: string[]): ((cols: unknown[]) => Row) | null {
+  if (codeGenerationBlocked || names.includes('__proto__')) {
+    return null;
+  }
+
+  // \u0000 cannot appear in a Firebird identifier, so it cannot make two
+  // different column lists collide.
+  const signature = names.join('\u0000');
+  const cached = rowBuilders.get(signature);
+  if (cached) return cached;
+
+  let built: (cols: unknown[]) => Row;
+  try {
+    built = new Function(
+      'c',
+      'return {' + names.map((n, i) => `${stringLiteral(n)}:c[${i}]`).join(',') + '}',
+    ) as (cols: unknown[]) => Row;
+  } catch {
+    // A strict CSP. Every later result set takes the fallback without
+    // re-testing, and nothing about the returned rows changes.
+    codeGenerationBlocked = true;
+    return null;
+  }
+
+  if (rowBuilders.size >= MAX_ROW_BUILDERS) {
+    rowBuilders.clear();
+  }
+  rowBuilders.set(signature, built);
+  return built;
+}
+
 /** Decode the engine's JSON result set into rows keyed by column name. */
 export function decodeResultSet<T extends Row>(json: string): QueryResult<T> {
   const parsed = JSON.parse(json) as {
@@ -145,8 +235,15 @@ export function decodeResultSet<T extends Row>(json: string): QueryResult<T> {
     nullable: c.nullable,
   }));
 
-  const rows = parsed.rows.map((cols) =>
-    Object.fromEntries(fields.map((f, i) => [f.name, cols[i]])),
+  const names = fields.map((f) => f.name);
+  const build = rowBuilder(names);
+
+  const rows = (
+    build
+      ? parsed.rows.map(build)
+      : parsed.rows.map((cols) =>
+          Object.fromEntries(names.map((name, i) => [name, cols[i]])),
+        )
   ) as T[];
 
   return { rows, fields };

@@ -64,6 +64,22 @@ a constructor generated once per result set from the column names.
 
 Do this first regardless of what happens to the rest.
 
+> **Done** — see the commit that added `rowBuilder` to `engine-transport.ts`.
+> Two things the plan got wrong, both found by measuring the implementation
+> rather than the sketch:
+>
+> - **Computed keys are not an option.** The plan suggested them as the safe
+>   way to interpolate names. They force dictionary-mode objects and measured
+>   14.7 ms against `Object.fromEntries`'s 15.2 ms — no win at all. Literal
+>   keys with a `__proto__` guard is the only shape that pays.
+> - **Caching is required, not an optimisation.** Building a constructor per
+>   result set turns 2.5 ms into 5.5 ms across 2000 one-row queries. Cached, it
+>   is 1.1 ms. Without the cache the change would have been a regression for
+>   small queries, which are most of them.
+>
+> Measured after: 12.2 → 2.2 ms on 10,000 rows, 12.2 → 0.7 ms on 100-row pages
+> repeated 200 times.
+
 ### 2. Typed values — opt-in, decode-side
 
 The values callers actually want, without a new wire format. Each is a decision

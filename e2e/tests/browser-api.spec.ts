@@ -465,6 +465,116 @@ test.describe('IndexedDBVFS', () => {
 // FirebirdBrowser — driven against the stub C ABI
 // ===========================================================================
 
+test.describe('Row construction', () => {
+  test('builds rows with a generated constructor, and reuses it', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      // Two queries with the same column list must produce identical shapes;
+      // the second reuses the builder cached from the first.
+      window.__stub.queryResult = {
+        columns: ['ID', 'NAME'],
+        rows: [
+          [1, 'a'],
+          [2, 'b'],
+        ],
+      };
+
+      const db = new window.FB.FirebirdBrowser('rows-fast', { autoPersist: false });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+
+      const first = await db.query('SELECT id, name FROM t');
+      const second = await db.query('SELECT id, name FROM t');
+      await db.close();
+
+      return {
+        first: first.rows,
+        second: second.rows,
+        // Same hidden class is not observable, but the shape must be.
+        keys: Object.keys(first.rows[0] as object),
+        ownIsEnumerable: Object.entries(second.rows[0] as object).length,
+      };
+    });
+
+    expect(result.first).toEqual([
+      { ID: 1, NAME: 'a' },
+      { ID: 2, NAME: 'b' },
+    ]);
+    expect(result.second).toEqual(result.first);
+    expect(result.keys).toEqual(['ID', 'NAME']);
+    expect(result.ownIsEnumerable).toBe(2);
+  });
+
+  test('cannot pollute a prototype through a column name', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      // `{__proto__: v}` in an object literal sets the prototype rather than
+      // defining a property, so the generated builder must not be used here.
+      // Firebird allows it via a quoted identifier, so it is reachable.
+      window.__stub.queryResult = {
+        columns: ['__proto__', 'OK'],
+        rows: [[{ injected: true }, 'value']],
+      };
+
+      const db = new window.FB.FirebirdBrowser('rows-proto', { autoPersist: false });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      const r = await db.query('SELECT * FROM t');
+      await db.close();
+
+      const row = r.rows[0] as Record<string, unknown>;
+      return {
+        // Column names are upper-cased, so this arrives as __PROTO__ and is an
+        // ordinary key. The assertion is a regression guard: if the
+        // upper-casing ever goes, the literal-key builder must not be what
+        // handles this column.
+        upperCased: Object.prototype.hasOwnProperty.call(row, '__PROTO__'),
+        value: row['__PROTO__'],
+        other: row['OK'],
+        // Nothing was injected into the prototype either way.
+        prototypeIsObject: Object.getPrototypeOf(row) === Object.prototype,
+        pollutedGlobally: ({} as Record<string, unknown>)['injected'],
+      };
+    });
+
+    expect(result.upperCased).toBe(true);
+    expect(result.value).toEqual({ injected: true });
+    expect(result.other).toBe('value');
+    expect(result.prototypeIsObject).toBe(true);
+    expect(result.pollutedGlobally).toBeUndefined();
+  });
+
+  test('survives column names that are not valid identifiers', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      // Quoted identifiers let a column be called almost anything, and the
+      // name is interpolated into generated source.
+      window.__stub.queryResult = {
+        columns: ['a"b', "c'd", 'e\\f', 'has space', '123'],
+        rows: [['1', '2', '3', '4', '5']],
+      };
+
+      const db = new window.FB.FirebirdBrowser('rows-odd', { autoPersist: false });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      const r = await db.query('SELECT * FROM t');
+      await db.close();
+      return r.rows[0];
+    });
+
+    // Upper-cased, as every column name is — see decodeResultSet. What matters
+    // here is that the quote, apostrophe, backslash and space survived being
+    // interpolated into generated source.
+    expect(result).toEqual({
+      'A"B': '1',
+      "C'D": '2',
+      'E\\F': '3',
+      'HAS SPACE': '4',
+      '123': '5',
+    });
+  });
+});
+
 test.describe('Transaction options', () => {
   test('passes the isolation level and access mode to the engine', async ({
     page,
