@@ -498,6 +498,23 @@ Two findings worth keeping even if the approach changes:
    `src/common/isc_sync.cpp` — `eventPost`, `eventClear` and `event_blocked` —
    and instrument the poster, not the waiter; the waiter's behaviour is
    already understood.
+
+   **The pthread primitive is not the fault — do not spend a rebuild
+   re-testing it.**  A standalone Emscripten program reproducing the exact
+   shape of these four functions — a process-shared mutex and condvar, a
+   waiter looping on `count < value`, a poster incrementing and broadcasting —
+   wakes correctly **five times out of five posts**.  Two things fell out of
+   writing it:
+
+   - `pthread_mutexattr_setpshared` and `pthread_condattr_setpshared` really do
+     return `ENOTSUP` (138) under Emscripten, which is why
+     `fb_wasm_stubs.cpp` overrides both to return success.  That stub is load-
+     bearing: without it `eventInit` returns `FB_FAILURE` before ever calling
+     `pthread_mutex_init`, and `src/jrd/event.cpp:612` raises on that failure.
+   - With the stub in place the attributes are simply default ones, and default
+     condvars wake repeatedly.  So the fault is above the primitive, in the
+     event manager's own protocol — the watcher loop, the event block, or which
+     `event_t` the poster reaches — not in Emscripten's threading.
 2. **The feedback loop is slow.**  Each hypothesis costs an incremental
    rebuild of the engine, a few minutes with a warm build tree and about an
    hour without one.  Batch the diagnostics: print from the poster and the
