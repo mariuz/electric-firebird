@@ -155,14 +155,25 @@ export class FirebirdLite {
 
     const tx = new FirebirdTransaction(attachment, transaction);
 
+    let result: T;
     try {
-      const result = await fn(tx);
-      await transaction.commit();
-      return result;
+      result = await fn(tx);
     } catch (err) {
-      await transaction.rollback().catch(() => undefined);
+      // The callback may have rolled back before throwing; rolling back twice
+      // targets a transaction the driver has already finished with.
+      if (!tx.isFinished) {
+        await transaction.rollback().catch(() => undefined);
+      }
       throw err;
     }
+
+    // A callback that rolled back deliberately must not then be committed.
+    if (tx.isFinished) {
+      return result;
+    }
+
+    await transaction.commit();
+    return result;
   }
 
   /**
@@ -188,15 +199,42 @@ export class FirebirdLite {
  * `FirebirdLite.transaction()`.
  */
 export class FirebirdTransaction {
+  private finished = false;
+
   constructor(
     private readonly attachment: Attachment,
     private readonly transaction: Transaction,
   ) {}
 
+  /** Whether this transaction has already been rolled back. */
+  get isFinished(): boolean {
+    return this.finished;
+  }
+
+  /**
+   * Roll this transaction back and stop.
+   *
+   * The enclosing `transaction()` will not commit afterwards.  Use this to
+   * abandon a transaction deliberately, rather than throwing an error you do
+   * not mean — throwing also rolls back, but it propagates to the caller.
+   */
+  async rollback(): Promise<void> {
+    if (this.finished) return;
+    this.finished = true;
+    await this.transaction.rollback();
+  }
+
+  private assertUsable(): void {
+    if (this.finished) {
+      throw new Error('Transaction has already been rolled back');
+    }
+  }
+
   /**
    * Execute a DDL or DML statement inside this transaction.
    */
   async exec(sql: string, params: QueryParams = []): Promise<void> {
+    this.assertUsable();
     if (params.length > 0) {
       const stmt = await this.attachment.prepare(this.transaction, sql);
       try {
@@ -216,6 +254,8 @@ export class FirebirdTransaction {
     sql: string,
     params: QueryParams = [],
   ): Promise<QueryResult<T>> {
+    this.assertUsable();
+
     const stmt = await this.attachment.prepare(this.transaction, sql);
     const columnLabels = await stmt.columnLabels;
     const fields: FieldInfo[] = columnLabels.map((label) => ({

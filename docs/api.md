@@ -304,6 +304,31 @@ type Row = Record<string, unknown>;
 type QueryParams = unknown[];
 ```
 
+#### `tx.rollback()`
+
+Roll the transaction back and stop. The enclosing `transaction()` will not
+commit afterwards, and the callback's return value is still returned — rolling
+back deliberately is not a failure.
+
+```ts
+const outcome = await db.transaction(async (tx) => {
+  await tx.exec('UPDATE ledger SET amount = ? WHERE id = ?', [999, 1]);
+
+  if (!looksRight(await tx.query('SELECT * FROM ledger'))) {
+    await tx.rollback();
+    return 'abandoned';
+  }
+  return 'applied';
+});
+```
+
+Use this rather than throwing an error you do not mean: throwing also rolls
+back, but it propagates to the caller. Statements issued after a rollback throw
+`Transaction has already been rolled back` rather than running outside any
+transaction the caller believes in, and `tx.isFinished` reports the state.
+
+Available on both backends.
+
 ### `IsolationLevel`
 
 ```ts

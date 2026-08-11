@@ -123,6 +123,59 @@ describeIfFirebird('FirebirdLite', () => {
     expect(result.rows[0]).toMatchObject({ CNT: 2 });
   });
 
+  it('rolls back explicitly, without raising an error', async () => {
+    await db.exec('CREATE TABLE ledger (id INTEGER, amount INTEGER)');
+    await db.exec('INSERT INTO ledger VALUES (1, 100)');
+
+    // Throwing also rolls back, but it propagates to the caller. Abandoning a
+    // transaction on purpose should not require inventing an error, and the
+    // call that does it must not then be committed on top.
+    const decided = await db.transaction(async (tx) => {
+      await tx.exec('UPDATE ledger SET amount = 999 WHERE id = 1');
+
+      const inside = await tx.query('SELECT amount FROM ledger WHERE id = 1');
+      expect(inside.rows[0]).toMatchObject({ AMOUNT: 999 });
+
+      await tx.rollback();
+      return 'abandoned';
+    });
+
+    // The callback's value is still returned: rolling back is not a failure.
+    expect(decided).toBe('abandoned');
+
+    const after = await db.query('SELECT amount FROM ledger WHERE id = 1');
+    expect(after.rows[0]).toMatchObject({ AMOUNT: 100 });
+  });
+
+  it('refuses to use a transaction after rolling it back', async () => {
+    await db.exec('CREATE TABLE guarded (id INTEGER)');
+
+    await db.transaction(async (tx) => {
+      await tx.rollback();
+
+      // Statements after a rollback would run outside any transaction the
+      // caller believes in, so they fail rather than quietly succeeding.
+      await expect(tx.exec('INSERT INTO guarded VALUES (1)')).rejects.toThrow(
+        'already been rolled back',
+      );
+      await expect(tx.query('SELECT * FROM guarded')).rejects.toThrow(
+        'already been rolled back',
+      );
+
+      expect(tx.isFinished).toBe(true);
+    });
+
+    const rows = await db.query('SELECT COUNT(*) AS CNT FROM guarded');
+    expect(rows.rows[0]).toMatchObject({ CNT: 0 });
+  });
+
+  it('tolerates rollback() being called twice', async () => {
+    await db.transaction(async (tx) => {
+      await tx.rollback();
+      await expect(tx.rollback()).resolves.toBeUndefined();
+    });
+  });
+
   it('rolls back a transaction on error', async () => {
     await db.exec('CREATE TABLE accounts (id INTEGER, balance INTEGER)');
     await db.exec('INSERT INTO accounts VALUES (1, 1000)');

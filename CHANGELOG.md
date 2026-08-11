@@ -4,6 +4,18 @@ All notable changes to `firebird-wasm`. This project follows
 [semantic versioning](https://semver.org/); while the major version is 0 the
 API may still move between minor releases.
 
+## Unreleased
+
+### Added
+
+- **`tx.rollback()` on the Node backend.** The browser backend has had it since
+  0.1.0; the Node one had only `exec` and `query`, so abandoning a transaction
+  there meant throwing an error you did not mean and catching it again. Both
+  now behave the same way: the enclosing `transaction()` does not commit
+  afterwards, the callback's return value is still returned, statements issued
+  after a rollback throw rather than running outside any transaction, and
+  `tx.isFinished` reports the state.
+
 ## 0.2.0
 
 ### Added
