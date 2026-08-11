@@ -74,6 +74,9 @@ using namespace Firebird;
  */
 extern "C" void FB_PLUGIN_ENTRY_POINT(Firebird::IMaster* master);
 
+/** Supplies ICU with collation data; see fb_wasm_icu_data.cpp. */
+extern "C" bool fb_wasm_load_icu_data();
+
 namespace {
 
 // ---------------------------------------------------------------------------
@@ -1134,6 +1137,10 @@ int fb_init(void)
 	// chosen a root means it deliberately.
 	setenv("FIREBIRD", "/firebird", 0);
 #endif
+
+	// Before anything touches ICU: the engine's UNICODE collations open a
+	// collator during database creation, and ICU only reads its data once.
+	fb_wasm_load_icu_data();
 
 	g_master = fb_get_master_interface();
 	if (!g_master)
