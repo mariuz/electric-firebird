@@ -550,8 +550,8 @@ Legend: ✅ shipped · 🟡 partial · ❌ missing · n/a not applicable
 | OPFS | — | ❌ | The natural fit for Firebird's page I/O; see M4 |
 | Incremental / dirty-page writes | ✅ | ✅ | Pages compared against what is stored |
 | Durability tuning | ✅ `relaxedDurability` | ✅ | `autoPersist` + `autoPersistDebounceMs` |
-| `dumpDataDir()` on the DB object | ✅ | 🟡 | `IndexedDBVFS.exportDatabase()` exists but is unreachable from `FirebirdBrowser` |
-| `loadDataDir` at construction | ✅ | 🟡 | Same: `importDatabase()` is VFS-only |
+| `dumpDataDir()` on the DB object | ✅ | ✅ | Returns the live image as a `Uint8Array` — read from the engine's filesystem, so unpersisted writes are included and a `memory://` database can be dumped at all |
+| `loadDataDir` at construction | ✅ | ✅ | Seeds a database that does not exist yet; a stored one always wins, so passing it on every load seeds once instead of resetting the user's data every reload |
 
 ### Concurrency & reactivity
 
@@ -853,10 +853,12 @@ be built:
       single IndexedDB transaction rather than the write-then-flip scheme
       sketched here — IndexedDB is already all-or-nothing, so the flip was
       solving a problem the store does not have.
-- [ ] `db.dump()` / `loadDataDir`-style option on `FirebirdBrowser`. The VFS
-      has `exportDatabase()` and `importDatabase()`; what is missing is the
-      convenience of reaching them from the database object.
-- [ ] `memory://`-equivalent ephemeral mode (skip IndexedDB entirely).
+- [x] `dumpDataDir()` / `loadDataDir` on `FirebirdBrowser`. Not the convenience
+      wrapper this entry expected: both read and write the *live* engine
+      filesystem rather than the VFS's `exportDatabase()`/`importDatabase()`,
+      which read and write IndexedDB. That is what makes an unpersisted write
+      dumpable and a `memory://` database dumpable at all.
+- [x] `memory://`-equivalent ephemeral mode (skip IndexedDB entirely).
 - [x] Auto-persist policy: debounced after writes, plus a best-effort flush on
       `visibilitychange` and `pagehide`. On by default.
 

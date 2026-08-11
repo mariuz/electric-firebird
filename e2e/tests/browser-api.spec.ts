@@ -715,6 +715,70 @@ test.describe('sql`…` tag', () => {
 // Custom parsers and serializers
 // ===========================================================================
 
+test.describe('dumpDataDir / loadDataDir', () => {
+  test('dumps the live database, not the stored copy', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('dump-live', { autoPersist: false });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+
+      const bytes = await db.dumpDataDir();
+      await db.close();
+
+      // The image comes from the engine's filesystem — the same place
+      // persist() reads — so writes that were never persisted are in it.
+      return { length: bytes.byteLength, isBytes: bytes instanceof Uint8Array };
+    });
+
+    expect(result.isBytes).toBe(true);
+    expect(result.length).toBeGreaterThan(0);
+  });
+
+  test('seeds a database that does not exist yet', async ({ page }) => {
+    const written = await page.evaluate(async () => {
+      const seed = new Uint8Array(1024).fill(7);
+
+      const db = new window.FB.FirebirdBrowser('memory://seeded', {
+        autoPersist: false,
+        loadDataDir: seed,
+      });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+
+      // Attached rather than created: the seed put a file there first.
+      const attached = window.__stub.countCalls('_fb_attach_database');
+      const created = window.__stub.countCalls('_fb_create_database');
+      await db.close();
+
+      return { attached, created };
+    });
+
+    expect(written.attached).toBe(1);
+    expect(written.created).toBe(0);
+  });
+
+  test('rejects an empty seed rather than creating a broken database', async ({
+    page,
+  }) => {
+    const message = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('memory://empty-seed', {
+        loadDataDir: new Uint8Array(0),
+      });
+      try {
+        await db.exec('CREATE TABLE t (id INTEGER)');
+        return 'no error';
+      } catch (err) {
+        return (err as Error).message;
+      } finally {
+        await db.close().catch(() => undefined);
+      }
+    });
+
+    // Zero bytes would write an empty file and then fail inside the engine,
+    // where the message would be about a corrupt database rather than about
+    // the argument that caused it.
+    expect(message).toContain('loadDataDir is empty');
+  });
+});
+
 test.describe('memory:// databases', () => {
   test('never touches IndexedDB', async ({ page }) => {
     const stores = await page.evaluate(async () => {

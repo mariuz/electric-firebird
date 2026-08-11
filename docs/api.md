@@ -373,6 +373,46 @@ class FirebirdBrowser {
 | `options.vfs.prefix` | `string` | `'firebird_'` | IndexedDB database name prefix. |
 | `options.types` | [`TypeOptions`](#typeoptions) | `{}` | How values convert on the way in and out. All off by default. |
 
+#### `db.dumpDataDir()`
+
+The database as bytes, ready to store, send, or hand back to `loadDataDir`.
+
+```ts
+const bytes = await db.dumpDataDir();
+const url = URL.createObjectURL(new Blob([bytes]));   // to download it
+```
+
+Read from the **live** database rather than from IndexedDB, which matters
+twice: writes not yet persisted are included, and a `memory://` database has no
+stored copy to read at all.  It is the image `persist()` writes, taken the same
+way.
+
+Returns `Uint8Array` rather than a `Blob` — a `Blob` is one constructor away
+and exists only in a browser, while this class also runs in Node against a
+direct transport.
+
+#### `loadDataDir` (constructor option)
+
+Initial contents for a database that does not exist yet:
+
+```ts
+const db = new FirebirdBrowser('mydb', { loadDataDir: bytes });
+```
+
+**A stored database always wins.**  An application passes this option on every
+load, so a seed that replaced what was there would reset the user's data to the
+snapshot on every page reload.  Seeding and restoring are different operations,
+and only one of them is safe to do unconditionally.
+
+To load a snapshot regardless of what is stored, open it as ephemeral:
+
+```ts
+const inspect = new FirebirdBrowser('memory://', { loadDataDir: bytes });
+```
+
+An empty `Uint8Array` throws rather than writing an empty file the engine would
+later reject as corrupt.
+
 #### Ephemeral databases — `memory://`
 
 A name beginning with `memory://` opens a database that is never stored:

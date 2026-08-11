@@ -163,6 +163,19 @@ export interface FirebirdBrowserOptions {
    * ```
    */
   types?: TypeOptions;
+  /**
+   * Initial contents for the database, as the bytes {@link
+   * FirebirdBrowser.dumpDataDir} produced.
+   *
+   * Used **only when there is no database yet** — a stored one always wins.
+   * That is deliberate and is the difference between seeding and destroying:
+   * an application passes this on every load, so a seed that replaced what was
+   * there would reset the user's data to the snapshot on every page reload.
+   *
+   * To load a snapshot regardless of what is stored, open it as an ephemeral
+   * database: `new FirebirdBrowser('memory://', { loadDataDir: bytes })`.
+   */
+  loadDataDir?: Uint8Array;
 }
 
 // ---------------------------------------------------------------------------
@@ -551,6 +564,29 @@ export class FirebirdBrowser {
    * Persist the in-memory database pages to IndexedDB.
    * Call this periodically or before the page unloads to avoid data loss.
    */
+  /**
+   * The database as bytes, ready to be stored, sent, or handed to
+   * {@link FirebirdBrowserOptions.loadDataDir}.
+   *
+   * ```ts
+   * const bytes = await db.dumpDataDir();
+   * const url = URL.createObjectURL(new Blob([bytes]));
+   * ```
+   *
+   * Read from the **live** database rather than from IndexedDB, which matters
+   * twice over: writes that have not been persisted yet are included, and an
+   * ephemeral `memory://` database has no stored copy to read at all. It is
+   * the same image `persist()` writes, taken the same way.
+   *
+   * A `Uint8Array` rather than a `Blob` — a `Blob` is one constructor away and
+   * exists only in a browser, while this class also runs in Node against a
+   * direct transport.
+   */
+  async dumpDataDir(): Promise<Uint8Array> {
+    await this.ensureReady();
+    return this.engine.readFile(this.dbPath);
+  }
+
   async persist(): Promise<void> {
     if (!this.dbHandle || !this.mayPersist) return;
 
@@ -789,6 +825,18 @@ export class FirebirdBrowser {
       if (stored.byteLength > 0) {
         await this.engine.writeFile(this.dbPath, stored);
       }
+    }
+
+    // After the stored image, never before it: `loadDataDir` is what to start
+    // from when there is nothing, not what to overwrite with.
+    const seed = this.options.loadDataDir;
+    if (seed && !(await this.engine.exists(this.dbPath))) {
+      if (seed.byteLength === 0) {
+        throw new RangeError(
+          'loadDataDir is empty; pass the bytes from dumpDataDir() or omit it',
+        );
+      }
+      await this.engine.writeFile(this.dbPath, seed);
     }
 
     this.dbHandle = (await this.engine.exists(this.dbPath))

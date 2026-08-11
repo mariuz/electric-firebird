@@ -8,6 +8,15 @@ API may still move between minor releases.
 
 ### Added
 
+- **`dumpDataDir()` and `loadDataDir`.** `db.dumpDataDir()` returns the
+  database as a `Uint8Array`, read from the live engine filesystem rather than
+  from IndexedDB — so writes that have not been persisted are included, and a
+  `memory://` database can be dumped at all. `new FirebirdBrowser(name, {
+  loadDataDir })` seeds a database that does not exist yet. A stored database
+  always wins: an application passes the option on every load, so a seed that
+  replaced what was there would reset the user's data to the snapshot on every
+  reload. To load a snapshot regardless, open it as `memory://`.
+
 - **`memory://` databases.** `new FirebirdBrowser('memory://')` opens a
   database that is never stored: no IndexedDB store is created — not even an
   empty one — no cross-tab lock is taken, `persist()` is a no-op, and the file

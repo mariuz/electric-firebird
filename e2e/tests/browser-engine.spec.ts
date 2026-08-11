@@ -478,6 +478,79 @@ test.describe('FirebirdBrowser against the real engine', () => {
     expect(result.numUnchanged).toBe('1234.5678');
   });
 
+  test('round-trips a database through dumpDataDir and loadDataDir', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      const source = new window.FB.FirebirdBrowser('dump-source', {
+        worker: new Worker('/firebird-engine-worker.js'),
+        autoPersist: false,
+      });
+      await source.exec('CREATE TABLE saved (id INTEGER, name VARCHAR(20))');
+      await source.query('INSERT INTO saved VALUES (?, ?)', [1, 'carried over']);
+
+      // Deliberately never persisted: autoPersist is off and persist() is not
+      // called, so anything read out of IndexedDB would miss this row.
+      const bytes = await source.dumpDataDir();
+      await source.close();
+
+      // Into a database that has never existed, and an ephemeral one, so
+      // nothing stored can be supplying the answer.
+      const restored = new window.FB.FirebirdBrowser('memory://restored', {
+        worker: new Worker('/firebird-engine-worker.js'),
+        loadDataDir: bytes,
+      });
+      const rows = (await restored.query('SELECT id, name FROM saved')).rows;
+
+      // Still a working database, not just a readable one.
+      await restored.exec("INSERT INTO saved VALUES (2, 'added after')");
+      const after = (await restored.query('SELECT COUNT(*) AS N FROM saved')).rows[0];
+      await restored.close();
+
+      return { size: bytes.byteLength, rows, after };
+    });
+
+    expect(result.size).toBeGreaterThan(0);
+    expect(result.rows).toEqual([{ ID: 1, NAME: 'carried over' }]);
+    expect(result.after).toMatchObject({ N: 2 });
+  });
+
+  test('keeps the stored database when loadDataDir is also given', async ({ page }) => {
+    const rows = await page.evaluate(async () => {
+      const worker = () => new Worker('/firebird-engine-worker.js');
+
+      // A snapshot of one database…
+      const other = new window.FB.FirebirdBrowser('memory://snapshot', {
+        worker: worker(),
+      });
+      await other.exec('CREATE TABLE t (id INTEGER)');
+      await other.exec('INSERT INTO t VALUES (99)');
+      const snapshot = await other.dumpDataDir();
+      await other.close();
+
+      // …and a real, stored database with different contents.
+      const first = new window.FB.FirebirdBrowser('dump-existing', {
+        worker: worker(),
+      });
+      await first.exec('CREATE TABLE t (id INTEGER)');
+      await first.exec('INSERT INTO t VALUES (1)');
+      await first.persist();
+      await first.close();
+
+      // Reopening with loadDataDir — what an application does on every load —
+      // must not reset the user's data to the seed.
+      const reopened = new window.FB.FirebirdBrowser('dump-existing', {
+        worker: worker(),
+        loadDataDir: snapshot,
+      });
+      const result = (await reopened.query('SELECT id FROM t')).rows;
+      await reopened.close();
+      return result;
+    });
+
+    expect(rows).toEqual([{ ID: 1 }]);
+  });
+
   test('runs a memory:// database with nothing stored behind it', async ({ page }) => {
     const result = await page.evaluate(async () => {
       const before = (await indexedDB.databases()).map((d) => d.name);
