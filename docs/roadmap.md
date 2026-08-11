@@ -938,9 +938,10 @@ loadICU probe: ucol_open("") status=U_ZERO_ERROR coll=0x25e8a50
 `ucol_open` succeeds, in our own probe and inside Firebird's `loadICU`. The
 blocker in §5 is gone.
 
-### What does not work
+### What does not work — resolved
 
-Exercising a UNICODE collation then traps:
+*(Superseded by the section below; kept because the diagnosis is the useful
+part.)* Exercising a UNICODE collation then traps:
 
 ```
 RuntimeError: null function or function signature mismatch
@@ -980,5 +981,56 @@ rest is for `COLLATE ... 'LOCALE=de_DE'`. Note that the 800 KB package did
 *not* make `ucol_open` succeed on its own — only the fuller ones were tested
 working — so the minimum has still to be established.
 
-`-DFB_WASM_ICU_COLLATION=OFF` is the default and the artifact is byte-identical
-to `main` at 9,094,983 bytes, 15/15 ABI tests.
+### The trap, pinned and fixed
+
+A debug build with line info on `unicode_util.cpp` put the innermost frame in
+`Utf16Collation::create`, and `emsymbolizer` resolved it to
+`unicode_util.cpp:1706` — beside this call:
+
+```cpp
+icu->ucolGetContractionsAndExpansions(partialCollator, contractions, nullptr, false, &status);
+```
+
+It is the third of the three casts, and patch 0002's own comment said why it
+was there: *"ICU returns void here; the struct field declares int32_t."*
+
+That is the whole bug. A function's type in WebAssembly includes its return
+type, and every indirect call is type-checked, so calling a `void` function
+through an `int32_t`-returning pointer aborts. A native build gets away with
+the same cast because the caller ignores a return register nobody reads. The
+fix is a forwarding wrapper of the declared shape:
+
+```cpp
+int32_t U_EXPORT2 wasmUcolGetContractionsAndExpansions(const UCollator* coll,
+    USet* contractions, USet* expansions, UBool addPrefixes, UErrorCode* status)
+{
+    ucol_getContractionsAndExpansions(coll, contractions, expansions, addPrefixes, status);
+    return 0;
+}
+```
+
+The other two casts are harmless: they differ only in `const` and in enum
+spelling, neither of which changes a wasm type.
+
+### It works
+
+```
+CREATE with COLLATE UNICODE_CI      -> ok
+case-insensitive match              -> [{"NAME":"Ähnlich"}]     ('ähnlich' matched)
+accent-insensitive (UNICODE_CI_AI)  -> [{"V":"café"}]           ('CAFE' matched)
+locale-aware ORDER BY               -> Apfel < Ärzte < Zebra
+```
+
+`Ä` sorting with `A` rather than after `Z` is the difference between a collation
+and a byte comparison. With `FB_WASM_FULL_INTL=ON` as well, the same build has
+48 character sets and `CHARACTER SET WIN1251` works — 12.6 MB of artifact for
+both.
+
+Still to decide before this merges: which data package to ship (the root
+collator alone was never shown sufficient — only the 3.3 MB collation tree and
+the full 27 MB were tested working), whether either option should default on,
+and CI needs `icu-devtools` for `icupkg`.
+
+`-DFB_WASM_ICU_COLLATION=OFF` remains the default. The default artifact is
+9,094,990 bytes against `main`'s 9,094,983 — seven bytes, from the wrapper
+being compiled in unconditionally — with 15/15 ABI tests.

@@ -10,9 +10,17 @@ convIcuMutex) is compiled out because nothing can load or unload a module.
 Regenerated against Firebird master; the previous revision of this patch
 had malformed hunk headers and never applied.
 ---
+
+One ICU function needs a wrapper rather than a direct assignment.
+ucol_getContractionsAndExpansions returns void while Firebird's function table
+declares int32_t.  A cast bridges that on a native build, where the caller
+ignores a return register nobody reads; WebAssembly includes the return type in
+a function's type and type-checks every indirect call, so the cast aborts with
+"null function or function signature mismatch" the first time a UNICODE
+collation is opened.
+
 diff --git a/src/common/unicode_util.cpp b/src/common/unicode_util.cpp
-diff --git a/src/common/unicode_util.cpp b/src/common/unicode_util.cpp
-index 05ffe21..638d06e 100644
+index 05ffe21..1626cf2 100644
 --- a/src/common/unicode_util.cpp
 +++ b/src/common/unicode_util.cpp
 @@ -480,11 +480,16 @@ private:
@@ -46,7 +54,7 @@ index 05ffe21..638d06e 100644
  
  
  static void getVersions(const string& configInfo, ObjectsArray<string>& versions)
-@@ -1138,6 +1147,60 @@ void UnicodeUtil::utf8Normalize(UCharBuffer& data)
+@@ -1138,6 +1147,83 @@ void UnicodeUtil::utf8Normalize(UCharBuffer& data)
  	}
  }
  
@@ -55,6 +63,23 @@ index 05ffe21..638d06e 100644
 +// pointers are bound directly to the real ICU symbols instead of being looked
 +// up with dlsym().  Exactly one ICU version ships in the binary, so the
 +// requested version is ignored and a singleton is returned.
++namespace {
++
++/**
++ * ucol_getContractionsAndExpansions with the return type Firebird declares.
++ *
++ * The engine ignores the result; the type exists only so the indirect call
++ * through the ICU function table type-checks under WebAssembly.
++ */
++int32_t U_EXPORT2 wasmUcolGetContractionsAndExpansions(const UCollator* coll,
++	USet* contractions, USet* expansions, UBool addPrefixes, UErrorCode* status)
++{
++	ucol_getContractionsAndExpansions(coll, contractions, expansions, addPrefixes, status);
++	return 0;
++}
++
++} // namespace
++
 +UnicodeUtil::ICU* UnicodeUtil::loadICU(const Firebird::string& /*icuVersion*/,
 +	const Firebird::string& /*configInfo*/)
 +{
@@ -80,8 +105,14 @@ index 05ffe21..638d06e 100644
 +
 +	// i18n library (libicui18n)
 +	wasmIcu->ucolClose                        = ucol_close;
-+	// ICU returns void here; the struct field declares int32_t.
-+	wasmIcu->ucolGetContractionsAndExpansions = reinterpret_cast<decltype(wasmIcu->ucolGetContractionsAndExpansions)>(ucol_getContractionsAndExpansions);
++	// ICU returns void here and the struct field declares int32_t.  A cast
++	// makes that link, and traps on WebAssembly: a function's type includes
++	// its return type, and indirect calls are type-checked, so calling a void
++	// function through an int32_t-returning pointer aborts with "null function
++	// or function signature mismatch".  Native builds get away with it by
++	// reading a return register nobody looks at.  Forward through a wrapper of
++	// the declared shape instead.
++	wasmIcu->ucolGetContractionsAndExpansions = wasmUcolGetContractionsAndExpansions;
 +	wasmIcu->ucolGetRules                     = ucol_getRules;
 +	wasmIcu->ucolGetSortKey                   = ucol_getSortKey;
 +	wasmIcu->ucolOpen                         = ucol_open;
@@ -107,7 +138,7 @@ index 05ffe21..638d06e 100644
  UnicodeUtil::ICU* UnicodeUtil::loadICU(const string& icuVersion, const string& configInfo)
  {
  	ObjectsArray<string> versions;
-@@ -1270,6 +1333,7 @@ UnicodeUtil::ICU* UnicodeUtil::loadICU(const string& icuVersion, const string& c
+@@ -1270,6 +1356,7 @@ UnicodeUtil::ICU* UnicodeUtil::loadICU(const string& icuVersion, const string& c
  
  	return NULL;
  }
@@ -115,7 +146,7 @@ index 05ffe21..638d06e 100644
  
  
  void UnicodeUtil::getICUVersion(ICU* icu, int& majorVersion, int& minorVersion) noexcept
-@@ -1281,6 +1345,46 @@ void UnicodeUtil::getICUVersion(ICU* icu, int& majorVersion, int& minorVersion)
+@@ -1281,6 +1368,46 @@ void UnicodeUtil::getICUVersion(ICU* icu, int& majorVersion, int& minorVersion)
  
  UnicodeUtil::ConversionICU& UnicodeUtil::getConversionICU()
  {
@@ -162,7 +193,7 @@ index 05ffe21..638d06e 100644
  	if (convIcu)
  	{
  		return *convIcu;
-@@ -1375,6 +1479,7 @@ UnicodeUtil::ConversionICU& UnicodeUtil::getConversionICU()
+@@ -1375,6 +1502,7 @@ UnicodeUtil::ConversionICU& UnicodeUtil::getConversionICU()
  
  	// compiler warning silencer
  	return *convIcu;
