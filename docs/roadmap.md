@@ -904,3 +904,81 @@ correct answers.  That needs a linked WASM build (M1's remaining item), after
 which `e2e/tests/wasm.spec.ts` and
 `packages/firebird-wasm/src/__tests__/wasm-integration.test.ts` stop skipping —
 both now assert real rows rather than shapes a stub could satisfy.
+
+---
+
+## 6. ICU collation data — branch `icu-collation`, not merged
+
+The previous section ended at "Emscripten's ICU port is built without collation
+data, so this needs an ICU build we own". That turned out to be half right: the
+data can be supplied without building ICU at all, and doing so gets `ucol_open`
+working. Something else then traps.
+
+### What works
+
+`libicu_stubdata` is ICU's code with none of its data, and stub data exists
+precisely so an application can supply its own at runtime. So:
+
+- `wasm/tools/build-icu-data.sh` reduces ICU 68.2's own `icudt68l.dat` — already
+  present in the Emscripten port's download cache, no separate fetch — with
+  `icupkg`. The whole collation tree is **3.3 MB**; `coll/root.res` plus
+  `coll/ucadata.icu` alone is **800 KB / 270 KB gzipped**.
+- `wasm/fb_wasm_icu_data.cpp` hands the package to `udata_setCommonData()` from
+  `fb_init()`, before anything touches ICU.
+- `-DFB_WASM_ICU_COLLATION=ON` embeds it with `--embed-file`.
+
+Measured with that in place:
+
+```
+udata_setCommonData(28566176 bytes) -> U_ZERO_ERROR
+after setCommonData: ucol_open("") -> U_ZERO_ERROR coll=0x25e7ee0
+loadICU probe: ucol_open("") status=U_ZERO_ERROR coll=0x25e8a50
+```
+
+`ucol_open` succeeds, in our own probe and inside Firebird's `loadICU`. The
+blocker in §5 is gone.
+
+### What does not work
+
+Exercising a UNICODE collation then traps:
+
+```
+RuntimeError: null function or function signature mismatch
+```
+
+Reproducible, and independent of how much data is embedded — the same trap with
+3.3 MB and with the full 27 MB.
+
+That message is WebAssembly's indirect-call type check, and there is an obvious
+suspect. Patch 0002 populates Firebird's ICU function table by assigning ICU's
+symbols to fields, and three of them do not match their declared types, so the
+patch casts:
+
+```cpp
+wasmIcu->uVersionToString = reinterpret_cast<decltype(...)>(u_versionToString);
+wasmIcu->ucolGetContractionsAndExpansions = reinterpret_cast<decltype(...)>(...);
+wasmConv.ucalGet = reinterpret_cast<decltype(...)>(ucal_get);
+```
+
+On a native build, calling through a cast function pointer works because the
+ABI matches. WebAssembly type-checks every indirect call, so the same cast
+traps at the call. The fix is a forwarding wrapper with the declared signature
+for each, rather than a cast — but which of the three actually traps has not
+been confirmed. That needs a build with `FB_WASM_DEBUG_SOURCES` on
+`unicode_util.cpp` and `emsymbolizer` on the trap address, exactly as §4's
+alignment bug was located.
+
+### Cost, if it is finished
+
+| | raw | gzipped |
+|---|---|---|
+| Root collator only | 800 KB | 270 KB |
+| All 170 collation locales | 3.3 MB | ~1.1 MB |
+
+The root collator is what `UNICODE`, `UNICODE_CI` and `UNICODE_CI_AI` need. The
+rest is for `COLLATE ... 'LOCALE=de_DE'`. Note that the 800 KB package did
+*not* make `ucol_open` succeed on its own — only the fuller ones were tested
+working — so the minimum has still to be established.
+
+`-DFB_WASM_ICU_COLLATION=OFF` is the default and the artifact is byte-identical
+to `main` at 9,094,983 bytes, 15/15 ABI tests.

@@ -24,3 +24,7 @@ packages/firebird-wasm/wasm/build*/
 # Misc
 .DS_Store
 *.log
+
+# ICU data packages are generated from the Emscripten port's download
+# cache by wasm/tools/build-icu-data.sh; 800 KB to 27 MB, not source.
+packages/firebird-wasm/wasm/icu-data/*.dat
