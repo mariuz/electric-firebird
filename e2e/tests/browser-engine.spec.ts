@@ -478,6 +478,32 @@ test.describe('FirebirdBrowser against the real engine', () => {
     expect(result.numUnchanged).toBe('1234.5678');
   });
 
+  test('query() runs a statement that returns no rows', async ({ page }) => {
+    // `fb_query` prepared such a statement, serialised the empty result and
+    // committed — without ever executing it. So `query('INSERT …')` reported
+    // success and wrote nothing, silently, while the Node backend (which has
+    // always had an explicit `stmt.execute()` for this case) wrote the row.
+    // Every statement below goes through query() deliberately.
+    const result = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('query-dml', {
+        worker: new Worker('/firebird-engine-worker.js'),
+        autoPersist: false,
+      });
+
+      await db.query('CREATE TABLE dml (id INTEGER, name VARCHAR(20))');
+      await db.query('INSERT INTO dml VALUES (?, ?)', [1, 'inserted']);
+      await db.query('INSERT INTO dml VALUES (?, ?)', [2, 'doomed']);
+      await db.query('UPDATE dml SET name = ? WHERE id = ?', ['updated', 1]);
+      await db.query('DELETE FROM dml WHERE id = ?', [2]);
+
+      const rows = (await db.query('SELECT id, name FROM dml ORDER BY id')).rows;
+      await db.close();
+      return rows;
+    });
+
+    expect(result).toEqual([{ ID: 1, NAME: 'updated' }]);
+  });
+
   test('applies custom parsers and serializers', async ({ page }) => {
     const result = await page.evaluate(async () => {
       // A value type the built-in encoder has no text form for — the gap a

@@ -994,6 +994,31 @@ bool serialiseCursor(IAttachment* attachment, ITransaction* transaction,
 
 	// A statement with no output columns (INSERT, DDL, …) still succeeds; it
 	// simply yields an empty result set rather than an error.
+	//
+	// It has to be *executed* to do that, which is what openCursor does for a
+	// SELECT below and what nothing did here: the statement was prepared, the
+	// empty result serialised, and the transaction committed, so
+	// `query('INSERT …')` reported success having written nothing. The Node
+	// backend has always run the same statement through `stmt.execute()`, so
+	// the two backends disagreed about whether the row was there.
+	if (!columnCount)
+	{
+		statement->execute(status.ptr(), transaction, inMeta, inBuffer, nullptr, nullptr);
+
+		if (status.failed())
+		{
+			setErrorFromStatus("could not execute statement", status.ptr());
+			return false;
+		}
+
+		Status affectedStatus;
+		const ISC_UINT64 affected = statement->getAffectedRecords(affectedStatus.ptr());
+		// DDL reports no count, which is not a failure — it simply has none.
+		g_lastAffectedRows = affectedStatus.failed()
+			? 0
+			: static_cast<ISC_INT64>(affected);
+	}
+
 	std::vector<unsigned> types(columnCount);
 	std::vector<int>      subTypes(columnCount);
 	std::vector<int>      scales(columnCount);
