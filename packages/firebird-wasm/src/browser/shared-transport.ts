@@ -533,6 +533,10 @@ export class SharedEngineTransport implements EngineTransport {
     return this.call<void>('writeFile', path, data);
   }
 
+  unlink(path: string): Promise<void> {
+    return this.call<void>('unlink', path);
+  }
+
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;

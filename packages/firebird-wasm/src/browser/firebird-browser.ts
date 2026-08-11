@@ -169,6 +169,32 @@ export interface FirebirdBrowserOptions {
 // Shared helpers
 // ---------------------------------------------------------------------------
 
+/** Prefix marking a database that is never stored.  Matches PGlite's. */
+const MEMORY_PREFIX = 'memory://';
+
+/**
+ * Distinguishes ephemeral databases opened in one page.
+ *
+ * A counter rather than randomness: every instance in a tab shares one WASM
+ * module and therefore one filesystem, so all this has to do is not repeat.
+ */
+let ephemeralCounter = 0;
+
+/**
+ * A filesystem name for `memory://` or `memory://label`.
+ *
+ * The label is kept for readability when looking at the engine's filesystem,
+ * and made unique regardless: two `memory://scratch` databases are two
+ * databases, not one shared by two owners. Nothing addresses this path from
+ * outside, so uniqueness costs nothing and a collision would silently join two
+ * callers who each believe they have their own.
+ */
+function ephemeralFileName(dbName: string): string {
+  const label = dbName.slice(MEMORY_PREFIX.length).replace(/[^A-Za-z0-9_-]/g, '') || 'memory';
+  ephemeralCounter += 1;
+  return `${label}-${ephemeralCounter}`;
+}
+
 // ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
@@ -181,6 +207,17 @@ export interface FirebirdBrowserOptions {
  */
 export class FirebirdBrowser {
   private readonly dbName: string;
+  /** True for a `memory://` database: never stored, discarded on close. */
+  private readonly ephemeral: boolean;
+  /**
+   * Name of the file inside the engine's own filesystem.
+   *
+   * The same as `dbName` for a stored database. For an ephemeral one it is
+   * made unique per instance, so two `memory://` databases in one page cannot
+   * land on the same path — the WASM module, and therefore its filesystem, is
+   * shared by every instance in a tab.
+   */
+  private readonly fileName: string;
   private readonly options: FirebirdBrowserOptions;
   private readonly vfs: IndexedDBVFS;
   private readonly engine: EngineTransport;
@@ -212,10 +249,16 @@ export class FirebirdBrowser {
    */
   constructor(dbName: string, options: FirebirdBrowserOptions = {}) {
     this.dbName = dbName;
+    this.ephemeral = dbName.startsWith(MEMORY_PREFIX);
+    this.fileName = this.ephemeral ? ephemeralFileName(dbName) : dbName;
     this.options = options;
     this.vfs = new IndexedDBVFS(options.vfs);
 
-    this.multiTab = options.multiTab ?? 'exclusive';
+    // An ephemeral database is private to this instance and never stored, so
+    // there is nothing for another tab to overwrite and nothing to lock
+    // against. Taking the lock anyway would make two tabs queue for a database
+    // neither of them shares.
+    this.multiTab = this.ephemeral ? 'allow-unsafe' : options.multiTab ?? 'exclusive';
     this.lockTimeoutMs = options.lockTimeoutMs ?? 5_000;
 
     this.autoPersist = options.autoPersist ?? true;
@@ -277,7 +320,7 @@ export class FirebirdBrowser {
 
   /** Path of the database inside Emscripten's filesystem. */
   private get dbPath(): string {
-    return `/data/${this.dbName}.fdb`;
+    return `/data/${this.fileName}.fdb`;
   }
 
   /**
@@ -572,7 +615,14 @@ export class FirebirdBrowser {
     }
 
     try {
-      await this.vfs.close();
+      if (this.ephemeral) {
+        // Reclaim it: the engine's filesystem outlives this instance — the
+        // module is cached for the whole page — so a long-lived tab that
+        // opened many scratch databases would hold every one of them.
+        await this.engine.unlink(this.dbPath).catch(() => undefined);
+      } else {
+        await this.vfs.close();
+      }
       await this.engine.dispose();
     } finally {
       // Last, and unconditionally: a lock still held after a failed teardown
@@ -599,6 +649,10 @@ export class FirebirdBrowser {
    * that multi-tab safety exists to prevent.
    */
   private get mayPersist(): boolean {
+    // Ephemeral first: there is nowhere to persist to, so persist() is a
+    // no-op and markDirty() schedules nothing. A caller who writes code that
+    // works for both kinds should not have to branch.
+    if (this.ephemeral) return false;
     return this.shared === null || this.shared.isLeader;
   }
 
@@ -705,7 +759,12 @@ export class FirebirdBrowser {
     // it, and a second request from the same tab would queue behind itself.
 
     await this.engine.init();
-    await this.vfs.open(this.dbName);
+    // An ephemeral database never touches IndexedDB, so the store is not
+    // opened at all — opening it would create an empty one on disk for a
+    // database whose whole point is leaving nothing behind.
+    if (!this.ephemeral) {
+      await this.vfs.open(this.dbName);
+    }
     await this.openDatabase();
     this.attachLifecycleListeners();
   }

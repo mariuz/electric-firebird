@@ -715,6 +715,117 @@ test.describe('sql`…` tag', () => {
 // Custom parsers and serializers
 // ===========================================================================
 
+test.describe('memory:// databases', () => {
+  test('never touches IndexedDB', async ({ page }) => {
+    const stores = await page.evaluate(async () => {
+      const before = (await indexedDB.databases()).map((d) => d.name);
+
+      const db = new window.FB.FirebirdBrowser('memory://', { autoPersist: false });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      await db.persist(); // explicit, and still must store nothing
+      await db.close();
+
+      const after = (await indexedDB.databases()).map((d) => d.name);
+      return { before, after };
+    });
+
+    // Not "the store is empty" — the store is never created. An ephemeral
+    // database that left an empty IndexedDB behind would have left something
+    // behind.
+    expect(stores.after).toEqual(stores.before);
+  });
+
+  test('holds data for the life of the connection', async ({ page }) => {
+    const rows = await page.evaluate(async () => {
+      window.__stub.queryResult = { columns: ['ID'], rows: [[1]] };
+
+      const db = new window.FB.FirebirdBrowser('memory://scratch', {
+        autoPersist: false,
+      });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      await db.exec('INSERT INTO t VALUES (1)');
+      const result = await db.query('SELECT id FROM t');
+      await db.close();
+      return result.rows;
+    });
+
+    expect(rows).toEqual([{ ID: 1 }]);
+  });
+
+  test('gives two instances of one name two databases', async ({ page }) => {
+    const paths = await page.evaluate(async () => {
+      const first = new window.FB.FirebirdBrowser('memory://scratch', {
+        autoPersist: false,
+      });
+      const second = new window.FB.FirebirdBrowser('memory://scratch', {
+        autoPersist: false,
+      });
+      await first.exec('CREATE TABLE t (id INTEGER)');
+      await second.exec('CREATE TABLE t (id INTEGER)');
+
+      // Every instance in a page shares one filesystem, so the same name must
+      // not become the same file — that would silently join two callers who
+      // each believe they have their own database.
+      const created = window.__stub.calls
+        .filter((c) => c.fn === '_fb_create_database')
+        .map((c) => c.args[0]);
+
+      await first.close();
+      await second.close();
+      return created;
+    });
+
+    expect(paths).toHaveLength(2);
+    expect(paths[0]).not.toBe(paths[1]);
+    expect(paths[0]).toMatch(/\/data\/scratch-\d+\.fdb/);
+  });
+
+  test('discards the file on close', async ({ page }) => {
+    const state = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('memory://', { autoPersist: false });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+
+      const created = window.__stub.calls
+        .filter((c) => c.fn === '_fb_create_database')
+        .map((c) => c.args[0] as string);
+      const path = created[created.length - 1]!;
+
+      const existedBefore = window.__stub.fileExists(path);
+      await db.close();
+      return { existedBefore, existsAfter: window.__stub.fileExists(path) };
+    });
+
+    // The engine's filesystem outlives the instance, so a scratch database
+    // that stayed would accumulate for as long as the tab is open.
+    expect(state.existedBefore).toBe(true);
+    expect(state.existsAfter).toBe(false);
+  });
+
+  test('takes no cross-tab lock', async ({ page }) => {
+    const opened = await page.evaluate(async () => {
+      // Two tabs holding `memory://x` share nothing, so waiting for each other
+      // would be waiting on a database neither can see. With a stored name
+      // this second open would block until the timeout.
+      const first = new window.FB.FirebirdBrowser('memory://locked', {
+        autoPersist: false,
+      });
+      await first.exec('CREATE TABLE t (id INTEGER)');
+
+      const second = new window.FB.FirebirdBrowser('memory://locked', {
+        autoPersist: false,
+        lockTimeoutMs: 250,
+      });
+      await second.exec('CREATE TABLE t (id INTEGER)');
+
+      await first.close();
+      await second.close();
+      return true;
+    });
+
+    expect(opened).toBe(true);
+  });
+});
+
 test.describe('Binary BLOB side channel', () => {
   const SQL_BLOB = 520;
   const blobColumn = (name: string) => ({

@@ -8,6 +8,16 @@ API may still move between minor releases.
 
 ### Added
 
+- **`memory://` databases.** `new FirebirdBrowser('memory://')` opens a
+  database that is never stored: no IndexedDB store is created — not even an
+  empty one — no cross-tab lock is taken, `persist()` is a no-op, and the file
+  is discarded on `close()`. The engine has always run from memory, so this
+  removes the durability copy rather than adding a mode. Two instances of one
+  `memory://name` are two databases: every instance in a page shares one WASM
+  filesystem, and a shared path would silently join two callers who each
+  believe they own theirs. No equivalent on the Node backend, where Firebird
+  has no in-memory engine.
+
 - **Binary BLOBs travel beside the JSON, not inside it.** With
   `types: { binary: true }` the engine now publishes binary `BLOB` bytes in a
   side buffer and leaves a `{"$blob": N}` reference in the result, instead of

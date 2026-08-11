@@ -373,6 +373,34 @@ class FirebirdBrowser {
 | `options.vfs.prefix` | `string` | `'firebird_'` | IndexedDB database name prefix. |
 | `options.types` | [`TypeOptions`](#typeoptions) | `{}` | How values convert on the way in and out. All off by default. |
 
+#### Ephemeral databases — `memory://`
+
+A name beginning with `memory://` opens a database that is never stored:
+
+```ts
+const db = new FirebirdBrowser('memory://');          // anonymous
+const scratch = new FirebirdBrowser('memory://tests'); // labelled
+```
+
+The engine has always run from memory — IndexedDB is the durability copy — so
+this removes that copy rather than adding a mode.  Concretely: no IndexedDB
+store is opened (not even an empty one), no cross-tab lock is taken,
+`persist()` is a no-op, `autoPersist` schedules nothing, and the file is
+discarded from the engine's filesystem on `close()`.
+
+The label after the prefix is for readability only.  **Two instances of one
+name are two databases**, not one shared between them — every instance in a
+page shares a single WASM filesystem, and a shared path would silently join two
+callers who each believe they own their database.
+
+`persist()` is a no-op rather than an error, so code that persists periodically
+works unchanged against either kind of database.
+
+> There is no equivalent on the Node backend, and it is not an oversight:
+> Firebird has no in-memory engine, so an "ephemeral" database there would be a
+> temporary file with a different failure surface.  Use a path in the system
+> temporary directory and delete it.
+
 #### `db.persist()`
 
 Flush the in-memory Emscripten FS to IndexedDB.  Call this periodically or

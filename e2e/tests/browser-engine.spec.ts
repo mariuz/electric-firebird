@@ -478,6 +478,39 @@ test.describe('FirebirdBrowser against the real engine', () => {
     expect(result.numUnchanged).toBe('1234.5678');
   });
 
+  test('runs a memory:// database with nothing stored behind it', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const before = (await indexedDB.databases()).map((d) => d.name);
+
+      const db = new window.FB.FirebirdBrowser('memory://scratch', {
+        worker: new Worker('/firebird-engine-worker.js'),
+      });
+
+      // A real engine, a real database, a real transaction — only the storage
+      // is absent. autoPersist is left at its default, so this also asserts
+      // that the automatic path stays quiet rather than being switched off.
+      await db.exec('CREATE TABLE ephemeral (id INTEGER, name VARCHAR(20))');
+      await db.query('INSERT INTO ephemeral VALUES (?, ?)', [1, 'gone soon']);
+      await db.transaction(async (tx) => {
+        await tx.exec('INSERT INTO ephemeral VALUES (?, ?)', [2, 'also gone']);
+      });
+
+      const rows = (await db.query('SELECT id, name FROM ephemeral ORDER BY id')).rows;
+      await db.persist();
+      await db.close();
+
+      const after = (await indexedDB.databases()).map((d) => d.name);
+      return { rows, before, after };
+    });
+
+    expect(result.rows).toEqual([
+      { ID: 1, NAME: 'gone soon' },
+      { ID: 2, NAME: 'also gone' },
+    ]);
+    // Nothing was created, not even an empty store.
+    expect(result.after).toEqual(result.before);
+  });
+
   test('carries binary BLOBs beside the JSON, not inside it', async ({ page }) => {
     const result = await page.evaluate(async () => {
       const db = new window.FB.FirebirdBrowser('blob-side-channel', {

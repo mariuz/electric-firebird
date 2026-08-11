@@ -217,6 +217,10 @@ export class WorkerTransport implements EngineTransport {
     return this.call<void>('writeFile', path, data);
   }
 
+  unlink(path: string): Promise<void> {
+    return this.call<void>('unlink', path);
+  }
+
   async dispose(): Promise<void> {
     this.worker.removeEventListener('message', this.onMessage);
     this.worker.removeEventListener('error', this.onError);

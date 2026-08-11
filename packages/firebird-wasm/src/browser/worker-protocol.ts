@@ -24,7 +24,8 @@ export type EngineOp =
   | 'mkdir'
   | 'exists'
   | 'readFile'
-  | 'writeFile';
+  | 'writeFile'
+  | 'unlink';
 
 /** A call from the main thread to the Worker. */
 export interface EngineRequest {

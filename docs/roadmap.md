@@ -544,7 +544,7 @@ Legend: ✅ shipped · 🟡 partial · ❌ missing · n/a not applicable
 
 | Capability | PGlite | electric-firebird | Notes |
 |---|---|---|---|
-| In-memory / ephemeral database | ✅ `memory://` | ❌ | Everything goes through IndexedDB |
+| In-memory / ephemeral database | ✅ `memory://` | ✅ | `new FirebirdBrowser('memory://')` — no IndexedDB store is opened, no lock is taken, `persist()` is a no-op, and the file is discarded on `close()`. The engine already ran from memory; what this removes is the durability copy |
 | Node filesystem | ✅ `file://` | ✅ | Via the native driver, not WASM |
 | IndexedDB | ✅ `idb://` | ✅ | One transaction per persist, only changed pages written |
 | OPFS | — | ❌ | The natural fit for Firebird's page I/O; see M4 |

@@ -97,6 +97,8 @@ export interface EngineTransport {
   exists(path: string): Promise<boolean>;
   readFile(path: string): Promise<Uint8Array>;
   writeFile(path: string, data: Uint8Array): Promise<void>;
+  /** Remove a file.  Used to discard an ephemeral database on close. */
+  unlink(path: string): Promise<void>;
 
   /** Release anything the transport owns.  Does not detach databases. */
   dispose(): Promise<void>;
@@ -636,6 +638,12 @@ export class DirectTransport implements EngineTransport {
 
   async writeFile(path: string, data: Uint8Array): Promise<void> {
     this.module.FS.writeFile(path, data);
+  }
+
+  async unlink(path: string): Promise<void> {
+    if (this.module.FS.analyzePath(path).exists) {
+      this.module.FS.unlink(path);
+    }
   }
 
   async dispose(): Promise<void> {
