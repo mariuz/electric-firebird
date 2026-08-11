@@ -11,7 +11,6 @@ Regenerated against Firebird master; the previous revision of this patch
 had malformed hunk headers and never applied.
 ---
 diff --git a/src/common/unicode_util.cpp b/src/common/unicode_util.cpp
-diff --git a/src/common/unicode_util.cpp b/src/common/unicode_util.cpp
 index 05ffe21..638d06e 100644
 --- a/src/common/unicode_util.cpp
 +++ b/src/common/unicode_util.cpp

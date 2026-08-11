@@ -22,8 +22,6 @@ intl module is linked.  The other 43 are table-driven and work.
 
 diff --git a/src/jrd/IntlManager.cpp b/src/jrd/IntlManager.cpp
 index 3c4c74c..6d978ae 100644
-diff --git a/src/jrd/IntlManager.cpp b/src/jrd/IntlManager.cpp
-index 3c4c74c..6d978ae 100644
 --- a/src/jrd/IntlManager.cpp
 +++ b/src/jrd/IntlManager.cpp
 @@ -102,6 +102,12 @@ static GlobalPtr<ModulesMap> modules;
