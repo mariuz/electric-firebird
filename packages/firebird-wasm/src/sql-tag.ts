@@ -201,7 +201,7 @@ function tag(strings: TemplateStringsArray, ...values: unknown[]): SqlFragment {
     text += chunk;
 
     if (i < values.length) {
-      text += interpolate(values[i], params, i);
+      text += interpolate(values[i], params, i, 'template');
     }
   }
 
@@ -211,11 +211,23 @@ function tag(strings: TemplateStringsArray, ...values: unknown[]): SqlFragment {
 /**
  * Render one `${…}`, appending to `params` when it binds.
  *
+ * `where` names the caller, because the two callers fail differently and a
+ * message that describes the wrong one sends the reader to the wrong line —
+ * see {@link join}.
+ *
  * @returns the text this value contributes.
  */
-function interpolate(value: unknown, params: unknown[], index: number): string {
+function interpolate(
+  value: unknown,
+  params: unknown[],
+  index: number,
+  where: 'template' | 'join',
+): string {
   if (isSqlFragment(value)) {
-    params.push(...value.params);
+    // A loop rather than push(...spread): every parameter would otherwise
+    // become a separate argument, and a large enough list overflows the call
+    // stack with a RangeError that names neither the list nor the limit.
+    for (const param of value.params) params.push(param);
     return value.sql;
   }
 
@@ -229,8 +241,12 @@ function interpolate(value: unknown, params: unknown[], index: number): string {
     // the parameter encoder it surfaces as "unsupported type object" at bind
     // time, which does not suggest the fix.
     throw new TypeError(
-      `Value ${index} in sql\`…\` is an array, which cannot bind to a single ` +
-        'placeholder; use sql.join(values) to expand it into a list',
+      where === 'join'
+        ? `Element ${index} passed to sql.join() is an array. sql.join() does ` +
+          'not flatten, because a nested list has no unambiguous SQL form — ' +
+          'flatten it first, or join the inner lists yourself'
+        : `Value ${index} in sql\`…\` is an array, which cannot bind to a ` +
+          'single placeholder; use sql.join(values) to expand it into a list',
     );
   }
 
@@ -265,7 +281,7 @@ function join(values: readonly unknown[], separator = ', '): SqlFragment {
 
   values.forEach((value, index) => {
     if (index > 0) text += separator;
-    text += interpolate(value, params, index);
+    text += interpolate(value, params, index, 'join');
   });
 
   return new SqlFragment(text, params);
@@ -310,19 +326,51 @@ export function toStatement(
   sql: string | SqlFragment,
   params: QueryParams = [],
 ): Statement {
-  if (!isSqlFragment(sql)) {
+  if (typeof sql === 'string') {
     return { sql, params };
   }
 
-  if (params.length > 0) {
-    throw new TypeError(
-      'A sql`…` fragment already carries its parameters; passing more would ' +
-        'bind them to nothing. Interpolate the values into the template ' +
-        'instead',
-    );
+  if (isSqlFragment(sql)) {
+    if (params.length > 0) {
+      throw new TypeError(
+        'A sql`…` fragment already carries its parameters; passing more would ' +
+          'bind them to nothing. Interpolate the values into the template ' +
+          'instead',
+      );
+    }
+
+    return { sql: sql.sql, params: sql.params };
   }
 
-  return { sql: sql.sql, params: sql.params };
+  // Anything else would have been passed through as the statement text, and
+  // an object reaches the engine as "[object Object]" — a syntax error that
+  // names a token rather than the argument, with the fragment's values
+  // silently dropped.
+  //
+  // The look-alike this catches is not hypothetical. `SqlFragment` is
+  // structurally `{ sql, params }`, so a plain object of that shape type-checks
+  // against the fragment overload, and the brand is a symbol, which neither
+  // `structuredClone` nor `JSON` carries: a fragment built in a Worker and
+  // posted to the main thread arrives as exactly such a look-alike.
+  throw new TypeError(
+    `Expected a SQL string or a sql\`…\` fragment, got ${describe(sql)}. ` +
+      'A fragment does not survive structuredClone or JSON — it carries a ' +
+      'symbol brand — so rebuild it on the receiving side rather than sending it',
+  );
+}
+
+/** Name a value for an error message, without dumping its contents. */
+function describe(value: unknown): string {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'an array';
+  if (typeof value !== 'object') return `a ${typeof value}`;
+
+  const name = (value as object).constructor?.name;
+  const looksLikeFragment =
+    'sql' in (value as object) && 'params' in (value as object);
+  return looksLikeFragment
+    ? `a { sql, params } object that is not a fragment (${name ?? 'object'})`
+    : `a ${name ?? 'object'}`;
 }
 
 /**
@@ -334,16 +382,36 @@ export function toStatement(
  * to reach the third argument would be a poor trade for the tag's ergonomics.
  * The two are told apart by whether the argument is an array, which is
  * unambiguous: parameters are always one, options never are.
+ *
+ * @throws if a string statement is given a second argument that is not an
+ *   array. `query('… WHERE id = ?', 5)` reads as though it binds 5, and taking
+ *   it for transaction options instead would run the statement with no
+ *   parameters at all — the engine then complains about a placeholder count,
+ *   naming nothing the caller wrote. TypeScript rules this out; untyped
+ *   JavaScript, which the browser build is used from, does not.
  */
 export function resolveQueryCall(
   sql: string | SqlFragment,
   paramsOrOptions: QueryParams | TransactionOptions = [],
   maybeOptions: TransactionOptions = {},
 ): { statement: Statement; options: TransactionOptions } {
-  const params = Array.isArray(paramsOrOptions) ? paramsOrOptions : [];
-  const options = Array.isArray(paramsOrOptions)
-    ? maybeOptions
-    : (paramsOrOptions as TransactionOptions);
+  if (Array.isArray(paramsOrOptions)) {
+    return {
+      statement: toStatement(sql, paramsOrOptions),
+      options: maybeOptions,
+    };
+  }
 
-  return { statement: toStatement(sql, params), options };
+  if (typeof sql === 'string') {
+    throw new TypeError(
+      `Expected an array of parameters, got ${describe(paramsOrOptions)}. ` +
+        'Transaction options go in the second argument only for a sql`…` ' +
+        'fragment, which carries its own parameters',
+    );
+  }
+
+  return {
+    statement: toStatement(sql, []),
+    options: paramsOrOptions as TransactionOptions,
+  };
 }

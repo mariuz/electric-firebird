@@ -93,7 +93,9 @@ await db.query(sql`SELECT * FROM items WHERE id = ${1}`, { readOnly: true });
 ```
 
 Passing both a fragment and parameters throws, rather than binding values that
-could not reach a placeholder.
+could not reach a placeholder.  So does passing a non-array where parameters
+belong — `query('… WHERE id = ?', 5)` reads as though it binds `5`, and taking
+it for options instead would run the statement with none.
 
 #### `db.transaction(fn, options?)`
 
@@ -236,7 +238,13 @@ class SqlFragment {
 
 `isSqlFragment(value)` tests for one.  `toStatement(sql, params?)` reduces
 either calling convention to `{ sql, params }`, for code running statements
-itself.
+itself, and throws on anything that is neither.
+
+> A fragment **does not survive `structuredClone` or `JSON`** — the brand is a
+> symbol, and neither carries symbols.  One posted from a Worker arrives as a
+> plain `{ sql, params }` object, which is structurally a fragment but not one;
+> passing it to `query()` throws rather than sending `[object Object]` as the
+> statement.  Send the text and values, and rebuild on the receiving side.
 
 ---
 
@@ -522,6 +530,14 @@ The type code alone does not always identify a type: `NUMERIC` and `BIGINT`
 share `SQL_INT64` (580) and differ by `scale`; BLOBs differ by `subType`.  Both
 reach the parser on `field`, so a parser registered for a shared code has to
 check — exactly as the built-in conversions do.
+
+A code may be registered with or without the nullable flag in its low bit —
+`580` and `581` name the same type, and both forms are published.  Registering
+**both** throws, since one could only ever be dead.
+
+A parser that throws is not caught: the query rejects rather than returning
+half-converted rows.  The error names the column, the type code and the value,
+and keeps the original as its `cause`.
 
 #### `serializers`
 

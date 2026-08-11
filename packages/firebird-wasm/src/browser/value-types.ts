@@ -123,6 +123,14 @@ export interface TypeOptions {
    * `BIGINT` share `SQL_INT64` (580) and differ by `scale`, and BLOBs differ
    * by `subType`. Both reach the parser on `field`, so a parser registered for
    * a shared code has to check — the built-in conversions do exactly that.
+   *
+   * A code may be registered with or without the nullable flag in its low bit
+   * — `580` and `581` name the same type, and both are published. Registering
+   * *both* throws, because one of them could only ever be dead.
+   *
+   * A parser that throws is not caught: the query rejects, since returning
+   * half-converted rows would be worse. The error names the column, the type
+   * code and the offending value, and keeps the original as its `cause`.
    */
   parsers?: Record<number, Parser>;
 
@@ -179,6 +187,41 @@ function base64ToBytes(value: string): Uint8Array {
 }
 
 /**
+ * Index {@link TypeOptions.parsers} by type code with the nullable flag cleared.
+ *
+ * The flag is the low bit. The engine reports it clear — Firebird ORs it in
+ * only when filling a legacy XSQLDA — but the codes are published both ways,
+ * and a parser registered as `{ 581: fn }` for a nullable `BIGINT` would
+ * otherwise never fire: no conversion, no error, and a column that silently
+ * keeps its raw form. Normalising the *registration* keys is what makes that
+ * work; masking the lookup alone cannot, because the engine's code is already
+ * even.
+ *
+ * @throws if two keys normalise to the same code, which means one of them is
+ *   silently unreachable.
+ */
+function normaliseParsers(
+  parsers: Record<number, Parser> | undefined,
+): Map<number, Parser> | null {
+  if (!parsers) return null;
+
+  const byType = new Map<number, Parser>();
+  for (const [key, parser] of Object.entries(parsers)) {
+    const code = Number(key) & ~1;
+    if (byType.has(code)) {
+      throw new TypeError(
+        `types.parsers has two entries for SQL type ${code}: ${key} and its ` +
+          'counterpart with the nullable bit differing. Keep one — they name ' +
+          'the same type',
+      );
+    }
+    byType.set(code, parser);
+  }
+
+  return byType;
+}
+
+/**
  * A converter for one column, or null when the column needs none.
  *
  * Chosen once per result set from {@link FieldInfo} rather than per value: the
@@ -188,20 +231,37 @@ function base64ToBytes(value: string): Uint8Array {
 function converterFor(
   field: FieldInfo,
   options: TypeOptions,
+  parsers: Map<number, Parser> | null,
 ): ((value: unknown) => unknown) | null {
   const type = field.type;
   if (type === undefined) return null;
 
-  // The nullable flag is the low bit. The engine reports it clear — Firebird
-  // ORs it in only when filling a legacy XSQLDA — but masking costs one
-  // operation and means a caller who keys a parser off a code they read
-  // somewhere with the bit set still matches.
-  const parser = options.parsers?.[type & ~1];
+  const parser = parsers?.get(type & ~1);
   if (parser) {
     // Wins over the built-ins below, which is what makes `parsers` the way to
     // override `dates` rather than a second conversion fighting it.
-    return (value) =>
-      value === null || value === undefined ? value : parser(value, field);
+    return (value) => {
+      if (value === null || value === undefined) return value;
+      try {
+        return parser(value, field);
+      } catch (err) {
+        // A parser is application code and can throw on a value it did not
+        // expect. Unwrapped, the error names neither the column nor the type
+        // code that selected the parser, and the whole query rejects — the
+        // rows are gone, so there is nothing to inspect afterwards either.
+        const wrapped = new Error(
+          `parser for column ${field.name} (type ${type}) failed on ` +
+            `${typeof value === 'string' ? JSON.stringify(value) : String(value)}: ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+        );
+        // Assigned rather than passed as `new Error(msg, { cause })`, which
+        // needs lib ES2022 — this project targets ES2020, and bumping the
+        // whole compilation for one property is the wrong trade. The original
+        // error and its stack are kept either way.
+        (wrapped as { cause?: unknown }).cause = err;
+        throw wrapped;
+      }
+    };
   }
 
   if (options.bigint && type === SQL_INT64 && field.scale === 0) {
@@ -246,13 +306,24 @@ export function applyTypes<T extends Row>(
     return result;
   }
 
-  const converters: Array<[string, (value: unknown) => unknown]> = [];
+  const parsers = normaliseParsers(options!.parsers);
+
+  // Keyed by column name rather than accumulated per field, because a result
+  // set can name two columns the same — `SELECT a.ID, b.ID` — while a row
+  // holds one `ID`. Both row builders keep the *last* such column, so the
+  // last converter is the one that matches the value actually there; a Map
+  // gives exactly that, and running two converters over one cell would
+  // otherwise feed the second the first's output.
+  const converters = new Map<string, (value: unknown) => unknown>();
   for (const field of result.fields) {
-    const convert = converterFor(field, options!);
-    if (convert) converters.push([field.name, convert]);
+    const convert = converterFor(field, options!, parsers);
+    if (convert) converters.set(field.name, convert);
+    // A column with no conversion still shadows an earlier one of the same
+    // name, whose converter would otherwise run on this column's value.
+    else converters.delete(field.name);
   }
 
-  if (converters.length === 0) return result;
+  if (converters.size === 0) return result;
 
   for (const row of result.rows) {
     const target = row as Record<string, unknown>;

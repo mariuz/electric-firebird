@@ -357,6 +357,14 @@ export class FirebirdBrowser {
     params?: QueryParams,
     options?: TransactionOptions,
   ): Promise<QueryResult<T>>;
+  // Both shapes at once, so a caller holding a `string | SqlFragment` — one
+  // built conditionally — can call this without casting. Last, so the two
+  // specific overloads still win where they apply.
+  async query<T extends Row = Row>(
+    sql: string | SqlFragment,
+    params?: QueryParams,
+    options?: TransactionOptions,
+  ): Promise<QueryResult<T>>;
   async query<T extends Row = Row>(
     sql: string | SqlFragment,
     paramsOrOptions: QueryParams | TransactionOptions = [],

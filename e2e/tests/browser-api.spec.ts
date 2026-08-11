@@ -711,6 +711,7 @@ test.describe('sql`…` tag', () => {
 test.describe('Custom parsers and serializers', () => {
   // From firebird/impl/sqlda_pub.h, as in src/browser/field-types.ts.
   const SQL_VARYING = 448;
+  const SQL_LONG = 496;
   const SQL_TIMESTAMP = 510;
   const SQL_INT64 = 580;
 
@@ -833,6 +834,136 @@ test.describe('Custom parsers and serializers', () => {
       BIG: { kind: 'bigint', text: '9007199254740993' },
       NUM: { kind: 'numeric', scale: -4 },
     });
+  });
+
+  test('a parser keyed with the nullable bit set still fires', async ({ page }) => {
+    const value = await page.evaluate(
+      async ([int64]) => {
+        window.__stub.queryResult = {
+          columns: [
+            { name: 'BIG', type: int64, subType: 0, scale: 0, length: 8, nullable: true },
+          ],
+          rows: [['9007199254740993']],
+        };
+
+        const db = new window.FB.FirebirdBrowser('parser-nullbit', {
+          autoPersist: false,
+          // 581 is SQL_INT64 with the nullable flag — the form older XSQLDA
+          // documentation publishes. The engine reports 580, so a lookup that
+          // masked only its own side would never match this and would convert
+          // nothing, with no error to say why.
+          types: { parsers: { [int64 + 1]: (v) => `via-${v as string}` } },
+        });
+        await db.exec('CREATE TABLE t (big BIGINT)');
+        const rows = (await db.query('SELECT big FROM t')).rows;
+        await db.close();
+
+        return rows[0]!['BIG'];
+      },
+      [SQL_INT64],
+    );
+
+    expect(value).toBe('via-9007199254740993');
+  });
+
+  test('rejects two parser keys that name the same type', async ({ page }) => {
+    const message = await page.evaluate(
+      async ([int64]) => {
+        window.__stub.queryResult = { columns: ['BIG'], rows: [['1']] };
+
+        const db = new window.FB.FirebirdBrowser('parser-dupe-key', {
+          autoPersist: false,
+          // 580 and 581 are the same type; one of them would be unreachable.
+          types: {
+            parsers: { [int64]: (v) => `a-${v as string}`, [int64 + 1]: (v) => `b-${v as string}` },
+          },
+        });
+        await db.exec('CREATE TABLE t (big BIGINT)');
+        try {
+          await db.query('SELECT big FROM t');
+          return 'no error';
+        } catch (err) {
+          return (err as Error).message;
+        } finally {
+          await db.close();
+        }
+      },
+      [SQL_INT64],
+    );
+
+    expect(message).toContain('two entries for SQL type 580');
+  });
+
+  test('runs a parser once when two columns share a name', async ({ page }) => {
+    const result = await page.evaluate(
+      async ([long]) => {
+        // `SELECT a.ID, b.ID FROM a JOIN b` — two fields, one row property.
+        // Both builders keep the last column, so only its converter may run;
+        // running both fed the second the first's output.
+        window.__stub.queryResult = {
+          columns: [
+            { name: 'ID', type: long, subType: 0, scale: 0, length: 4, nullable: true },
+            { name: 'ID', type: long, subType: 0, scale: 0, length: 4, nullable: true },
+          ],
+          rows: [[1, 2]],
+        };
+
+        const db = new window.FB.FirebirdBrowser('parser-dupe-col', {
+          autoPersist: false,
+          types: { parsers: { [long]: (v) => ({ wrapped: v }) } },
+        });
+        await db.exec('CREATE TABLE t (id INTEGER)');
+        const rows = (await db.query('SELECT a.id, b.id FROM a JOIN b')).rows;
+        await db.close();
+
+        return rows[0];
+      },
+      [SQL_LONG],
+    );
+
+    // Wrapped once, and around the value the row actually holds — the second
+    // column's — rather than {wrapped: {wrapped: 1}}.
+    expect(result).toEqual({ ID: { wrapped: 2 } });
+  });
+
+  test('names the column when a parser throws', async ({ page }) => {
+    const message = await page.evaluate(
+      async ([timestamp]) => {
+        window.__stub.queryResult = {
+          columns: [
+            { name: 'TS', type: timestamp, subType: 0, scale: 0, length: 8, nullable: true },
+          ],
+          rows: [['not a timestamp']],
+        };
+
+        const db = new window.FB.FirebirdBrowser('parser-throws', {
+          autoPersist: false,
+          types: {
+            parsers: {
+              [timestamp]: (v) => {
+                throw new RangeError(`cannot parse ${v as string}`);
+              },
+            },
+          },
+        });
+        await db.exec('CREATE TABLE t (ts TIMESTAMP)');
+        try {
+          await db.query('SELECT ts FROM t');
+          return 'no error';
+        } catch (err) {
+          return (err as Error).message;
+        } finally {
+          await db.close();
+        }
+      },
+      [SQL_TIMESTAMP],
+    );
+
+    // Unwrapped this was a bare RangeError naming neither the column nor the
+    // value, on a query whose rows are already gone.
+    expect(message).toContain('parser for column TS (type 510) failed');
+    expect(message).toContain('"not a timestamp"');
+    expect(message).toContain('cannot parse');
   });
 
   test('a serializer renders a value the built-in encoder would reject', async ({

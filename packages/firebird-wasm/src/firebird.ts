@@ -84,28 +84,12 @@ export class FirebirdLite {
    * values are bound rather than interpolated.
    */
   async exec(sql: string | SqlFragment, params: QueryParams = []): Promise<void> {
-    await this.ensureReady();
-    const statement = toStatement(sql, params);
-    const attachment = this.attachment!;
-    const transaction = await attachment.startTransaction();
-    try {
-      if (statement.params.length > 0) {
-        // `execute` binds nothing, so a parameterised statement has to be
-        // prepared first — the same split FirebirdTransaction.exec makes.
-        const stmt = await attachment.prepare(transaction, statement.sql);
-        try {
-          await stmt.execute(transaction, statement.params);
-        } finally {
-          await stmt.dispose().catch(() => undefined);
-        }
-      } else {
-        await attachment.execute(transaction, statement.sql);
-      }
-      await transaction.commit();
-    } catch (err) {
-      await transaction.rollback().catch(() => undefined);
-      throw err;
-    }
+    // Delegated rather than reimplemented: "parameters present → prepare,
+    // execute, dispose; otherwise execute directly" is a rule that belongs in
+    // one place, and `transaction()` already wraps it in the commit-or-roll-
+    // back this needs. Two copies would drift the first time either grows a
+    // case.
+    await this.transaction((tx) => tx.exec(sql, params));
   }
 
   /**
@@ -128,6 +112,14 @@ export class FirebirdLite {
     params?: QueryParams,
     options?: TransactionOptions,
   ): Promise<QueryResult<T>>;
+  // Both shapes at once, so a caller holding a `string | SqlFragment` — one
+  // built conditionally — can call this without casting. Last, so the two
+  // specific overloads still win where they apply.
+  async query<T extends Row = Row>(
+    sql: string | SqlFragment,
+    params?: QueryParams,
+    options?: TransactionOptions,
+  ): Promise<QueryResult<T>>;
   async query<T extends Row = Row>(
     sql: string | SqlFragment,
     paramsOrOptions: QueryParams | TransactionOptions = [],
@@ -142,27 +134,39 @@ export class FirebirdLite {
 
     try {
       const stmt = await attachment.prepare(transaction, statement.sql);
-      const columnLabels = await stmt.columnLabels;
-      const fields: FieldInfo[] = columnLabels.map((label) => ({
-        name: label.toUpperCase(),
-      }));
 
       let rows: T[];
-      if (stmt.hasResultSet) {
-        const resultSet = await stmt.executeQuery(transaction, statement.params);
-        const rawRows = await resultSet.fetch();
-        await resultSet.close();
-        rows = rawRows.map((cols) =>
-          Object.fromEntries(fields.map((f, i) => [f.name, cols[i]])),
-        ) as T[];
-      } else {
-        await stmt.execute(transaction, statement.params);
-        rows = [];
+      let fields: FieldInfo[];
+      // Disposed in `finally`, not after the fetch: a statement that throws on
+      // execute — a lock conflict, an overflow, a wrong parameter count — would
+      // otherwise leak its handle, and the retry loop such failures are usually
+      // wrapped in leaks one per attempt until the attachment refuses more.
+      try {
+        const columnLabels = await stmt.columnLabels;
+        fields = columnLabels.map((label) => ({ name: label.toUpperCase() }));
+
+        if (stmt.hasResultSet) {
+          const resultSet = await stmt.executeQuery(transaction, statement.params);
+          // Same reasoning one level down: a failing fetch must still close.
+          try {
+            const rawRows = await resultSet.fetch();
+            rows = rawRows.map((cols) =>
+              Object.fromEntries(fields.map((f, i) => [f.name, cols[i]])),
+            ) as T[];
+          } finally {
+            await resultSet.close().catch(() => undefined);
+          }
+        } else {
+          await stmt.execute(transaction, statement.params);
+          rows = [];
+        }
+      } finally {
+        await stmt.dispose().catch(() => undefined);
       }
 
-      await stmt.dispose();
+      // After the statement is disposed, as before — the commit is the last
+      // thing that happens on the success path.
       await transaction.commit();
-
       return { rows, fields };
     } catch (err) {
       await transaction.rollback().catch(() => undefined);
@@ -291,21 +295,31 @@ export class FirebirdTransaction {
     const statement = toStatement(sql, params);
 
     const stmt = await this.attachment.prepare(this.transaction, statement.sql);
-    const columnLabels = await stmt.columnLabels;
-    const fields: FieldInfo[] = columnLabels.map((label) => ({
-      name: label.toUpperCase(),
-    }));
+    // Same leak as FirebirdLite.query had: a statement or result set that
+    // throws must still be released. More so here, because a transaction
+    // callback that catches its own errors goes on using the same attachment.
+    try {
+      const columnLabels = await stmt.columnLabels;
+      const fields: FieldInfo[] = columnLabels.map((label) => ({
+        name: label.toUpperCase(),
+      }));
 
-    const resultSet = await stmt.executeQuery(this.transaction, statement.params);
-    const rawRows = await resultSet.fetch();
-    await resultSet.close();
-    await stmt.dispose();
+      const resultSet = await stmt.executeQuery(this.transaction, statement.params);
+      let rawRows: unknown[][];
+      try {
+        rawRows = await resultSet.fetch();
+      } finally {
+        await resultSet.close().catch(() => undefined);
+      }
 
-    const rows = rawRows.map((cols) =>
-      Object.fromEntries(fields.map((f, i) => [f.name, cols[i]])),
-    ) as T[];
+      const rows = rawRows.map((cols) =>
+        Object.fromEntries(fields.map((f, i) => [f.name, cols[i]])),
+      ) as T[];
 
-    return { rows, fields };
+      return { rows, fields };
+    } finally {
+      await stmt.dispose().catch(() => undefined);
+    }
   }
 }
 

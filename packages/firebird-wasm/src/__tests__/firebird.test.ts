@@ -3,6 +3,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { FirebirdLite } from '../firebird';
 import { sql } from '../sql-tag';
+import type { SqlFragment } from '../sql-tag';
 
 // Skip tests if Firebird client library is not available or server is not running
 const hasFirebirdLib = (() => {
@@ -290,6 +291,32 @@ describeIfFirebird('FirebirdLite', () => {
         sql`SELECT name FROM tagged WHERE id = ${3}`,
       );
       expect(result.rows).toEqual([{ NAME: 'renamed' }]);
+    });
+
+    it('accepts a statement whose type is string-or-fragment', async () => {
+      // Compiling is half the test: with only the two specific overloads this
+      // is TS2769, so a caller building a statement conditionally had to cast.
+      const useTag = true as boolean;
+      const statement: string | SqlFragment = useTag
+        ? sql`SELECT id FROM tagged WHERE id = ${1}`
+        : 'SELECT id FROM tagged WHERE id = 1';
+
+      const result = await db.query<{ ID: number }>(statement);
+      expect(result.rows).toEqual([{ ID: 1 }]);
+    });
+
+    it('releases the statement when the query fails', async () => {
+      // A statement that throws on execute used to leak its handle, so a
+      // retry loop — the usual response to a lock conflict — leaked one per
+      // attempt. Twenty failures now leave the attachment perfectly usable.
+      for (let i = 0; i < 20; i++) {
+        await expect(db.query('SELECT * FROM no_such_table')).rejects.toThrow();
+      }
+
+      const after = await db.query<{ ID: number }>(
+        sql`SELECT id FROM tagged WHERE id = ${1}`,
+      );
+      expect(after.rows).toEqual([{ ID: 1 }]);
     });
 
     it('passes transaction options in the slot parameters would have used', async () => {

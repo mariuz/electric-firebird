@@ -119,6 +119,26 @@ describe('sql.join', () => {
   it('refuses an empty list rather than emitting IN ()', () => {
     expect(() => sql.join([])).toThrow(/at least one value/);
   });
+
+  it('names sql.join, not the enclosing template, for a nested array', () => {
+    // The remedy for an array in a template is "use sql.join" — useless advice
+    // when sql.join is what failed, and the index would name a hole in the
+    // enclosing template rather than the element that is wrong.
+    expect(() => sql.join([1, [2, 3]])).toThrow(
+      /Element 1 passed to sql\.join\(\).*does not flatten/s,
+    );
+  });
+
+  it('splices a parameter list too large to spread', () => {
+    // `params.push(...value.params)` made every parameter an argument, and
+    // past roughly 100k V8 throws "Maximum call stack size exceeded" from
+    // inside the tag — naming neither the list nor the limit.
+    const ids = Array.from({ length: 200_000 }, (_, i) => i);
+    const fragment = sql`SELECT * FROM t WHERE id IN (${sql.join(ids)})`;
+
+    expect(fragment.params).toHaveLength(200_000);
+    expect(fragment.params[199_999]).toBe(199_999);
+  });
 });
 
 describe('sql.identifier', () => {
@@ -214,6 +234,31 @@ describe('toStatement', () => {
       /already carries its parameters/,
     );
   });
+
+  // Before this check the object fell through as the statement text and
+  // reached the engine as "[object Object]", a syntax error naming a token
+  // rather than the argument — with the fragment's values silently dropped.
+  it('refuses a { sql, params } look-alike rather than sending it as text', () => {
+    const lookAlike = { sql: 'SELECT * FROM t WHERE id = ?', params: [1] };
+
+    expect(() => toStatement(lookAlike as never)).toThrow(
+      /not a fragment|Expected a SQL string/,
+    );
+  });
+
+  it('refuses a fragment that lost its brand crossing a clone boundary', () => {
+    // The brand is a symbol, which neither structuredClone nor JSON carries —
+    // so a fragment built in a Worker arrives on the main thread like this.
+    const cloned = JSON.parse(JSON.stringify(sql`SELECT id FROM t WHERE id = ${1}`));
+
+    expect(isSqlFragment(cloned)).toBe(false);
+    expect(() => toStatement(cloned)).toThrow(/structuredClone or JSON/);
+  });
+
+  it('refuses other non-statements, naming what it got', () => {
+    expect(() => toStatement(42 as never)).toThrow(/got a number/);
+    expect(() => toStatement(null as never)).toThrow(/got null/);
+  });
 });
 
 describe('resolveQueryCall', () => {
@@ -240,5 +285,18 @@ describe('resolveQueryCall', () => {
 
     expect(statement).toEqual({ sql: 'SELECT ?', params: [1] });
     expect(options).toEqual({});
+  });
+
+  // The options slot is only free when the statement is a fragment. With a
+  // string, a non-array here used to be silently taken for options: the
+  // statement then ran with no parameters at all, and the engine complained
+  // about a placeholder count, naming nothing the caller wrote.
+  it('refuses a non-array second argument after a string statement', () => {
+    expect(() => resolveQueryCall('SELECT * FROM t WHERE id = ?', 5 as never)).toThrow(
+      /Expected an array of parameters, got a number/,
+    );
+    expect(() =>
+      resolveQueryCall('SELECT * FROM t WHERE id = ?', { readOnly: true }),
+    ).toThrow(/Expected an array of parameters/);
   });
 });
