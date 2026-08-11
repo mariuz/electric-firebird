@@ -815,31 +815,39 @@ be built:
 
 ### M2 — A correct API surface
 
-- [ ] `fb_execute_params` / `fb_query_params`: message-buffer binding via
-      `IMessageMetadata`/`IMetadataBuilder`, then accept `params` instead of
-      throwing.
+*Complete except the typed wire format.*
+
+- [x] `fb_execute_params` / `fb_query_params`. Bound through the statement's
+      *declared* metadata plus `IUtil::convert`, not `IMetadataBuilder` — the
+      builder approach failed with a bare "internal error" and was abandoned.
 - [x] Thread `txHandle` through `fb_execute`/`fb_query`.
-- [ ] Add an explicit `tx.rollback()`.
-- [ ] Replace the JSON ABI with a typed encoding; carry Firebird type codes in
-      `FieldInfo`; map `BIGINT`→`BigInt`, `TIMESTAMP`→`Date`, `BLOB`→
-      `Uint8Array`.  (The JSON path already decodes these correctly but has to
-      flatten them to strings — see the type table in `fb_wasm_api.cpp`.)
-- [ ] `exec()` accepts multi-statement scripts and returns one result per
-      statement.
-- [ ] Populate `affectedRows` on the browser path
-      (`IStatement::getAffectedRecords`).
+- [x] Add an explicit `tx.rollback()`. Browser in `4380ce7`, Node in `b6accb4`.
+- [ ] Replace the JSON ABI with a typed encoding. **Half done.** `FieldInfo`
+      carries `type`, `typeName`, `subType`, `scale`, `length` and `nullable`,
+      so a caller can tell an exact `NUMERIC` from a `VARCHAR` of digits. The
+      wire format is still JSON and exact numerics still travel as decimal
+      strings rather than `BigInt`; `TIMESTAMP` is ISO-8601 rather than `Date`
+      and binary `BLOB` is base64 rather than `Uint8Array`.
+- [x] `exec()` accepts multi-statement scripts and returns one result per
+      statement. Splitting respects strings, quoted identifiers, comments and
+      `SET TERM`.
+- [x] Populate `affectedRows` on the browser path.
 
 ### M3 — Persistence you can trust
 
-- [ ] Dirty-page tracking: persist only changed pages instead of `clear()` +
-      full rewrite.
-- [ ] Atomic swap (write-then-flip metadata) so an interrupted persist cannot
-      truncate the database.
-- [ ] `db.dump()` / `loadDataDir`-style constructor option on `FirebirdBrowser`,
-      wrapping the VFS export/import that already exists.
+*Complete except two conveniences.*
+
+- [x] Dirty-page tracking: only pages whose contents changed are written.
+- [x] An interrupted persist cannot corrupt the database. Achieved with a
+      single IndexedDB transaction rather than the write-then-flip scheme
+      sketched here — IndexedDB is already all-or-nothing, so the flip was
+      solving a problem the store does not have.
+- [ ] `db.dump()` / `loadDataDir`-style option on `FirebirdBrowser`. The VFS
+      has `exportDatabase()` and `importDatabase()`; what is missing is the
+      convenience of reaching them from the database object.
 - [ ] `memory://`-equivalent ephemeral mode (skip IndexedDB entirely).
-- [ ] Auto-persist policy (debounced, on `visibilitychange`) instead of asking
-      users to wire `beforeunload` themselves.
+- [x] Auto-persist policy: debounced after writes, plus a best-effort flush on
+      `visibilitychange` and `pagehide`. On by default.
 
 ### M4 — Concurrency, distribution, reactivity
 
