@@ -537,6 +537,11 @@ export class SharedEngineTransport implements EngineTransport {
     return this.call<void>('unlink', path);
   }
 
+  mountOpfs(dbName: string): Promise<string> {
+    // The mount happens on the far side; only the resulting path comes back.
+    return this.call<string>('mountOpfs', dbName);
+  }
+
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;

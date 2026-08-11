@@ -185,6 +185,9 @@ export interface FirebirdBrowserOptions {
 /** Prefix marking a database that is never stored.  Matches PGlite's. */
 const MEMORY_PREFIX = 'memory://';
 
+/** Prefix marking a database whose pages live in OPFS rather than IndexedDB. */
+const OPFS_PREFIX = 'opfs://';
+
 /**
  * Distinguishes ephemeral databases opened in one page.
  *
@@ -222,6 +225,10 @@ export class FirebirdBrowser {
   private readonly dbName: string;
   /** True for a `memory://` database: never stored, discarded on close. */
   private readonly ephemeral: boolean;
+  /** True for an `opfs://` database: the engine writes its pages straight to a file. */
+  private readonly opfs: boolean;
+  /** Path the engine opens.  Set by the OPFS mount, which chooses it. */
+  private opfsPath: string | null = null;
   /**
    * Name of the file inside the engine's own filesystem.
    *
@@ -263,7 +270,12 @@ export class FirebirdBrowser {
   constructor(dbName: string, options: FirebirdBrowserOptions = {}) {
     this.dbName = dbName;
     this.ephemeral = dbName.startsWith(MEMORY_PREFIX);
-    this.fileName = this.ephemeral ? ephemeralFileName(dbName) : dbName;
+    this.opfs = dbName.startsWith(OPFS_PREFIX);
+    this.fileName = this.ephemeral
+      ? ephemeralFileName(dbName)
+      : this.opfs
+        ? dbName.slice(OPFS_PREFIX.length)
+        : dbName;
     this.options = options;
     this.vfs = new IndexedDBVFS(options.vfs);
 
@@ -271,7 +283,11 @@ export class FirebirdBrowser {
     // there is nothing for another tab to overwrite and nothing to lock
     // against. Taking the lock anyway would make two tabs queue for a database
     // neither of them shares.
-    this.multiTab = this.ephemeral ? 'allow-unsafe' : options.multiTab ?? 'exclusive';
+    // OPFS holds the file exclusively itself — a second sync access handle on
+    // the same file is refused by the platform — so the Web Lock would be a
+    // second, weaker copy of a guarantee already made.
+    this.multiTab =
+      this.ephemeral || this.opfs ? 'allow-unsafe' : options.multiTab ?? 'exclusive';
     this.lockTimeoutMs = options.lockTimeoutMs ?? 5_000;
 
     this.autoPersist = options.autoPersist ?? true;
@@ -333,7 +349,7 @@ export class FirebirdBrowser {
 
   /** Path of the database inside Emscripten's filesystem. */
   private get dbPath(): string {
-    return `/data/${this.fileName}.fdb`;
+    return this.opfsPath ?? `/data/${this.fileName}.fdb`;
   }
 
   /**
@@ -651,7 +667,10 @@ export class FirebirdBrowser {
     }
 
     try {
-      if (this.ephemeral) {
+      if (this.opfs) {
+        // The mount owns the sync access handle and releases it with the
+        // module; nothing here writes, because nothing was ever buffered.
+      } else if (this.ephemeral) {
         // Reclaim it: the engine's filesystem outlives this instance — the
         // module is cached for the whole page — so a long-lived tab that
         // opened many scratch databases would hold every one of them.
@@ -688,7 +707,10 @@ export class FirebirdBrowser {
     // Ephemeral first: there is nowhere to persist to, so persist() is a
     // no-op and markDirty() schedules nothing. A caller who writes code that
     // works for both kinds should not have to branch.
-    if (this.ephemeral) return false;
+    //
+    // OPFS for the opposite reason: the engine's writes already went to the
+    // file, so there is nothing left to copy and a persist would be pure cost.
+    if (this.ephemeral || this.opfs) return false;
     return this.shared === null || this.shared.isLeader;
   }
 
@@ -795,10 +817,14 @@ export class FirebirdBrowser {
     // it, and a second request from the same tab would queue behind itself.
 
     await this.engine.init();
-    // An ephemeral database never touches IndexedDB, so the store is not
-    // opened at all — opening it would create an empty one on disk for a
-    // database whose whole point is leaving nothing behind.
-    if (!this.ephemeral) {
+    if (this.opfs) {
+      // The mount both opens the file and decides where it lives, so the path
+      // comes back rather than being assumed on this side.
+      this.opfsPath = await this.engine.mountOpfs(this.fileName);
+    } else if (!this.ephemeral) {
+      // An ephemeral database never touches IndexedDB, so the store is not
+      // opened at all — opening it would create an empty one on disk for a
+      // database whose whole point is leaving nothing behind.
       await this.vfs.open(this.dbName);
     }
     await this.openDatabase();
@@ -839,6 +865,9 @@ export class FirebirdBrowser {
       await this.engine.writeFile(this.dbPath, seed);
     }
 
+    // Works unchanged for OPFS: that filesystem reports a file as existing
+    // only once it has bytes, so a database that has never been written is
+    // absent here rather than present and empty.
     this.dbHandle = (await this.engine.exists(this.dbPath))
       ? await this.engine.attachDatabase(this.dbPath)
       : await this.engine.createDatabase(this.dbPath);

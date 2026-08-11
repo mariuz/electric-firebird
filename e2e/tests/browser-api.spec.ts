@@ -715,6 +715,30 @@ test.describe('sql`…` tag', () => {
 // Custom parsers and serializers
 // ===========================================================================
 
+test.describe('opfs:// databases', () => {
+  test('refuses to start without a Worker, and says why', async ({ page }) => {
+    const message = await page.evaluate(async () => {
+      // No `worker`, so the engine runs on this thread — where
+      // createSyncAccessHandle does not exist. Failing here is far better than
+      // failing inside a filesystem callback with no way back to the cause.
+      const db = new window.FB.FirebirdBrowser('opfs://no-worker', {
+        autoPersist: false,
+      });
+      try {
+        await db.exec('CREATE TABLE t (id INTEGER)');
+        return 'no error';
+      } catch (err) {
+        return (err as Error).message;
+      } finally {
+        await db.close().catch(() => undefined);
+      }
+    });
+
+    expect(message).toContain('OPFS storage needs a Worker');
+    expect(message).toContain('memory://');
+  });
+});
+
 test.describe('dumpDataDir / loadDataDir', () => {
   test('dumps the live database, not the stored copy', async ({ page }) => {
     const result = await page.evaluate(async () => {

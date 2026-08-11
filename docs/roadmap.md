@@ -547,7 +547,7 @@ Legend: ✅ shipped · 🟡 partial · ❌ missing · n/a not applicable
 | In-memory / ephemeral database | ✅ `memory://` | ✅ | `new FirebirdBrowser('memory://')` — no IndexedDB store is opened, no lock is taken, `persist()` is a no-op, and the file is discarded on `close()`. The engine already ran from memory; what this removes is the durability copy |
 | Node filesystem | ✅ `file://` | ✅ | Via the native driver, not WASM |
 | IndexedDB | ✅ `idb://` | ✅ | One transaction per persist, only changed pages written |
-| OPFS | — | ❌ | The natural fit for Firebird's page I/O; see M4 |
+| OPFS | — | ✅ | `opfs://name`. The engine's own reads and writes land in an OPFS file through a custom Emscripten filesystem backed by sync access handles, so there is no image copy and no persist step at all |
 | Incremental / dirty-page writes | ✅ | ✅ | Pages compared against what is stored |
 | Durability tuning | ✅ `relaxedDurability` | ✅ | `autoPersist` + `autoPersistDebounceMs` |
 | `dumpDataDir()` on the DB object | ✅ | ✅ | Returns the live image as a `Uint8Array` — read from the engine's filesystem, so unpersisted writes are included and a `memory://` database can be dumped at all |
@@ -874,8 +874,15 @@ be built:
       `SharedWorker` holding the engine because it reuses the lock already
       built and works anywhere Web Locks do, without depending on a
       SharedWorker being able to spawn the nested Workers pthreads needs.
-- [ ] OPFS backend with sync access handles — a much better match for
-      page-oriented I/O than IndexedDB.
+- [x] OPFS backend with sync access handles. Not a VFS beside the engine but a
+      filesystem *under* it: Firebird's `read`/`write` reach JavaScript through
+      Emscripten's FS, which was measured before any of it was designed — 1,678
+      writes and 14.1 MB for a create-and-insert. Two things the sketch did not
+      anticipate: the WASM heap is a `SharedArrayBuffer` under pthreads and OPFS
+      rejects views onto one, so every I/O copies through a scratch buffer; and
+      a sync access handle creates its file on open, so "does this database
+      exist" has to mean *has bytes* or the engine's `O_CREAT | O_EXCL` fails
+      with EEXIST on a database that was never written.
 - [x] Publish the prebuilt artifact to npm. Shipped in `firebird-wasm@0.1.0`.
 - [ ] A size budget and a default `locateFile` for CDN use; the 9 MB artifact
       is currently unbudgeted and every consumer wires `locateFile` by hand.

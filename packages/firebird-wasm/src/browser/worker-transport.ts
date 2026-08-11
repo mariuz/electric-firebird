@@ -221,6 +221,11 @@ export class WorkerTransport implements EngineTransport {
     return this.call<void>('unlink', path);
   }
 
+  mountOpfs(dbName: string): Promise<string> {
+    // The mount happens on the far side; only the resulting path comes back.
+    return this.call<string>('mountOpfs', dbName);
+  }
+
   async dispose(): Promise<void> {
     this.worker.removeEventListener('message', this.onMessage);
     this.worker.removeEventListener('error', this.onError);

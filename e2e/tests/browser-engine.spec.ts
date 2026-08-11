@@ -478,6 +478,70 @@ test.describe('FirebirdBrowser against the real engine', () => {
     expect(result.numUnchanged).toBe('1234.5678');
   });
 
+  test('stores an opfs:// database in a real OPFS file', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const opfsSize = async (name: string) => {
+        const root = await navigator.storage.getDirectory();
+        try {
+          const dir = await root.getDirectoryHandle('firebird');
+          const handle = await dir.getFileHandle(`${name}.fdb`);
+          return (await handle.getFile()).size;
+        } catch {
+          return -1; // no such file
+        }
+      };
+
+      // Explicit, not incidental: Playwright starts from a fresh profile, but
+      // a persistent context (--headed with a user data dir) would carry the
+      // previous run's file and make "created it" untestable.
+      const root = await navigator.storage.getDirectory();
+      const dir = await root.getDirectoryHandle('firebird', { create: true });
+      await dir.removeEntry('durable.fdb').catch(() => undefined);
+
+      const before = await opfsSize('durable');
+
+      const db = new window.FB.FirebirdBrowser('opfs://durable', {
+        worker: new Worker('/firebird-engine-worker.js'),
+      });
+      await db.exec('CREATE TABLE kept (id INTEGER, name VARCHAR(20))');
+      await db.query('INSERT INTO kept VALUES (?, ?)', [1, 'on disk']);
+      const rows = (await db.query('SELECT id, name FROM kept')).rows;
+
+      // No persist() call anywhere: the engine's own writes went to the file.
+      await db.close();
+
+      const after = await opfsSize('durable');
+      return { rows, before, after };
+    });
+
+    expect(result.rows).toEqual([{ ID: 1, NAME: 'on disk' }]);
+    // Nothing there beforehand, a real database file afterwards.
+    expect(result.before).toBe(-1);
+    expect(result.after).toBeGreaterThan(0);
+  });
+
+  test('reopens an opfs:// database with its data intact', async ({ page }) => {
+    const rows = await page.evaluate(async () => {
+      const first = new window.FB.FirebirdBrowser('opfs://reopened', {
+        worker: new Worker('/firebird-engine-worker.js'),
+      });
+      await first.exec('CREATE TABLE survives (id INTEGER)');
+      await first.exec('INSERT INTO survives VALUES (42)');
+      await first.close();
+
+      // A second connection, a second worker, a second engine — everything
+      // in between is gone, so anything read back came from the file.
+      const second = new window.FB.FirebirdBrowser('opfs://reopened', {
+        worker: new Worker('/firebird-engine-worker.js'),
+      });
+      const result = (await second.query('SELECT id FROM survives')).rows;
+      await second.close();
+      return result;
+    });
+
+    expect(rows).toEqual([{ ID: 42 }]);
+  });
+
   test('round-trips a database through dumpDataDir and loadDataDir', async ({
     page,
   }) => {

@@ -34,6 +34,14 @@ import { isolationCode } from './isolation';
 import { encodeParams } from './params';
 import { firebirdTypeName } from './field-types';
 import { statementKind } from '../statement-types';
+import {
+  mountOpfs as mountOpfsFilesystem,
+  openDatabaseHandle,
+  opfsAvailable,
+} from './opfs-fs';
+
+/** Where an OPFS-backed database is mounted inside the engine's filesystem. */
+export const OPFS_MOUNT = '/opfs';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -99,6 +107,15 @@ export interface EngineTransport {
   writeFile(path: string, data: Uint8Array): Promise<void>;
   /** Remove a file.  Used to discard an ephemeral database on close. */
   unlink(path: string): Promise<void>;
+  /**
+   * Mount an OPFS-backed filesystem holding one database, and return the path
+   * the engine should open.
+   *
+   * Runs wherever the engine runs: the sync access handle is opened on that
+   * side and never crosses a boundary, because it is neither cloneable nor
+   * transferable.
+   */
+  mountOpfs(dbName: string): Promise<string>;
 
   /** Release anything the transport owns.  Does not detach databases. */
   dispose(): Promise<void>;
@@ -644,6 +661,22 @@ export class DirectTransport implements EngineTransport {
     if (this.module.FS.analyzePath(path).exists) {
       this.module.FS.unlink(path);
     }
+  }
+
+  async mountOpfs(dbName: string): Promise<string> {
+    if (!opfsAvailable()) {
+      throw new Error(
+        'OPFS storage needs a Worker: FileSystemSyncAccessHandle is not ' +
+          'available on a main thread, and Node has no OPFS at all. Pass a ' +
+          '`worker` to FirebirdBrowser, or use an IndexedDB or memory:// database',
+      );
+    }
+
+    // Opened before the mount, because a filesystem callback cannot await.
+    const handle = await openDatabaseHandle(dbName);
+    const fileName = `${dbName}.fdb`;
+    mountOpfsFilesystem(this.module, OPFS_MOUNT, new Map([[fileName, handle]]));
+    return `${OPFS_MOUNT}/${fileName}`;
   }
 
   async dispose(): Promise<void> {

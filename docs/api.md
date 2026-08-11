@@ -413,6 +413,37 @@ const inspect = new FirebirdBrowser('memory://', { loadDataDir: bytes });
 An empty `Uint8Array` throws rather than writing an empty file the engine would
 later reject as corrupt.
 
+#### OPFS storage — `opfs://`
+
+A name beginning with `opfs://` puts the database in the Origin Private File
+System, and the engine writes to it directly:
+
+```ts
+const db = new FirebirdBrowser('opfs://mydb', {
+  worker: new Worker('/firebird-engine-worker.js'),
+});
+```
+
+This is a different shape from the IndexedDB path rather than a different
+store.  There, the database lives in memory and the whole image is copied out
+on each persist.  Here, Firebird's own page reads and writes go through a
+custom Emscripten filesystem backed by `FileSystemSyncAccessHandle`, so:
+
+- **`persist()` is a no-op** — the bytes were written when the engine wrote
+  them.  `autoPersist` schedules nothing.
+- **The database is not bounded by memory**, because it is never held as one
+  image.
+- **No cross-tab Web Lock is taken.**  OPFS refuses a second sync access handle
+  on the same file itself, so the platform enforces what the lock approximated.
+
+**A Worker is required.**  `FileSystemSyncAccessHandle` exists only in a
+Worker, and a filesystem callback cannot await, so there is no main-thread
+fallback.  Without one the constructor's first operation throws and names the
+reason — a browser has to run the engine in a Worker anyway.
+
+Files live under `firebird/<name>.fdb` in the origin's private directory.  They
+are invisible to the user's filesystem and cleared when site data is cleared.
+
 #### Ephemeral databases — `memory://`
 
 A name beginning with `memory://` opens a database that is never stored:

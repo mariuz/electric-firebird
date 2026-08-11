@@ -25,7 +25,8 @@ export type EngineOp =
   | 'exists'
   | 'readFile'
   | 'writeFile'
-  | 'unlink';
+  | 'unlink'
+  | 'mountOpfs';
 
 /** A call from the main thread to the Worker. */
 export interface EngineRequest {

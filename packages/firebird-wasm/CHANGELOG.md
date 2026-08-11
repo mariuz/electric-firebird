@@ -8,6 +8,16 @@ API may still move between minor releases.
 
 ### Added
 
+- **OPFS storage — `opfs://name`.** The engine's own page reads and writes land
+  in an Origin Private File System file, through a custom Emscripten filesystem
+  backed by `FileSystemSyncAccessHandle`. Unlike the IndexedDB path there is no
+  image copy and no persist step: `persist()` is a no-op because the bytes were
+  already written, and the database is not bounded by what fits in memory. Needs
+  a Worker — sync access handles exist nowhere else — and says so plainly if it
+  does not have one. No cross-tab Web Lock either: OPFS refuses a second handle
+  on the same file itself, which is a stronger guarantee than the lock it
+  replaces.
+
 - **`dumpDataDir()` and `loadDataDir`.** `db.dumpDataDir()` returns the
   database as a `Uint8Array`, read from the live engine filesystem rather than
   from IndexedDB — so writes that have not been persisted are included, and a
