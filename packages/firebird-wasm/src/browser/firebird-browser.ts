@@ -29,7 +29,7 @@ import type { EngineHandle, EngineTransport } from './engine-transport';
 import { WorkerTransport } from './worker-transport';
 import { splitStatements } from './sql-script';
 import { hasTransactionOptions } from './isolation';
-import { applyTypes } from './value-types';
+import { applyTypes, applySerializers } from './value-types';
 import type { TypeOptions } from './value-types';
 import { acquireDatabaseLock } from './db-lock';
 import { SharedEngineTransport } from './shared-transport';
@@ -273,6 +273,17 @@ export class FirebirdBrowser {
     return `/data/${this.dbName}.fdb`;
   }
 
+  /**
+   * Run any configured serializers over outgoing parameters.
+   *
+   * Here rather than in the encoder because the encoder may be on the far side
+   * of a Worker, where the serializer functions cannot follow — see
+   * {@link applySerializers}.
+   */
+  private serialize(params: QueryParams): QueryParams {
+    return applySerializers(params, this.options.types?.serializers);
+  }
+
   // ── Public API (mirrors FirebirdLite) ─────────────────────────────────
 
   /**
@@ -314,7 +325,7 @@ export class FirebirdBrowser {
         this.dbHandle,
         0,
         statement.sql,
-        script.params,
+        this.serialize(script.params),
       );
       results.push({ affectedRows });
     }
@@ -369,7 +380,7 @@ export class FirebirdBrowser {
           this.dbHandle,
           0,
           statement.sql,
-          statement.params,
+          this.serialize(statement.params),
         ),
         this.options.types,
       );
@@ -381,7 +392,7 @@ export class FirebirdBrowser {
         this.dbHandle,
         txHandle,
         statement.sql,
-        statement.params,
+        this.serialize(statement.params),
       );
       await this.engine.commit(txHandle);
       return applyTypes(result, this.options.types);
@@ -748,7 +759,7 @@ export class FirebirdBrowserTransaction {
       this.dbHandle,
       this.txHandle,
       statement.sql,
-      statement.params,
+      applySerializers(statement.params, this.types?.serializers),
     );
     return { affectedRows };
   }
@@ -765,7 +776,7 @@ export class FirebirdBrowserTransaction {
         this.dbHandle,
         this.txHandle,
         statement.sql,
-        statement.params,
+        applySerializers(statement.params, this.types?.serializers),
       ),
       this.types,
     );

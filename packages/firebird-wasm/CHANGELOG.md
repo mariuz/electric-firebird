@@ -8,6 +8,20 @@ API may still move between minor releases.
 
 ### Added
 
+- **Custom `parsers` and `serializers`.** `types: { parsers, serializers }` on
+  `FirebirdBrowser` opens both conversion paths to application code. A parser
+  is keyed by Firebird SQL type code and **replaces** the built-in conversion
+  for that type, which is how `dates` gets overridden — useful for `TIMESTAMP`,
+  where the built-in truncates the 100 µs Firebird stores and a parser can keep
+  it. Parsers receive the `FieldInfo`, because a type code alone does not
+  separate `NUMERIC` from `BIGINT` or a text BLOB from a binary one.
+  Serializers are a *list* rather than a map keyed by type: an outgoing
+  parameter has no declared type to key on — every value crosses as text and
+  Firebird converts it — so each serializer inspects the value and declines by
+  returning `undefined`. Neither is called for `null`. Browser backend only;
+  the Node driver reports no column type codes, so there is nothing to key a
+  parser on.
+
 - **The `` sql`…` `` template tag.** Values interpolated into a tagged
   template become `?` parameters rather than text, so a value can never be read
   as SQL. Accepted by `query()` and `exec()` on both backends and inside

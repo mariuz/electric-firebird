@@ -282,6 +282,7 @@ class FirebirdBrowser {
 | `options.locateFile` | `(filename: string) => string` | — | Emscripten `locateFile` callback for resolving WASM artefacts. |
 | `options.vfs.pageSize` | `number` | `8192` | Firebird page size in bytes. Must match the database. |
 | `options.vfs.prefix` | `string` | `'firebird_'` | IndexedDB database name prefix. |
+| `options.types` | [`TypeOptions`](#typeoptions) | `{}` | How values convert on the way in and out. All off by default. |
 
 #### `db.persist()`
 
@@ -291,10 +292,6 @@ before the page unloads to avoid data loss.
 ```ts
 window.addEventListener('beforeunload', () => db.persist());
 ```
-
-> **Note:** `FirebirdBrowser.query()` does not yet support parameterised
-> queries.  Parameters will be supported once the C API wrapper exposes
-> `_fb_query_params`.
 
 ---
 
@@ -468,8 +465,89 @@ interface FirebirdBrowserOptions {
   vfs?: IndexedDBVFSOptions;
   wasmBinary?: ArrayBuffer | string;
   locateFile?: (filename: string) => string;
+  types?: TypeOptions;
+  // …plus worker, transport, autoPersist, multiTab and lockTimeoutMs —
+  // see the class documentation in src/browser/firebird-browser.ts.
 }
 ```
+
+### `TypeOptions`
+
+How values convert on the way out of a result set and on the way into a
+parameter.  Everything defaults to **off**: the values Firebird returns are
+already correct, just awkward, and a database library that changes what `rows`
+contains without being asked is not one to trust.
+
+```ts
+interface TypeOptions {
+  bigint?: boolean                      // BIGINT      → bigint
+  dates?: boolean                       // DATE, TIMESTAMP → Date (UTC, 1 ms)
+  binary?: boolean                      // binary BLOB → Uint8Array
+  parsers?: Record<number, Parser>      // by Firebird SQL type code
+  serializers?: Serializer[]            // by inspecting the value
+}
+
+type Parser = (value: unknown, field: FieldInfo) => unknown
+type Serializer = (value: unknown) => string | null | undefined
+```
+
+Browser backend only.  The Node backend's native driver returns real JavaScript
+types already and does not report column type codes — `FieldInfo` there carries
+only `name` — so there is nothing for a parser to key on.
+
+#### `parsers`
+
+Convert incoming values, keyed by the type code `FieldInfo.type` reports
+(`firebirdTypeName()` names them; the list is in `field-types.ts`).
+
+```ts
+const SQL_TIMESTAMP = 510;
+
+new FirebirdBrowser('mydb', {
+  worker,
+  types: { parsers: { [SQL_TIMESTAMP]: (v) => Temporal.PlainDateTime.from(v as string) } },
+});
+```
+
+A parser **replaces** the built-in conversion for its type rather than running
+alongside it, so this is also how `bigint` or `dates` is overridden — useful
+for `TIMESTAMP`, where `dates` truncates the 100 µs Firebird stores and a
+parser can keep it.
+
+Parsers are **never called for `null`**.  One that had to guard every value
+would be all guard, and the alternative — every parser crashing on the first
+nullable column — is worse.
+
+The type code alone does not always identify a type: `NUMERIC` and `BIGINT`
+share `SQL_INT64` (580) and differ by `scale`; BLOBs differ by `subType`.  Both
+reach the parser on `field`, so a parser registered for a shared code has to
+check — exactly as the built-in conversions do.
+
+#### `serializers`
+
+Convert outgoing parameters.  Each is offered the value and returns `undefined`
+to decline, a string to bind that text, or `null` to bind SQL NULL.
+
+```ts
+new FirebirdBrowser('mydb', {
+  worker,
+  types: { serializers: [(v) => (v instanceof Decimal ? v.toFixed() : undefined)] },
+});
+```
+
+A list rather than a map keyed by type, because **there is no type to key on**:
+parameters carry no declared type on the way out.  Every value crosses as text
+and Firebird converts it to whatever the column actually is, which is what lets
+one path serve integers, dates and strings alike.  So a serializer is chosen by
+looking at the value.
+
+They are consulted **before** the built-in encoder, so they also override how a
+`Date` or a `number` is rendered, and — like parsers — are never called for
+`null` or `undefined`, which are already SQL NULL.
+
+Serializers run before the parameters reach the engine rather than inside the
+encoder, because with a Worker transport the encoder is on the far side of
+`postMessage` and a function cannot be structured-cloned.
 
 ### `IndexedDBVFSOptions`
 

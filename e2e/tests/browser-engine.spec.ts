@@ -477,4 +477,56 @@ test.describe('FirebirdBrowser against the real engine', () => {
     expect(result.binText).toBe('hello bytes');
     expect(result.numUnchanged).toBe('1234.5678');
   });
+
+  test('applies custom parsers and serializers', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      // A value type the built-in encoder has no text form for — the gap a
+      // serializer exists to fill.
+      class Money {
+        constructor(readonly cents: number) {}
+      }
+
+      const SQL_TIMESTAMP = 510;
+
+      const db = new window.FB.FirebirdBrowser('custom-types', {
+        worker: new Worker('/firebird-engine-worker.js'),
+        autoPersist: false,
+        types: {
+          // `dates` would truncate the 100 µs Firebird stores; the parser
+          // keeps the string the engine actually sent, and wins over it.
+          dates: true,
+          parsers: { [SQL_TIMESTAMP]: (v) => ({ exact: v as string }) },
+          serializers: [
+            (v) => (v instanceof Money ? (v.cents / 100).toFixed(2) : undefined),
+          ],
+        },
+      });
+
+      await db.exec(
+        'CREATE TABLE custom (id INTEGER, price NUMERIC(10,2), ts TIMESTAMP)',
+      );
+      // The Money instance is serialized on this side and reaches the engine
+      // as text, which Firebird converts to NUMERIC.
+      await db.query('INSERT INTO custom VALUES (?, ?, ?)', [
+        1,
+        new Money(1999),
+        '2026-08-11 11:22:33.4567',
+      ]);
+
+      const row = (await db.query('SELECT id, price, ts FROM custom')).rows[0] as Record<
+        string,
+        unknown
+      >;
+      await db.close();
+
+      return { id: row['ID'], price: row['PRICE'], ts: row['TS'] };
+    });
+
+    expect(result.id).toBe(1);
+    // Round-tripped through the serializer and Firebird's own conversion.
+    expect(result.price).toBe('19.99');
+    // The parser replaced `dates`, so the fourth fractional digit survived
+    // instead of being truncated into a Date.
+    expect(result.ts).toEqual({ exact: '2026-08-11T11:22:33.4567' });
+  });
 });

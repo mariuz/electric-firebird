@@ -28,7 +28,22 @@ interface StubControl {
   calls: Array<{ fn: string; args: unknown[] }>;
   initRc: number;
   execRc: number;
-  queryResult: { columns: string[]; rows: unknown[][] };
+  queryResult: {
+    // A column may be named only, or described in full when a test needs to
+    // control the type code the library sees.
+    columns: Array<
+      | string
+      | {
+          name: string;
+          type: number;
+          subType: number;
+          scale: number;
+          length: number;
+          nullable: boolean;
+        }
+    >;
+    rows: unknown[][];
+  };
   queryReturnsNull: boolean;
   createFails: boolean;
   startTxFails: boolean;
@@ -686,6 +701,234 @@ test.describe('sql`…` tag', () => {
     });
 
     expect(message).toContain('already carries its parameters');
+  });
+});
+
+// ===========================================================================
+// Custom parsers and serializers
+// ===========================================================================
+
+test.describe('Custom parsers and serializers', () => {
+  // From firebird/impl/sqlda_pub.h, as in src/browser/field-types.ts.
+  const SQL_VARYING = 448;
+  const SQL_TIMESTAMP = 510;
+  const SQL_INT64 = 580;
+
+  /** A described column, so the type code the library sees is the test's. */
+  const column = (name: string, type: number, scale = 0, subType = 0) => ({
+    name,
+    type,
+    subType,
+    scale,
+    length: 32,
+    nullable: true,
+  });
+
+  test('a parser converts values for its type code, and never sees null', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(
+      async ([varying]) => {
+        window.__stub.queryResult = {
+          columns: [
+            { name: 'A', type: varying, subType: 0, scale: 0, length: 32, nullable: true },
+            { name: 'B', type: varying, subType: 0, scale: 0, length: 32, nullable: true },
+          ],
+          rows: [['abc', null]],
+        };
+
+        let calls = 0;
+        const db = new window.FB.FirebirdBrowser('parser-basic', {
+          autoPersist: false,
+          types: {
+            parsers: {
+              [varying]: (value) => {
+                calls += 1;
+                return (value as string).toUpperCase();
+              },
+            },
+          },
+        });
+        await db.exec('CREATE TABLE t (a VARCHAR(32))');
+        const rows = (await db.query('SELECT a, b FROM t')).rows;
+        await db.close();
+
+        return { row: rows[0], calls };
+      },
+      [SQL_VARYING],
+    );
+
+    expect(result.row).toEqual({ A: 'ABC', B: null });
+    // The null column was skipped rather than handed to a parser that would
+    // have thrown on it.
+    expect(result.calls).toBe(1);
+  });
+
+  test('a parser replaces the built-in conversion for its type', async ({ page }) => {
+    const value = await page.evaluate(
+      async ([timestamp]) => {
+        window.__stub.queryResult = {
+          columns: [
+            { name: 'TS', type: timestamp, subType: 0, scale: 0, length: 8, nullable: true },
+          ],
+          rows: [['2026-08-11T11:22:33.4567']],
+        };
+
+        const db = new window.FB.FirebirdBrowser('parser-override', {
+          autoPersist: false,
+          // `dates` would make this a Date; the parser wins, which is how a
+          // caller keeps the full 100 µs precision Date would truncate.
+          types: {
+            dates: true,
+            parsers: { [timestamp]: (v) => `exact:${v as string}` },
+          },
+        });
+        await db.exec('CREATE TABLE t (ts TIMESTAMP)');
+        const rows = (await db.query('SELECT ts FROM t')).rows;
+        await db.close();
+
+        return rows[0]!['TS'];
+      },
+      [SQL_TIMESTAMP],
+    );
+
+    expect(value).toBe('exact:2026-08-11T11:22:33.4567');
+  });
+
+  test('a parser is given the field, which is what separates NUMERIC from BIGINT', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(
+      async ([int64]) => {
+        // Both columns are SQL_INT64; only `scale` says which is which.
+        window.__stub.queryResult = {
+          columns: [
+            { name: 'BIG', type: int64, subType: 0, scale: 0, length: 8, nullable: true },
+            { name: 'NUM', type: int64, subType: 1, scale: -4, length: 8, nullable: true },
+          ],
+          rows: [['9007199254740993', '1234.5678']],
+        };
+
+        const db = new window.FB.FirebirdBrowser('parser-field', {
+          autoPersist: false,
+          types: {
+            parsers: {
+              [int64]: (value, field) =>
+                field.scale === 0
+                  ? { kind: 'bigint', text: value }
+                  : { kind: 'numeric', scale: field.scale },
+            },
+          },
+        });
+        await db.exec('CREATE TABLE t (big BIGINT, num NUMERIC(18,4))');
+        const rows = (await db.query('SELECT big, num FROM t')).rows;
+        await db.close();
+
+        return rows[0];
+      },
+      [SQL_INT64],
+    );
+
+    expect(result).toEqual({
+      BIG: { kind: 'bigint', text: '9007199254740993' },
+      NUM: { kind: 'numeric', scale: -4 },
+    });
+  });
+
+  test('a serializer renders a value the built-in encoder would reject', async ({
+    page,
+  }) => {
+    const params = await page.evaluate(async () => {
+      window.__stub.queryResult = { columns: ['ID'], rows: [] };
+
+      class Money {
+        constructor(readonly cents: number) {}
+      }
+
+      const db = new window.FB.FirebirdBrowser('serializer-basic', {
+        autoPersist: false,
+        types: {
+          serializers: [
+            (v) => (v instanceof Money ? (v.cents / 100).toFixed(2) : undefined),
+          ],
+        },
+      });
+      await db.exec('CREATE TABLE t (id INTEGER, price NUMERIC(10,2))');
+      window.__stub.resetCalls();
+
+      // Without the serializer this throws: a plain object has no SQL text
+      // form, which is exactly the gap serializers fill.
+      await db.query('SELECT id FROM t WHERE price = ?', [new Money(1999)]);
+      await db.close();
+
+      return window.__stub.firstCall('_fb_query_params')?.args[3];
+    });
+
+    expect(params).toEqual(['19.99']);
+  });
+
+  test('serializers run before the built-in encoder and decline by returning undefined', async ({
+    page,
+  }) => {
+    const params = await page.evaluate(async () => {
+      window.__stub.queryResult = { columns: ['ID'], rows: [] };
+
+      const db = new window.FB.FirebirdBrowser('serializer-chain', {
+        autoPersist: false,
+        types: {
+          serializers: [
+            // Declines everything, so the next one gets a look.
+            () => undefined,
+            // Overrides how a Date is rendered, which the built-in encoder
+            // would otherwise do itself.
+            (v) => (v instanceof Date ? 'THE-EPOCH' : undefined),
+          ],
+        },
+      });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      window.__stub.resetCalls();
+
+      await db.query('SELECT id FROM t WHERE a = ? AND b = ? AND c = ?', [
+        new Date(0),
+        42,
+        'plain',
+      ]);
+      await db.close();
+
+      return window.__stub.firstCall('_fb_query_params')?.args[3];
+    });
+
+    // The Date took the override; the others fell through to the built-ins.
+    expect(params).toEqual(['THE-EPOCH', '42', 'plain']);
+  });
+
+  test('serializers apply inside a transaction and skip null', async ({ page }) => {
+    const calls = await page.evaluate(async () => {
+      window.__stub.queryResult = { columns: ['ID'], rows: [] };
+
+      const db = new window.FB.FirebirdBrowser('serializer-tx', {
+        autoPersist: false,
+        types: {
+          serializers: [(v) => (typeof v === 'symbol' ? String(v.description) : undefined)],
+        },
+      });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      window.__stub.resetCalls();
+
+      await db.transaction(async (tx) => {
+        await tx.exec('UPDATE t SET a = ?, b = ?', [Symbol('tagged'), null]);
+        await tx.query('SELECT id FROM t WHERE a = ?', [Symbol('other')]);
+      });
+      await db.close();
+
+      return window.__stub.calls
+        .filter((c) => c.fn.endsWith('_params'))
+        .map((c) => c.args[3]);
+    });
+
+    // null stayed null — a serializer would have had to recognise it
+    // otherwise, and every serializer would carry the same guard.
+    expect(calls).toEqual([['tagged', null], ['other']]);
   });
 });
 

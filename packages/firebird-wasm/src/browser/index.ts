@@ -21,8 +21,8 @@ export { firebirdTypeName } from './field-types';
 
 export { isolationCode, hasTransactionOptions } from './isolation';
 
-export { applyTypes, hasTypeOptions } from './value-types';
-export type { TypeOptions } from './value-types';
+export { applyTypes, applySerializers, hasTypeOptions } from './value-types';
+export type { TypeOptions, Parser, Serializer } from './value-types';
 
 export {
   acquireDatabaseLock,

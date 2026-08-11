@@ -11,7 +11,7 @@
  * contains is not one to trust. See {@link TypeOptions} for what each costs.
  */
 
-import type { FieldInfo, QueryResult, Row } from '../types';
+import type { FieldInfo, QueryParams, QueryResult, Row } from '../types';
 
 // Firebird type codes, from firebird/impl/sqlda_pub.h.
 const SQL_TIMESTAMP = 510;
@@ -21,6 +21,25 @@ const SQL_INT64 = 580;
 
 /** Binary BLOBs are sub-type 0; 1 is text, and the engine already decodes it. */
 const BLOB_SUBTYPE_BINARY = 0;
+
+/**
+ * Convert one incoming column value.
+ *
+ * Called once per cell of a column it is registered for, never for `null` —
+ * see {@link TypeOptions.parsers}. `field` carries the column's `subType`,
+ * `scale` and `length`, which is what separates a `NUMERIC` from a `BIGINT`
+ * or a text BLOB from a binary one when the type code alone does not.
+ */
+export type Parser = (value: unknown, field: FieldInfo) => unknown;
+
+/**
+ * Convert one outgoing parameter to the text Firebird will parse.
+ *
+ * Return `undefined` to decline, leaving the value to the next serializer and
+ * finally to the built-in encoder. Return a string to bind that text, or
+ * `null` to bind SQL NULL.
+ */
+export type Serializer = (value: unknown) => string | null | undefined;
 
 /**
  * Which values to convert.  Everything defaults to off.
@@ -76,11 +95,77 @@ export interface TypeOptions {
    * engine already returns those as strings.
    */
   binary?: boolean;
+
+  /**
+   * Convert incoming values yourself, keyed by Firebird SQL type code.
+   *
+   * ```ts
+   * const SQL_TIMESTAMP = 510;
+   * new FirebirdBrowser('mydb', {
+   *   worker,
+   *   types: { parsers: { [SQL_TIMESTAMP]: (v) => Temporal.PlainDateTime.from(v as string) } },
+   * });
+   * ```
+   *
+   * The code is the one {@link FieldInfo.type} reports — `firebirdTypeName()`
+   * names them, and they are listed in `field-types.ts`.
+   *
+   * A parser **replaces** the built-in conversion for its type rather than
+   * running alongside it, so `parsers` is also how `bigint` or `dates` gets
+   * overridden. Two conversions for one column would otherwise need an order,
+   * and no order is obviously right.
+   *
+   * **Never called for `null`.** A parser that had to guard every value would
+   * be all guard, and the alternative — every parser crashing on the first
+   * nullable column — is worse. A column's nulls stay null.
+   *
+   * The type code alone does not always identify a type: `NUMERIC` and
+   * `BIGINT` share `SQL_INT64` (580) and differ by `scale`, and BLOBs differ
+   * by `subType`. Both reach the parser on `field`, so a parser registered for
+   * a shared code has to check — the built-in conversions do exactly that.
+   */
+  parsers?: Record<number, Parser>;
+
+  /**
+   * Convert outgoing parameters yourself.
+   *
+   * ```ts
+   * new FirebirdBrowser('mydb', {
+   *   worker,
+   *   types: { serializers: [(v) => (v instanceof Decimal ? v.toFixed() : undefined)] },
+   * });
+   * ```
+   *
+   * A list rather than a map keyed by type, because there is no type to key
+   * on: parameters carry no declared type on the way out. Every value crosses
+   * as text and Firebird converts it to whatever the column actually is, which
+   * is what lets one path serve integers, dates and strings alike. So a
+   * serializer is selected by looking at the *value*, and each one declines by
+   * returning `undefined`.
+   *
+   * Consulted **before** the built-in encoder, so these also override how a
+   * `Date` or a `number` is rendered. Like {@link TypeOptions.parsers}, they
+   * are never called for `null` or `undefined`, both of which are already SQL
+   * NULL.
+   */
+  serializers?: Serializer[];
 }
 
-/** True if any conversion is switched on. */
+/**
+ * True if any incoming conversion is switched on.
+ *
+ * Serializers are deliberately not counted: they apply to parameters going
+ * out, and this gates {@link applyTypes}, which only ever looks at rows
+ * coming back.
+ */
 export function hasTypeOptions(options: TypeOptions | undefined): boolean {
-  return Boolean(options && (options.bigint || options.dates || options.binary));
+  return Boolean(
+    options &&
+      (options.bigint ||
+        options.dates ||
+        options.binary ||
+        (options.parsers && Object.keys(options.parsers).length > 0)),
+  );
 }
 
 /** Decode base64 to bytes, in either a browser or Node. */
@@ -106,6 +191,18 @@ function converterFor(
 ): ((value: unknown) => unknown) | null {
   const type = field.type;
   if (type === undefined) return null;
+
+  // The nullable flag is the low bit. The engine reports it clear — Firebird
+  // ORs it in only when filling a legacy XSQLDA — but masking costs one
+  // operation and means a caller who keys a parser off a code they read
+  // somewhere with the bit set still matches.
+  const parser = options.parsers?.[type & ~1];
+  if (parser) {
+    // Wins over the built-ins below, which is what makes `parsers` the way to
+    // override `dates` rather than a second conversion fighting it.
+    return (value) =>
+      value === null || value === undefined ? value : parser(value, field);
+  }
 
   if (options.bigint && type === SQL_INT64 && field.scale === 0) {
     // scale 0 is what separates a BIGINT from a NUMERIC stored in the same
@@ -165,4 +262,37 @@ export function applyTypes<T extends Row>(
   }
 
   return result;
+}
+
+/**
+ * Run {@link TypeOptions.serializers} over a parameter list.
+ *
+ * Returns a new array — the caller's is not theirs to modify — or the original
+ * when there is nothing to do, so the common case allocates nothing.
+ *
+ * This has to happen here rather than in the parameter encoder, for the same
+ * reason {@link applyTypes} does: with a Worker transport the encoder runs on
+ * the other side of `postMessage`, and a function cannot be structured-cloned.
+ * Serializing before the values cross means the Worker only ever receives
+ * strings, which clone fine.
+ */
+export function applySerializers(
+  params: QueryParams,
+  serializers: Serializer[] | undefined,
+): QueryParams {
+  if (!serializers || serializers.length === 0 || params.length === 0) {
+    return params;
+  }
+
+  return params.map((value) => {
+    // null and undefined are already SQL NULL; a serializer that had to
+    // recognise them would be writing the encoder's job out again.
+    if (value === null || value === undefined) return value;
+
+    for (const serialize of serializers) {
+      const serialized = serialize(value);
+      if (serialized !== undefined) return serialized;
+    }
+    return value;
+  });
 }

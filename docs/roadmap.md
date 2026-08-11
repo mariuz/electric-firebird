@@ -526,7 +526,7 @@ Legend: ✅ shipped · 🟡 partial · ❌ missing · n/a not applicable
 | Template-literal `` sql`…` `` tag | ✅ | ✅ | Values bind as `?` parameters; fragments nest. `sql.identifier()` quotes names, `sql.join()` expands `IN` lists, `sql.unsafe()` is the named escape hatch |
 | `exec(sql)` multi-statement script → array of results | ✅ | ✅ | Splitting respects strings, identifiers, comments and `SET TERM` |
 | `rowMode: 'object' \| 'array'` | ✅ | ❌ | Always object mode |
-| Custom `parsers` / `serializers` | ✅ | ❌ | |
+| Custom `parsers` / `serializers` | ✅ | 🟡 | `types: { parsers, serializers }` on the browser backend. Parsers key on the Firebird type code and replace the built-in conversion; serializers are a list, because an outgoing parameter has no declared type to key on. Not on the Node backend, whose driver reports no type codes |
 | `describeQuery()` | ✅ | ❌ | |
 | Typed field metadata (`dataTypeID`) | ✅ | ✅ | `FieldInfo` carries type, typeName, subType, scale, length, nullable |
 | Affected-row count | ✅ | ✅ | `exec()` returns `{ affectedRows }` |
