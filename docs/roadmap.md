@@ -288,15 +288,19 @@ Consequences worth knowing:
 Typed results, multi-statement `exec()`, `affectedRows`, `tx.rollback()` and
 multi-tab safety have all landed since this list was written; what remains:
 
-- Live queries (§M4). Firebird's `POST_EVENT` is the natural fit and is unused.
-- Two tabs cannot *share* a database — the second is refused, not served (§M4).
+- Live queries (§M4). Firebird's `POST_EVENT` is the natural fit; the C API
+  exists on `events-wip` and the engine delivers exactly one event and then
+  stops — see §1 for where it stops.
+- ~~Two tabs cannot *share* a database.~~ Done: `multiTab: 'shared'` elects one
+  tab to run the engine and serves the rest over a `BroadcastChannel`. The
+  default is still `'exclusive'`, so sharing is opt-in.
 - A typed *binary* result encoding, so exact numerics need not travel as
   strings at all.
 - `loadFirebirdWasm()` caches one module process-wide with no way to dispose
   it; `close()` does not release the WASM heap.
-- Only the built-in character sets are compiled in; loadable ones need
-  `dlopen`. Investigated — see below; the size question is answered and the
-  wiring is not.
+- Only the built-in character sets are compiled in, and the UNICODE collations
+  do not work. Both are solved on `icu-collation` (§6, PR #12) and neither is
+  merged.
 - ElectricSQL sync (§M5) — the project's namesake.
 
 ### Persistence is atomic and incremental
@@ -533,8 +537,8 @@ Legend: ✅ shipped · 🟡 partial · ❌ missing · n/a not applicable
 | Capability | PGlite | electric-firebird | Notes |
 |---|---|---|---|
 | `transaction(cb)` with auto commit/rollback | ✅ | ✅ | Statements are bound to the transaction handle; commit/rollback paths tested |
-| Explicit `tx.rollback()` | ✅ | ✅ | Abandons the transaction without throwing |
-| Isolation levels | ✅ | 🟡 | `TransactionOptions` is honoured on Node, ignored in the browser |
+| Explicit `tx.rollback()` | ✅ | ✅ | Abandons the transaction without throwing. Both backends since b6accb4 — the Node one had only `exec` and `query` before that, so this row was optimistic |
+| Isolation levels | ✅ | ✅ | Honoured by both backends since 0.1.1. The browser path builds a TPB through `IXpbBuilder`; `READ_COMMITTED` includes `isc_tpb_rec_version` rather than leaving the choice to the engine |
 
 ### Storage & persistence
 
@@ -622,7 +626,10 @@ be built:
    first thing anyone notices.
 4. **The module cannot be disposed.** `loadFirebirdWasm()` caches one instance
    process-wide and `close()` does not release the heap.
-5. **Only built-in character sets.** Groundwork done:
+5. **Only built-in character sets, and no working UNICODE collations.**
+   Solved on a branch, not merged — see
+   [PR #12](https://github.com/mariuz/electric-firebird/pull/12) and §6.
+   Groundwork on `main`:
 
       `src/intl` **compiles and links cleanly under Emscripten** — all 29 files,
       no errors. Cost, measured rather than estimated: **+616 KB raw, +245 KB
@@ -871,9 +878,16 @@ be built:
 
 ## 5. Test coverage added alongside this review
 
-`src/browser/` was excluded from Jest and had no browser tests.  It now has 30
+`src/browser/` was excluded from Jest and had no browser tests.  It now has 73
 Playwright tests running in real Chromium against real IndexedDB
-(`e2e/tests/browser-api.spec.ts`, run via `npm run test:browser -w e2e`).
+(`npm run test:browser -w e2e`), plus 16 driving the published demo site and 6
+against a real Firebird server.
+
+> Counts as of b6accb4: **73** browser (`playwright.wasm.config.ts`), **16**
+> demo (`playwright.demo.config.ts`), **6** server-backed
+> (`playwright.config.ts`), and **40** Jest across four suites. The narrative
+> below describes the first pass, when there were 30; the coverage has grown
+> with each feature rather than being rewritten each time.
 
 They do not need the WASM artifact: `e2e/fixtures/stub-engine.js` supplies the
 C ABI with a real byte heap and a real in-memory filesystem, so the code under
@@ -904,3 +918,57 @@ correct answers.  That needs a linked WASM build (M1's remaining item), after
 which `e2e/tests/wasm.spec.ts` and
 `packages/firebird-wasm/src/__tests__/wasm-integration.test.ts` stop skipping —
 both now assert real rows rather than shapes a stub could satisfy.
+
+---
+
+## 6. ICU collation data — branch `icu-collation`, PR #12, not merged
+
+`main` ships with `UNICODE`, `UNICODE_CI` and `UNICODE_CI_AI` listed in
+`RDB$COLLATIONS` and failing on use, so there is no case-insensitive
+comparison, no accent-insensitive search, and `ORDER BY` on UTF8 text sorts by
+code point. The branch fixes that. It is recorded here because the two causes
+are the sort of thing that costs a day to rediscover.
+
+### Cause 1 — Emscripten's ICU port ships no data
+
+`-sUSE_ICU=1` links `libicu_stubdata`: ICU's code with none of its data, so
+`ucol_open()` returns `U_FILE_ACCESS_ERROR`. Stub data exists precisely so an
+application can supply its own, so no ICU build is needed —
+`tools/build-icu-data.sh` trims ICU 68.2's own `icudt68l.dat` with `icupkg`
+(already in the port's download cache), and `fb_wasm_icu_data.cpp` hands it to
+`udata_setCommonData()` from `fb_init()`.
+
+### Cause 2 — a cast function pointer that traps only on WebAssembly
+
+With data in place the first collation aborted with `null function or function
+signature mismatch`. `emsymbolizer` on a debug build put it at
+`unicode_util.cpp:1706`, beside `ucolGetContractionsAndExpansions`. Patch 0002
+had already named the reason in a comment: *ICU returns `void` there; the
+struct field declares `int32_t`.*
+
+A function's type in WebAssembly includes its return type and indirect calls
+are type-checked, so calling a `void` function through an `int32_t`-returning
+pointer aborts. Native builds survive the same cast because the caller ignores
+a return register nobody reads. A forwarding wrapper of the declared shape
+fixes it.
+
+### Result
+
+```
+CREATE with COLLATE UNICODE_CI      -> ok
+case-insensitive match              -> [{"NAME":"Ähnlich"}]   ('ähnlich' matched)
+accent-insensitive (UNICODE_CI_AI)  -> [{"V":"café"}]         ('CAFE' matched)
+locale-aware ORDER BY               -> Apfel < Ärzte < Zebra
+```
+
+| Package | raw | gzipped |
+|---|---|---|
+| `coll/root.res` + `coll/ucadata.icu` | 800 KB | 270 KB |
+| Whole collation tree, 170 locales | 3.3 MB | ~1.1 MB |
+
+Open before it merges: which package to ship (the 800 KB one has not been
+retested since the loading mechanism started working, so the minimum is
+unknown), whether either flag defaults on, CI needing `icu-devtools`, the
+unenforced coupling between the data file and the port's ICU `TAG`, and the
+absence of any automated test — the evidence above is from a script run by
+hand.
