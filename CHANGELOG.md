@@ -8,6 +8,20 @@ API may still move between minor releases.
 
 ### Added
 
+- **The `` sql`…` `` template tag.** Values interpolated into a tagged
+  template become `?` parameters rather than text, so a value can never be read
+  as SQL. Accepted by `query()` and `exec()` on both backends and inside
+  transactions, in place of a `(sql, params)` pair. Fragments nest, which is
+  what makes a conditional `WHERE` bearable. What cannot be a parameter gets
+  three named helpers instead of one permissive one: `sql.identifier()` quotes
+  a name (doubling any `"`), `sql.join()` expands a list into placeholders, and
+  `sql.unsafe()` escapes nothing and says so at the call site. Passing a
+  fragment together with parameters throws rather than binding values that
+  could not reach a placeholder.
+
+  `FirebirdLite.exec()` gained a `params` argument along the way — it had none,
+  so a tagged fragment would have had nowhere to bind.
+
 - **Opt-in typed result values.** `types: { bigint, dates, binary }` on
   `FirebirdBrowser` converts values on the way out: `BIGINT` → `bigint`,
   binary `BLOB` → `Uint8Array`, and `DATE`/`TIMESTAMP` → `Date`. Off by

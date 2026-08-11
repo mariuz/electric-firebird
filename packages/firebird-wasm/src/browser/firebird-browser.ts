@@ -34,6 +34,8 @@ import type { TypeOptions } from './value-types';
 import { acquireDatabaseLock } from './db-lock';
 import { SharedEngineTransport } from './shared-transport';
 import type { DatabaseLock } from './db-lock';
+import { toStatement, resolveQueryCall } from '../sql-tag';
+import type { SqlFragment } from '../sql-tag';
 import type {
   QueryResult,
   Row,
@@ -289,12 +291,16 @@ export class FirebirdBrowser {
    *
    * @returns one result per statement, in order.
    */
-  async exec(sql: string, params: QueryParams = []): Promise<ExecResult[]> {
+  async exec(
+    sql: string | SqlFragment,
+    params: QueryParams = [],
+  ): Promise<ExecResult[]> {
     await this.ensureReady();
 
-    const statements = splitStatements(sql);
+    const script = toStatement(sql, params);
+    const statements = splitStatements(script.sql);
 
-    if (params.length > 0 && statements.length > 1) {
+    if (script.params.length > 0 && statements.length > 1) {
       throw new Error(
         `Parameters cannot be used with a multi-statement script ` +
           `(${statements.length} statements found); run the statements separately`,
@@ -308,7 +314,7 @@ export class FirebirdBrowser {
         this.dbHandle,
         0,
         statement.sql,
-        params,
+        script.params,
       );
       results.push({ affectedRows });
     }
@@ -323,18 +329,35 @@ export class FirebirdBrowser {
   /**
    * Execute a SQL query and return the result rows.
    *
-   * Parameters are bound with `?` placeholders, as in the Node.js backend:
+   * Parameters are bound with `?` placeholders, as in the Node.js backend, or
+   * interpolated into a `` sql`…` `` fragment:
    *
    * ```ts
    * await db.query('SELECT * FROM items WHERE id = ?', [1]);
+   * await db.query(sql`SELECT * FROM items WHERE id = ${1}`);
    * ```
    */
   async query<T extends Row = Row>(
+    sql: SqlFragment,
+    options?: TransactionOptions,
+  ): Promise<QueryResult<T>>;
+  async query<T extends Row = Row>(
     sql: string,
-    params: QueryParams = [],
-    options: TransactionOptions = {},
+    params?: QueryParams,
+    options?: TransactionOptions,
+  ): Promise<QueryResult<T>>;
+  async query<T extends Row = Row>(
+    sql: string | SqlFragment,
+    paramsOrOptions: QueryParams | TransactionOptions = [],
+    maybeOptions: TransactionOptions = {},
   ): Promise<QueryResult<T>> {
     await this.ensureReady();
+
+    const { statement, options } = resolveQueryCall(
+      sql,
+      paramsOrOptions,
+      maybeOptions,
+    );
 
     // Without options the engine's own auto-commit transaction is used, which
     // is one fewer round trip to the Worker.  With them, the statement has to
@@ -342,7 +365,12 @@ export class FirebirdBrowser {
     // which starts one for every query.
     if (!hasTransactionOptions(options)) {
       return applyTypes(
-        await this.engine.query<T>(this.dbHandle, 0, sql, params),
+        await this.engine.query<T>(
+          this.dbHandle,
+          0,
+          statement.sql,
+          statement.params,
+        ),
         this.options.types,
       );
     }
@@ -352,8 +380,8 @@ export class FirebirdBrowser {
       const result = await this.engine.query<T>(
         this.dbHandle,
         txHandle,
-        sql,
-        params,
+        statement.sql,
+        statement.params,
       );
       await this.engine.commit(txHandle);
       return applyTypes(result, this.options.types);
@@ -710,25 +738,35 @@ export class FirebirdBrowserTransaction {
    *
    * @returns the number of rows affected.
    */
-  async exec(sql: string, params: QueryParams = []): Promise<ExecResult> {
+  async exec(
+    sql: string | SqlFragment,
+    params: QueryParams = [],
+  ): Promise<ExecResult> {
     this.assertUsable();
+    const statement = toStatement(sql, params);
     const affectedRows = await this.engine.execute(
       this.dbHandle,
       this.txHandle,
-      sql,
-      params,
+      statement.sql,
+      statement.params,
     );
     return { affectedRows };
   }
 
   /** Execute a SELECT inside this transaction and return rows. */
   async query<T extends Row = Row>(
-    sql: string,
+    sql: string | SqlFragment,
     params: QueryParams = [],
   ): Promise<QueryResult<T>> {
     this.assertUsable();
+    const statement = toStatement(sql, params);
     return applyTypes(
-      await this.engine.query<T>(this.dbHandle, this.txHandle, sql, params),
+      await this.engine.query<T>(
+        this.dbHandle,
+        this.txHandle,
+        statement.sql,
+        statement.params,
+      ),
       this.types,
     );
   }

@@ -12,6 +12,9 @@
 export { FirebirdBrowser, FirebirdBrowserTransaction } from './firebird-browser';
 export type { FirebirdBrowserOptions, ExecResult } from './firebird-browser';
 
+export { sql, SqlFragment, RawSql, isSqlFragment, toStatement } from '../sql-tag';
+export type { SqlTag, Statement } from '../sql-tag';
+
 export { encodeParams, encodeParamValue } from './params';
 
 export { firebirdTypeName } from './field-types';

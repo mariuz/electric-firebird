@@ -20,7 +20,8 @@ A PGlite-style wrapper around the Firebird embedded engine for Node.js.
 class FirebirdLite {
   constructor(dbPath: string, options?: FirebirdLiteOptions)
 
-  exec(sql: string): Promise<void>
+  exec(sql: string | SqlFragment, params?: QueryParams): Promise<void>
+  query<T extends Row = Row>(sql: SqlFragment, options?: TransactionOptions): Promise<QueryResult<T>>
   query<T extends Row = Row>(
     sql: string,
     params?: QueryParams,
@@ -49,7 +50,7 @@ call to `exec()`, `query()`, or `transaction()`.
 
 If the database file does not exist it is created automatically.
 
-#### `db.exec(sql)`
+#### `db.exec(sql, params?)`
 
 Execute a DDL or DML statement in its own auto-committed transaction.  Returns
 `Promise<void>`.
@@ -57,6 +58,7 @@ Execute a DDL or DML statement in its own auto-committed transaction.  Returns
 ```ts
 await db.exec('CREATE TABLE items (id INTEGER, name VARCHAR(100))');
 await db.exec("INSERT INTO items VALUES (1, 'hello')");
+await db.exec(sql`INSERT INTO items VALUES (${2}, ${'world'})`);
 ```
 
 #### `db.query<T>(sql, params?, options?)`
@@ -76,12 +78,22 @@ Row keys are always **upper-cased** column names (or aliases).
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `sql` | `string` | — | SQL statement. |
+| `sql` | `string \| SqlFragment` | — | SQL statement, or a [`` sql`…` ``](#the-sql-template-tag) fragment. |
 | `params` | `QueryParams` | `[]` | Positional bind parameters (`?` placeholders). |
 | `options.isolationLevel` | `IsolationLevel` | engine default | Transaction isolation. |
 | `options.readOnly` | `boolean` | `false` | Open a read-only transaction. |
 
 Returns `Promise<QueryResult<T>>`.
+
+Given a fragment, `options` moves into the second slot — the fragment already
+carries its parameters, so there is nothing for that argument to hold:
+
+```ts
+await db.query(sql`SELECT * FROM items WHERE id = ${1}`, { readOnly: true });
+```
+
+Passing both a fragment and parameters throws, rather than binding values that
+could not reach a placeholder.
 
 #### `db.transaction(fn, options?)`
 
@@ -112,9 +124,9 @@ A handle to an active transaction, passed to the callback of
 
 ```ts
 class FirebirdTransaction {
-  exec(sql: string, params?: QueryParams): Promise<void>
+  exec(sql: string | SqlFragment, params?: QueryParams): Promise<void>
   query<T extends Row = Row>(
-    sql: string,
+    sql: string | SqlFragment,
     params?: QueryParams,
   ): Promise<QueryResult<T>>
 }
@@ -127,6 +139,104 @@ Execute a DDL or DML statement inside the active transaction.
 #### `tx.query<T>(sql, params?)`
 
 Execute a SELECT statement inside the active transaction and return rows.
+
+---
+
+## The `sql` template tag
+
+Exported from **both** entry points.  Builds a `SqlFragment` — statement text
+plus the values bound to it — which `query()` and `exec()` accept anywhere a
+string works, on either backend and inside transactions.
+
+```ts
+import { sql } from 'firebird-wasm';          // or 'firebird-wasm/browser'
+
+await db.query(sql`SELECT * FROM items WHERE id = ${id} AND name = ${name}`);
+// → 'SELECT * FROM items WHERE id = ? AND name = ?', params [id, name]
+```
+
+Every `${…}` becomes a `?` and its value is bound.  A value is therefore never
+parsed as SQL, whatever it contains — which is the entire safety property, and
+it does not depend on escaping anything.
+
+Fragments nest, which is what makes conditional SQL bearable:
+
+```ts
+const active = onlyActive ? sql`AND active = ${true}` : sql``;
+await db.query(sql`SELECT * FROM items WHERE owner = ${user} ${active}`);
+```
+
+Both `sql` and `params` are readable on a fragment, so a query can be logged
+before it runs.
+
+### What cannot be a parameter
+
+Table names, column names and syntax are not values, and no amount of binding
+will make them work.  Three named helpers produce text, so the unsafe one is
+visible at the call site:
+
+#### `sql.identifier(name)`
+
+Quote a table or column name.  Any `"` in the name is doubled, so the quoting
+cannot be ended.
+
+```ts
+await db.query(sql`SELECT * FROM ${sql.identifier('ITEMS')} WHERE id = ${id}`);
+```
+
+> **Firebird folds unquoted names to upper case, and quoting turns that off.**
+> `CREATE TABLE items` stores `ITEMS`, so `sql.identifier('items')` produces
+> `"items"` and will not find it.  Pass the name in its stored case — usually
+> upper.  This does not upper-case for you, because names created *with* quotes
+> keep whatever case they were given, and mangling those would break a name
+> that was previously correct.
+
+#### `sql.join(values, separator?)`
+
+Expand a list into placeholders.  One placeholder binds one value, so
+`WHERE id IN ${ids}` cannot work.
+
+```ts
+await db.query(sql`SELECT * FROM items WHERE id IN (${sql.join(ids)})`);
+// → 'SELECT * FROM items WHERE id IN (?, ?, ?)'
+```
+
+Elements may themselves be fragments, which is how conditions compose:
+
+```ts
+sql`WHERE ${sql.join(conditions, ' AND ')}`
+```
+
+The parentheses above are the caller's — `join` cannot know whether it is
+filling an `IN` list or an `AND` chain.  An **empty list throws**: `IN ()` is a
+syntax error and an empty `AND` chain is an empty `WHERE`, so guard the case
+with the condition you mean (`1 = 0` to match nothing, `1 = 1` for no filter).
+
+#### `sql.unsafe(text)`
+
+Splice text in literally, escaping nothing.  For syntax that is neither a value
+nor an identifier:
+
+```ts
+const dir = ascending ? sql.unsafe('ASC') : sql.unsafe('DESC');
+await db.query(sql`SELECT * FROM items ORDER BY name ${dir}`);
+```
+
+Anything reaching this from outside the program is an injection.  The name is
+the warning.
+
+### `SqlFragment`
+
+```ts
+class SqlFragment {
+  readonly sql: string        // text, with a ? per bound value
+  readonly params: QueryParams
+}
+```
+
+`isSqlFragment(value)` tests for one.  `toStatement(sql, params?)` reduces
+either calling convention to `{ sql, params }`, for code running statements
+itself.
 
 ---
 
@@ -147,7 +257,8 @@ IndexedDB-based virtual filesystem.
 class FirebirdBrowser {
   constructor(dbName: string, options?: FirebirdBrowserOptions)
 
-  exec(sql: string): Promise<void>
+  exec(sql: string | SqlFragment, params?: QueryParams): Promise<ExecResult[]>
+  query<T extends Row = Row>(sql: SqlFragment, options?: TransactionOptions): Promise<QueryResult<T>>
   query<T extends Row = Row>(
     sql: string,
     params?: QueryParams,
@@ -193,8 +304,11 @@ Returned by `FirebirdBrowser.transaction()`.  Mirrors `FirebirdTransaction`.
 
 ```ts
 class FirebirdBrowserTransaction {
-  exec(sql: string): Promise<void>
-  query<T extends Row = Row>(sql: string): Promise<QueryResult<T>>
+  exec(sql: string | SqlFragment, params?: QueryParams): Promise<ExecResult>
+  query<T extends Row = Row>(
+    sql: string | SqlFragment,
+    params?: QueryParams,
+  ): Promise<QueryResult<T>>
 }
 ```
 

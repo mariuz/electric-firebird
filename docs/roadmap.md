@@ -523,7 +523,7 @@ Legend: ✅ shipped · 🟡 partial · ❌ missing · n/a not applicable
 | Capability | PGlite | electric-firebird | Notes |
 |---|---|---|---|
 | `query(sql, params)` | ✅ | ✅ | `?` placeholders on both backends |
-| Template-literal `` sql`…` `` tag | ✅ | ❌ | Ergonomics + injection safety |
+| Template-literal `` sql`…` `` tag | ✅ | ✅ | Values bind as `?` parameters; fragments nest. `sql.identifier()` quotes names, `sql.join()` expands `IN` lists, `sql.unsafe()` is the named escape hatch |
 | `exec(sql)` multi-statement script → array of results | ✅ | ✅ | Splitting respects strings, identifiers, comments and `SET TERM` |
 | `rowMode: 'object' \| 'array'` | ✅ | ❌ | Always object mode |
 | Custom `parsers` / `serializers` | ✅ | ❌ | |

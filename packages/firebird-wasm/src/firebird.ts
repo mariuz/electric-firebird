@@ -19,6 +19,8 @@ import type {
   TransactionOptions,
   FieldInfo,
 } from './types';
+import { toStatement, resolveQueryCall } from './sql-tag';
+import type { SqlFragment } from './sql-tag';
 
 /**
  * FirebirdLite – a PGlite-style wrapper around Firebird Embedded.
@@ -77,13 +79,28 @@ export class FirebirdLite {
    * Execute a DDL or DML statement that does not return rows.
    *
    * The statement is executed in its own auto-committed transaction.
+   *
+   * Accepts a `` sql`…` `` fragment in place of a string, in which case its
+   * values are bound rather than interpolated.
    */
-  async exec(sql: string): Promise<void> {
+  async exec(sql: string | SqlFragment, params: QueryParams = []): Promise<void> {
     await this.ensureReady();
+    const statement = toStatement(sql, params);
     const attachment = this.attachment!;
     const transaction = await attachment.startTransaction();
     try {
-      await attachment.execute(transaction, sql);
+      if (statement.params.length > 0) {
+        // `execute` binds nothing, so a parameterised statement has to be
+        // prepared first — the same split FirebirdTransaction.exec makes.
+        const stmt = await attachment.prepare(transaction, statement.sql);
+        try {
+          await stmt.execute(transaction, statement.params);
+        } finally {
+          await stmt.dispose().catch(() => undefined);
+        }
+      } else {
+        await attachment.execute(transaction, statement.sql);
+      }
       await transaction.commit();
     } catch (err) {
       await transaction.rollback().catch(() => undefined);
@@ -96,20 +113,35 @@ export class FirebirdLite {
    *
    * For SELECT queries the rows are returned as plain objects keyed by the
    * (upper-cased) column name, mirroring the PGlite convention.
+   *
+   * ```ts
+   * await db.query('SELECT * FROM items WHERE id = ?', [id]);
+   * await db.query(sql`SELECT * FROM items WHERE id = ${id}`);
+   * ```
    */
   async query<T extends Row = Row>(
+    sql: SqlFragment,
+    options?: TransactionOptions,
+  ): Promise<QueryResult<T>>;
+  async query<T extends Row = Row>(
     sql: string,
-    params: QueryParams = [],
-    options: TransactionOptions = {},
+    params?: QueryParams,
+    options?: TransactionOptions,
+  ): Promise<QueryResult<T>>;
+  async query<T extends Row = Row>(
+    sql: string | SqlFragment,
+    paramsOrOptions: QueryParams | TransactionOptions = [],
+    maybeOptions: TransactionOptions = {},
   ): Promise<QueryResult<T>> {
     await this.ensureReady();
+    const { statement, options } = resolveQueryCall(sql, paramsOrOptions, maybeOptions);
     const attachment = this.attachment!;
 
     const txOptions = buildTransactionOptions(options);
     const transaction = await attachment.startTransaction(txOptions);
 
     try {
-      const stmt = await attachment.prepare(transaction, sql);
+      const stmt = await attachment.prepare(transaction, statement.sql);
       const columnLabels = await stmt.columnLabels;
       const fields: FieldInfo[] = columnLabels.map((label) => ({
         name: label.toUpperCase(),
@@ -117,14 +149,14 @@ export class FirebirdLite {
 
       let rows: T[];
       if (stmt.hasResultSet) {
-        const resultSet = await stmt.executeQuery(transaction, params);
+        const resultSet = await stmt.executeQuery(transaction, statement.params);
         const rawRows = await resultSet.fetch();
         await resultSet.close();
         rows = rawRows.map((cols) =>
           Object.fromEntries(fields.map((f, i) => [f.name, cols[i]])),
         ) as T[];
       } else {
-        await stmt.execute(transaction, params);
+        await stmt.execute(transaction, statement.params);
         rows = [];
       }
 
@@ -233,17 +265,18 @@ export class FirebirdTransaction {
   /**
    * Execute a DDL or DML statement inside this transaction.
    */
-  async exec(sql: string, params: QueryParams = []): Promise<void> {
+  async exec(sql: string | SqlFragment, params: QueryParams = []): Promise<void> {
     this.assertUsable();
-    if (params.length > 0) {
-      const stmt = await this.attachment.prepare(this.transaction, sql);
+    const statement = toStatement(sql, params);
+    if (statement.params.length > 0) {
+      const stmt = await this.attachment.prepare(this.transaction, statement.sql);
       try {
-        await stmt.execute(this.transaction, params);
+        await stmt.execute(this.transaction, statement.params);
       } finally {
         await stmt.dispose().catch(() => undefined);
       }
     } else {
-      await this.attachment.execute(this.transaction, sql);
+      await this.attachment.execute(this.transaction, statement.sql);
     }
   }
 
@@ -251,18 +284,19 @@ export class FirebirdTransaction {
    * Execute a SELECT statement inside this transaction and return rows.
    */
   async query<T extends Row = Row>(
-    sql: string,
+    sql: string | SqlFragment,
     params: QueryParams = [],
   ): Promise<QueryResult<T>> {
     this.assertUsable();
+    const statement = toStatement(sql, params);
 
-    const stmt = await this.attachment.prepare(this.transaction, sql);
+    const stmt = await this.attachment.prepare(this.transaction, statement.sql);
     const columnLabels = await stmt.columnLabels;
     const fields: FieldInfo[] = columnLabels.map((label) => ({
       name: label.toUpperCase(),
     }));
 
-    const resultSet = await stmt.executeQuery(this.transaction, params);
+    const resultSet = await stmt.executeQuery(this.transaction, statement.params);
     const rawRows = await resultSet.fetch();
     await resultSet.close();
     await stmt.dispose();

@@ -575,6 +575,120 @@ test.describe('Row construction', () => {
   });
 });
 
+// ===========================================================================
+// The sql`…` template tag, through the real browser query path
+// ===========================================================================
+
+test.describe('sql`…` tag', () => {
+  test('sends placeholders and binds the values separately', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      window.__stub.queryResult = { columns: ['ID'], rows: [[1]] };
+
+      const db = new window.FB.FirebirdBrowser('tag-bind', { autoPersist: false });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      window.__stub.resetCalls();
+
+      const { sql } = window.FB;
+      // A value that would end the statement if it were interpolated.
+      const hostile = "'; DROP TABLE t; --";
+      await db.query(sql`SELECT id FROM t WHERE id = ${7} AND name = ${hostile}`);
+      await db.close();
+
+      const call = window.__stub.firstCall('_fb_query_params');
+      return { sql: call?.args[2], params: call?.args[3] };
+    });
+
+    expect(result.sql).toBe('SELECT id FROM t WHERE id = ? AND name = ?');
+    // Sent as text, which is how this parameter encoding works — but as a
+    // *parameter*, which is the property that matters.
+    expect(result.params).toEqual(['7', "'; DROP TABLE t; --"]);
+  });
+
+  test('composes nested fragments and a joined list', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      window.__stub.queryResult = { columns: ['ID'], rows: [] };
+
+      const db = new window.FB.FirebirdBrowser('tag-compose', { autoPersist: false });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      window.__stub.resetCalls();
+
+      const { sql } = window.FB;
+      const active = sql`AND active = ${true}`;
+      await db.query(
+        sql`SELECT id FROM ${sql.identifier('T')} WHERE id IN (${sql.join([1, 2, 3])}) ${active}`,
+      );
+      await db.close();
+
+      const call = window.__stub.firstCall('_fb_query_params');
+      return { sql: call?.args[2], params: call?.args[3] };
+    });
+
+    expect(result.sql).toBe(
+      'SELECT id FROM "T" WHERE id IN (?, ?, ?) AND active = ?',
+    );
+    expect(result.params).toEqual(['1', '2', '3', 'TRUE']);
+  });
+
+  test('works through exec() and inside a transaction', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      window.__stub.queryResult = { columns: ['N'], rows: [[1]] };
+
+      const db = new window.FB.FirebirdBrowser('tag-tx', { autoPersist: false });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      window.__stub.resetCalls();
+
+      const { sql } = window.FB;
+      await db.exec(sql`INSERT INTO t VALUES (${5})`);
+      await db.transaction(async (tx) => {
+        await tx.exec(sql`UPDATE t SET id = ${6} WHERE id = ${5}`);
+        await tx.query(sql`SELECT COUNT(*) AS N FROM t WHERE id = ${6}`);
+      });
+      await db.close();
+
+      return window.__stub.calls
+        .filter((c) => c.fn.endsWith('_params'))
+        .map((c) => ({ fn: c.fn, sql: c.args[2], params: c.args[3] }));
+    });
+
+    expect(result).toEqual([
+      { fn: '_fb_execute_params', sql: 'INSERT INTO t VALUES (?)', params: ['5'] },
+      {
+        fn: '_fb_execute_params',
+        sql: 'UPDATE t SET id = ? WHERE id = ?',
+        params: ['6', '5'],
+      },
+      {
+        fn: '_fb_query_params',
+        sql: 'SELECT COUNT(*) AS N FROM t WHERE id = ?',
+        params: ['6'],
+      },
+    ]);
+  });
+
+  test('rejects a fragment given extra parameters', async ({ page }) => {
+    const message = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('tag-conflict', { autoPersist: false });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+
+      const { sql } = window.FB;
+      try {
+        // Reachable from JavaScript even though TypeScript rules it out.
+        await (db.query as (s: unknown, p: unknown) => Promise<unknown>)(
+          sql`SELECT id FROM t WHERE id = ${1}`,
+          [2],
+        );
+        return 'no error';
+      } catch (err) {
+        return (err as Error).message;
+      } finally {
+        await db.close();
+      }
+    });
+
+    expect(message).toContain('already carries its parameters');
+  });
+});
+
 test.describe('Transaction options', () => {
   test('passes the isolation level and access mode to the engine', async ({
     page,

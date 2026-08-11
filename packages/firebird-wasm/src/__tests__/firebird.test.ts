@@ -2,6 +2,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
 import { FirebirdLite } from '../firebird';
+import { sql } from '../sql-tag';
 
 // Skip tests if Firebird client library is not available or server is not running
 const hasFirebirdLib = (() => {
@@ -213,6 +214,92 @@ describeIfFirebird('FirebirdLite', () => {
     await expect(db.query("SELECT 1 FROM RDB$DATABASE")).rejects.toThrow(
       'FirebirdLite instance has been closed',
     );
+  });
+
+  // The unit tests cover what the tag builds; these cover the engine accepting
+  // it — that the `?` placeholders and the parameter order actually line up
+  // once a real statement is prepared.
+  describe('sql`…`', () => {
+    beforeEach(async () => {
+      await db.exec('CREATE TABLE tagged (id INTEGER, name VARCHAR(50))');
+      await db.exec("INSERT INTO tagged VALUES (1, 'first')");
+      await db.exec("INSERT INTO tagged VALUES (2, 'second')");
+    });
+
+    it('runs a tagged query', async () => {
+      const id = 2;
+      const result = await db.query<{ NAME: string }>(
+        sql`SELECT name FROM tagged WHERE id = ${id}`,
+      );
+
+      expect(result.rows).toEqual([{ NAME: 'second' }]);
+    });
+
+    it('binds values in template order', async () => {
+      const result = await db.query<{ ID: number }>(
+        sql`SELECT id FROM tagged WHERE name = ${'first'} AND id = ${1}`,
+      );
+
+      expect(result.rows).toEqual([{ ID: 1 }]);
+    });
+
+    it('expands a list through sql.join', async () => {
+      const result = await db.query<{ ID: number }>(
+        sql`SELECT id FROM tagged WHERE id IN (${sql.join([1, 2])}) ORDER BY id`,
+      );
+
+      expect(result.rows).toEqual([{ ID: 1 }, { ID: 2 }]);
+    });
+
+    it('quotes an identifier the engine then resolves', async () => {
+      // Upper case because `CREATE TABLE tagged` stored TAGGED — the folding
+      // rule sql.identifier deliberately does not paper over.
+      const result = await db.query(
+        sql`SELECT COUNT(*) AS N FROM ${sql.identifier('TAGGED')}`,
+      );
+
+      expect(result.rows[0]).toMatchObject({ N: 2 });
+    });
+
+    it('treats a value that looks like SQL as data', async () => {
+      const hostile = "'; DELETE FROM tagged; --";
+      const result = await db.query(
+        sql`SELECT id FROM tagged WHERE name = ${hostile}`,
+      );
+
+      expect(result.rows).toEqual([]);
+      // The table survived, which is the point.
+      const after = await db.query<{ N: number }>(
+        'SELECT COUNT(*) AS N FROM tagged',
+      );
+      expect(after.rows[0].N).toBe(2);
+    });
+
+    it('runs a tagged statement through exec() and inside a transaction', async () => {
+      await db.exec(sql`INSERT INTO tagged VALUES (${3}, ${'third'})`);
+
+      await db.transaction(async (tx) => {
+        await tx.exec(sql`UPDATE tagged SET name = ${'renamed'} WHERE id = ${3}`);
+        const inside = await tx.query<{ NAME: string }>(
+          sql`SELECT name FROM tagged WHERE id = ${3}`,
+        );
+        expect(inside.rows).toEqual([{ NAME: 'renamed' }]);
+      });
+
+      const result = await db.query<{ NAME: string }>(
+        sql`SELECT name FROM tagged WHERE id = ${3}`,
+      );
+      expect(result.rows).toEqual([{ NAME: 'renamed' }]);
+    });
+
+    it('passes transaction options in the slot parameters would have used', async () => {
+      const result = await db.query<{ ID: number }>(
+        sql`SELECT id FROM tagged WHERE id = ${1}`,
+        { readOnly: true, isolationLevel: 'READ_COMMITTED' },
+      );
+
+      expect(result.rows).toEqual([{ ID: 1 }]);
+    });
   });
 });
 
