@@ -822,12 +822,20 @@ be built:
       builder approach failed with a bare "internal error" and was abandoned.
 - [x] Thread `txHandle` through `fb_execute`/`fb_query`.
 - [x] Add an explicit `tx.rollback()`. Browser in `4380ce7`, Node in `b6accb4`.
-- [ ] Replace the JSON ABI with a typed encoding. **Half done.** `FieldInfo`
-      carries `type`, `typeName`, `subType`, `scale`, `length` and `nullable`,
-      so a caller can tell an exact `NUMERIC` from a `VARCHAR` of digits. The
-      wire format is still JSON and exact numerics still travel as decimal
-      strings rather than `BigInt`; `TIMESTAMP` is ISO-8601 rather than `Date`
-      and binary `BLOB` is base64 rather than `Uint8Array`.
+- [ ] Replace the JSON ABI with a typed encoding. **Half done, and the other
+      half should probably not be this.** `FieldInfo` carries `type`,
+      `typeName`, `subType`, `scale`, `length` and `nullable`, so a caller can
+      tell an exact `NUMERIC` from a `VARCHAR` of digits. Values still travel
+      as decimal strings, ISO-8601 and base64.
+
+      Measured before planning the rest, and the premise did not survive:
+      `JSON.parse` is **8 ms of a 45 ms decode** on 10,000 rows. The dominant
+      cost is **33 ms building row objects**, which a binary format would not
+      change — and which a generated constructor cuts by 12× with no ABI change
+      at all. See [plans/typed-results.md](./plans/typed-results.md) for the
+      numbers and what to do instead: fast row construction, opt-in typed
+      values, and a binary path for BLOBs only where base64 actually costs
+      something.
 - [x] `exec()` accepts multi-statement scripts and returns one result per
       statement. Splitting respects strings, quoted identifiers, comments and
       `SET TERM`.
