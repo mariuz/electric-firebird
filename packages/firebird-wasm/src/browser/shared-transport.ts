@@ -27,7 +27,14 @@
  * apply it twice. An error a caller can see beats a duplicate row it cannot.
  */
 
-import type { Row, QueryResult, QueryParams, RowMode, TransactionOptions } from '../types';
+import type {
+  Row,
+  QueryResult,
+  QueryDescription,
+  QueryParams,
+  RowMode,
+  TransactionOptions,
+} from '../types';
 import type { EngineHandle, EngineTransport } from './engine-transport';
 import { electLeader } from './leader-election';
 import type { LeaderElection } from './leader-election';
@@ -84,6 +91,9 @@ type SharedMessage = CallMessage | ReplyMessage | LeaderMessage | QueryLeaderMes
 const REPLAYABLE: ReadonlySet<SharedOp> = new Set<SharedOp>([
   'init',
   'query',
+  // Prepares a statement and drops it, executing nothing, so re-issuing it is
+  // indistinguishable from issuing it once.
+  'describe',
   'exists',
   'readFile',
 ]);
@@ -471,6 +481,14 @@ export class SharedEngineTransport implements EngineTransport {
     // call rather than being applied to what comes back. It is a string, so
     // it survives structured cloning like the rest of the arguments.
     return this.call<QueryResult<T>>('query', dbHandle, txHandle, sql, params, rowMode);
+  }
+
+  describe(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    sql: string,
+  ): Promise<QueryDescription> {
+    return this.call<QueryDescription>('describe', dbHandle, txHandle, sql);
   }
 
   startTransaction(

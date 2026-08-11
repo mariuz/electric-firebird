@@ -53,6 +53,10 @@
      * serialised, so the library still parses the real shape.
      */
     queryResult: { columns: [], rows: [] },
+    // What _fb_describe reports.  Separate from queryResult because a
+    // description is about a statement's shape, not about any rows.
+    description: { params: [], columns: [], statementType: 1 },
+    describeReturnsNull: false,
     /** When true, `_fb_query` returns a NULL pointer. */
     queryReturnsNull: false,
     /** When true, `_fb_create_database` returns a NULL handle. */
@@ -289,6 +293,25 @@
         stub.calls.push({ fn: '_fb_query', args: [handle, txHandle, sql] });
         if (stub.queryReturnsNull) return 0;
         const ptr = heapString(serialiseQueryResult());
+        liveResults.add(ptr);
+        return ptr;
+      },
+
+      /**
+       * Describe without executing.  `stub.description` controls what comes
+       * back; the default is an empty shape, which is what a statement with
+       * no parameters and no columns really reports.
+       */
+      _fb_describe(handle, txHandle, sqlPtr) {
+        const sql = UTF8ToString(sqlPtr);
+        stub.calls.push({ fn: '_fb_describe', args: [handle, txHandle, sql] });
+        if (stub.describeReturnsNull) return 0;
+        const described = {
+          params: stub.description.params ?? [],
+          columns: stub.description.columns ?? [],
+          statementType: stub.description.statementType ?? 1,
+        };
+        const ptr = heapString(JSON.stringify(described));
         liveResults.add(ptr);
         return ptr;
       },

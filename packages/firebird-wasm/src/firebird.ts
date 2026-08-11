@@ -14,6 +14,7 @@ import type {
 import type {
   ArrayRow,
   FirebirdLiteOptions,
+  QueryDescription,
   QueryResult,
   QueryOptions,
   Row,
@@ -22,6 +23,7 @@ import type {
   TransactionOptions,
   FieldInfo,
 } from './types';
+import { statementKind } from './statement-types';
 import { toStatement, resolveQueryCall } from './sql-tag';
 import type { SqlFragment } from './sql-tag';
 
@@ -196,6 +198,53 @@ export class FirebirdLite {
     } catch (err) {
       await transaction.rollback().catch(() => undefined);
       throw err;
+    }
+  }
+
+  /**
+   * Describe a statement's shape without running it.
+   *
+   * ```ts
+   * const shape = await db.describeQuery('SELECT id, name FROM items WHERE id = ?');
+   * // shape.fields        → [{ name: 'ID' }, { name: 'NAME' }]
+   * // shape.statementType → 'SELECT'
+   * ```
+   *
+   * The statement is prepared and disposed, so nothing runs: describing an
+   * `INSERT` inserts nothing.
+   *
+   * **`params` is `undefined` here.** The native driver exposes no input
+   * metadata — `Statement` offers `columnLabels`, `hasResultSet` and `type`
+   * and nothing about `?` placeholders — and an empty array would claim the
+   * statement takes none. `fields` carries names only, for the same reason
+   * `FieldInfo` does everywhere on this backend. The WASM backend reports both
+   * in full.
+   */
+  async describeQuery(sql: string | SqlFragment): Promise<QueryDescription> {
+    await this.ensureReady();
+    const attachment = this.attachment!;
+    const text = toStatement(sql).sql;
+
+    const transaction = await attachment.startTransaction();
+    try {
+      const stmt = await attachment.prepare(transaction, text);
+      try {
+        const columnLabels = await stmt.columnLabels;
+        const type = await stmt.type;
+
+        return {
+          params: undefined,
+          fields: columnLabels.map((label) => ({ name: label.toUpperCase() })),
+          statementType: statementKind(type),
+          hasResultSet: stmt.hasResultSet,
+        };
+      } finally {
+        await stmt.dispose().catch(() => undefined);
+      }
+    } finally {
+      // Nothing ran, so there is nothing to commit — but the transaction still
+      // has to be finished.
+      await transaction.commit().catch(() => undefined);
     }
   }
 

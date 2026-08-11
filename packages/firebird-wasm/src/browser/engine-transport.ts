@@ -24,6 +24,7 @@ import { loadFirebirdWasm, allocString, lastError } from '../wasm-loader';
 import type {
   Row,
   QueryResult,
+  QueryDescription,
   FieldInfo,
   QueryParams,
   RowMode,
@@ -32,6 +33,7 @@ import type {
 import { isolationCode } from './isolation';
 import { encodeParams } from './params';
 import { firebirdTypeName } from './field-types';
+import { statementKind } from '../statement-types';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -68,6 +70,12 @@ export interface EngineTransport {
     params?: QueryParams,
     rowMode?: RowMode,
   ): Promise<QueryResult<T>>;
+  /** Describe a statement's shape without executing it. */
+  describe(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    sql: string,
+  ): Promise<QueryDescription>;
 
   /**
    * Begin a transaction.
@@ -267,6 +275,42 @@ export function decodeResultSet<T = Row>(
   return { rows, fields };
 }
 
+/** One field of a description, as the engine encodes it. */
+function decodeField(c: EncodedColumn): FieldInfo {
+  return {
+    name: c.name.toUpperCase(),
+    type: c.type,
+    typeName: firebirdTypeName(c.type, c.scale),
+    subType: c.subType,
+    scale: c.scale,
+    length: c.length,
+    nullable: c.nullable,
+  };
+}
+
+/** Decode what `fb_describe` reports about a statement. */
+export function decodeDescription(json: string): QueryDescription {
+  const parsed = JSON.parse(json) as {
+    params: EncodedColumn[];
+    columns: EncodedColumn[];
+    statementType: number;
+  };
+
+  const fields = parsed.columns.map(decodeField);
+
+  return {
+    // Parameters are positional in Firebird and carry no name, so the engine
+    // sends "" and upper-casing it changes nothing — they are described by
+    // type and position alone.
+    params: parsed.params.map(decodeField),
+    fields,
+    statementType: statementKind(parsed.statementType),
+    // Derived rather than reported separately: a statement yields rows exactly
+    // when it describes some.
+    hasResultSet: fields.length > 0,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // DirectTransport
 // ---------------------------------------------------------------------------
@@ -414,6 +458,26 @@ export class DirectTransport implements EngineTransport {
       return decodeResultSet<T>(json, rowMode);
       }),
     );
+  }
+
+  async describe(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    sql: string,
+  ): Promise<QueryDescription> {
+    const mod = this.module;
+    return this.withString(sql, (sqlPtr) => {
+      const resultPtr = mod._fb_describe(dbHandle, txHandle, sqlPtr);
+      if (resultPtr === 0) {
+        throw engineError(mod, `Firebird could not describe: ${sql}`);
+      }
+
+      // Same ownership rule as a result set: the engine owns it until freed.
+      const json = mod.UTF8ToString(resultPtr);
+      mod._fb_free_result(resultPtr);
+
+      return decodeDescription(json);
+    });
   }
 
   async startTransaction(

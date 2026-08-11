@@ -18,6 +18,8 @@ export type { SqlTag, Statement } from '../sql-tag';
 export { encodeParams, encodeParamValue } from './params';
 
 export { firebirdTypeName } from './field-types';
+export { statementKind } from '../statement-types';
+export { decodeDescription } from './engine-transport';
 
 export { isolationCode, hasTransactionOptions } from './isolation';
 
@@ -77,6 +79,8 @@ export type {
   FieldInfo,
   FirebirdTypeName,
   QueryOptions,
+  QueryDescription,
+  StatementKind,
   RowMode,
   ArrayRow,
   TransactionOptions,

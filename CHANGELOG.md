@@ -8,6 +8,18 @@ API may still move between minor releases.
 
 ### Added
 
+- **`describeQuery()`.** Reports a statement's shape without running it:
+  result columns, parameters, and what kind of statement it is
+  (`'SELECT' | 'INSERT' | 'DDL' | …`). The statement is prepared and dropped,
+  so describing an `INSERT` inserts nothing — asserted against the real engine
+  rather than assumed. Needed a new C entry point, `fb_describe`, which reads
+  the input and output metadata Firebird already has after a prepare; both are
+  encoded in the same per-field shape result sets use, so one decoder reads
+  either. On the Node backend `params` is `undefined` rather than `[]`: the
+  native driver exposes no input metadata, and an empty array would claim the
+  statement takes no parameters, which is a different and wrong statement about
+  `WHERE id = ?`.
+
 - **`rowMode: 'object' | 'array'`.** A per-query option on both backends:
   `'array'` returns each row as its values in column order, with the names
   still in `fields`. Two reasons, and the smaller one is speed — 1.11× on

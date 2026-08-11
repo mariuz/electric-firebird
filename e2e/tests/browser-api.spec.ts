@@ -45,6 +45,12 @@ interface StubControl {
     rows: unknown[][];
   };
   queryReturnsNull: boolean;
+  description: {
+    params?: Array<Record<string, unknown>>;
+    columns?: Array<Record<string, unknown>>;
+    statementType?: number;
+  };
+  describeReturnsNull: boolean;
   createFails: boolean;
   startTxFails: boolean;
   commitRc: number;
@@ -707,6 +713,115 @@ test.describe('sql`…` tag', () => {
 // ===========================================================================
 // Custom parsers and serializers
 // ===========================================================================
+
+test.describe('describeQuery', () => {
+  test('decodes parameters, columns and the statement kind', async ({ page }) => {
+    const shape = await page.evaluate(async () => {
+      const SQL_LONG = 496;
+      const SQL_VARYING = 448;
+      window.__stub.description = {
+        // Parameters are positional in Firebird and carry no name.
+        params: [
+          { name: '', type: SQL_LONG, subType: 0, scale: 0, length: 4, nullable: true },
+        ],
+        columns: [
+          { name: 'ID', type: SQL_LONG, subType: 0, scale: 0, length: 4, nullable: false },
+          { name: 'NAME', type: SQL_VARYING, subType: 0, scale: 0, length: 20, nullable: true },
+        ],
+        statementType: 1, // isc_info_sql_stmt_select
+      };
+
+      const db = new window.FB.FirebirdBrowser('describe-basic', { autoPersist: false });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      window.__stub.resetCalls();
+
+      const described = await db.describeQuery('SELECT id, name FROM t WHERE id = ?');
+      const call = window.__stub.firstCall('_fb_describe');
+      await db.close();
+
+      return { described, sql: call?.args[2], freed: window.__stub.stats().liveResults };
+    });
+
+    expect(shape.described.params).toEqual([
+      {
+        name: '',
+        type: 496,
+        typeName: 'INTEGER',
+        subType: 0,
+        scale: 0,
+        length: 4,
+        nullable: true,
+      },
+    ]);
+    expect(shape.described.fields.map((f) => f.name)).toEqual(['ID', 'NAME']);
+    expect(shape.described.fields[1]!.typeName).toBe('VARYING');
+    expect(shape.described.statementType).toBe('SELECT');
+    expect(shape.described.hasResultSet).toBe(true);
+    expect(shape.sql).toBe('SELECT id, name FROM t WHERE id = ?');
+    // The description is engine-owned memory, freed like a result set.
+    expect(shape.freed).toBe(0);
+  });
+
+  test('reports no result set when a statement describes no columns', async ({
+    page,
+  }) => {
+    const shape = await page.evaluate(async () => {
+      window.__stub.description = { params: [], columns: [], statementType: 2 };
+
+      const db = new window.FB.FirebirdBrowser('describe-insert', { autoPersist: false });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      const described = await db.describeQuery('INSERT INTO t VALUES (1)');
+      await db.close();
+      return described;
+    });
+
+    expect(shape.statementType).toBe('INSERT');
+    // Derived from the columns rather than reported twice, so the two can
+    // never disagree.
+    expect(shape.hasResultSet).toBe(false);
+    expect(shape.fields).toEqual([]);
+  });
+
+  test('names an unfamiliar statement kind rather than failing', async ({ page }) => {
+    const kind = await page.evaluate(async () => {
+      // A code this library has no name for — a future Firebird could add one,
+      // and an otherwise complete description should still come back.
+      window.__stub.description = { params: [], columns: [], statementType: 99 };
+
+      const db = new window.FB.FirebirdBrowser('describe-unknown', {
+        autoPersist: false,
+      });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      const described = await db.describeQuery('SOMETHING NEW');
+      await db.close();
+      return described.statementType;
+    });
+
+    expect(kind).toBe('UNKNOWN');
+  });
+
+  test('surfaces the engine error when describing fails', async ({ page }) => {
+    const message = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('describe-fails', { autoPersist: false });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+
+      window.__stub.describeReturnsNull = true;
+      window.__stub.lastError = 'Token unknown - line 1, column 8';
+      try {
+        await db.describeQuery('SELECT nonsense FROM');
+        return 'no error';
+      } catch (err) {
+        return (err as Error).message;
+      } finally {
+        window.__stub.describeReturnsNull = false;
+        await db.close();
+      }
+    });
+
+    expect(message).toContain('could not describe');
+    expect(message).toContain('Token unknown');
+  });
+});
 
 test.describe('rowMode', () => {
   test('returns positional rows and keeps the names in fields', async ({ page }) => {

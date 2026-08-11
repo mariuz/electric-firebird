@@ -19,6 +19,7 @@
 export { FirebirdLite, FirebirdTransaction } from './firebird';
 
 export { sql, SqlFragment, RawSql, isSqlFragment, toStatement } from './sql-tag';
+export { statementKind } from './statement-types';
 export type { SqlTag, Statement } from './sql-tag';
 
 export type {
@@ -28,6 +29,8 @@ export type {
   Row,
   FieldInfo,
   QueryOptions,
+  QueryDescription,
+  StatementKind,
   RowMode,
   ArrayRow,
   TransactionOptions,

@@ -105,6 +105,17 @@ export interface FirebirdWasmModule {
    * doubles, which keeps counts above 2^31 intact.
    */
   _fb_last_affected_rows(): number;
+  /**
+   * Describe a statement without running it.
+   *
+   * Returns a pointer to JSON — `{params, columns, statementType}` — or 0 on
+   * failure.  Released with `_fb_free_result`, like a result set.
+   */
+  _fb_describe(
+    dbHandle: FbHandle,
+    txHandle: FbHandle,
+    sqlPtr: number,
+  ): number;
   /** Free a result set returned by `_fb_query`. */
   _fb_free_result(resultPtr: number): void;
   /** Start a new transaction and return a transaction handle (0 = failed). */

@@ -17,6 +17,7 @@ export type EngineOp =
   | 'detachDatabase'
   | 'execute'
   | 'query'
+  | 'describe'
   | 'startTransaction'
   | 'commit'
   | 'rollback'

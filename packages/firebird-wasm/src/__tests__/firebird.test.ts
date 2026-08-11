@@ -217,6 +217,72 @@ describeIfFirebird('FirebirdLite', () => {
     );
   });
 
+  describe('describeQuery', () => {
+    beforeEach(async () => {
+      await db.exec('CREATE TABLE described (id INTEGER, name VARCHAR(20))');
+    });
+
+    it('reports the result columns and the statement kind', async () => {
+      const shape = await db.describeQuery(
+        'SELECT id, name FROM described WHERE id = ?',
+      );
+
+      expect(shape.fields.map((f) => f.name)).toEqual(['ID', 'NAME']);
+      expect(shape.statementType).toBe('SELECT');
+      expect(shape.hasResultSet).toBe(true);
+    });
+
+    it('reports params as undefined, which is not the same as none', async () => {
+      // The native driver exposes no input metadata at all. Returning [] would
+      // say "this statement takes no parameters", which is a different and
+      // wrong claim about a statement with a placeholder in it.
+      const shape = await db.describeQuery('SELECT id FROM described WHERE id = ?');
+
+      expect(shape.params).toBeUndefined();
+    });
+
+    it('describes a statement that returns nothing', async () => {
+      const shape = await db.describeQuery('INSERT INTO described VALUES (?, ?)');
+
+      expect(shape.statementType).toBe('INSERT');
+      expect(shape.hasResultSet).toBe(false);
+      expect(shape.fields).toEqual([]);
+    });
+
+    it('names DDL and UPDATE too', async () => {
+      expect((await db.describeQuery('CREATE TABLE later (id INTEGER)')).statementType)
+        .toBe('DDL');
+      expect((await db.describeQuery('UPDATE described SET name = ?')).statementType)
+        .toBe('UPDATE');
+      expect((await db.describeQuery('DELETE FROM described')).statementType)
+        .toBe('DELETE');
+    });
+
+    it('runs nothing — describing an INSERT inserts nothing', async () => {
+      await db.describeQuery("INSERT INTO described VALUES (1, 'ghost')");
+      await db.describeQuery('DELETE FROM described');
+
+      const after = await db.query<{ N: number }>(
+        'SELECT COUNT(*) AS N FROM described',
+      );
+      expect(after.rows[0].N).toBe(0);
+    });
+
+    it('accepts a fragment, describing its text', async () => {
+      // The values are irrelevant to the shape; only the text decides it.
+      const shape = await db.describeQuery(
+        sql`SELECT id FROM described WHERE id = ${99}`,
+      );
+
+      expect(shape.fields.map((f) => f.name)).toEqual(['ID']);
+      expect(shape.statementType).toBe('SELECT');
+    });
+
+    it('surfaces the engine error for a statement that will not prepare', async () => {
+      await expect(db.describeQuery('SELECT * FROM no_such_table')).rejects.toThrow();
+    });
+  });
+
   describe('rowMode', () => {
     beforeEach(async () => {
       await db.exec('CREATE TABLE shaped (id INTEGER, name VARCHAR(20))');

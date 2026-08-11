@@ -478,6 +478,71 @@ test.describe('FirebirdBrowser against the real engine', () => {
     expect(result.numUnchanged).toBe('1234.5678');
   });
 
+  test('describes a statement without running it', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('describe-engine', {
+        worker: new Worker('/firebird-engine-worker.js'),
+        autoPersist: false,
+      });
+
+      await db.exec(
+        'CREATE TABLE described (id INTEGER, name VARCHAR(20), amount NUMERIC(10,2))',
+      );
+
+      const select = await db.describeQuery(
+        'SELECT id, name, amount FROM described WHERE id = ? AND name = ?',
+      );
+      const insert = await db.describeQuery(
+        'INSERT INTO described VALUES (?, ?, ?)',
+      );
+      const ddl = await db.describeQuery('CREATE TABLE another (id INTEGER)');
+
+      // Nothing above should have run: the INSERT describes three parameters
+      // and must still have inserted nothing, and `another` must not exist.
+      await db.exec("INSERT INTO described VALUES (1, 'real', 9.99)");
+      const count = (await db.query('SELECT COUNT(*) AS N FROM described')).rows[0];
+
+      let anotherExists = true;
+      try {
+        await db.query('SELECT id FROM another');
+      } catch {
+        anotherExists = false;
+      }
+
+      await db.close();
+      return { select, insert, ddl, count, anotherExists };
+    });
+
+    // Real metadata from the engine: names and type codes for the columns,
+    // and one entry per placeholder with the type the engine inferred.
+    expect(result.select.statementType).toBe('SELECT');
+    expect(result.select.hasResultSet).toBe(true);
+    expect(result.select.fields.map((f) => f.name)).toEqual(['ID', 'NAME', 'AMOUNT']);
+    expect(result.select.fields.map((f) => f.typeName)).toEqual([
+      'INTEGER',
+      'VARYING',
+      // NUMERIC is a scaled integer, which is exactly what typeName exists to
+      // disambiguate.
+      'NUMERIC',
+    ]);
+    expect(result.select.params).toHaveLength(2);
+    expect(result.select.params!.map((p) => p.typeName)).toEqual([
+      'INTEGER',
+      'VARYING',
+    ]);
+
+    expect(result.insert.statementType).toBe('INSERT');
+    expect(result.insert.hasResultSet).toBe(false);
+    expect(result.insert.fields).toEqual([]);
+    expect(result.insert.params).toHaveLength(3);
+
+    expect(result.ddl.statementType).toBe('DDL');
+
+    // Describing executed nothing — one real row, and no table from the DDL.
+    expect(result.count).toMatchObject({ N: 1 });
+    expect(result.anotherExists).toBe(false);
+  });
+
   test('returns positional rows through the Worker', async ({ page }) => {
     // Decoding happens inside the Worker, so `rowMode` has to travel with the
     // call — applying it to what comes back would be too late, and the rows

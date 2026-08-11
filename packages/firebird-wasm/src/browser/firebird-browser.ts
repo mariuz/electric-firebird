@@ -39,6 +39,7 @@ import type { SqlFragment } from '../sql-tag';
 import type {
   ArrayRow,
   QueryResult,
+  QueryDescription,
   QueryOptions,
   Row,
   QueryParams,
@@ -432,6 +433,29 @@ export class FirebirdBrowser {
       await this.engine.rollback(txHandle).catch(() => undefined);
       throw err;
     }
+  }
+
+  /**
+   * Describe a statement's shape without running it.
+   *
+   * ```ts
+   * const shape = await db.describeQuery('SELECT id, name FROM items WHERE id = ?');
+   * // shape.params        → [{ type: 496, typeName: 'INTEGER', … }]
+   * // shape.fields        → [{ name: 'ID', … }, { name: 'NAME', … }]
+   * // shape.statementType → 'SELECT'
+   * ```
+   *
+   * The statement is prepared and dropped, so nothing happens: describing an
+   * `INSERT` inserts nothing. Preparing is not free — the engine parses and
+   * plans — but it is the only way to learn a shape, and the alternative,
+   * running the statement to see what comes back, is not one.
+   *
+   * A `` sql`…` `` fragment is accepted and its values ignored; only the text
+   * decides the shape, and a fragment is often what a caller has to hand.
+   */
+  async describeQuery(sql: string | SqlFragment): Promise<QueryDescription> {
+    await this.ensureReady();
+    return this.engine.describe(this.dbHandle, 0, toStatement(sql).sql);
   }
 
   /**

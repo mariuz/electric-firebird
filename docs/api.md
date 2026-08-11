@@ -145,6 +145,51 @@ Execute a SELECT statement inside the active transaction and return rows.
 
 ---
 
+## `describeQuery(sql)`
+
+What a statement *is*, without running it.
+
+```ts
+const shape = await db.describeQuery('SELECT id, name FROM items WHERE id = ?');
+// shape.params        → [{ name: '', type: 496, typeName: 'INTEGER', … }]
+// shape.fields        → [{ name: 'ID', … }, { name: 'NAME', … }]
+// shape.statementType → 'SELECT'
+// shape.hasResultSet  → true
+```
+
+```ts
+interface QueryDescription {
+  params?: FieldInfo[]      // one per `?`, in order
+  fields: FieldInfo[]       // one per result column
+  statementType: StatementKind   // 'SELECT' | 'INSERT' | 'DDL' | …
+  hasResultSet: boolean
+}
+```
+
+The statement is prepared and dropped, so **nothing runs** — describing an
+`INSERT` inserts nothing and describing a `CREATE TABLE` creates none.
+Preparing is not free (the engine parses and plans), but it is the only way to
+learn a shape, and the alternative — running the statement to see what comes
+back — is not one.
+
+A `` sql`…` `` fragment is accepted; only its text decides the shape, so its
+values are ignored.
+
+Parameters are positional in Firebird and have no names, so `ParamInfo.name` is
+the empty string.  They are described by type and position.
+
+`statementType` is `'UNKNOWN'` for a code this library has no name for — a
+future Firebird may add one, and that is no reason to fail a description that
+is otherwise complete.
+
+> **`params` is `undefined` on the Node backend.**  The native driver exposes
+> no input metadata at all, and `[]` would claim the statement takes no
+> parameters — a different and wrong thing to say about `WHERE id = ?`.
+> `fields` there carries names only, as `FieldInfo` does everywhere on that
+> backend.  The WASM backend reports both in full.
+
+---
+
 ## `rowMode`
 
 Each row is an object keyed by upper-cased column name by default.  `'array'`

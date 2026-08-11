@@ -10,7 +10,14 @@
  * operations are part of the transport rather than being done by the caller.
  */
 
-import type { Row, QueryResult, QueryParams, RowMode, TransactionOptions } from '../types';
+import type {
+  Row,
+  QueryResult,
+  QueryDescription,
+  QueryParams,
+  RowMode,
+  TransactionOptions,
+} from '../types';
 import type { EngineHandle, EngineTransport } from './engine-transport';
 import type { EngineOp, EngineRequest, EngineResponse } from './worker-protocol';
 
@@ -157,6 +164,14 @@ export class WorkerTransport implements EngineTransport {
     // call rather than being applied to what comes back. It is a string, so
     // it survives structured cloning like the rest of the arguments.
     return this.call<QueryResult<T>>('query', dbHandle, txHandle, sql, params, rowMode);
+  }
+
+  describe(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    sql: string,
+  ): Promise<QueryDescription> {
+    return this.call<QueryDescription>('describe', dbHandle, txHandle, sql);
   }
 
   startTransaction(

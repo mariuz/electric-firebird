@@ -152,3 +152,50 @@ export interface QueryOptions extends TransactionOptions {
 
 /** A row in `rowMode: 'array'` — values in column order. */
 export type ArrayRow = unknown[];
+
+/**
+ * What a statement is, from Firebird's `isc_info_sql_stmt_*` codes.
+ *
+ * `'UNKNOWN'` covers a code this library does not name rather than a failure
+ * to describe the statement.
+ */
+export type StatementKind =
+  | 'SELECT'
+  | 'INSERT'
+  | 'UPDATE'
+  | 'DELETE'
+  | 'DDL'
+  | 'GET_SEGMENT'
+  | 'PUT_SEGMENT'
+  | 'EXEC_PROCEDURE'
+  | 'START_TRANS'
+  | 'COMMIT'
+  | 'ROLLBACK'
+  | 'SELECT_FOR_UPD'
+  | 'SET_GENERATOR'
+  | 'SAVEPOINT'
+  | 'UNKNOWN';
+
+/**
+ * The shape of a statement, without running it.
+ *
+ * Returned by `describeQuery()`. Parameters are positional `?` in Firebird and
+ * carry no names, so a `ParamInfo` has everything a {@link FieldInfo} has
+ * except a meaningful one.
+ */
+export interface QueryDescription {
+  /**
+   * One entry per `?`, in order.
+   *
+   * `undefined` where the backend cannot report them — the Node driver
+   * exposes no input metadata, and an empty array there would claim the
+   * statement takes no parameters.
+   */
+  params?: FieldInfo[];
+  /** One entry per result column, in order.  Empty for a statement returning none. */
+  fields: FieldInfo[];
+  /** What kind of statement it is. */
+  statementType: StatementKind;
+  /** Whether executing it yields rows. */
+  hasResultSet: boolean;
+}

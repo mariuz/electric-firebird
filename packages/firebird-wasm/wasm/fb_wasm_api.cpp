@@ -983,6 +983,66 @@ IProvider* locateProvider()
  * input message is supplied.  `cursor` is an out-parameter so the caller's
  * cleanup owns it on every exit path, including the error ones.
  */
+/**
+ * Append a JSON array describing every field of `meta`.
+ *
+ * The same shape the result-set encoder emits for its columns, so one decoder
+ * on the JS side reads both. A null `meta` — which is what a statement with no
+ * parameters or no output reports — is an empty array, not an error.
+ */
+bool describeMetadata(IMessageMetadata* meta, std::string& json)
+{
+	Status status;
+
+	json += '[';
+
+	if (meta)
+	{
+		const unsigned count = meta->getCount(status.ptr());
+		if (status.failed())
+		{
+			setErrorFromStatus("could not read metadata count", status.ptr());
+			return false;
+		}
+
+		for (unsigned i = 0; i < count; i++)
+		{
+			if (i)
+				json += ',';
+
+			// Prefer the alias, as the result-set encoder does. Input
+			// parameters have neither, and come back as "".
+			const char* name = meta->getAlias(status.ptr(), i);
+			if (status.failed() || !name || !*name)
+				name = meta->getField(status.ptr(), i);
+
+			const unsigned type     = meta->getType(status.ptr(), i);
+			const int      subType  = meta->getSubType(status.ptr(), i);
+			const int      scale    = meta->getScale(status.ptr(), i);
+			const unsigned length   = meta->getLength(status.ptr(), i);
+			const FB_BOOLEAN nullable = meta->isNullable(status.ptr(), i);
+
+			if (status.failed())
+			{
+				setErrorFromStatus("could not read field metadata", status.ptr());
+				return false;
+			}
+
+			json += "{\"name\":";
+			jsonEscape(name ? name : "", name ? strlen(name) : 0, json);
+
+			char described[128];
+			snprintf(described, sizeof(described),
+				",\"type\":%u,\"subType\":%d,\"scale\":%d,\"length\":%u,\"nullable\":%s}",
+				type, subType, scale, length, nullable ? "true" : "false");
+			json += described;
+		}
+	}
+
+	json += ']';
+	return true;
+}
+
 bool serialiseCursor(IAttachment* attachment, ITransaction* transaction,
 	IStatement* statement, IMessageMetadata* metadata, unsigned columnCount,
 	IMessageMetadata* inMeta, void* inBuffer,
@@ -1355,6 +1415,135 @@ double fb_last_affected_rows(void)
  * `tx_handle` of 0 runs the query in its own transaction, committed once the
  * cursor has been drained.
  */
+/**
+ * Describe a prepared statement without running it.
+ *
+ * Returns `{"params":[…],"columns":[…],"statementType":N}`, where both arrays
+ * carry the same per-field shape the result sets already use. Input parameters
+ * have no names in Firebird — they are positional `?` — so their `name` is the
+ * empty string rather than an invention.
+ *
+ * The statement is prepared and dropped. Preparing is not free (the engine
+ * parses and plans) but it is the only way to learn a statement's shape, and
+ * it is what makes this answerable without side effects: nothing is executed,
+ * so describing an `INSERT` inserts nothing.
+ */
+FB_WASM_EXPORT
+const char* fb_describe(int db_handle, int tx_handle, const char* sql)
+{
+	clearError();
+
+	IAttachment* attachment = lookupAttachment(db_handle);
+	if (!attachment)
+	{
+		setError("fb_describe: unknown database handle");
+		return nullptr;
+	}
+
+	ITransaction* transaction = nullptr;
+	bool ownTransaction = false;
+
+	if (tx_handle)
+	{
+		transaction = lookupTransaction(tx_handle);
+		if (!transaction)
+		{
+			setError("fb_describe: unknown transaction handle");
+			return nullptr;
+		}
+	}
+	else
+	{
+		Status status;
+		transaction = attachment->startTransaction(status.ptr(), 0, nullptr);
+		if (status.failed() || !transaction)
+		{
+			setErrorFromStatus("fb_describe: could not start transaction", status.ptr());
+			return nullptr;
+		}
+		ownTransaction = true;
+	}
+
+	IStatement*       statement = nullptr;
+	IMessageMetadata* inMeta    = nullptr;
+	IMessageMetadata* outMeta   = nullptr;
+
+	auto cleanup = [&]()
+	{
+		if (inMeta)
+			inMeta->release();
+		if (outMeta)
+			outMeta->release();
+		if (statement)
+			statement->free(Status().ptr());
+
+		if (ownTransaction && transaction)
+		{
+			// Nothing ran, so there is nothing to commit — but the transaction
+			// still has to be finished or it leaks.
+			Status s;
+			transaction->commit(s.ptr());
+			transaction = nullptr;
+		}
+	};
+
+	Status status;
+	statement = attachment->prepare(status.ptr(), transaction, 0, sql, SQL_DIALECT_V6,
+		IStatement::PREPARE_PREFETCH_METADATA);
+
+	if (status.failed() || !statement)
+	{
+		setErrorFromStatus("fb_describe: prepare failed", status.ptr());
+		cleanup();
+		return nullptr;
+	}
+
+	inMeta = statement->getInputMetadata(status.ptr());
+	if (status.failed())
+	{
+		setErrorFromStatus("fb_describe: could not read input metadata", status.ptr());
+		cleanup();
+		return nullptr;
+	}
+
+	outMeta = statement->getOutputMetadata(status.ptr());
+	if (status.failed())
+	{
+		setErrorFromStatus("fb_describe: could not read output metadata", status.ptr());
+		cleanup();
+		return nullptr;
+	}
+
+	const unsigned statementType = statement->getType(status.ptr());
+	if (status.failed())
+	{
+		setErrorFromStatus("fb_describe: could not read statement type", status.ptr());
+		cleanup();
+		return nullptr;
+	}
+
+	std::string json = "{\"params\":";
+	if (!describeMetadata(inMeta, json))
+	{
+		cleanup();
+		return nullptr;
+	}
+
+	json += ",\"columns\":";
+	if (!describeMetadata(outMeta, json))
+	{
+		cleanup();
+		return nullptr;
+	}
+
+	char tail[64];
+	snprintf(tail, sizeof(tail), ",\"statementType\":%u}", statementType);
+	json += tail;
+
+	cleanup();
+	return allocCString(json);
+}
+
 FB_WASM_EXPORT
 const char* fb_query(int db_handle, int tx_handle, const char* sql)
 {
