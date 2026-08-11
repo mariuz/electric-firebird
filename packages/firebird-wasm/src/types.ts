@@ -117,3 +117,38 @@ export interface TransactionOptions {
   isolationLevel?: IsolationLevel;
   readOnly?: boolean;
 }
+
+/**
+ * What each row is.
+ *
+ * - `'object'` (default) keys every value by its upper-cased column name.
+ * - `'array'` gives the values in column order, positionally.
+ *
+ * Names live in `fields` either way, so `'array'` loses nothing — it trades
+ * the convenience of `row.NAME` for `row[1]`, and for that it skips building
+ * one object per row.
+ */
+export type RowMode = 'object' | 'array';
+
+/**
+ * Options accepted by `query()`.
+ *
+ * A superset of {@link TransactionOptions}: a query may start a transaction of
+ * its own, and it decides the shape of what comes back.
+ */
+export interface QueryOptions extends TransactionOptions {
+  /**
+   * How to shape each row.
+   *
+   * `'array'` is worth reaching for on large result sets and on columns whose
+   * names collide: `SELECT a.ID, b.ID` has two columns and, in object mode,
+   * one `ID` key — the second value wins and the first is unreachable.
+   * Positional rows keep both.
+   *
+   * @default 'object'
+   */
+  rowMode?: RowMode;
+}
+
+/** A row in `rowMode: 'array'` — values in column order. */
+export type ArrayRow = unknown[];

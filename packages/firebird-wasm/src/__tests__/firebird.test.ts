@@ -217,6 +217,81 @@ describeIfFirebird('FirebirdLite', () => {
     );
   });
 
+  describe('rowMode', () => {
+    beforeEach(async () => {
+      await db.exec('CREATE TABLE shaped (id INTEGER, name VARCHAR(20))');
+      await db.exec("INSERT INTO shaped VALUES (1, 'alpha')");
+      await db.exec("INSERT INTO shaped VALUES (2, 'beta')");
+    });
+
+    it('returns positional rows, with the names still in fields', async () => {
+      const result = await db.query('SELECT id, name FROM shaped ORDER BY id', [], {
+        rowMode: 'array',
+      });
+
+      expect(result.rows).toEqual([
+        [1, 'alpha'],
+        [2, 'beta'],
+      ]);
+      // Nothing is lost: the names are where they always were.
+      expect(result.fields.map((f) => f.name)).toEqual(['ID', 'NAME']);
+    });
+
+    it('defaults to objects', async () => {
+      const result = await db.query('SELECT id, name FROM shaped WHERE id = 1');
+
+      expect(result.rows).toEqual([{ ID: 1, NAME: 'alpha' }]);
+    });
+
+    it('types the rows by the mode, not by hope', async () => {
+      // Compiling is the test. `rows` is unknown[][] here, so indexing it is
+      // allowed and reading a property is not — the overload picked the array
+      // shape from the literal in the options object.
+      const arrays = await db.query('SELECT id, name FROM shaped WHERE id = 1', [], {
+        rowMode: 'array',
+      });
+      const first: unknown[] = arrays.rows[0];
+      expect(first[1]).toBe('alpha');
+
+      const objects = await db.query<{ ID: number }>(
+        'SELECT id FROM shaped WHERE id = 1',
+      );
+      const id: number = objects.rows[0].ID;
+      expect(id).toBe(1);
+    });
+
+    it('keeps both columns when two share a name', async () => {
+      // In object mode `SELECT a.id, b.id` collapses to one ID and the first
+      // value is unreachable. Positional rows keep both, which is the reason
+      // to reach for this mode beyond speed.
+      const result = await db.query(
+        'SELECT a.id, b.id FROM shaped a JOIN shaped b ON b.id = 2 WHERE a.id = 1',
+        [],
+        { rowMode: 'array' },
+      );
+
+      expect(result.rows).toEqual([[1, 2]]);
+      expect(result.fields.map((f) => f.name)).toEqual(['ID', 'ID']);
+    });
+
+    it('works with a fragment and inside a transaction', async () => {
+      const viaFragment = await db.query(sql`SELECT id FROM shaped WHERE id = ${2}`, {
+        rowMode: 'array',
+      });
+      expect(viaFragment.rows).toEqual([[2]]);
+
+      await db.transaction(async (tx) => {
+        const inside = await tx.query('SELECT id, name FROM shaped ORDER BY id', [], {
+          rowMode: 'array',
+        });
+        expect(inside.rows).toEqual([
+          [1, 'alpha'],
+          [2, 'beta'],
+        ]);
+      });
+    });
+  });
+
   // The unit tests cover what the tag builds; these cover the engine accepting
   // it — that the `?` placeholders and the parameter order actually line up
   // once a real statement is prepared.

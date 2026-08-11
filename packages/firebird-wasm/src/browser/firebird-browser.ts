@@ -37,11 +37,17 @@ import type { DatabaseLock } from './db-lock';
 import { toStatement, resolveQueryCall } from '../sql-tag';
 import type { SqlFragment } from '../sql-tag';
 import type {
+  ArrayRow,
   QueryResult,
+  QueryOptions,
   Row,
   QueryParams,
+  RowMode,
   TransactionOptions,
 } from '../types';
+
+/** `QueryOptions` with the array mode pinned, for the overloads below. */
+type ArrayModeOptions = QueryOptions & { rowMode: 'array' };
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -348,14 +354,25 @@ export class FirebirdBrowser {
    * await db.query(sql`SELECT * FROM items WHERE id = ${1}`);
    * ```
    */
+  // `rowMode: 'array'` first, so the literal in the options object picks these
+  // and the return type follows the mode rather than the caller's hope.
+  async query(
+    sql: SqlFragment,
+    options: ArrayModeOptions,
+  ): Promise<QueryResult<ArrayRow>>;
+  async query(
+    sql: string | SqlFragment,
+    params: QueryParams | undefined,
+    options: ArrayModeOptions,
+  ): Promise<QueryResult<ArrayRow>>;
   async query<T extends Row = Row>(
     sql: SqlFragment,
-    options?: TransactionOptions,
+    options?: QueryOptions,
   ): Promise<QueryResult<T>>;
   async query<T extends Row = Row>(
     sql: string,
     params?: QueryParams,
-    options?: TransactionOptions,
+    options?: QueryOptions,
   ): Promise<QueryResult<T>>;
   // Both shapes at once, so a caller holding a `string | SqlFragment` — one
   // built conditionally — can call this without casting. Last, so the two
@@ -363,12 +380,12 @@ export class FirebirdBrowser {
   async query<T extends Row = Row>(
     sql: string | SqlFragment,
     params?: QueryParams,
-    options?: TransactionOptions,
+    options?: QueryOptions,
   ): Promise<QueryResult<T>>;
-  async query<T extends Row = Row>(
+  async query<T = Row>(
     sql: string | SqlFragment,
-    paramsOrOptions: QueryParams | TransactionOptions = [],
-    maybeOptions: TransactionOptions = {},
+    paramsOrOptions: QueryParams | QueryOptions = [],
+    maybeOptions: QueryOptions = {},
   ): Promise<QueryResult<T>> {
     await this.ensureReady();
 
@@ -382,6 +399,8 @@ export class FirebirdBrowser {
     // is one fewer round trip to the Worker.  With them, the statement has to
     // run inside a transaction that carries them — matching the Node backend,
     // which starts one for every query.
+    const rowMode = (options as QueryOptions).rowMode ?? 'object';
+
     if (!hasTransactionOptions(options)) {
       return applyTypes(
         await this.engine.query<T>(
@@ -389,8 +408,10 @@ export class FirebirdBrowser {
           0,
           statement.sql,
           this.serialize(statement.params),
+          rowMode,
         ),
         this.options.types,
+        rowMode,
       );
     }
 
@@ -401,9 +422,10 @@ export class FirebirdBrowser {
         txHandle,
         statement.sql,
         this.serialize(statement.params),
+        rowMode,
       );
       await this.engine.commit(txHandle);
-      return applyTypes(result, this.options.types);
+      return applyTypes(result, this.options.types, rowMode);
     } catch (err) {
       // A failed commit finishes the transaction itself, so only a failure
       // from the query leaves anything to roll back.
@@ -773,20 +795,34 @@ export class FirebirdBrowserTransaction {
   }
 
   /** Execute a SELECT inside this transaction and return rows. */
+  async query(
+    sql: string | SqlFragment,
+    params: QueryParams | undefined,
+    options: ArrayModeOptions,
+  ): Promise<QueryResult<ArrayRow>>;
   async query<T extends Row = Row>(
     sql: string | SqlFragment,
+    params?: QueryParams,
+    options?: { rowMode?: RowMode },
+  ): Promise<QueryResult<T>>;
+  async query<T = Row>(
+    sql: string | SqlFragment,
     params: QueryParams = [],
+    options: { rowMode?: RowMode } = {},
   ): Promise<QueryResult<T>> {
     this.assertUsable();
     const statement = toStatement(sql, params);
+    const rowMode = options.rowMode ?? 'object';
     return applyTypes(
       await this.engine.query<T>(
         this.dbHandle,
         this.txHandle,
         statement.sql,
         applySerializers(statement.params, this.types?.serializers),
+        rowMode,
       ),
       this.types,
+      rowMode,
     );
   }
 }

@@ -8,6 +8,16 @@ API may still move between minor releases.
 
 ### Added
 
+- **`rowMode: 'object' | 'array'`.** A per-query option on both backends:
+  `'array'` returns each row as its values in column order, with the names
+  still in `fields`. Two reasons, and the smaller one is speed — 1.11× on
+  10,000 rows, because the generated constructor had already cut object
+  building to a tenth of a decode that `JSON.parse` dominates. The real reason
+  is that `SELECT a.ID, b.ID` has two columns and one `ID` key in object mode,
+  where the second value wins and the first is unreachable; positional rows
+  keep both. The mode travels with the query rather than being applied to the
+  result, because with a Worker transport the decode happens on the far side.
+
 - **Custom `parsers` and `serializers`.** `types: { parsers, serializers }` on
   `FirebirdBrowser` opens both conversion paths to application code. A parser
   is keyed by Firebird SQL type code and **replaces** the built-in conversion

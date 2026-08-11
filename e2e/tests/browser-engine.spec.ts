@@ -478,6 +478,52 @@ test.describe('FirebirdBrowser against the real engine', () => {
     expect(result.numUnchanged).toBe('1234.5678');
   });
 
+  test('returns positional rows through the Worker', async ({ page }) => {
+    // Decoding happens inside the Worker, so `rowMode` has to travel with the
+    // call — applying it to what comes back would be too late, and the rows
+    // would already have been built as objects and structured-cloned.
+    const result = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('rowmode-engine', {
+        worker: new Worker('/firebird-engine-worker.js'),
+        autoPersist: false,
+      });
+
+      await db.exec('CREATE TABLE shaped (id INTEGER, name VARCHAR(20))');
+      await db.exec("INSERT INTO shaped VALUES (1, 'alpha')");
+      await db.exec("INSERT INTO shaped VALUES (2, 'beta')");
+
+      const arrays = await db.query('SELECT id, name FROM shaped ORDER BY id', [], {
+        rowMode: 'array',
+      });
+      const objects = await db.query('SELECT id, name FROM shaped ORDER BY id');
+      // Two columns, one name: object mode can only keep the last.
+      const collided = await db.query(
+        'SELECT a.id, b.id FROM shaped a JOIN shaped b ON b.id = 2 WHERE a.id = 1',
+        [],
+        { rowMode: 'array' },
+      );
+      await db.close();
+
+      return {
+        arrays: arrays.rows,
+        names: arrays.fields.map((f) => f.name),
+        objects: objects.rows,
+        collided: collided.rows,
+      };
+    });
+
+    expect(result.arrays).toEqual([
+      [1, 'alpha'],
+      [2, 'beta'],
+    ]);
+    expect(result.names).toEqual(['ID', 'NAME']);
+    expect(result.objects).toEqual([
+      { ID: 1, NAME: 'alpha' },
+      { ID: 2, NAME: 'beta' },
+    ]);
+    expect(result.collided).toEqual([[1, 2]]);
+  });
+
   test('query() runs a statement that returns no rows', async ({ page }) => {
     // `fb_query` prepared such a statement, serialised the empty result and
     // committed — without ever executing it. So `query('INSERT …')` reported

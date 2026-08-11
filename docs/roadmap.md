@@ -525,7 +525,7 @@ Legend: ✅ shipped · 🟡 partial · ❌ missing · n/a not applicable
 | `query(sql, params)` | ✅ | ✅ | `?` placeholders on both backends |
 | Template-literal `` sql`…` `` tag | ✅ | ✅ | Values bind as `?` parameters; fragments nest. `sql.identifier()` quotes names, `sql.join()` expands `IN` lists, `sql.unsafe()` is the named escape hatch |
 | `exec(sql)` multi-statement script → array of results | ✅ | ✅ | Splitting respects strings, identifiers, comments and `SET TERM` |
-| `rowMode: 'object' \| 'array'` | ✅ | ❌ | Always object mode |
+| `rowMode: 'object' \| 'array'` | ✅ | ✅ | Per query, on both backends. Names stay in `fields`. Worth it less for speed (1.1× on 10k rows, since the generated constructor already made object building cheap) than for `SELECT a.ID, b.ID`, which object mode can only half-represent |
 | Custom `parsers` / `serializers` | ✅ | 🟡 | `types: { parsers, serializers }` on the browser backend. Parsers key on the Firebird type code and replace the built-in conversion; serializers are a list, because an outgoing parameter has no declared type to key on. Not on the Node backend, whose driver reports no type codes |
 | `describeQuery()` | ✅ | ❌ | |
 | Typed field metadata (`dataTypeID`) | ✅ | ✅ | `FieldInfo` carries type, typeName, subType, scale, length, nullable |

@@ -11,7 +11,7 @@
  * contains is not one to trust. See {@link TypeOptions} for what each costs.
  */
 
-import type { FieldInfo, QueryParams, QueryResult, Row } from '../types';
+import type { FieldInfo, QueryParams, QueryResult, Row, RowMode } from '../types';
 
 // Firebird type codes, from firebird/impl/sqlda_pub.h.
 const SQL_TIMESTAMP = 510;
@@ -298,15 +298,36 @@ function converterFor(
  * a result set with nothing convertible costs one pass over the field list and
  * nothing per row.
  */
-export function applyTypes<T extends Row>(
+export function applyTypes<T>(
   result: QueryResult<T>,
   options: TypeOptions | undefined,
+  rowMode: RowMode = 'object',
 ): QueryResult<T> {
   if (!hasTypeOptions(options) || result.rows.length === 0) {
     return result;
   }
 
   const parsers = normaliseParsers(options!.parsers);
+
+  if (rowMode === 'array') {
+    // Positional rows need positional converters, and get the simpler job of
+    // the two: one converter per column, with no names to collide, so the
+    // shadowing rule below does not arise.
+    const byIndex = result.fields.map((field) =>
+      converterFor(field, options!, parsers),
+    );
+    if (byIndex.every((convert) => convert === null)) return result;
+
+    for (const row of result.rows) {
+      const target = row as unknown[];
+      for (let i = 0; i < byIndex.length; i++) {
+        const convert = byIndex[i];
+        if (convert) target[i] = convert(target[i]);
+      }
+    }
+
+    return result;
+  }
 
   // Keyed by column name rather than accumulated per field, because a result
   // set can name two columns the same — `SELECT a.ID, b.ID` — while a row

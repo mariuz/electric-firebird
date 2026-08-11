@@ -326,6 +326,42 @@ function runCacheScenario() {
 }
 
 // ---------------------------------------------------------------------------
+// Scenario: rowMode
+// ---------------------------------------------------------------------------
+
+/**
+ * What `rowMode: 'array'` saves.
+ *
+ * Reported, never asserted on: this is a shape the caller chooses, not a
+ * regression that can creep in — if array mode ever stopped being the cheaper
+ * of the two, that would be visible here as a number rather than a failure.
+ *
+ * It answers the plan's open question about columnar output with a
+ * measurement. The engine already sends each row as an array, so this mode
+ * hands the parsed rows straight back: the whole of row construction, which
+ * step 1 cut by a factor and could not remove, simply does not happen.
+ */
+function runRowModeScenario() {
+  const json = makeResultSet(10000);
+
+  const objects = fastest(() => {
+    sink = decodeResultSet(json, 'object');
+  });
+  const arrays = fastest(() => {
+    sink = decodeResultSet(json, 'array');
+  });
+
+  return {
+    name: 'rowMode',
+    description: '10,000 rows × 5 columns, object vs array',
+    rowCount: 10000,
+    objectMs: objects.best,
+    arrayMs: arrays.best,
+    speedup: objects.best / arrays.best,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Scenario: opt-in typed values
 // ---------------------------------------------------------------------------
 
@@ -376,7 +412,7 @@ function verdict(passed) {
   return passed ? 'ok' : 'REGRESSED';
 }
 
-function report(results, cache, typed) {
+function report(results, cache, rowMode, typed) {
   const rows = [
     ['scenario', 'current', 'baseline', 'JSON.parse', 'speedup', 'floor', ''],
     ...results.map((r) => [
@@ -421,6 +457,10 @@ function report(results, cache, typed) {
   // rather than left to the column header.
   process.stdout.write(`${cache.name}: ${cache.description}, baseline column is the fresh ones\n`);
   process.stdout.write(
+    `rowMode: ${rowMode.description} — ${ms(rowMode.objectMs)} as objects, `
+      + `${ms(rowMode.arrayMs)} as arrays (${times(rowMode.speedup)} faster)\n`,
+  );
+  process.stdout.write(
     `typed: ${typed.description} — ${ms(typed.decodeMs)} to decode, `
       + `${ms(typed.conversionMs)} to convert, ${typed.overheadPercent.toFixed(0)}% on top\n`,
   );
@@ -454,8 +494,9 @@ function main(argv) {
 
   const results = SCENARIOS.map(runScenario);
   const cache = runCacheScenario();
+  const rowMode = runRowModeScenario();
   const typed = runTypedScenario();
-  report(results, cache, typed);
+  report(results, cache, rowMode, typed);
 
   if (jsonPath) {
     // Timings are rounded on the way out. Full float precision in a file meant
@@ -472,6 +513,7 @@ function main(argv) {
       samples: SAMPLES,
       scenarios: results,
       cache,
+      rowMode,
       typed,
     };
     fs.mkdirSync(path.dirname(path.resolve(jsonPath)), { recursive: true });

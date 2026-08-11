@@ -26,6 +26,7 @@ import type {
   QueryResult,
   FieldInfo,
   QueryParams,
+  RowMode,
   TransactionOptions,
 } from '../types';
 import { isolationCode } from './isolation';
@@ -60,11 +61,12 @@ export interface EngineTransport {
     sql: string,
     params?: QueryParams,
   ): Promise<number>;
-  query<T extends Row = Row>(
+  query<T = Row>(
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     sql: string,
     params?: QueryParams,
+    rowMode?: RowMode,
   ): Promise<QueryResult<T>>;
 
   /**
@@ -218,8 +220,18 @@ function rowBuilder(names: string[]): ((cols: unknown[]) => Row) | null {
   return built;
 }
 
-/** Decode the engine's JSON result set into rows keyed by column name. */
-export function decodeResultSet<T extends Row>(json: string): QueryResult<T> {
+/**
+ * Decode the engine's JSON result set.
+ *
+ * `rowMode: 'array'` returns the parsed rows as they arrive — the engine
+ * already sends each row as an array of values, so this is the one shape that
+ * costs nothing to produce. Object mode is what the row builder above exists
+ * for, and what the decode benchmark measures.
+ */
+export function decodeResultSet<T = Row>(
+  json: string,
+  rowMode: RowMode = 'object',
+): QueryResult<T> {
   const parsed = JSON.parse(json) as {
     columns: EncodedColumn[];
     rows: unknown[][];
@@ -234,6 +246,12 @@ export function decodeResultSet<T extends Row>(json: string): QueryResult<T> {
     length: c.length,
     nullable: c.nullable,
   }));
+
+  if (rowMode === 'array') {
+    // Handed straight through: no builder, no per-row object, and nothing to
+    // collide when two columns share a name.
+    return { rows: parsed.rows as T[], fields };
+  }
 
   const names = fields.map((f) => f.name);
   const build = rowBuilder(names);
@@ -371,11 +389,12 @@ export class DirectTransport implements EngineTransport {
     return mod._fb_last_affected_rows();
   }
 
-  async query<T extends Row = Row>(
+  async query<T = Row>(
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     sql: string,
     params: QueryParams = [],
+    rowMode: RowMode = 'object',
   ): Promise<QueryResult<T>> {
     const mod = this.module;
     return this.withString(sql, (sqlPtr) =>
@@ -392,7 +411,7 @@ export class DirectTransport implements EngineTransport {
       const json = mod.UTF8ToString(resultPtr);
       mod._fb_free_result(resultPtr);
 
-      return decodeResultSet<T>(json);
+      return decodeResultSet<T>(json, rowMode);
       }),
     );
   }

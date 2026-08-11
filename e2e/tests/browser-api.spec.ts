@@ -708,6 +708,96 @@ test.describe('sql`…` tag', () => {
 // Custom parsers and serializers
 // ===========================================================================
 
+test.describe('rowMode', () => {
+  test('returns positional rows and keeps the names in fields', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      window.__stub.queryResult = {
+        columns: ['ID', 'NAME'],
+        rows: [
+          [1, 'alpha'],
+          [2, 'beta'],
+        ],
+      };
+
+      const db = new window.FB.FirebirdBrowser('rowmode-array', { autoPersist: false });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+
+      const arrays = await db.query('SELECT id, name FROM t', [], { rowMode: 'array' });
+      const objects = await db.query('SELECT id, name FROM t');
+      await db.close();
+
+      return {
+        arrays: arrays.rows,
+        names: arrays.fields.map((f) => f.name),
+        objects: objects.rows,
+      };
+    });
+
+    expect(result.arrays).toEqual([
+      [1, 'alpha'],
+      [2, 'beta'],
+    ]);
+    expect(result.names).toEqual(['ID', 'NAME']);
+    // The default is unchanged.
+    expect(result.objects).toEqual([
+      { ID: 1, NAME: 'alpha' },
+      { ID: 2, NAME: 'beta' },
+    ]);
+  });
+
+  test('keeps both values when two columns share a name', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      window.__stub.queryResult = { columns: ['ID', 'ID'], rows: [[1, 2]] };
+
+      const db = new window.FB.FirebirdBrowser('rowmode-dupe', { autoPersist: false });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+
+      const arrays = await db.query('SELECT a.id, b.id FROM t a JOIN t b', [], {
+        rowMode: 'array',
+      });
+      const objects = await db.query('SELECT a.id, b.id FROM t a JOIN t b');
+      await db.close();
+
+      return { arrays: arrays.rows, objects: objects.rows };
+    });
+
+    expect(result.arrays).toEqual([[1, 2]]);
+    // Object mode can only keep one, which is the trade positional rows undo.
+    expect(result.objects).toEqual([{ ID: 2 }]);
+  });
+
+  test('converts values by position, so types still apply', async ({ page }) => {
+    const value = await page.evaluate(async () => {
+      const SQL_INT64 = 580;
+      window.__stub.queryResult = {
+        columns: [
+          { name: 'BIG', type: SQL_INT64, subType: 0, scale: 0, length: 8, nullable: true },
+          { name: 'TXT', type: 448, subType: 0, scale: 0, length: 32, nullable: true },
+        ],
+        rows: [['9007199254740993', 'untouched']],
+      };
+
+      const db = new window.FB.FirebirdBrowser('rowmode-typed', {
+        autoPersist: false,
+        types: { bigint: true },
+      });
+      await db.exec('CREATE TABLE t (big BIGINT)');
+      const rows = (await db.query('SELECT big, txt FROM t', [], { rowMode: 'array' }))
+        .rows;
+      await db.close();
+
+      const row = rows[0] as unknown[];
+      return { kind: typeof row[0], exact: row[0] === 9007199254740993n, other: row[1] };
+    });
+
+    // Converters are chosen per column and applied by index — the column with
+    // no conversion is left alone.
+    expect(value.kind).toBe('bigint');
+    expect(value.exact).toBe(true);
+    expect(value.other).toBe('untouched');
+  });
+});
+
 test.describe('Custom parsers and serializers', () => {
   // From firebird/impl/sqlda_pub.h, as in src/browser/field-types.ts.
   const SQL_VARYING = 448;

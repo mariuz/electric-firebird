@@ -76,6 +76,9 @@ export type {
   Row,
   FieldInfo,
   FirebirdTypeName,
+  QueryOptions,
+  RowMode,
+  ArrayRow,
   TransactionOptions,
   IsolationLevel,
 } from '../types';

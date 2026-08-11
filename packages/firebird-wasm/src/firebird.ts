@@ -12,15 +12,21 @@ import type {
   TransactionOptions as NativeTransactionOptions,
 } from 'node-firebird-driver';
 import type {
+  ArrayRow,
   FirebirdLiteOptions,
   QueryResult,
+  QueryOptions,
   Row,
   QueryParams,
+  RowMode,
   TransactionOptions,
   FieldInfo,
 } from './types';
 import { toStatement, resolveQueryCall } from './sql-tag';
 import type { SqlFragment } from './sql-tag';
+
+/** `QueryOptions` with the array mode pinned, for the overloads below. */
+type ArrayModeOptions = QueryOptions & { rowMode: 'array' };
 
 /**
  * FirebirdLite – a PGlite-style wrapper around Firebird Embedded.
@@ -103,14 +109,25 @@ export class FirebirdLite {
    * await db.query(sql`SELECT * FROM items WHERE id = ${id}`);
    * ```
    */
+  // `rowMode: 'array'` first, so the literal in the options object picks these
+  // and the return type follows the mode rather than the caller's hope.
+  async query(
+    sql: SqlFragment,
+    options: ArrayModeOptions,
+  ): Promise<QueryResult<ArrayRow>>;
+  async query(
+    sql: string | SqlFragment,
+    params: QueryParams | undefined,
+    options: ArrayModeOptions,
+  ): Promise<QueryResult<ArrayRow>>;
   async query<T extends Row = Row>(
     sql: SqlFragment,
-    options?: TransactionOptions,
+    options?: QueryOptions,
   ): Promise<QueryResult<T>>;
   async query<T extends Row = Row>(
     sql: string,
     params?: QueryParams,
-    options?: TransactionOptions,
+    options?: QueryOptions,
   ): Promise<QueryResult<T>>;
   // Both shapes at once, so a caller holding a `string | SqlFragment` — one
   // built conditionally — can call this without casting. Last, so the two
@@ -118,15 +135,16 @@ export class FirebirdLite {
   async query<T extends Row = Row>(
     sql: string | SqlFragment,
     params?: QueryParams,
-    options?: TransactionOptions,
+    options?: QueryOptions,
   ): Promise<QueryResult<T>>;
-  async query<T extends Row = Row>(
+  async query<T = Row>(
     sql: string | SqlFragment,
-    paramsOrOptions: QueryParams | TransactionOptions = [],
-    maybeOptions: TransactionOptions = {},
+    paramsOrOptions: QueryParams | QueryOptions = [],
+    maybeOptions: QueryOptions = {},
   ): Promise<QueryResult<T>> {
     await this.ensureReady();
     const { statement, options } = resolveQueryCall(sql, paramsOrOptions, maybeOptions);
+    const rowMode: RowMode = (options as QueryOptions).rowMode ?? 'object';
     const attachment = this.attachment!;
 
     const txOptions = buildTransactionOptions(options);
@@ -150,8 +168,15 @@ export class FirebirdLite {
           // Same reasoning one level down: a failing fetch must still close.
           try {
             const rawRows = await resultSet.fetch();
-            rows = rawRows.map((cols) =>
-              Object.fromEntries(fields.map((f, i) => [f.name, cols[i]])),
+            // The driver already hands back positional rows, so array mode is
+            // the shape that costs nothing — object mode is the one that
+            // builds.
+            rows = (
+              rowMode === 'array'
+                ? rawRows
+                : rawRows.map((cols) =>
+                    Object.fromEntries(fields.map((f, i) => [f.name, cols[i]])),
+                  )
             ) as T[];
           } finally {
             await resultSet.close().catch(() => undefined);
@@ -287,12 +312,24 @@ export class FirebirdTransaction {
   /**
    * Execute a SELECT statement inside this transaction and return rows.
    */
+  async query(
+    sql: string | SqlFragment,
+    params: QueryParams | undefined,
+    options: ArrayModeOptions,
+  ): Promise<QueryResult<ArrayRow>>;
   async query<T extends Row = Row>(
     sql: string | SqlFragment,
+    params?: QueryParams,
+    options?: { rowMode?: RowMode },
+  ): Promise<QueryResult<T>>;
+  async query<T = Row>(
+    sql: string | SqlFragment,
     params: QueryParams = [],
+    options: { rowMode?: RowMode } = {},
   ): Promise<QueryResult<T>> {
     this.assertUsable();
     const statement = toStatement(sql, params);
+    const rowMode = options.rowMode ?? 'object';
 
     const stmt = await this.attachment.prepare(this.transaction, statement.sql);
     // Same leak as FirebirdLite.query had: a statement or result set that
@@ -312,8 +349,12 @@ export class FirebirdTransaction {
         await resultSet.close().catch(() => undefined);
       }
 
-      const rows = rawRows.map((cols) =>
-        Object.fromEntries(fields.map((f, i) => [f.name, cols[i]])),
+      const rows = (
+        rowMode === 'array'
+          ? rawRows
+          : rawRows.map((cols) =>
+              Object.fromEntries(fields.map((f, i) => [f.name, cols[i]])),
+            )
       ) as T[];
 
       return { rows, fields };

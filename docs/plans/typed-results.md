@@ -216,8 +216,14 @@ database.
 - Is `{ unscaled: bigint, scale: number }` the right shape for exact decimals,
   or should this wait for a decimal proposal to land in JS? Worth checking what
   PGlite settled on for `numeric` before inventing one.
-- Should columnar output be offered (`rows` as arrays plus a name index)? It was
-  as fast as the generated constructor and avoids per-row objects entirely, but
-  it is a second result shape to document and support.
+- ~~Should columnar output be offered (`rows` as arrays plus a name index)?~~
+  **Answered, and the premise was half wrong.** It shipped as
+  `rowMode: 'array'`, and the benchmark now measures it: 3.6 ms against 3.3 ms
+  on 10,000 rows, or **1.11×**. "As fast as the generated constructor" was
+  right; what that implies is that there is almost no speed left to win — step
+  1 had already reduced row construction to a tenth of a decode dominated by
+  `JSON.parse`. The case for the mode turned out to be semantic rather than
+  performance: `SELECT a.ID, b.ID` has two columns and, in object mode, one
+  `ID` key, so positional rows are the only shape that keeps both.
 - The engine query itself is 73 ms of the 118 ms end-to-end. Nothing here
   touches that, and it may be the better target.

@@ -27,7 +27,7 @@
  * apply it twice. An error a caller can see beats a duplicate row it cannot.
  */
 
-import type { Row, QueryResult, QueryParams, TransactionOptions } from '../types';
+import type { Row, QueryResult, QueryParams, RowMode, TransactionOptions } from '../types';
 import type { EngineHandle, EngineTransport } from './engine-transport';
 import { electLeader } from './leader-election';
 import type { LeaderElection } from './leader-election';
@@ -460,13 +460,17 @@ export class SharedEngineTransport implements EngineTransport {
     return this.call<number>('execute', dbHandle, txHandle, sql, params);
   }
 
-  query<T extends Row = Row>(
+  query<T = Row>(
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     sql: string,
     params: QueryParams = [],
+    rowMode: RowMode = 'object',
   ): Promise<QueryResult<T>> {
-    return this.call<QueryResult<T>>('query', dbHandle, txHandle, sql, params);
+    // Decoding happens on the far side, so the mode has to travel with the
+    // call rather than being applied to what comes back. It is a string, so
+    // it survives structured cloning like the rest of the arguments.
+    return this.call<QueryResult<T>>('query', dbHandle, txHandle, sql, params, rowMode);
   }
 
   startTransaction(

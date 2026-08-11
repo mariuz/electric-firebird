@@ -27,6 +27,9 @@ export type {
   QueryParams,
   Row,
   FieldInfo,
+  QueryOptions,
+  RowMode,
+  ArrayRow,
   TransactionOptions,
   IsolationLevel,
 } from './types';
