@@ -122,6 +122,11 @@ file(GLOB_RECURSE FB_JRD_SRCS
 # Exclude standalone test utilities in jrd/misc/ (e.g. evl_string_test.cpp) –
 # they are not part of the embedded engine and reference constructors/types
 # that may not compile in the WASM context.
+# common/os/posix/mod_loader.cpp is dlopen.  fb_wasm_mod_loader.cpp replaces it:
+# nothing is loadable at runtime here, and the intl module needs to be reachable
+# by name even though it is linked in.  Both cannot define ModuleLoader.
+list(FILTER FB_COMMON_SRCS EXCLUDE REGEX ".*/common/os/posix/mod_loader\\.cpp$")
+
 list(FILTER FB_JRD_SRCS EXCLUDE REGEX ".*/jrd/misc/.*")
 # Exclude Boost-dependent test files in jrd/tests/ (CompressorTest.cpp,
 # EngineTest.cpp) – they require Boost test headers unavailable in WASM.
@@ -148,6 +153,49 @@ list(FILTER FB_JRD_SRCS EXCLUDE REGEX ".*/jrd/extds/.*")
 #    in-memory WASM VFS and is fully disabled by this removal.
 # Emscripten exposes pread/pwrite via its MEMFS virtual filesystem, giving the
 # WASM engine real in-memory page storage without any native disk dependency.
+
+# ---------------------------------------------------------------------------
+# International text: charsets and collations beyond the built-ins
+# ---------------------------------------------------------------------------
+#
+# Normally these live in a separately loaded `fbintl` module, and Emscripten
+# has no dlopen to load it with.  Compiling them in is the only way to have
+# them at all, so it is an option rather than a given: they are mostly codepage
+# tables, on an artifact a browser has to download, for encodings many
+# applications never touch.  Measure before enabling — see docs/roadmap.md.
+option(FB_WASM_FULL_INTL "Compile the loadable character sets and collations into the engine" OFF)
+
+if(FB_WASM_FULL_INTL)
+  # Enabling this today buys size and nothing else.  The sources compile and
+  # link, but IntlManager still reaches the module through ModuleLoader, which
+  # needs a dlopen Emscripten does not have — so the charsets are present in
+  # the binary and unreachable from SQL.  Measured cost: +616 KB raw,
+  # +245 KB gzipped.  See docs/roadmap.md for what is left to wire up.
+  message(WARNING
+    "FB_WASM_FULL_INTL compiles src/intl in, but the charsets are not yet "
+    "reachable: IntlManager has no way to load the module without dlopen. "
+    "This adds ~616 KB and enables nothing. See docs/roadmap.md.")
+  # All of it, or none: ld.cpp holds a single static table naming all 89
+  # charsets, so dropping the legacy codepages to keep only the ICU collations
+  # leaves 175 undefined symbols. Trimming that table is possible but means a
+  # new patch to rebase onto every Firebird release, for 616 KB.
+  file(GLOB FB_INTL_SRCS "${FIREBIRD_SRC}/src/intl/*.cpp")
+  # The module loader shim references the entry points by address, which is
+  # what keeps the subsystem from being dead-stripped.
+  add_compile_definitions(FB_WASM_STATIC_INTL)
+
+  # IntlManager scans <root>/intl for *.conf to learn which charsets live in
+  # which module.  There is no installation to read one from, so the stock
+  # config is embedded in the artifact and fb_init() points the root at it.
+  set(FB_INTL_CONF "${FIREBIRD_SRC}/builds/install/misc/fbintl.conf")
+  if(NOT EXISTS "${FB_INTL_CONF}")
+    message(FATAL_ERROR "FB_WASM_FULL_INTL needs ${FB_INTL_CONF}, which is missing")
+  endif()
+  # cs_icu/cv_icu reach ICU through the same static build the engine uses.
+  message(STATUS "Full INTL enabled: ${FIREBIRD_SRC}/src/intl")
+else()
+  set(FB_INTL_SRCS "")
+endif()
 
 file(GLOB_RECURSE FB_LOCK_SRCS
   "${FIREBIRD_SRC}/src/lock/*.cpp"
@@ -262,6 +310,7 @@ set(FB_INCLUDE_DIRS
 set(FB_WASM_GLUE_SRCS
   "${CMAKE_CURRENT_SOURCE_DIR}/fb_wasm_api.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/fb_wasm_stubs.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/fb_wasm_mod_loader.cpp"
 )
 
 # Diagnostic: exercises Firebird's MemoryPool directly, with no engine
@@ -281,6 +330,7 @@ add_executable(firebird-embedded
   ${FB_COMMON_SRCS}
   ${FB_DSQL_SRCS}
   ${FB_JRD_SRCS}
+  ${FB_INTL_SRCS}
   ${FB_LOCK_SRCS}
   ${FB_YVALVE_SRCS}
   ${FB_EPP_SRCS}
@@ -367,7 +417,8 @@ set(FB_EXPORTED_FUNCTIONS
   _fb_init _fb_last_error _fb_last_affected_rows
   _fb_create_database _fb_attach_database _fb_detach_database
   _fb_execute _fb_query _fb_execute_params _fb_query_params _fb_free_result
-  _fb_start_transaction _fb_commit _fb_rollback
+  _fb_describe _fb_last_blobs _fb_last_blobs_size
+  _fb_start_transaction _fb_start_transaction_ex _fb_commit _fb_rollback
   _fb_events_subscribe _fb_events_poll _fb_events_cancel
   _malloc _free
 )
@@ -470,6 +521,14 @@ elseif(FB_WASM_SANITIZE STREQUAL "address")
   )
 elseif(NOT FB_WASM_SANITIZE STREQUAL "none")
   message(FATAL_ERROR "FB_WASM_SANITIZE must be one of: none, safe-heap, address")
+endif()
+
+if(FB_WASM_FULL_INTL)
+  # Embedded rather than written at runtime: the config must exist before the
+  # engine initialises, and baking it into the artifact means no host setup and
+  # no way to ship the engine without it.  fb_init() points the root here.
+  list(APPEND EMSCRIPTEN_LINK_FLAGS
+    "--embed-file ${FB_INTL_CONF}@/firebird/intl/fbintl.conf")
 endif()
 
 # Compile a few files with DWARF so their frames carry line numbers.  Doing

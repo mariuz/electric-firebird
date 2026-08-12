@@ -165,7 +165,7 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
 
       const sqlPtr = allocString(mod, 'SELECT id, name FROM items ORDER BY id');
       try {
-        const resultPtr = mod._fb_query(db, 0, sqlPtr);
+        const resultPtr = mod._fb_query(db, 0, sqlPtr, 0);
         expect({ pointer: resultPtr > 0, error: errorText() })
           .toEqual({ pointer: true, error: '' });
 
@@ -225,7 +225,7 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
       // The insert ran inside the transaction, so the rollback must undo it.
       const sqlPtr = allocString(mod, 'SELECT COUNT(*) AS CNT FROM t');
       try {
-        const resultPtr = mod._fb_query(db, 0, sqlPtr);
+        const resultPtr = mod._fb_query(db, 0, sqlPtr, 0);
         const parsed = JSON.parse(mod.UTF8ToString(resultPtr)) as {
           rows: unknown[][];
         };
@@ -234,6 +234,105 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
       } finally {
         mod._free(sqlPtr);
       }
+
+      expect(mod._fb_detach_database(db)).toBe(0);
+    });
+
+    it('applies the isolation level rather than accepting and ignoring it', () => {
+      mod._fb_init();
+
+      const dbPath = '/data/isolation.fdb';
+      if (mod.FS.analyzePath(dbPath).exists) mod.FS.unlink(dbPath);
+
+      const pathPtr = allocString(mod, dbPath);
+      const db = mod._fb_create_database(pathPtr);
+      mod._free(pathPtr);
+      expect(db).toBeGreaterThan(0);
+
+      const exec = (sql: string, tx: number): number => {
+        const ptr = allocString(mod, sql);
+        try {
+          return mod._fb_execute(db, tx, ptr);
+        } finally {
+          mod._free(ptr);
+        }
+      };
+
+      const countIn = (tx: number): number => {
+        const ptr = allocString(mod, 'SELECT COUNT(*) AS CNT FROM t');
+        try {
+          const resultPtr = mod._fb_query(db, tx, ptr, 0);
+          expect(resultPtr).toBeGreaterThan(0);
+          const parsed = JSON.parse(mod.UTF8ToString(resultPtr)) as {
+            rows: number[][];
+          };
+          mod._fb_free_result(resultPtr);
+          return parsed.rows[0]![0]!;
+        } finally {
+          mod._free(ptr);
+        }
+      };
+
+      expect(exec('CREATE TABLE t (id INTEGER)', 0)).toBe(0);
+      expect(exec('INSERT INTO t VALUES (1)', 0)).toBe(0);
+
+      // Asserting that the argument arrives would not be worth much; what
+      // matters is that it changes what the transaction can see.  So the same
+      // concurrent commit is run against two isolation levels, which must
+      // disagree about it.
+
+      // 1 = READ_COMMITTED: sees work committed after it started.
+      const readCommitted = mod._fb_start_transaction_ex(db, 1, 0);
+      expect(readCommitted).toBeGreaterThan(0);
+      const rcBefore = countIn(readCommitted);
+      expect(exec('INSERT INTO t VALUES (2)', 0)).toBe(0);
+      expect(countIn(readCommitted)).toBe(rcBefore + 1);
+      expect(mod._fb_commit(readCommitted)).toBe(0);
+
+      // 2 = SNAPSHOT: does not.
+      const snapshot = mod._fb_start_transaction_ex(db, 2, 0);
+      expect(snapshot).toBeGreaterThan(0);
+      const snapBefore = countIn(snapshot);
+      expect(exec('INSERT INTO t VALUES (3)', 0)).toBe(0);
+      expect(countIn(snapshot)).toBe(snapBefore);
+      expect(mod._fb_commit(snapshot)).toBe(0);
+
+      expect(mod._fb_detach_database(db)).toBe(0);
+    });
+
+    it('enforces a read-only transaction, and rejects an unknown level', () => {
+      mod._fb_init();
+
+      const dbPath = '/data/readonly.fdb';
+      if (mod.FS.analyzePath(dbPath).exists) mod.FS.unlink(dbPath);
+
+      const pathPtr = allocString(mod, dbPath);
+      const db = mod._fb_create_database(pathPtr);
+      mod._free(pathPtr);
+      expect(db).toBeGreaterThan(0);
+
+      const exec = (sql: string, tx: number): number => {
+        const ptr = allocString(mod, sql);
+        try {
+          return mod._fb_execute(db, tx, ptr);
+        } finally {
+          mod._free(ptr);
+        }
+      };
+
+      expect(exec('CREATE TABLE t (id INTEGER)', 0)).toBe(0);
+
+      // read_only is enforced by the engine, not advisory.
+      const readOnly = mod._fb_start_transaction_ex(db, 0, 1);
+      expect(readOnly).toBeGreaterThan(0);
+      expect(exec('INSERT INTO t VALUES (1)', readOnly)).not.toBe(0);
+      expect(errorText()).toMatch(/read-only/i);
+      expect(mod._fb_rollback(readOnly)).toBe(0);
+
+      // An out-of-range code must fail loudly instead of falling back to the
+      // default, which would be the original bug wearing a different hat.
+      expect(mod._fb_start_transaction_ex(db, 99, 0)).toBe(0);
+      expect(errorText()).toContain('unknown isolation level');
 
       expect(mod._fb_detach_database(db)).toBe(0);
     });
@@ -251,7 +350,7 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
 
       const sqlPtr = allocString(mod, 'SELECT * FROM no_such_table');
       try {
-        expect(mod._fb_query(db, 0, sqlPtr)).toBe(0);
+        expect(mod._fb_query(db, 0, sqlPtr, 0)).toBe(0);
         // Not just a numeric code — the engine's own text must reach the caller.
         expect(errorText().length).toBeGreaterThan(0);
         expect(errorText().toUpperCase()).toContain('NO_SUCH_TABLE');

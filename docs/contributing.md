@@ -44,6 +44,26 @@ cd e2e
 FIREBIRD_PASSWORD=masterkey npx playwright test
 ```
 
+### 5. Run the decode benchmark
+
+```bash
+npm run bench                             # print the table
+npm run bench -- bench-results/decode.json  # …and record it
+```
+
+Measures the built package, so run the build first. It needs no database: the
+result sets are synthetic, and what it times is the decode path between the
+engine's JSON and the rows a caller gets.
+
+CI runs this and **fails on a regression**. The checks are ratios against the
+`Object.fromEntries` construction that decoding used to do, not wall-clock
+limits — see `docs/plans/typed-results.md` for what each scenario can and
+cannot detect. If one trips, the cause is in `src/browser/engine-transport.ts`,
+and the message says which of the two failure modes it looks like.
+
+Times on your machine will not match the ones in the plan, and are not
+supposed to. Only the ratios are comparable across machines.
+
 ---
 
 ## Project structure
@@ -54,6 +74,7 @@ electric-firebird/
 ├── e2e/                         ← Playwright end-to-end tests
 ├── packages/
 │   └── firebird-wasm/
+│       ├── bench/                ← decode benchmark + regression guard
 │       ├── src/
 │       │   ├── __tests__/       ← Jest unit tests
 │       │   ├── browser/         ← Browser/WASM entry point

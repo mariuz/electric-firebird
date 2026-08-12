@@ -48,6 +48,36 @@ declare const self: EngineWorkerScope & {
 };
 
 /**
+ * Every distinct ArrayBuffer behind a Uint8Array in a query result.
+ *
+ * Only query results are walked, and only one level into each row: a value is
+ * either a blob or it is not, and scanning arbitrary structures on every reply
+ * would cost more than the transfer saves.
+ *
+ * De-duplicated because transferring the same buffer twice throws
+ * DataCloneError, and two rows can hold views on one buffer if the same blob
+ * appeared twice.
+ */
+function collectBlobBuffers(result: unknown): ArrayBufferLike[] {
+  if (typeof result !== 'object' || result === null) return [];
+
+  const rows = (result as { rows?: unknown }).rows;
+  if (!Array.isArray(rows)) return [];
+
+  const buffers = new Set<ArrayBufferLike>();
+  for (const row of rows) {
+    if (typeof row !== 'object' || row === null) continue;
+    // Rows are arrays in rowMode 'array' and plain objects otherwise;
+    // Object.values covers both.
+    for (const value of Object.values(row as Record<string, unknown>)) {
+      if (value instanceof Uint8Array) buffers.add(value.buffer);
+    }
+  }
+
+  return [...buffers];
+}
+
+/**
  * Wire a transport up to a Worker scope.
  *
  * Exported so a host application can build its own Worker entry point — for
@@ -60,8 +90,15 @@ export function serveEngine(
   const reply = (response: EngineResponse): void => {
     // Transfer the buffer for readFile rather than copying it: a database
     // image is measured in megabytes and this runs on every persist.
+    //
+    // The same applies to binary BLOBs coming back from a query, which arrive
+    // as Uint8Arrays inside the rows. Structured cloning would copy every one
+    // of them across the boundary — the cost a base64 string could never avoid
+    // and the reason the side channel is worth having at all.
     const transfer =
-      response.result instanceof Uint8Array ? [response.result.buffer] : [];
+      response.result instanceof Uint8Array
+        ? [response.result.buffer]
+        : collectBlobBuffers(response.result);
     scope.postMessage(response, transfer as Transferable[]);
   };
 

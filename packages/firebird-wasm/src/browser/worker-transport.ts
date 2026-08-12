@@ -10,7 +10,14 @@
  * operations are part of the transport rather than being done by the caller.
  */
 
-import type { Row, QueryResult, QueryParams } from '../types';
+import type {
+  Row,
+  QueryResult,
+  QueryDescription,
+  QueryParams,
+  RowMode,
+  TransactionOptions,
+} from '../types';
 import type { EngineHandle, EngineTransport } from './engine-transport';
 import type { EngineOp, EngineRequest, EngineResponse } from './worker-protocol';
 
@@ -146,17 +153,44 @@ export class WorkerTransport implements EngineTransport {
     return this.call<number>('execute', dbHandle, txHandle, sql, params);
   }
 
-  query<T extends Row = Row>(
+  query<T = Row>(
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     sql: string,
     params: QueryParams = [],
+    rowMode: RowMode = 'object',
+    binaryBlobs = false,
   ): Promise<QueryResult<T>> {
-    return this.call<QueryResult<T>>('query', dbHandle, txHandle, sql, params);
+    // Decoding happens on the far side, so both of these have to travel with
+    // the call rather than being applied to what comes back. They are a string
+    // and a boolean, so they survive structured cloning like the rest of the
+    // arguments — and the Uint8Arrays that come back from a side-channelled
+    // BLOB survive it too, which is what made this placement possible.
+    return this.call<QueryResult<T>>(
+      'query',
+      dbHandle,
+      txHandle,
+      sql,
+      params,
+      rowMode,
+      binaryBlobs,
+    );
   }
 
-  startTransaction(dbHandle: EngineHandle): Promise<EngineHandle> {
-    return this.call<EngineHandle>('startTransaction', dbHandle);
+  describe(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    sql: string,
+  ): Promise<QueryDescription> {
+    return this.call<QueryDescription>('describe', dbHandle, txHandle, sql);
+  }
+
+  startTransaction(
+    dbHandle: EngineHandle,
+    options: TransactionOptions = {},
+  ): Promise<EngineHandle> {
+    // Plain data, so it survives structured cloning to the Worker as-is.
+    return this.call<EngineHandle>('startTransaction', dbHandle, options);
   }
 
   commit(txHandle: EngineHandle): Promise<void> {
@@ -181,6 +215,15 @@ export class WorkerTransport implements EngineTransport {
 
   writeFile(path: string, data: Uint8Array): Promise<void> {
     return this.call<void>('writeFile', path, data);
+  }
+
+  unlink(path: string): Promise<void> {
+    return this.call<void>('unlink', path);
+  }
+
+  mountOpfs(dbName: string): Promise<string> {
+    // The mount happens on the far side; only the resulting path comes back.
+    return this.call<string>('mountOpfs', dbName);
   }
 
   async dispose(): Promise<void> {

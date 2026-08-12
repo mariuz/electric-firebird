@@ -117,3 +117,85 @@ export interface TransactionOptions {
   isolationLevel?: IsolationLevel;
   readOnly?: boolean;
 }
+
+/**
+ * What each row is.
+ *
+ * - `'object'` (default) keys every value by its upper-cased column name.
+ * - `'array'` gives the values in column order, positionally.
+ *
+ * Names live in `fields` either way, so `'array'` loses nothing — it trades
+ * the convenience of `row.NAME` for `row[1]`, and for that it skips building
+ * one object per row.
+ */
+export type RowMode = 'object' | 'array';
+
+/**
+ * Options accepted by `query()`.
+ *
+ * A superset of {@link TransactionOptions}: a query may start a transaction of
+ * its own, and it decides the shape of what comes back.
+ */
+export interface QueryOptions extends TransactionOptions {
+  /**
+   * How to shape each row.
+   *
+   * `'array'` is worth reaching for on large result sets and on columns whose
+   * names collide: `SELECT a.ID, b.ID` has two columns and, in object mode,
+   * one `ID` key — the second value wins and the first is unreachable.
+   * Positional rows keep both.
+   *
+   * @default 'object'
+   */
+  rowMode?: RowMode;
+}
+
+/** A row in `rowMode: 'array'` — values in column order. */
+export type ArrayRow = unknown[];
+
+/**
+ * What a statement is, from Firebird's `isc_info_sql_stmt_*` codes.
+ *
+ * `'UNKNOWN'` covers a code this library does not name rather than a failure
+ * to describe the statement.
+ */
+export type StatementKind =
+  | 'SELECT'
+  | 'INSERT'
+  | 'UPDATE'
+  | 'DELETE'
+  | 'DDL'
+  | 'GET_SEGMENT'
+  | 'PUT_SEGMENT'
+  | 'EXEC_PROCEDURE'
+  | 'START_TRANS'
+  | 'COMMIT'
+  | 'ROLLBACK'
+  | 'SELECT_FOR_UPD'
+  | 'SET_GENERATOR'
+  | 'SAVEPOINT'
+  | 'UNKNOWN';
+
+/**
+ * The shape of a statement, without running it.
+ *
+ * Returned by `describeQuery()`. Parameters are positional `?` in Firebird and
+ * carry no names, so a `ParamInfo` has everything a {@link FieldInfo} has
+ * except a meaningful one.
+ */
+export interface QueryDescription {
+  /**
+   * One entry per `?`, in order.
+   *
+   * `undefined` where the backend cannot report them — the Node driver
+   * exposes no input metadata, and an empty array there would claim the
+   * statement takes no parameters.
+   */
+  params?: FieldInfo[];
+  /** One entry per result column, in order.  Empty for a statement returning none. */
+  fields: FieldInfo[];
+  /** What kind of statement it is. */
+  statementType: StatementKind;
+  /** Whether executing it yields rows. */
+  hasResultSet: boolean;
+}

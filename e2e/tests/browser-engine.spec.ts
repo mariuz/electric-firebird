@@ -397,4 +397,509 @@ test.describe('FirebirdBrowser against the real engine', () => {
 
     expect(rows).toEqual([{ ID: 1, NAME: 'persisted' }]);
   });
+
+  test('converts values to richer types only when asked', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const setup = `CREATE TABLE typed (
+        d DATE, ts TIMESTAMP, tm TIME,
+        big BIGINT, num NUMERIC(18,4),
+        bin BLOB SUB_TYPE BINARY, txt BLOB SUB_TYPE TEXT
+      )`;
+      const insert = `INSERT INTO typed VALUES (
+        DATE '2026-08-11', TIMESTAMP '2026-08-11 11:22:33.4567', TIME '11:22:33.4567',
+        9007199254740993, 1234.5678, 'hello bytes', 'some text'
+      )`;
+
+      const plain = new window.FB.FirebirdBrowser('typed-off', {
+        worker: new Worker('/firebird-engine-worker.js'),
+        autoPersist: false,
+      });
+      await plain.exec(setup);
+      await plain.exec(insert);
+      const before = (await plain.query('SELECT * FROM typed')).rows[0] as Record<string, unknown>;
+      await plain.close();
+
+      const typed = new window.FB.FirebirdBrowser('typed-on', {
+        worker: new Worker('/firebird-engine-worker.js'),
+        autoPersist: false,
+        types: { bigint: true, dates: true, binary: true },
+      });
+      await typed.exec(setup);
+      await typed.exec(insert);
+      const after = (await typed.query('SELECT * FROM typed')).rows[0] as Record<string, unknown>;
+      await typed.close();
+
+      const describe = (v: unknown) =>
+        v instanceof Date ? 'Date' : v instanceof Uint8Array ? 'Uint8Array' : typeof v;
+
+      return {
+        beforeTypes: Object.fromEntries(
+          Object.entries(before).map(([k, v]) => [k, describe(v)]),
+        ),
+        afterTypes: Object.fromEntries(
+          Object.entries(after).map(([k, v]) => [k, describe(v)]),
+        ),
+        bigExact: after['BIG'] === 9007199254740993n,
+        // UTC-anchored, so this is the same on any machine running the test.
+        tsIso: (after['TS'] as Date).toISOString(),
+        dIso: (after['D'] as Date).toISOString(),
+        binText: new TextDecoder().decode(after['BIN'] as Uint8Array),
+        numUnchanged: after['NUM'],
+        beforeBig: before['BIG'],
+      };
+    });
+
+    // Default: every value is a primitive, exactly as before.
+    expect(result.beforeTypes).toEqual({
+      D: 'string', TS: 'string', TM: 'string',
+      BIG: 'string', NUM: 'string', BIN: 'string', TXT: 'string',
+    });
+    expect(result.beforeBig).toBe('9007199254740993');
+
+    expect(result.afterTypes).toEqual({
+      D: 'Date',
+      TS: 'Date',
+      // TIME has no Date representation — new Date('11:22:33') is invalid — so
+      // it is deliberately left alone.
+      TM: 'string',
+      BIG: 'bigint',
+      // NUMERIC shares BIGINT's storage; converting would drop the scale.
+      NUM: 'string',
+      BIN: 'Uint8Array',
+      TXT: 'string',
+    });
+
+    expect(result.bigExact).toBe(true);
+    // 100 microseconds truncated to milliseconds, and anchored to UTC rather
+    // than to whatever zone the machine running this happens to be in.
+    expect(result.tsIso).toBe('2026-08-11T11:22:33.456Z');
+    expect(result.dIso).toBe('2026-08-11T00:00:00.000Z');
+    expect(result.binText).toBe('hello bytes');
+    expect(result.numUnchanged).toBe('1234.5678');
+  });
+
+  test('stores an opfs:// database in a real OPFS file', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const opfsSize = async (name: string) => {
+        const root = await navigator.storage.getDirectory();
+        try {
+          const dir = await root.getDirectoryHandle('firebird');
+          const handle = await dir.getFileHandle(`${name}.fdb`);
+          return (await handle.getFile()).size;
+        } catch {
+          return -1; // no such file
+        }
+      };
+
+      // Explicit, not incidental: Playwright starts from a fresh profile, but
+      // a persistent context (--headed with a user data dir) would carry the
+      // previous run's file and make "created it" untestable.
+      const root = await navigator.storage.getDirectory();
+      const dir = await root.getDirectoryHandle('firebird', { create: true });
+      await dir.removeEntry('durable.fdb').catch(() => undefined);
+
+      const before = await opfsSize('durable');
+
+      const db = new window.FB.FirebirdBrowser('opfs://durable', {
+        worker: new Worker('/firebird-engine-worker.js'),
+      });
+      await db.exec('CREATE TABLE kept (id INTEGER, name VARCHAR(20))');
+      await db.query('INSERT INTO kept VALUES (?, ?)', [1, 'on disk']);
+      const rows = (await db.query('SELECT id, name FROM kept')).rows;
+
+      // No persist() call anywhere: the engine's own writes went to the file.
+      await db.close();
+
+      const after = await opfsSize('durable');
+      return { rows, before, after };
+    });
+
+    expect(result.rows).toEqual([{ ID: 1, NAME: 'on disk' }]);
+    // Nothing there beforehand, a real database file afterwards.
+    expect(result.before).toBe(-1);
+    expect(result.after).toBeGreaterThan(0);
+  });
+
+  test('reopens an opfs:// database with its data intact', async ({ page }) => {
+    const rows = await page.evaluate(async () => {
+      const first = new window.FB.FirebirdBrowser('opfs://reopened', {
+        worker: new Worker('/firebird-engine-worker.js'),
+      });
+      await first.exec('CREATE TABLE survives (id INTEGER)');
+      await first.exec('INSERT INTO survives VALUES (42)');
+      await first.close();
+
+      // A second connection, a second worker, a second engine — everything
+      // in between is gone, so anything read back came from the file.
+      const second = new window.FB.FirebirdBrowser('opfs://reopened', {
+        worker: new Worker('/firebird-engine-worker.js'),
+      });
+      const result = (await second.query('SELECT id FROM survives')).rows;
+      await second.close();
+      return result;
+    });
+
+    expect(rows).toEqual([{ ID: 42 }]);
+  });
+
+  test('round-trips a database through dumpDataDir and loadDataDir', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      const source = new window.FB.FirebirdBrowser('dump-source', {
+        worker: new Worker('/firebird-engine-worker.js'),
+        autoPersist: false,
+      });
+      await source.exec('CREATE TABLE saved (id INTEGER, name VARCHAR(20))');
+      await source.query('INSERT INTO saved VALUES (?, ?)', [1, 'carried over']);
+
+      // Deliberately never persisted: autoPersist is off and persist() is not
+      // called, so anything read out of IndexedDB would miss this row.
+      const bytes = await source.dumpDataDir();
+      await source.close();
+
+      // Into a database that has never existed, and an ephemeral one, so
+      // nothing stored can be supplying the answer.
+      const restored = new window.FB.FirebirdBrowser('memory://restored', {
+        worker: new Worker('/firebird-engine-worker.js'),
+        loadDataDir: bytes,
+      });
+      const rows = (await restored.query('SELECT id, name FROM saved')).rows;
+
+      // Still a working database, not just a readable one.
+      await restored.exec("INSERT INTO saved VALUES (2, 'added after')");
+      const after = (await restored.query('SELECT COUNT(*) AS N FROM saved')).rows[0];
+      await restored.close();
+
+      return { size: bytes.byteLength, rows, after };
+    });
+
+    expect(result.size).toBeGreaterThan(0);
+    expect(result.rows).toEqual([{ ID: 1, NAME: 'carried over' }]);
+    expect(result.after).toMatchObject({ N: 2 });
+  });
+
+  test('keeps the stored database when loadDataDir is also given', async ({ page }) => {
+    const rows = await page.evaluate(async () => {
+      const worker = () => new Worker('/firebird-engine-worker.js');
+
+      // A snapshot of one database…
+      const other = new window.FB.FirebirdBrowser('memory://snapshot', {
+        worker: worker(),
+      });
+      await other.exec('CREATE TABLE t (id INTEGER)');
+      await other.exec('INSERT INTO t VALUES (99)');
+      const snapshot = await other.dumpDataDir();
+      await other.close();
+
+      // …and a real, stored database with different contents.
+      const first = new window.FB.FirebirdBrowser('dump-existing', {
+        worker: worker(),
+      });
+      await first.exec('CREATE TABLE t (id INTEGER)');
+      await first.exec('INSERT INTO t VALUES (1)');
+      await first.persist();
+      await first.close();
+
+      // Reopening with loadDataDir — what an application does on every load —
+      // must not reset the user's data to the seed.
+      const reopened = new window.FB.FirebirdBrowser('dump-existing', {
+        worker: worker(),
+        loadDataDir: snapshot,
+      });
+      const result = (await reopened.query('SELECT id FROM t')).rows;
+      await reopened.close();
+      return result;
+    });
+
+    expect(rows).toEqual([{ ID: 1 }]);
+  });
+
+  test('runs a memory:// database with nothing stored behind it', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const before = (await indexedDB.databases()).map((d) => d.name);
+
+      const db = new window.FB.FirebirdBrowser('memory://scratch', {
+        worker: new Worker('/firebird-engine-worker.js'),
+      });
+
+      // A real engine, a real database, a real transaction — only the storage
+      // is absent. autoPersist is left at its default, so this also asserts
+      // that the automatic path stays quiet rather than being switched off.
+      await db.exec('CREATE TABLE ephemeral (id INTEGER, name VARCHAR(20))');
+      await db.query('INSERT INTO ephemeral VALUES (?, ?)', [1, 'gone soon']);
+      await db.transaction(async (tx) => {
+        await tx.exec('INSERT INTO ephemeral VALUES (?, ?)', [2, 'also gone']);
+      });
+
+      const rows = (await db.query('SELECT id, name FROM ephemeral ORDER BY id')).rows;
+      await db.persist();
+      await db.close();
+
+      const after = (await indexedDB.databases()).map((d) => d.name);
+      return { rows, before, after };
+    });
+
+    expect(result.rows).toEqual([
+      { ID: 1, NAME: 'gone soon' },
+      { ID: 2, NAME: 'also gone' },
+    ]);
+    // Nothing was created, not even an empty store.
+    expect(result.after).toEqual(result.before);
+  });
+
+  test('carries binary BLOBs beside the JSON, not inside it', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('blob-side-channel', {
+        worker: new Worker('/firebird-engine-worker.js'),
+        autoPersist: false,
+        types: { binary: true },
+      });
+
+      await db.exec(
+        'CREATE TABLE payloads (id INTEGER, bytes BLOB SUB_TYPE BINARY, note BLOB SUB_TYPE TEXT)',
+      );
+      // Every byte value, so nothing survives by looking like text: a NUL, a
+      // 0xFF, and everything between.
+      await db.exec(
+        "INSERT INTO payloads VALUES (1, x'00FF10203040506070', 'still text')",
+      );
+      await db.exec("INSERT INTO payloads VALUES (2, NULL, 'no bytes')");
+
+      const rows = (
+        await db.query('SELECT id, bytes, note FROM payloads ORDER BY id')
+      ).rows as Array<Record<string, unknown>>;
+
+      // Through a Worker, so these Uint8Arrays crossed postMessage — the
+      // buffers are transferred rather than cloned, and a transferred buffer
+      // is still perfectly readable here.
+      const first = rows[0]!['BYTES'];
+      await db.close();
+
+      return {
+        isBytes: first instanceof Uint8Array,
+        bytes: first instanceof Uint8Array ? [...first] : null,
+        // A text BLOB is not binary and must be untouched by any of this.
+        note: rows[0]!['NOTE'],
+        nullBlob: rows[1]!['BYTES'],
+      };
+    });
+
+    expect(result.isBytes).toBe(true);
+    expect(result.bytes).toEqual([0x00, 0xff, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70]);
+    expect(result.note).toBe('still text');
+    expect(result.nullBlob).toBeNull();
+  });
+
+  test('still base64s binary BLOBs when bytes were not asked for', async ({ page }) => {
+    const value = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('blob-default', {
+        worker: new Worker('/firebird-engine-worker.js'),
+        autoPersist: false,
+      });
+
+      await db.exec('CREATE TABLE plain (bytes BLOB SUB_TYPE BINARY)');
+      await db.exec("INSERT INTO plain VALUES (x'00FF10')");
+
+      const row = (await db.query('SELECT bytes FROM plain')).rows[0] as Record<
+        string,
+        unknown
+      >;
+      await db.close();
+      return row['BYTES'];
+    });
+
+    // Unchanged for a caller who never opted in.
+    expect(typeof value).toBe('string');
+    expect(value).toBe(btoa(String.fromCharCode(0x00, 0xff, 0x10)));
+  });
+
+  test('describes a statement without running it', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('describe-engine', {
+        worker: new Worker('/firebird-engine-worker.js'),
+        autoPersist: false,
+      });
+
+      await db.exec(
+        'CREATE TABLE described (id INTEGER, name VARCHAR(20), amount NUMERIC(10,2))',
+      );
+
+      const select = await db.describeQuery(
+        'SELECT id, name, amount FROM described WHERE id = ? AND name = ?',
+      );
+      const insert = await db.describeQuery(
+        'INSERT INTO described VALUES (?, ?, ?)',
+      );
+      const ddl = await db.describeQuery('CREATE TABLE another (id INTEGER)');
+
+      // Nothing above should have run: the INSERT describes three parameters
+      // and must still have inserted nothing, and `another` must not exist.
+      await db.exec("INSERT INTO described VALUES (1, 'real', 9.99)");
+      const count = (await db.query('SELECT COUNT(*) AS N FROM described')).rows[0];
+
+      let anotherExists = true;
+      try {
+        await db.query('SELECT id FROM another');
+      } catch {
+        anotherExists = false;
+      }
+
+      await db.close();
+      return { select, insert, ddl, count, anotherExists };
+    });
+
+    // Real metadata from the engine: names and type codes for the columns,
+    // and one entry per placeholder with the type the engine inferred.
+    expect(result.select.statementType).toBe('SELECT');
+    expect(result.select.hasResultSet).toBe(true);
+    expect(result.select.fields.map((f) => f.name)).toEqual(['ID', 'NAME', 'AMOUNT']);
+    expect(result.select.fields.map((f) => f.typeName)).toEqual([
+      'INTEGER',
+      'VARYING',
+      // NUMERIC is a scaled integer, which is exactly what typeName exists to
+      // disambiguate.
+      'NUMERIC',
+    ]);
+    expect(result.select.params).toHaveLength(2);
+    expect(result.select.params!.map((p) => p.typeName)).toEqual([
+      'INTEGER',
+      'VARYING',
+    ]);
+
+    expect(result.insert.statementType).toBe('INSERT');
+    expect(result.insert.hasResultSet).toBe(false);
+    expect(result.insert.fields).toEqual([]);
+    expect(result.insert.params).toHaveLength(3);
+
+    expect(result.ddl.statementType).toBe('DDL');
+
+    // Describing executed nothing — one real row, and no table from the DDL.
+    expect(result.count).toMatchObject({ N: 1 });
+    expect(result.anotherExists).toBe(false);
+  });
+
+  test('returns positional rows through the Worker', async ({ page }) => {
+    // Decoding happens inside the Worker, so `rowMode` has to travel with the
+    // call — applying it to what comes back would be too late, and the rows
+    // would already have been built as objects and structured-cloned.
+    const result = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('rowmode-engine', {
+        worker: new Worker('/firebird-engine-worker.js'),
+        autoPersist: false,
+      });
+
+      await db.exec('CREATE TABLE shaped (id INTEGER, name VARCHAR(20))');
+      await db.exec("INSERT INTO shaped VALUES (1, 'alpha')");
+      await db.exec("INSERT INTO shaped VALUES (2, 'beta')");
+
+      const arrays = await db.query('SELECT id, name FROM shaped ORDER BY id', [], {
+        rowMode: 'array',
+      });
+      const objects = await db.query('SELECT id, name FROM shaped ORDER BY id');
+      // Two columns, one name: object mode can only keep the last.
+      const collided = await db.query(
+        'SELECT a.id, b.id FROM shaped a JOIN shaped b ON b.id = 2 WHERE a.id = 1',
+        [],
+        { rowMode: 'array' },
+      );
+      await db.close();
+
+      return {
+        arrays: arrays.rows,
+        names: arrays.fields.map((f) => f.name),
+        objects: objects.rows,
+        collided: collided.rows,
+      };
+    });
+
+    expect(result.arrays).toEqual([
+      [1, 'alpha'],
+      [2, 'beta'],
+    ]);
+    expect(result.names).toEqual(['ID', 'NAME']);
+    expect(result.objects).toEqual([
+      { ID: 1, NAME: 'alpha' },
+      { ID: 2, NAME: 'beta' },
+    ]);
+    expect(result.collided).toEqual([[1, 2]]);
+  });
+
+  test('query() runs a statement that returns no rows', async ({ page }) => {
+    // `fb_query` prepared such a statement, serialised the empty result and
+    // committed — without ever executing it. So `query('INSERT …')` reported
+    // success and wrote nothing, silently, while the Node backend (which has
+    // always had an explicit `stmt.execute()` for this case) wrote the row.
+    // Every statement below goes through query() deliberately.
+    const result = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('query-dml', {
+        worker: new Worker('/firebird-engine-worker.js'),
+        autoPersist: false,
+      });
+
+      await db.query('CREATE TABLE dml (id INTEGER, name VARCHAR(20))');
+      await db.query('INSERT INTO dml VALUES (?, ?)', [1, 'inserted']);
+      await db.query('INSERT INTO dml VALUES (?, ?)', [2, 'doomed']);
+      await db.query('UPDATE dml SET name = ? WHERE id = ?', ['updated', 1]);
+      await db.query('DELETE FROM dml WHERE id = ?', [2]);
+
+      const rows = (await db.query('SELECT id, name FROM dml ORDER BY id')).rows;
+      await db.close();
+      return rows;
+    });
+
+    expect(result).toEqual([{ ID: 1, NAME: 'updated' }]);
+  });
+
+  test('applies custom parsers and serializers', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      // A value type the built-in encoder has no text form for — the gap a
+      // serializer exists to fill.
+      class Money {
+        constructor(readonly cents: number) {}
+      }
+
+      const SQL_TIMESTAMP = 510;
+
+      const db = new window.FB.FirebirdBrowser('custom-types', {
+        worker: new Worker('/firebird-engine-worker.js'),
+        autoPersist: false,
+        types: {
+          // `dates` would truncate the 100 µs Firebird stores; the parser
+          // keeps the string the engine actually sent, and wins over it.
+          dates: true,
+          parsers: { [SQL_TIMESTAMP]: (v) => ({ exact: v as string }) },
+          serializers: [
+            (v) => (v instanceof Money ? (v.cents / 100).toFixed(2) : undefined),
+          ],
+        },
+      });
+
+      await db.exec(
+        'CREATE TABLE custom (id INTEGER, price NUMERIC(10,2), ts TIMESTAMP)',
+      );
+      // The Money instance is serialized on this side and reaches the engine
+      // as text, which Firebird converts to NUMERIC.
+      await db.query('INSERT INTO custom VALUES (?, ?, ?)', [
+        1,
+        new Money(1999),
+        '2026-08-11 11:22:33.4567',
+      ]);
+
+      const row = (await db.query('SELECT id, price, ts FROM custom')).rows[0] as Record<
+        string,
+        unknown
+      >;
+      await db.close();
+
+      return { id: row['ID'], price: row['PRICE'], ts: row['TS'] };
+    });
+
+    expect(result.id).toBe(1);
+    // Round-tripped through the serializer and Firebird's own conversion.
+    expect(result.price).toBe('19.99');
+    // The parser replaced `dates`, so the fourth fractional digit survived
+    // instead of being truncated into a Date.
+    expect(result.ts).toEqual({ exact: '2026-08-11T11:22:33.4567' });
+  });
 });

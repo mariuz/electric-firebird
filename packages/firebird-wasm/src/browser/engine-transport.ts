@@ -21,9 +21,27 @@
 
 import type { FirebirdWasmModule } from '../wasm-loader';
 import { loadFirebirdWasm, allocString, lastError } from '../wasm-loader';
-import type { Row, QueryResult, FieldInfo, QueryParams } from '../types';
+import type {
+  Row,
+  QueryResult,
+  QueryDescription,
+  FieldInfo,
+  QueryParams,
+  RowMode,
+  TransactionOptions,
+} from '../types';
+import { isolationCode } from './isolation';
 import { encodeParams } from './params';
 import { firebirdTypeName } from './field-types';
+import { statementKind } from '../statement-types';
+import {
+  mountOpfs as mountOpfsFilesystem,
+  openDatabaseHandle,
+  opfsAvailable,
+} from './opfs-fs';
+
+/** Where an OPFS-backed database is mounted inside the engine's filesystem. */
+export const OPFS_MOUNT = '/opfs';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -53,14 +71,32 @@ export interface EngineTransport {
     sql: string,
     params?: QueryParams,
   ): Promise<number>;
-  query<T extends Row = Row>(
+  query<T = Row>(
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     sql: string,
     params?: QueryParams,
+    rowMode?: RowMode,
+    binaryBlobs?: boolean,
   ): Promise<QueryResult<T>>;
+  /** Describe a statement's shape without executing it. */
+  describe(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    sql: string,
+  ): Promise<QueryDescription>;
 
-  startTransaction(dbHandle: EngineHandle): Promise<EngineHandle>;
+  /**
+   * Begin a transaction.
+   *
+   * `options` is honoured, not accepted and dropped: the Node backend has
+   * always applied isolationLevel and readOnly, and a browser caller
+   * writing the same code deserves the same transaction.
+   */
+  startTransaction(
+    dbHandle: EngineHandle,
+    options?: TransactionOptions,
+  ): Promise<EngineHandle>;
   commit(txHandle: EngineHandle): Promise<void>;
   rollback(txHandle: EngineHandle): Promise<void>;
 
@@ -69,6 +105,17 @@ export interface EngineTransport {
   exists(path: string): Promise<boolean>;
   readFile(path: string): Promise<Uint8Array>;
   writeFile(path: string, data: Uint8Array): Promise<void>;
+  /** Remove a file.  Used to discard an ephemeral database on close. */
+  unlink(path: string): Promise<void>;
+  /**
+   * Mount an OPFS-backed filesystem holding one database, and return the path
+   * the engine should open.
+   *
+   * Runs wherever the engine runs: the sync access handle is opened on that
+   * side and never crosses a boundary, because it is neither cloneable nor
+   * transferable.
+   */
+  mountOpfs(dbName: string): Promise<string>;
 
   /** Release anything the transport owns.  Does not detach databases. */
   dispose(): Promise<void>;
@@ -111,8 +158,108 @@ interface EncodedColumn {
   nullable: boolean;
 }
 
-/** Decode the engine's JSON result set into rows keyed by column name. */
-export function decodeResultSet<T extends Row>(json: string): QueryResult<T> {
+// ---------------------------------------------------------------------------
+// Row construction
+// ---------------------------------------------------------------------------
+
+/**
+ * Row builders, keyed by the column-name signature.
+ *
+ * Building one costs more than it saves on a single small result, so a query
+ * run repeatedly — which is most of them — has to reuse the builder. Measured
+ * on 5 columns: rebuilding per call turns 2.5 ms into 5.5 ms across 2000
+ * one-row queries, while reusing turns it into 1.1 ms.
+ */
+const rowBuilders = new Map<string, (cols: unknown[]) => Row>();
+
+/**
+ * Cap on distinct shapes remembered.  Cleared wholesale rather than evicted
+ * one at a time: this exists to stop unbounded growth in a process issuing
+ * endlessly varied `SELECT` lists, not to be a good cache.
+ */
+const MAX_ROW_BUILDERS = 64;
+
+/** Set once `new Function` is known to be unavailable — see {@link rowBuilder}. */
+let codeGenerationBlocked = false;
+
+/**
+ * A column name as a JavaScript string literal.
+ *
+ * `JSON.stringify` handles quotes, backslashes and control characters. U+2028
+ * and U+2029 are legal in string literals from ES2019 and are escaped anyway,
+ * because the cost is nothing and the failure would be a syntax error at
+ * runtime on an older engine.
+ */
+function stringLiteral(name: string): string {
+  return JSON.stringify(name)
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
+}
+
+/**
+ * Build a function that turns one row of values into an object.
+ *
+ * Generated with literal keys, which is the whole point: every row then shares
+ * one hidden class, and the engine can compile the construction. The obvious
+ * safe alternative — computed keys, `{[name]: c[0]}` — forces dictionary-mode
+ * objects and measured *no faster than `Object.fromEntries`* (14.7 ms against
+ * 15.2 ms on 10,000 rows), so it is not a trade worth making.
+ *
+ * Returns null when the caller must fall back:
+ *
+ * - A column named `__proto__`. As a literal key that sets the prototype
+ *   instead of defining a property, so the value would be silently lost.
+ *   `Object.fromEntries` defines it correctly, so the slow path is also the
+ *   right path here. Unreachable today, because column names are upper-cased
+ *   before they get here and `__PROTO__` is an ordinary key — kept because the
+ *   guard costs one comparison and the upper-casing is not this function's to
+ *   rely on.
+ * - A Content-Security-Policy without `unsafe-eval`, where `new Function`
+ *   throws. Remembered, so it is attempted once rather than per query.
+ */
+function rowBuilder(names: string[]): ((cols: unknown[]) => Row) | null {
+  if (codeGenerationBlocked || names.includes('__proto__')) {
+    return null;
+  }
+
+  // \u0000 cannot appear in a Firebird identifier, so it cannot make two
+  // different column lists collide.
+  const signature = names.join('\u0000');
+  const cached = rowBuilders.get(signature);
+  if (cached) return cached;
+
+  let built: (cols: unknown[]) => Row;
+  try {
+    built = new Function(
+      'c',
+      'return {' + names.map((n, i) => `${stringLiteral(n)}:c[${i}]`).join(',') + '}',
+    ) as (cols: unknown[]) => Row;
+  } catch {
+    // A strict CSP. Every later result set takes the fallback without
+    // re-testing, and nothing about the returned rows changes.
+    codeGenerationBlocked = true;
+    return null;
+  }
+
+  if (rowBuilders.size >= MAX_ROW_BUILDERS) {
+    rowBuilders.clear();
+  }
+  rowBuilders.set(signature, built);
+  return built;
+}
+
+/**
+ * Decode the engine's JSON result set.
+ *
+ * `rowMode: 'array'` returns the parsed rows as they arrive — the engine
+ * already sends each row as an array of values, so this is the one shape that
+ * costs nothing to produce. Object mode is what the row builder above exists
+ * for, and what the decode benchmark measures.
+ */
+export function decodeResultSet<T = Row>(
+  json: string,
+  rowMode: RowMode = 'object',
+): QueryResult<T> {
   const parsed = JSON.parse(json) as {
     columns: EncodedColumn[];
     rows: unknown[][];
@@ -128,11 +275,152 @@ export function decodeResultSet<T extends Row>(json: string): QueryResult<T> {
     nullable: c.nullable,
   }));
 
-  const rows = parsed.rows.map((cols) =>
-    Object.fromEntries(fields.map((f, i) => [f.name, cols[i]])),
+  if (rowMode === 'array') {
+    // Handed straight through: no builder, no per-row object, and nothing to
+    // collide when two columns share a name.
+    return { rows: parsed.rows as T[], fields };
+  }
+
+  const names = fields.map((f) => f.name);
+  const build = rowBuilder(names);
+
+  const rows = (
+    build
+      ? parsed.rows.map(build)
+      : parsed.rows.map((cols) =>
+          Object.fromEntries(names.map((name, i) => [name, cols[i]])),
+        )
   ) as T[];
 
   return { rows, fields };
+}
+
+/** One field of a description, as the engine encodes it. */
+function decodeField(c: EncodedColumn): FieldInfo {
+  return {
+    name: c.name.toUpperCase(),
+    type: c.type,
+    typeName: firebirdTypeName(c.type, c.scale),
+    subType: c.subType,
+    scale: c.scale,
+    length: c.length,
+    nullable: c.nullable,
+  };
+}
+
+/** Decode what `fb_describe` reports about a statement. */
+export function decodeDescription(json: string): QueryDescription {
+  const parsed = JSON.parse(json) as {
+    params: EncodedColumn[];
+    columns: EncodedColumn[];
+    statementType: number;
+  };
+
+  const fields = parsed.columns.map(decodeField);
+
+  return {
+    // Parameters are positional in Firebird and carry no name, so the engine
+    // sends "" and upper-casing it changes nothing — they are described by
+    // type and position alone.
+    params: parsed.params.map(decodeField),
+    fields,
+    statementType: statementKind(parsed.statementType),
+    // Derived rather than reported separately: a statement yields rows exactly
+    // when it describes some.
+    hasResultSet: fields.length > 0,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Binary BLOB side channel
+// ---------------------------------------------------------------------------
+
+/** `flags` bit asking the engine to send binary BLOBs beside the JSON. */
+export const BLOB_SIDE_CHANNEL = 1;
+
+/** The placeholder a side-channelled BLOB leaves in the JSON. */
+interface BlobRef {
+  $blob: number;
+}
+
+function isBlobRef(value: unknown): value is BlobRef {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as BlobRef).$blob === 'number'
+  );
+}
+
+/**
+ * Copy the side buffer out of the WASM heap into one JavaScript buffer.
+ *
+ * One copy, and it is not the "no copy" the plan hoped for. A `Uint8Array`
+ * over `HEAPU8.buffer` is a view into memory the engine reuses on the next
+ * query and that `ALLOW_MEMORY_GROWTH` can detach from underneath it, so
+ * handing such a view to a caller would be handing them something that goes
+ * wrong later and elsewhere. What the side channel actually removes is the
+ * 33% base64 inflation, the JSON string for those bytes, and the `atob` plus
+ * per-byte loop that decoded them — measured in the benchmark.
+ *
+ * The single buffer is deliberate: it is what a Worker can *transfer* rather
+ * than clone, which is the other half of the win and impossible for a base64
+ * string.
+ */
+function readBlobs(mod: FirebirdWasmModule): Uint8Array[] | null {
+  const ptr = mod._fb_last_blobs();
+  const size = mod._fb_last_blobs_size();
+  if (ptr === 0 || size === 0) return null;
+
+  // Re-read HEAPU8 rather than closing over it: the query may have grown the
+  // heap, which replaces the buffer and detaches older views.
+  const heap = mod.HEAPU8;
+  const view = new DataView(heap.buffer, heap.byteOffset + ptr, size);
+
+  const count = view.getUint32(0, true);
+  const headerBytes = 4 * (1 + count);
+
+  const blobs: Uint8Array[] = new Array(count);
+  let offset = headerBytes;
+  for (let i = 0; i < count; i++) {
+    const length = view.getUint32(4 * (1 + i), true);
+    // slice() copies; subarray() would alias the heap.
+    blobs[i] = heap.slice(ptr + offset, ptr + offset + length);
+    offset += length;
+  }
+
+  return blobs;
+}
+
+/**
+ * Replace every `{"$blob":N}` placeholder with its bytes.
+ *
+ * Walks the decoded rows rather than the JSON text: the values are already
+ * parsed, and a placeholder is the only object a row can contain, so
+ * recognising one is a type check rather than a search.
+ */
+export function attachBlobs<T>(
+  result: QueryResult<T>,
+  blobs: Uint8Array[],
+  rowMode: RowMode,
+): QueryResult<T> {
+  for (const row of result.rows) {
+    if (rowMode === 'array') {
+      const values = row as unknown[];
+      for (let i = 0; i < values.length; i++) {
+        const value = values[i];
+        if (isBlobRef(value)) values[i] = blobs[value.$blob];
+      }
+      continue;
+    }
+
+    const target = row as Record<string, unknown>;
+    for (const key of Object.keys(target)) {
+      const value = target[key];
+      if (isBlobRef(value)) target[key] = blobs[value.$blob];
+    }
+  }
+
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -257,19 +545,29 @@ export class DirectTransport implements EngineTransport {
     return mod._fb_last_affected_rows();
   }
 
-  async query<T extends Row = Row>(
+  async query<T = Row>(
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     sql: string,
     params: QueryParams = [],
+    rowMode: RowMode = 'object',
+    binaryBlobs = false,
   ): Promise<QueryResult<T>> {
     const mod = this.module;
+    const flags = binaryBlobs ? BLOB_SIDE_CHANNEL : 0;
     return this.withString(sql, (sqlPtr) =>
       this.withParams(params, (paramPtr, paramLen) => {
       const resultPtr =
         params.length === 0
-          ? mod._fb_query(dbHandle, txHandle, sqlPtr)
-          : mod._fb_query_params(dbHandle, txHandle, sqlPtr, paramPtr, paramLen);
+          ? mod._fb_query(dbHandle, txHandle, sqlPtr, flags)
+          : mod._fb_query_params(
+              dbHandle,
+              txHandle,
+              sqlPtr,
+              paramPtr,
+              paramLen,
+              flags,
+            );
       if (resultPtr === 0) {
         throw engineError(mod, `Firebird query failed for: ${sql}`);
       }
@@ -278,14 +576,46 @@ export class DirectTransport implements EngineTransport {
       const json = mod.UTF8ToString(resultPtr);
       mod._fb_free_result(resultPtr);
 
-      return decodeResultSet<T>(json);
+      // Read before anything else can run: the side buffer belongs to the
+      // engine and the next query replaces it.
+      const blobs = binaryBlobs ? readBlobs(mod) : null;
+
+      const result = decodeResultSet<T>(json, rowMode);
+      return blobs ? attachBlobs(result, blobs, rowMode) : result;
       }),
     );
   }
 
-  async startTransaction(dbHandle: EngineHandle): Promise<EngineHandle> {
+  async describe(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    sql: string,
+  ): Promise<QueryDescription> {
     const mod = this.module;
-    const txHandle = mod._fb_start_transaction(dbHandle);
+    return this.withString(sql, (sqlPtr) => {
+      const resultPtr = mod._fb_describe(dbHandle, txHandle, sqlPtr);
+      if (resultPtr === 0) {
+        throw engineError(mod, `Firebird could not describe: ${sql}`);
+      }
+
+      // Same ownership rule as a result set: the engine owns it until freed.
+      const json = mod.UTF8ToString(resultPtr);
+      mod._fb_free_result(resultPtr);
+
+      return decodeDescription(json);
+    });
+  }
+
+  async startTransaction(
+    dbHandle: EngineHandle,
+    options: TransactionOptions = {},
+  ): Promise<EngineHandle> {
+    const mod = this.module;
+    const txHandle = mod._fb_start_transaction_ex(
+      dbHandle,
+      isolationCode(options),
+      options.readOnly === true ? 1 : 0,
+    );
     if (txHandle === 0) {
       throw engineError(mod, 'Failed to start transaction');
     }
@@ -325,6 +655,28 @@ export class DirectTransport implements EngineTransport {
 
   async writeFile(path: string, data: Uint8Array): Promise<void> {
     this.module.FS.writeFile(path, data);
+  }
+
+  async unlink(path: string): Promise<void> {
+    if (this.module.FS.analyzePath(path).exists) {
+      this.module.FS.unlink(path);
+    }
+  }
+
+  async mountOpfs(dbName: string): Promise<string> {
+    if (!opfsAvailable()) {
+      throw new Error(
+        'OPFS storage needs a Worker: FileSystemSyncAccessHandle is not ' +
+          'available on a main thread, and Node has no OPFS at all. Pass a ' +
+          '`worker` to FirebirdBrowser, or use an IndexedDB or memory:// database',
+      );
+    }
+
+    // Opened before the mount, because a filesystem callback cannot await.
+    const handle = await openDatabaseHandle(dbName);
+    const fileName = `${dbName}.fdb`;
+    mountOpfsFilesystem(this.module, OPFS_MOUNT, new Map([[fileName, handle]]));
+    return `${OPFS_MOUNT}/${fileName}`;
   }
 
   async dispose(): Promise<void> {

@@ -28,8 +28,30 @@ interface StubControl {
   calls: Array<{ fn: string; args: unknown[] }>;
   initRc: number;
   execRc: number;
-  queryResult: { columns: string[]; rows: unknown[][] };
+  queryResult: {
+    // A column may be named only, or described in full when a test needs to
+    // control the type code the library sees.
+    columns: Array<
+      | string
+      | {
+          name: string;
+          type: number;
+          subType: number;
+          scale: number;
+          length: number;
+          nullable: boolean;
+        }
+    >;
+    rows: unknown[][];
+  };
   queryReturnsNull: boolean;
+  description: {
+    params?: Array<Record<string, unknown>>;
+    columns?: Array<Record<string, unknown>>;
+    statementType?: number;
+  };
+  describeReturnsNull: boolean;
+  blobs: Uint8Array[];
   createFails: boolean;
   startTxFails: boolean;
   commitRc: number;
@@ -465,6 +487,1233 @@ test.describe('IndexedDBVFS', () => {
 // FirebirdBrowser — driven against the stub C ABI
 // ===========================================================================
 
+test.describe('Row construction', () => {
+  test('builds rows with a generated constructor, and reuses it', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      // Two queries with the same column list must produce identical shapes;
+      // the second reuses the builder cached from the first.
+      window.__stub.queryResult = {
+        columns: ['ID', 'NAME'],
+        rows: [
+          [1, 'a'],
+          [2, 'b'],
+        ],
+      };
+
+      const db = new window.FB.FirebirdBrowser('rows-fast', { autoPersist: false });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+
+      const first = await db.query('SELECT id, name FROM t');
+      const second = await db.query('SELECT id, name FROM t');
+      await db.close();
+
+      return {
+        first: first.rows,
+        second: second.rows,
+        // Same hidden class is not observable, but the shape must be.
+        keys: Object.keys(first.rows[0] as object),
+        ownIsEnumerable: Object.entries(second.rows[0] as object).length,
+      };
+    });
+
+    expect(result.first).toEqual([
+      { ID: 1, NAME: 'a' },
+      { ID: 2, NAME: 'b' },
+    ]);
+    expect(result.second).toEqual(result.first);
+    expect(result.keys).toEqual(['ID', 'NAME']);
+    expect(result.ownIsEnumerable).toBe(2);
+  });
+
+  test('cannot pollute a prototype through a column name', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      // `{__proto__: v}` in an object literal sets the prototype rather than
+      // defining a property, so the generated builder must not be used here.
+      // Firebird allows it via a quoted identifier, so it is reachable.
+      window.__stub.queryResult = {
+        columns: ['__proto__', 'OK'],
+        rows: [[{ injected: true }, 'value']],
+      };
+
+      const db = new window.FB.FirebirdBrowser('rows-proto', { autoPersist: false });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      const r = await db.query('SELECT * FROM t');
+      await db.close();
+
+      const row = r.rows[0] as Record<string, unknown>;
+      return {
+        // Column names are upper-cased, so this arrives as __PROTO__ and is an
+        // ordinary key. The assertion is a regression guard: if the
+        // upper-casing ever goes, the literal-key builder must not be what
+        // handles this column.
+        upperCased: Object.prototype.hasOwnProperty.call(row, '__PROTO__'),
+        value: row['__PROTO__'],
+        other: row['OK'],
+        // Nothing was injected into the prototype either way.
+        prototypeIsObject: Object.getPrototypeOf(row) === Object.prototype,
+        pollutedGlobally: ({} as Record<string, unknown>)['injected'],
+      };
+    });
+
+    expect(result.upperCased).toBe(true);
+    expect(result.value).toEqual({ injected: true });
+    expect(result.other).toBe('value');
+    expect(result.prototypeIsObject).toBe(true);
+    expect(result.pollutedGlobally).toBeUndefined();
+  });
+
+  test('survives column names that are not valid identifiers', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      // Quoted identifiers let a column be called almost anything, and the
+      // name is interpolated into generated source.
+      window.__stub.queryResult = {
+        columns: ['a"b', "c'd", 'e\\f', 'has space', '123'],
+        rows: [['1', '2', '3', '4', '5']],
+      };
+
+      const db = new window.FB.FirebirdBrowser('rows-odd', { autoPersist: false });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      const r = await db.query('SELECT * FROM t');
+      await db.close();
+      return r.rows[0];
+    });
+
+    // Upper-cased, as every column name is — see decodeResultSet. What matters
+    // here is that the quote, apostrophe, backslash and space survived being
+    // interpolated into generated source.
+    expect(result).toEqual({
+      'A"B': '1',
+      "C'D": '2',
+      'E\\F': '3',
+      'HAS SPACE': '4',
+      '123': '5',
+    });
+  });
+});
+
+// ===========================================================================
+// The sql`…` template tag, through the real browser query path
+// ===========================================================================
+
+test.describe('sql`…` tag', () => {
+  test('sends placeholders and binds the values separately', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      window.__stub.queryResult = { columns: ['ID'], rows: [[1]] };
+
+      const db = new window.FB.FirebirdBrowser('tag-bind', { autoPersist: false });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      window.__stub.resetCalls();
+
+      const { sql } = window.FB;
+      // A value that would end the statement if it were interpolated.
+      const hostile = "'; DROP TABLE t; --";
+      await db.query(sql`SELECT id FROM t WHERE id = ${7} AND name = ${hostile}`);
+      await db.close();
+
+      const call = window.__stub.firstCall('_fb_query_params');
+      return { sql: call?.args[2], params: call?.args[3] };
+    });
+
+    expect(result.sql).toBe('SELECT id FROM t WHERE id = ? AND name = ?');
+    // Sent as text, which is how this parameter encoding works — but as a
+    // *parameter*, which is the property that matters.
+    expect(result.params).toEqual(['7', "'; DROP TABLE t; --"]);
+  });
+
+  test('composes nested fragments and a joined list', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      window.__stub.queryResult = { columns: ['ID'], rows: [] };
+
+      const db = new window.FB.FirebirdBrowser('tag-compose', { autoPersist: false });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      window.__stub.resetCalls();
+
+      const { sql } = window.FB;
+      const active = sql`AND active = ${true}`;
+      await db.query(
+        sql`SELECT id FROM ${sql.identifier('T')} WHERE id IN (${sql.join([1, 2, 3])}) ${active}`,
+      );
+      await db.close();
+
+      const call = window.__stub.firstCall('_fb_query_params');
+      return { sql: call?.args[2], params: call?.args[3] };
+    });
+
+    expect(result.sql).toBe(
+      'SELECT id FROM "T" WHERE id IN (?, ?, ?) AND active = ?',
+    );
+    expect(result.params).toEqual(['1', '2', '3', 'TRUE']);
+  });
+
+  test('works through exec() and inside a transaction', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      window.__stub.queryResult = { columns: ['N'], rows: [[1]] };
+
+      const db = new window.FB.FirebirdBrowser('tag-tx', { autoPersist: false });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      window.__stub.resetCalls();
+
+      const { sql } = window.FB;
+      await db.exec(sql`INSERT INTO t VALUES (${5})`);
+      await db.transaction(async (tx) => {
+        await tx.exec(sql`UPDATE t SET id = ${6} WHERE id = ${5}`);
+        await tx.query(sql`SELECT COUNT(*) AS N FROM t WHERE id = ${6}`);
+      });
+      await db.close();
+
+      return window.__stub.calls
+        .filter((c) => c.fn.endsWith('_params'))
+        .map((c) => ({ fn: c.fn, sql: c.args[2], params: c.args[3] }));
+    });
+
+    expect(result).toEqual([
+      { fn: '_fb_execute_params', sql: 'INSERT INTO t VALUES (?)', params: ['5'] },
+      {
+        fn: '_fb_execute_params',
+        sql: 'UPDATE t SET id = ? WHERE id = ?',
+        params: ['6', '5'],
+      },
+      {
+        fn: '_fb_query_params',
+        sql: 'SELECT COUNT(*) AS N FROM t WHERE id = ?',
+        params: ['6'],
+      },
+    ]);
+  });
+
+  test('rejects a fragment given extra parameters', async ({ page }) => {
+    const message = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('tag-conflict', { autoPersist: false });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+
+      const { sql } = window.FB;
+      try {
+        // Reachable from JavaScript even though TypeScript rules it out.
+        await (db.query as (s: unknown, p: unknown) => Promise<unknown>)(
+          sql`SELECT id FROM t WHERE id = ${1}`,
+          [2],
+        );
+        return 'no error';
+      } catch (err) {
+        return (err as Error).message;
+      } finally {
+        await db.close();
+      }
+    });
+
+    expect(message).toContain('already carries its parameters');
+  });
+});
+
+// ===========================================================================
+// Custom parsers and serializers
+// ===========================================================================
+
+test.describe('opfs:// databases', () => {
+  test('refuses to start without a Worker, and says why', async ({ page }) => {
+    const message = await page.evaluate(async () => {
+      // No `worker`, so the engine runs on this thread — where
+      // createSyncAccessHandle does not exist. Failing here is far better than
+      // failing inside a filesystem callback with no way back to the cause.
+      const db = new window.FB.FirebirdBrowser('opfs://no-worker', {
+        autoPersist: false,
+      });
+      try {
+        await db.exec('CREATE TABLE t (id INTEGER)');
+        return 'no error';
+      } catch (err) {
+        return (err as Error).message;
+      } finally {
+        await db.close().catch(() => undefined);
+      }
+    });
+
+    expect(message).toContain('OPFS storage needs a Worker');
+    expect(message).toContain('memory://');
+  });
+});
+
+test.describe('dumpDataDir / loadDataDir', () => {
+  test('dumps the live database, not the stored copy', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('dump-live', { autoPersist: false });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+
+      const bytes = await db.dumpDataDir();
+      await db.close();
+
+      // The image comes from the engine's filesystem — the same place
+      // persist() reads — so writes that were never persisted are in it.
+      return { length: bytes.byteLength, isBytes: bytes instanceof Uint8Array };
+    });
+
+    expect(result.isBytes).toBe(true);
+    expect(result.length).toBeGreaterThan(0);
+  });
+
+  test('seeds a database that does not exist yet', async ({ page }) => {
+    const written = await page.evaluate(async () => {
+      const seed = new Uint8Array(1024).fill(7);
+
+      const db = new window.FB.FirebirdBrowser('memory://seeded', {
+        autoPersist: false,
+        loadDataDir: seed,
+      });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+
+      // Attached rather than created: the seed put a file there first.
+      const attached = window.__stub.countCalls('_fb_attach_database');
+      const created = window.__stub.countCalls('_fb_create_database');
+      await db.close();
+
+      return { attached, created };
+    });
+
+    expect(written.attached).toBe(1);
+    expect(written.created).toBe(0);
+  });
+
+  test('rejects an empty seed rather than creating a broken database', async ({
+    page,
+  }) => {
+    const message = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('memory://empty-seed', {
+        loadDataDir: new Uint8Array(0),
+      });
+      try {
+        await db.exec('CREATE TABLE t (id INTEGER)');
+        return 'no error';
+      } catch (err) {
+        return (err as Error).message;
+      } finally {
+        await db.close().catch(() => undefined);
+      }
+    });
+
+    // Zero bytes would write an empty file and then fail inside the engine,
+    // where the message would be about a corrupt database rather than about
+    // the argument that caused it.
+    expect(message).toContain('loadDataDir is empty');
+  });
+});
+
+test.describe('memory:// databases', () => {
+  test('never touches IndexedDB', async ({ page }) => {
+    const stores = await page.evaluate(async () => {
+      const before = (await indexedDB.databases()).map((d) => d.name);
+
+      const db = new window.FB.FirebirdBrowser('memory://', { autoPersist: false });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      await db.persist(); // explicit, and still must store nothing
+      await db.close();
+
+      const after = (await indexedDB.databases()).map((d) => d.name);
+      return { before, after };
+    });
+
+    // Not "the store is empty" — the store is never created. An ephemeral
+    // database that left an empty IndexedDB behind would have left something
+    // behind.
+    expect(stores.after).toEqual(stores.before);
+  });
+
+  test('holds data for the life of the connection', async ({ page }) => {
+    const rows = await page.evaluate(async () => {
+      window.__stub.queryResult = { columns: ['ID'], rows: [[1]] };
+
+      const db = new window.FB.FirebirdBrowser('memory://scratch', {
+        autoPersist: false,
+      });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      await db.exec('INSERT INTO t VALUES (1)');
+      const result = await db.query('SELECT id FROM t');
+      await db.close();
+      return result.rows;
+    });
+
+    expect(rows).toEqual([{ ID: 1 }]);
+  });
+
+  test('gives two instances of one name two databases', async ({ page }) => {
+    const paths = await page.evaluate(async () => {
+      const first = new window.FB.FirebirdBrowser('memory://scratch', {
+        autoPersist: false,
+      });
+      const second = new window.FB.FirebirdBrowser('memory://scratch', {
+        autoPersist: false,
+      });
+      await first.exec('CREATE TABLE t (id INTEGER)');
+      await second.exec('CREATE TABLE t (id INTEGER)');
+
+      // Every instance in a page shares one filesystem, so the same name must
+      // not become the same file — that would silently join two callers who
+      // each believe they have their own database.
+      const created = window.__stub.calls
+        .filter((c) => c.fn === '_fb_create_database')
+        .map((c) => c.args[0]);
+
+      await first.close();
+      await second.close();
+      return created;
+    });
+
+    expect(paths).toHaveLength(2);
+    expect(paths[0]).not.toBe(paths[1]);
+    expect(paths[0]).toMatch(/\/data\/scratch-\d+\.fdb/);
+  });
+
+  test('discards the file on close', async ({ page }) => {
+    const state = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('memory://', { autoPersist: false });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+
+      const created = window.__stub.calls
+        .filter((c) => c.fn === '_fb_create_database')
+        .map((c) => c.args[0] as string);
+      const path = created[created.length - 1]!;
+
+      const existedBefore = window.__stub.fileExists(path);
+      await db.close();
+      return { existedBefore, existsAfter: window.__stub.fileExists(path) };
+    });
+
+    // The engine's filesystem outlives the instance, so a scratch database
+    // that stayed would accumulate for as long as the tab is open.
+    expect(state.existedBefore).toBe(true);
+    expect(state.existsAfter).toBe(false);
+  });
+
+  test('takes no cross-tab lock', async ({ page }) => {
+    const opened = await page.evaluate(async () => {
+      // Two tabs holding `memory://x` share nothing, so waiting for each other
+      // would be waiting on a database neither can see. With a stored name
+      // this second open would block until the timeout.
+      const first = new window.FB.FirebirdBrowser('memory://locked', {
+        autoPersist: false,
+      });
+      await first.exec('CREATE TABLE t (id INTEGER)');
+
+      const second = new window.FB.FirebirdBrowser('memory://locked', {
+        autoPersist: false,
+        lockTimeoutMs: 250,
+      });
+      await second.exec('CREATE TABLE t (id INTEGER)');
+
+      await first.close();
+      await second.close();
+      return true;
+    });
+
+    expect(opened).toBe(true);
+  });
+});
+
+test.describe('Binary BLOB side channel', () => {
+  const SQL_BLOB = 520;
+  const blobColumn = (name: string) => ({
+    name,
+    type: SQL_BLOB,
+    subType: 0,
+    scale: 0,
+    length: 8,
+    nullable: true,
+  });
+
+  test('asks for the side channel only when binary values were requested', async ({
+    page,
+  }) => {
+    const flags = await page.evaluate(async () => {
+      window.__stub.queryResult = { columns: ['DATA'], rows: [['aGk=']] };
+
+      const off = new window.FB.FirebirdBrowser('blob-flag-off', {
+        autoPersist: false,
+      });
+      await off.exec('CREATE TABLE t (data BLOB)');
+      window.__stub.resetCalls();
+      await off.query('SELECT data FROM t');
+      const without = window.__stub.firstCall('_fb_query')?.args[3];
+      await off.close();
+
+      const on = new window.FB.FirebirdBrowser('blob-flag-on', {
+        autoPersist: false,
+        types: { binary: true },
+      });
+      await on.exec('CREATE TABLE t (data BLOB)');
+      window.__stub.resetCalls();
+      await on.query('SELECT data FROM t');
+      const with_ = window.__stub.firstCall('_fb_query')?.args[3];
+      await on.close();
+
+      return { without, with_ };
+    });
+
+    // Bit 0 is the side channel. Off by default, so every existing caller
+    // keeps getting base64 and nothing about their rows changes.
+    expect(flags.without).toBe(0);
+    expect(flags.with_).toBe(1);
+  });
+
+  test('replaces placeholders with the bytes beside them', async ({ page }) => {
+    const result = await page.evaluate(
+      async ([blobType]) => {
+        // What the engine sends with the side channel on: a reference in the
+        // JSON, and the bytes in the side buffer.
+        window.__stub.queryResult = {
+          columns: [
+            { name: 'ID', type: 496, subType: 0, scale: 0, length: 4, nullable: false },
+            { name: 'DATA', type: blobType, subType: 0, scale: 0, length: 8, nullable: true },
+          ],
+          rows: [
+            [1, { $blob: 0 }],
+            [2, { $blob: 1 }],
+            [3, null],
+          ],
+        };
+        window.__stub.blobs = [
+          new Uint8Array([1, 2, 3]),
+          new Uint8Array([255, 0, 128, 42]),
+        ];
+
+        const db = new window.FB.FirebirdBrowser('blob-bytes', {
+          autoPersist: false,
+          types: { binary: true },
+        });
+        await db.exec('CREATE TABLE t (data BLOB)');
+        const rows = (await db.query('SELECT id, data FROM t')).rows as Array<
+          Record<string, unknown>
+        >;
+        await db.close();
+
+        return rows.map((row) => ({
+          id: row['ID'],
+          isBytes: row['DATA'] instanceof Uint8Array,
+          bytes: row['DATA'] instanceof Uint8Array ? [...(row['DATA'] as Uint8Array)] : row['DATA'],
+        }));
+      },
+      [SQL_BLOB],
+    );
+
+    expect(result).toEqual([
+      { id: 1, isBytes: true, bytes: [1, 2, 3] },
+      { id: 2, isBytes: true, bytes: [255, 0, 128, 42] },
+      // A NULL blob has no bytes and no placeholder — it stays null rather
+      // than becoming an empty array.
+      { id: 3, isBytes: false, bytes: null },
+    ]);
+  });
+
+  test('works in array rowMode, where values have no names', async ({ page }) => {
+    const bytes = await page.evaluate(
+      async ([blobType]) => {
+        window.__stub.queryResult = {
+          columns: [
+            { name: 'DATA', type: blobType, subType: 0, scale: 0, length: 8, nullable: true },
+          ],
+          rows: [[{ $blob: 0 }]],
+        };
+        window.__stub.blobs = [new Uint8Array([9, 8, 7])];
+
+        const db = new window.FB.FirebirdBrowser('blob-array-mode', {
+          autoPersist: false,
+          types: { binary: true },
+        });
+        await db.exec('CREATE TABLE t (data BLOB)');
+        const rows = (await db.query('SELECT data FROM t', [], { rowMode: 'array' }))
+          .rows as unknown[][];
+        await db.close();
+
+        const value = rows[0]![0];
+        return value instanceof Uint8Array ? [...value] : null;
+      },
+      [SQL_BLOB],
+    );
+
+    expect(bytes).toEqual([9, 8, 7]);
+  });
+
+  test('leaves base64 alone when the side channel is off', async ({ page }) => {
+    const value = await page.evaluate(
+      async ([blobType]) => {
+        // 'hi' in base64 — what the engine sends without the flag.
+        window.__stub.queryResult = {
+          columns: [
+            { name: 'DATA', type: blobType, subType: 0, scale: 0, length: 8, nullable: true },
+          ],
+          rows: [['aGk=']],
+        };
+        window.__stub.blobs = [new Uint8Array([1, 2, 3])];
+
+        const db = new window.FB.FirebirdBrowser('blob-base64', { autoPersist: false });
+        await db.exec('CREATE TABLE t (data BLOB)');
+        const rows = (await db.query('SELECT data FROM t')).rows as Array<
+          Record<string, unknown>
+        >;
+        await db.close();
+        return rows[0]!['DATA'];
+      },
+      [SQL_BLOB],
+    );
+
+    // Unchanged for a caller who never asked for bytes.
+    expect(value).toBe('aGk=');
+  });
+});
+
+test.describe('describeQuery', () => {
+  test('decodes parameters, columns and the statement kind', async ({ page }) => {
+    const shape = await page.evaluate(async () => {
+      const SQL_LONG = 496;
+      const SQL_VARYING = 448;
+      window.__stub.description = {
+        // Parameters are positional in Firebird and carry no name.
+        params: [
+          { name: '', type: SQL_LONG, subType: 0, scale: 0, length: 4, nullable: true },
+        ],
+        columns: [
+          { name: 'ID', type: SQL_LONG, subType: 0, scale: 0, length: 4, nullable: false },
+          { name: 'NAME', type: SQL_VARYING, subType: 0, scale: 0, length: 20, nullable: true },
+        ],
+        statementType: 1, // isc_info_sql_stmt_select
+      };
+
+      const db = new window.FB.FirebirdBrowser('describe-basic', { autoPersist: false });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      window.__stub.resetCalls();
+
+      const described = await db.describeQuery('SELECT id, name FROM t WHERE id = ?');
+      const call = window.__stub.firstCall('_fb_describe');
+      await db.close();
+
+      return { described, sql: call?.args[2], freed: window.__stub.stats().liveResults };
+    });
+
+    expect(shape.described.params).toEqual([
+      {
+        name: '',
+        type: 496,
+        typeName: 'INTEGER',
+        subType: 0,
+        scale: 0,
+        length: 4,
+        nullable: true,
+      },
+    ]);
+    expect(shape.described.fields.map((f) => f.name)).toEqual(['ID', 'NAME']);
+    expect(shape.described.fields[1]!.typeName).toBe('VARYING');
+    expect(shape.described.statementType).toBe('SELECT');
+    expect(shape.described.hasResultSet).toBe(true);
+    expect(shape.sql).toBe('SELECT id, name FROM t WHERE id = ?');
+    // The description is engine-owned memory, freed like a result set.
+    expect(shape.freed).toBe(0);
+  });
+
+  test('reports no result set when a statement describes no columns', async ({
+    page,
+  }) => {
+    const shape = await page.evaluate(async () => {
+      window.__stub.description = { params: [], columns: [], statementType: 2 };
+
+      const db = new window.FB.FirebirdBrowser('describe-insert', { autoPersist: false });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      const described = await db.describeQuery('INSERT INTO t VALUES (1)');
+      await db.close();
+      return described;
+    });
+
+    expect(shape.statementType).toBe('INSERT');
+    // Derived from the columns rather than reported twice, so the two can
+    // never disagree.
+    expect(shape.hasResultSet).toBe(false);
+    expect(shape.fields).toEqual([]);
+  });
+
+  test('names an unfamiliar statement kind rather than failing', async ({ page }) => {
+    const kind = await page.evaluate(async () => {
+      // A code this library has no name for — a future Firebird could add one,
+      // and an otherwise complete description should still come back.
+      window.__stub.description = { params: [], columns: [], statementType: 99 };
+
+      const db = new window.FB.FirebirdBrowser('describe-unknown', {
+        autoPersist: false,
+      });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      const described = await db.describeQuery('SOMETHING NEW');
+      await db.close();
+      return described.statementType;
+    });
+
+    expect(kind).toBe('UNKNOWN');
+  });
+
+  test('surfaces the engine error when describing fails', async ({ page }) => {
+    const message = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('describe-fails', { autoPersist: false });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+
+      window.__stub.describeReturnsNull = true;
+      window.__stub.lastError = 'Token unknown - line 1, column 8';
+      try {
+        await db.describeQuery('SELECT nonsense FROM');
+        return 'no error';
+      } catch (err) {
+        return (err as Error).message;
+      } finally {
+        window.__stub.describeReturnsNull = false;
+        await db.close();
+      }
+    });
+
+    expect(message).toContain('could not describe');
+    expect(message).toContain('Token unknown');
+  });
+});
+
+test.describe('rowMode', () => {
+  test('returns positional rows and keeps the names in fields', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      window.__stub.queryResult = {
+        columns: ['ID', 'NAME'],
+        rows: [
+          [1, 'alpha'],
+          [2, 'beta'],
+        ],
+      };
+
+      const db = new window.FB.FirebirdBrowser('rowmode-array', { autoPersist: false });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+
+      const arrays = await db.query('SELECT id, name FROM t', [], { rowMode: 'array' });
+      const objects = await db.query('SELECT id, name FROM t');
+      await db.close();
+
+      return {
+        arrays: arrays.rows,
+        names: arrays.fields.map((f) => f.name),
+        objects: objects.rows,
+      };
+    });
+
+    expect(result.arrays).toEqual([
+      [1, 'alpha'],
+      [2, 'beta'],
+    ]);
+    expect(result.names).toEqual(['ID', 'NAME']);
+    // The default is unchanged.
+    expect(result.objects).toEqual([
+      { ID: 1, NAME: 'alpha' },
+      { ID: 2, NAME: 'beta' },
+    ]);
+  });
+
+  test('keeps both values when two columns share a name', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      window.__stub.queryResult = { columns: ['ID', 'ID'], rows: [[1, 2]] };
+
+      const db = new window.FB.FirebirdBrowser('rowmode-dupe', { autoPersist: false });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+
+      const arrays = await db.query('SELECT a.id, b.id FROM t a JOIN t b', [], {
+        rowMode: 'array',
+      });
+      const objects = await db.query('SELECT a.id, b.id FROM t a JOIN t b');
+      await db.close();
+
+      return { arrays: arrays.rows, objects: objects.rows };
+    });
+
+    expect(result.arrays).toEqual([[1, 2]]);
+    // Object mode can only keep one, which is the trade positional rows undo.
+    expect(result.objects).toEqual([{ ID: 2 }]);
+  });
+
+  test('converts values by position, so types still apply', async ({ page }) => {
+    const value = await page.evaluate(async () => {
+      const SQL_INT64 = 580;
+      window.__stub.queryResult = {
+        columns: [
+          { name: 'BIG', type: SQL_INT64, subType: 0, scale: 0, length: 8, nullable: true },
+          { name: 'TXT', type: 448, subType: 0, scale: 0, length: 32, nullable: true },
+        ],
+        rows: [['9007199254740993', 'untouched']],
+      };
+
+      const db = new window.FB.FirebirdBrowser('rowmode-typed', {
+        autoPersist: false,
+        types: { bigint: true },
+      });
+      await db.exec('CREATE TABLE t (big BIGINT)');
+      const rows = (await db.query('SELECT big, txt FROM t', [], { rowMode: 'array' }))
+        .rows;
+      await db.close();
+
+      const row = rows[0] as unknown[];
+      return { kind: typeof row[0], exact: row[0] === 9007199254740993n, other: row[1] };
+    });
+
+    // Converters are chosen per column and applied by index — the column with
+    // no conversion is left alone.
+    expect(value.kind).toBe('bigint');
+    expect(value.exact).toBe(true);
+    expect(value.other).toBe('untouched');
+  });
+});
+
+test.describe('Custom parsers and serializers', () => {
+  // From firebird/impl/sqlda_pub.h, as in src/browser/field-types.ts.
+  const SQL_VARYING = 448;
+  const SQL_LONG = 496;
+  const SQL_TIMESTAMP = 510;
+  const SQL_INT64 = 580;
+
+  /** A described column, so the type code the library sees is the test's. */
+  const column = (name: string, type: number, scale = 0, subType = 0) => ({
+    name,
+    type,
+    subType,
+    scale,
+    length: 32,
+    nullable: true,
+  });
+
+  test('a parser converts values for its type code, and never sees null', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(
+      async ([varying]) => {
+        window.__stub.queryResult = {
+          columns: [
+            { name: 'A', type: varying, subType: 0, scale: 0, length: 32, nullable: true },
+            { name: 'B', type: varying, subType: 0, scale: 0, length: 32, nullable: true },
+          ],
+          rows: [['abc', null]],
+        };
+
+        let calls = 0;
+        const db = new window.FB.FirebirdBrowser('parser-basic', {
+          autoPersist: false,
+          types: {
+            parsers: {
+              [varying]: (value) => {
+                calls += 1;
+                return (value as string).toUpperCase();
+              },
+            },
+          },
+        });
+        await db.exec('CREATE TABLE t (a VARCHAR(32))');
+        const rows = (await db.query('SELECT a, b FROM t')).rows;
+        await db.close();
+
+        return { row: rows[0], calls };
+      },
+      [SQL_VARYING],
+    );
+
+    expect(result.row).toEqual({ A: 'ABC', B: null });
+    // The null column was skipped rather than handed to a parser that would
+    // have thrown on it.
+    expect(result.calls).toBe(1);
+  });
+
+  test('a parser replaces the built-in conversion for its type', async ({ page }) => {
+    const value = await page.evaluate(
+      async ([timestamp]) => {
+        window.__stub.queryResult = {
+          columns: [
+            { name: 'TS', type: timestamp, subType: 0, scale: 0, length: 8, nullable: true },
+          ],
+          rows: [['2026-08-11T11:22:33.4567']],
+        };
+
+        const db = new window.FB.FirebirdBrowser('parser-override', {
+          autoPersist: false,
+          // `dates` would make this a Date; the parser wins, which is how a
+          // caller keeps the full 100 µs precision Date would truncate.
+          types: {
+            dates: true,
+            parsers: { [timestamp]: (v) => `exact:${v as string}` },
+          },
+        });
+        await db.exec('CREATE TABLE t (ts TIMESTAMP)');
+        const rows = (await db.query('SELECT ts FROM t')).rows;
+        await db.close();
+
+        return rows[0]!['TS'];
+      },
+      [SQL_TIMESTAMP],
+    );
+
+    expect(value).toBe('exact:2026-08-11T11:22:33.4567');
+  });
+
+  test('a parser is given the field, which is what separates NUMERIC from BIGINT', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(
+      async ([int64]) => {
+        // Both columns are SQL_INT64; only `scale` says which is which.
+        window.__stub.queryResult = {
+          columns: [
+            { name: 'BIG', type: int64, subType: 0, scale: 0, length: 8, nullable: true },
+            { name: 'NUM', type: int64, subType: 1, scale: -4, length: 8, nullable: true },
+          ],
+          rows: [['9007199254740993', '1234.5678']],
+        };
+
+        const db = new window.FB.FirebirdBrowser('parser-field', {
+          autoPersist: false,
+          types: {
+            parsers: {
+              [int64]: (value, field) =>
+                field.scale === 0
+                  ? { kind: 'bigint', text: value }
+                  : { kind: 'numeric', scale: field.scale },
+            },
+          },
+        });
+        await db.exec('CREATE TABLE t (big BIGINT, num NUMERIC(18,4))');
+        const rows = (await db.query('SELECT big, num FROM t')).rows;
+        await db.close();
+
+        return rows[0];
+      },
+      [SQL_INT64],
+    );
+
+    expect(result).toEqual({
+      BIG: { kind: 'bigint', text: '9007199254740993' },
+      NUM: { kind: 'numeric', scale: -4 },
+    });
+  });
+
+  test('a parser keyed with the nullable bit set still fires', async ({ page }) => {
+    const value = await page.evaluate(
+      async ([int64]) => {
+        window.__stub.queryResult = {
+          columns: [
+            { name: 'BIG', type: int64, subType: 0, scale: 0, length: 8, nullable: true },
+          ],
+          rows: [['9007199254740993']],
+        };
+
+        const db = new window.FB.FirebirdBrowser('parser-nullbit', {
+          autoPersist: false,
+          // 581 is SQL_INT64 with the nullable flag — the form older XSQLDA
+          // documentation publishes. The engine reports 580, so a lookup that
+          // masked only its own side would never match this and would convert
+          // nothing, with no error to say why.
+          types: { parsers: { [int64 + 1]: (v) => `via-${v as string}` } },
+        });
+        await db.exec('CREATE TABLE t (big BIGINT)');
+        const rows = (await db.query('SELECT big FROM t')).rows;
+        await db.close();
+
+        return rows[0]!['BIG'];
+      },
+      [SQL_INT64],
+    );
+
+    expect(value).toBe('via-9007199254740993');
+  });
+
+  test('rejects two parser keys that name the same type', async ({ page }) => {
+    const message = await page.evaluate(
+      async ([int64]) => {
+        window.__stub.queryResult = { columns: ['BIG'], rows: [['1']] };
+
+        const db = new window.FB.FirebirdBrowser('parser-dupe-key', {
+          autoPersist: false,
+          // 580 and 581 are the same type; one of them would be unreachable.
+          types: {
+            parsers: { [int64]: (v) => `a-${v as string}`, [int64 + 1]: (v) => `b-${v as string}` },
+          },
+        });
+        await db.exec('CREATE TABLE t (big BIGINT)');
+        try {
+          await db.query('SELECT big FROM t');
+          return 'no error';
+        } catch (err) {
+          return (err as Error).message;
+        } finally {
+          await db.close();
+        }
+      },
+      [SQL_INT64],
+    );
+
+    expect(message).toContain('two entries for SQL type 580');
+  });
+
+  test('runs a parser once when two columns share a name', async ({ page }) => {
+    const result = await page.evaluate(
+      async ([long]) => {
+        // `SELECT a.ID, b.ID FROM a JOIN b` — two fields, one row property.
+        // Both builders keep the last column, so only its converter may run;
+        // running both fed the second the first's output.
+        window.__stub.queryResult = {
+          columns: [
+            { name: 'ID', type: long, subType: 0, scale: 0, length: 4, nullable: true },
+            { name: 'ID', type: long, subType: 0, scale: 0, length: 4, nullable: true },
+          ],
+          rows: [[1, 2]],
+        };
+
+        const db = new window.FB.FirebirdBrowser('parser-dupe-col', {
+          autoPersist: false,
+          types: { parsers: { [long]: (v) => ({ wrapped: v }) } },
+        });
+        await db.exec('CREATE TABLE t (id INTEGER)');
+        const rows = (await db.query('SELECT a.id, b.id FROM a JOIN b')).rows;
+        await db.close();
+
+        return rows[0];
+      },
+      [SQL_LONG],
+    );
+
+    // Wrapped once, and around the value the row actually holds — the second
+    // column's — rather than {wrapped: {wrapped: 1}}.
+    expect(result).toEqual({ ID: { wrapped: 2 } });
+  });
+
+  test('names the column when a parser throws', async ({ page }) => {
+    const message = await page.evaluate(
+      async ([timestamp]) => {
+        window.__stub.queryResult = {
+          columns: [
+            { name: 'TS', type: timestamp, subType: 0, scale: 0, length: 8, nullable: true },
+          ],
+          rows: [['not a timestamp']],
+        };
+
+        const db = new window.FB.FirebirdBrowser('parser-throws', {
+          autoPersist: false,
+          types: {
+            parsers: {
+              [timestamp]: (v) => {
+                throw new RangeError(`cannot parse ${v as string}`);
+              },
+            },
+          },
+        });
+        await db.exec('CREATE TABLE t (ts TIMESTAMP)');
+        try {
+          await db.query('SELECT ts FROM t');
+          return 'no error';
+        } catch (err) {
+          return (err as Error).message;
+        } finally {
+          await db.close();
+        }
+      },
+      [SQL_TIMESTAMP],
+    );
+
+    // Unwrapped this was a bare RangeError naming neither the column nor the
+    // value, on a query whose rows are already gone.
+    expect(message).toContain('parser for column TS (type 510) failed');
+    expect(message).toContain('"not a timestamp"');
+    expect(message).toContain('cannot parse');
+  });
+
+  test('a serializer renders a value the built-in encoder would reject', async ({
+    page,
+  }) => {
+    const params = await page.evaluate(async () => {
+      window.__stub.queryResult = { columns: ['ID'], rows: [] };
+
+      class Money {
+        constructor(readonly cents: number) {}
+      }
+
+      const db = new window.FB.FirebirdBrowser('serializer-basic', {
+        autoPersist: false,
+        types: {
+          serializers: [
+            (v) => (v instanceof Money ? (v.cents / 100).toFixed(2) : undefined),
+          ],
+        },
+      });
+      await db.exec('CREATE TABLE t (id INTEGER, price NUMERIC(10,2))');
+      window.__stub.resetCalls();
+
+      // Without the serializer this throws: a plain object has no SQL text
+      // form, which is exactly the gap serializers fill.
+      await db.query('SELECT id FROM t WHERE price = ?', [new Money(1999)]);
+      await db.close();
+
+      return window.__stub.firstCall('_fb_query_params')?.args[3];
+    });
+
+    expect(params).toEqual(['19.99']);
+  });
+
+  test('serializers run before the built-in encoder and decline by returning undefined', async ({
+    page,
+  }) => {
+    const params = await page.evaluate(async () => {
+      window.__stub.queryResult = { columns: ['ID'], rows: [] };
+
+      const db = new window.FB.FirebirdBrowser('serializer-chain', {
+        autoPersist: false,
+        types: {
+          serializers: [
+            // Declines everything, so the next one gets a look.
+            () => undefined,
+            // Overrides how a Date is rendered, which the built-in encoder
+            // would otherwise do itself.
+            (v) => (v instanceof Date ? 'THE-EPOCH' : undefined),
+          ],
+        },
+      });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      window.__stub.resetCalls();
+
+      await db.query('SELECT id FROM t WHERE a = ? AND b = ? AND c = ?', [
+        new Date(0),
+        42,
+        'plain',
+      ]);
+      await db.close();
+
+      return window.__stub.firstCall('_fb_query_params')?.args[3];
+    });
+
+    // The Date took the override; the others fell through to the built-ins.
+    expect(params).toEqual(['THE-EPOCH', '42', 'plain']);
+  });
+
+  test('serializers apply inside a transaction and skip null', async ({ page }) => {
+    const calls = await page.evaluate(async () => {
+      window.__stub.queryResult = { columns: ['ID'], rows: [] };
+
+      const db = new window.FB.FirebirdBrowser('serializer-tx', {
+        autoPersist: false,
+        types: {
+          serializers: [(v) => (typeof v === 'symbol' ? String(v.description) : undefined)],
+        },
+      });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      window.__stub.resetCalls();
+
+      await db.transaction(async (tx) => {
+        await tx.exec('UPDATE t SET a = ?, b = ?', [Symbol('tagged'), null]);
+        await tx.query('SELECT id FROM t WHERE a = ?', [Symbol('other')]);
+      });
+      await db.close();
+
+      return window.__stub.calls
+        .filter((c) => c.fn.endsWith('_params'))
+        .map((c) => c.args[3]);
+    });
+
+    // null stayed null — a serializer would have had to recognise it
+    // otherwise, and every serializer would carry the same guard.
+    expect(calls).toEqual([['tagged', null], ['other']]);
+  });
+});
+
+test.describe('Transaction options', () => {
+  test('passes the isolation level and access mode to the engine', async ({
+    page,
+  }) => {
+    // The bug this replaces: FirebirdBrowser accepted TransactionOptions and
+    // dropped them, so a browser caller asking for SNAPSHOT silently got the
+    // engine default while the same code on Node got SNAPSHOT.  Asserting the
+    // arguments that reach the ABI is what makes that impossible to reintroduce.
+    const calls = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('tx-options', {
+        autoPersist: false,
+      });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      window.__stub.resetCalls();
+
+      await db.transaction(async () => {}, { isolationLevel: 'SNAPSHOT' });
+      await db.transaction(async () => {}, {
+        isolationLevel: 'READ_COMMITTED',
+        readOnly: true,
+      });
+      await db.transaction(async () => {});
+
+      const started = window.__stub.calls
+        .filter((c) => c.fn === '_fb_start_transaction_ex')
+        .map((c) => c.args.slice(1));
+
+      await db.close();
+      return started;
+    });
+
+    // [isolation, readOnly] — 2 is SNAPSHOT, 1 is READ_COMMITTED, 0 is default.
+    expect(calls).toEqual([
+      [2, 0],
+      [1, 1],
+      [0, 0],
+    ]);
+  });
+
+  test('runs a query with options inside its own transaction', async ({
+    page,
+  }) => {
+    const names = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('tx-options-query', {
+        autoPersist: false,
+      });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      window.__stub.resetCalls();
+
+      await db.query('SELECT * FROM t', [], { readOnly: true });
+
+      const withOptions = window.__stub.callNames();
+      window.__stub.resetCalls();
+
+      await db.query('SELECT * FROM t');
+      const without = window.__stub.callNames();
+
+      await db.close();
+      return { withOptions, without };
+    });
+
+    // With options the statement has to run inside a transaction carrying
+    // them, as it does on Node.  Without them the engine's own auto-commit
+    // transaction is used, which saves a round trip to the Worker.
+    expect(names.withOptions).toContain('_fb_start_transaction_ex');
+    expect(names.withOptions).toContain('_fb_commit');
+    expect(names.without).not.toContain('_fb_start_transaction_ex');
+  });
+
+  test('rejects an isolation level the engine does not have', async ({
+    page,
+  }) => {
+    const message = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('tx-options-bad', {
+        autoPersist: false,
+      });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      try {
+        // JavaScript callers have no compiler to stop them, so this has to
+        // fail at runtime rather than silently becoming the default.
+        await db.transaction(async () => {}, {
+          isolationLevel: 'TOTALLY_ISOLATED',
+        } as never);
+        return null;
+      } catch (err) {
+        return (err as Error).message;
+      } finally {
+        await db.close();
+      }
+    });
+
+    expect(message).toContain('Unknown isolation level');
+    expect(message).toContain('TOTALLY_ISOLATED');
+  });
+});
+
 test.describe('FirebirdBrowser', () => {
   test('does not load the WASM module until the first statement', async ({
     page,
@@ -658,7 +1907,7 @@ test.describe('FirebirdBrowser', () => {
 
     expect(result.value).toBe(2);
     expect(result.names).toEqual([
-      '_fb_start_transaction',
+      '_fb_start_transaction_ex',
       '_fb_execute',
       '_fb_query',
       '_fb_free_result',
@@ -864,9 +2113,15 @@ test.describe('FirebirdBrowser', () => {
       await db.query('SELECT id FROM t');
 
       // Only the statement calls; _fb_free_result and friends are noise here.
+      // The parameters are argument 3 of the *_params entry points; on plain
+      // _fb_query that position is the flags word, so it is read by name
+      // rather than by index.
       const calls = window.__stub.calls
         .filter((c) => /^_fb_(execute|query)/.test(c.fn))
-        .map((c) => ({ fn: c.fn, params: c.args[3] }));
+        .map((c) => ({
+          fn: c.fn,
+          params: c.fn.endsWith('_params') ? c.args[3] : undefined,
+        }));
 
       await db.close();
       return calls;
@@ -875,7 +2130,7 @@ test.describe('FirebirdBrowser', () => {
     expect(result).toEqual([
       { fn: '_fb_execute_params', params: ['1', 'alpha', 'TRUE', null] },
       { fn: '_fb_query_params', params: ['42'] },
-      // No parameters: the plain call, whose 4th argument does not exist.
+      // No parameters: the plain entry point, which takes none.
       { fn: '_fb_query', params: undefined },
     ]);
   });
@@ -922,7 +2177,7 @@ test.describe('FirebirdBrowser', () => {
         await tx.query('SELECT COUNT(*) AS cnt FROM t');
       });
 
-      const started = window.__stub.firstCall('_fb_start_transaction');
+      const started = window.__stub.firstCall('_fb_start_transaction_ex');
       const exec = window.__stub.firstCall('_fb_execute');
       const query = window.__stub.firstCall('_fb_query');
       const commit = window.__stub.firstCall('_fb_commit');

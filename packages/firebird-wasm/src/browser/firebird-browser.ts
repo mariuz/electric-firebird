@@ -28,14 +28,27 @@ import { DirectTransport } from './engine-transport';
 import type { EngineHandle, EngineTransport } from './engine-transport';
 import { WorkerTransport } from './worker-transport';
 import { splitStatements } from './sql-script';
+import { hasTransactionOptions } from './isolation';
+import { applyTypes, applySerializers } from './value-types';
+import type { TypeOptions } from './value-types';
 import { acquireDatabaseLock } from './db-lock';
+import { SharedEngineTransport } from './shared-transport';
 import type { DatabaseLock } from './db-lock';
+import { toStatement, resolveQueryCall } from '../sql-tag';
+import type { SqlFragment } from '../sql-tag';
 import type {
+  ArrayRow,
   QueryResult,
+  QueryDescription,
+  QueryOptions,
   Row,
   QueryParams,
+  RowMode,
   TransactionOptions,
 } from '../types';
+
+/** `QueryOptions` with the array mode pinned, for the overloads below. */
+type ArrayModeOptions = QueryOptions & { rowMode: 'array' };
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -71,8 +84,12 @@ export interface FirebirdBrowserOptions {
    *
    * Omit it only where blocking the calling thread is acceptable, such as
    * Node or a test harness driving a stub engine.
+   *
+   * With `multiTab: 'shared'` this must be a **factory**.  It is called only
+   * if this tab wins the election, so a follower never downloads and
+   * instantiates a 9 MB engine to sit idle beside the one already running.
    */
-  worker?: Worker;
+  worker?: Worker | (() => Worker);
   /**
    * Use a transport of your own.  Takes precedence over `worker`; mainly a
    * seam for tests.
@@ -115,12 +132,16 @@ export interface FirebirdBrowserOptions {
    *
    * - `'exclusive'` (default) takes a cross-tab lock and fails with
    *   {@link DatabaseLockedError} if another tab will not release it in time.
+   * - `'shared'` elects one tab to run the engine and serves the others from
+   *   it, so every tab sees the same live database.  Needs `worker` to be a
+   *   factory rather than an instance — a follower must not build an engine it
+   *   will never use.
    * - `'allow-unsafe'` skips the lock.  Only sound when at most one of the
    *   tabs writes.
    *
    * @default 'exclusive'
    */
-  multiTab?: 'exclusive' | 'allow-unsafe';
+  multiTab?: 'exclusive' | 'shared' | 'allow-unsafe';
   /**
    * How long to wait for another tab to release the database, in
    * milliseconds.  `Infinity` waits indefinitely.
@@ -128,11 +149,67 @@ export interface FirebirdBrowserOptions {
    * @default 5000
    */
   lockTimeoutMs?: number;
+  /**
+   * Convert result values to richer JavaScript types.
+   *
+   * Off by default: every conversion trades something away, and values as
+   * returned today are correct, just awkward. See {@link TypeOptions} for what
+   * each one costs — `dates` in particular loses precision and has to choose a
+   * time zone Firebird did not store.
+   *
+   * @example
+   * ```ts
+   * new FirebirdBrowser('mydb', { worker, types: { bigint: true, binary: true } })
+   * ```
+   */
+  types?: TypeOptions;
+  /**
+   * Initial contents for the database, as the bytes {@link
+   * FirebirdBrowser.dumpDataDir} produced.
+   *
+   * Used **only when there is no database yet** — a stored one always wins.
+   * That is deliberate and is the difference between seeding and destroying:
+   * an application passes this on every load, so a seed that replaced what was
+   * there would reset the user's data to the snapshot on every page reload.
+   *
+   * To load a snapshot regardless of what is stored, open it as an ephemeral
+   * database: `new FirebirdBrowser('memory://', { loadDataDir: bytes })`.
+   */
+  loadDataDir?: Uint8Array;
 }
 
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
+
+/** Prefix marking a database that is never stored.  Matches PGlite's. */
+const MEMORY_PREFIX = 'memory://';
+
+/** Prefix marking a database whose pages live in OPFS rather than IndexedDB. */
+const OPFS_PREFIX = 'opfs://';
+
+/**
+ * Distinguishes ephemeral databases opened in one page.
+ *
+ * A counter rather than randomness: every instance in a tab shares one WASM
+ * module and therefore one filesystem, so all this has to do is not repeat.
+ */
+let ephemeralCounter = 0;
+
+/**
+ * A filesystem name for `memory://` or `memory://label`.
+ *
+ * The label is kept for readability when looking at the engine's filesystem,
+ * and made unique regardless: two `memory://scratch` databases are two
+ * databases, not one shared by two owners. Nothing addresses this path from
+ * outside, so uniqueness costs nothing and a collision would silently join two
+ * callers who each believe they have their own.
+ */
+function ephemeralFileName(dbName: string): string {
+  const label = dbName.slice(MEMORY_PREFIX.length).replace(/[^A-Za-z0-9_-]/g, '') || 'memory';
+  ephemeralCounter += 1;
+  return `${label}-${ephemeralCounter}`;
+}
 
 // ---------------------------------------------------------------------------
 // Implementation
@@ -146,6 +223,21 @@ export interface FirebirdBrowserOptions {
  */
 export class FirebirdBrowser {
   private readonly dbName: string;
+  /** True for a `memory://` database: never stored, discarded on close. */
+  private readonly ephemeral: boolean;
+  /** True for an `opfs://` database: the engine writes its pages straight to a file. */
+  private readonly opfs: boolean;
+  /** Path the engine opens.  Set by the OPFS mount, which chooses it. */
+  private opfsPath: string | null = null;
+  /**
+   * Name of the file inside the engine's own filesystem.
+   *
+   * The same as `dbName` for a stored database. For an ephemeral one it is
+   * made unique per instance, so two `memory://` databases in one page cannot
+   * land on the same path — the WASM module, and therefore its filesystem, is
+   * shared by every instance in a tab.
+   */
+  private readonly fileName: string;
   private readonly options: FirebirdBrowserOptions;
   private readonly vfs: IndexedDBVFS;
   private readonly engine: EngineTransport;
@@ -163,10 +255,12 @@ export class FirebirdBrowser {
   private persistAgain = false;
   private lifecycleAttached = false;
 
-  private readonly multiTab: 'exclusive' | 'allow-unsafe';
+  private readonly multiTab: 'exclusive' | 'shared' | 'allow-unsafe';
   private readonly lockTimeoutMs: number;
   /** Held for the connection's lifetime; released by close(). */
   private lock: DatabaseLock | null = null;
+  /** Set only in shared mode; owns the election and the channel. */
+  private shared: SharedEngineTransport | null = null;
 
   /**
    * @param dbName  Logical database name.  Used as the IndexedDB store name
@@ -175,10 +269,25 @@ export class FirebirdBrowser {
    */
   constructor(dbName: string, options: FirebirdBrowserOptions = {}) {
     this.dbName = dbName;
+    this.ephemeral = dbName.startsWith(MEMORY_PREFIX);
+    this.opfs = dbName.startsWith(OPFS_PREFIX);
+    this.fileName = this.ephemeral
+      ? ephemeralFileName(dbName)
+      : this.opfs
+        ? dbName.slice(OPFS_PREFIX.length)
+        : dbName;
     this.options = options;
     this.vfs = new IndexedDBVFS(options.vfs);
 
-    this.multiTab = options.multiTab ?? 'exclusive';
+    // An ephemeral database is private to this instance and never stored, so
+    // there is nothing for another tab to overwrite and nothing to lock
+    // against. Taking the lock anyway would make two tabs queue for a database
+    // neither of them shares.
+    // OPFS holds the file exclusively itself — a second sync access handle on
+    // the same file is refused by the platform — so the Web Lock would be a
+    // second, weaker copy of a guarantee already made.
+    this.multiTab =
+      this.ephemeral || this.opfs ? 'allow-unsafe' : options.multiTab ?? 'exclusive';
     this.lockTimeoutMs = options.lockTimeoutMs ?? 5_000;
 
     this.autoPersist = options.autoPersist ?? true;
@@ -187,19 +296,71 @@ export class FirebirdBrowser {
       options.onPersistError ??
       ((error) => console.error('[firebird-wasm] background persist failed', error));
 
-    this.engine =
-      options.transport ??
-      (options.worker
-        ? new WorkerTransport(options.worker)
-        : new DirectTransport({
-            wasmBinary: options.wasmBinary,
-            locateFile: options.locateFile,
-          }));
+    this.engine = options.transport ?? this.createEngine();
+  }
+
+  /** Build the real engine for this tab: a Worker if given one, else direct. */
+  private createLocalEngine(): EngineTransport {
+    const worker = this.options.worker;
+    if (worker) {
+      return new WorkerTransport(typeof worker === 'function' ? worker() : worker);
+    }
+    return new DirectTransport({
+      wasmBinary: this.options.wasmBinary,
+      locateFile: this.options.locateFile,
+    });
+  }
+
+  private createEngine(): EngineTransport {
+    if (this.multiTab !== 'shared') {
+      return this.createLocalEngine();
+    }
+
+    if (typeof BroadcastChannel === 'undefined') {
+      throw new Error(
+        "multiTab: 'shared' needs BroadcastChannel, which this environment " +
+          "does not have. Use 'exclusive' instead.",
+      );
+    }
+
+    const shared = new SharedEngineTransport({
+      dbName: this.dbName,
+      createEngine: () => this.createLocalEngine(),
+      // A follower's writes run on the leader's engine, so the leader is the
+      // only one that can know its image went stale.
+      onServedMutation: () => this.markDirty(),
+      onEngineReplaced: () => this.reopenAfterEngineChange(),
+    });
+    this.shared = shared;
+    return shared;
+  }
+
+  /**
+   * Whether this tab is the one actually running the engine.
+   *
+   * Always true unless `multiTab: 'shared'`, where exactly one tab owns the
+   * engine and the rest are served by it. Useful for deciding which tab should
+   * do work that must happen once — an import, a migration, a scheduled
+   * cleanup — rather than once per open tab.
+   */
+  get isLeader(): boolean {
+    return this.shared === null || this.shared.isLeader;
   }
 
   /** Path of the database inside Emscripten's filesystem. */
   private get dbPath(): string {
-    return `/data/${this.dbName}.fdb`;
+    return this.opfsPath ?? `/data/${this.fileName}.fdb`;
+  }
+
+  /**
+   * Run any configured serializers over outgoing parameters.
+   *
+   * Here rather than in the encoder because the encoder may be on the far side
+   * of a Worker, where the serializer functions cannot follow — see
+   * {@link applySerializers}.
+   */
+  private serialize(params: QueryParams): QueryParams {
+    return applySerializers(params, this.options.types?.serializers);
   }
 
   // ── Public API (mirrors FirebirdLite) ─────────────────────────────────
@@ -220,12 +381,16 @@ export class FirebirdBrowser {
    *
    * @returns one result per statement, in order.
    */
-  async exec(sql: string, params: QueryParams = []): Promise<ExecResult[]> {
+  async exec(
+    sql: string | SqlFragment,
+    params: QueryParams = [],
+  ): Promise<ExecResult[]> {
     await this.ensureReady();
 
-    const statements = splitStatements(sql);
+    const script = toStatement(sql, params);
+    const statements = splitStatements(script.sql);
 
-    if (params.length > 0 && statements.length > 1) {
+    if (script.params.length > 0 && statements.length > 1) {
       throw new Error(
         `Parameters cannot be used with a multi-statement script ` +
           `(${statements.length} statements found); run the statements separately`,
@@ -239,7 +404,7 @@ export class FirebirdBrowser {
         this.dbHandle,
         0,
         statement.sql,
-        params,
+        this.serialize(script.params),
       );
       results.push({ affectedRows });
     }
@@ -254,19 +419,120 @@ export class FirebirdBrowser {
   /**
    * Execute a SQL query and return the result rows.
    *
-   * Parameters are bound with `?` placeholders, as in the Node.js backend:
+   * Parameters are bound with `?` placeholders, as in the Node.js backend, or
+   * interpolated into a `` sql`…` `` fragment:
    *
    * ```ts
    * await db.query('SELECT * FROM items WHERE id = ?', [1]);
+   * await db.query(sql`SELECT * FROM items WHERE id = ${1}`);
    * ```
    */
+  // `rowMode: 'array'` first, so the literal in the options object picks these
+  // and the return type follows the mode rather than the caller's hope.
+  async query(
+    sql: SqlFragment,
+    options: ArrayModeOptions,
+  ): Promise<QueryResult<ArrayRow>>;
+  async query(
+    sql: string | SqlFragment,
+    params: QueryParams | undefined,
+    options: ArrayModeOptions,
+  ): Promise<QueryResult<ArrayRow>>;
+  async query<T extends Row = Row>(
+    sql: SqlFragment,
+    options?: QueryOptions,
+  ): Promise<QueryResult<T>>;
   async query<T extends Row = Row>(
     sql: string,
-    params: QueryParams = [],
-    _options: TransactionOptions = {},
+    params?: QueryParams,
+    options?: QueryOptions,
+  ): Promise<QueryResult<T>>;
+  // Both shapes at once, so a caller holding a `string | SqlFragment` — one
+  // built conditionally — can call this without casting. Last, so the two
+  // specific overloads still win where they apply.
+  async query<T extends Row = Row>(
+    sql: string | SqlFragment,
+    params?: QueryParams,
+    options?: QueryOptions,
+  ): Promise<QueryResult<T>>;
+  async query<T = Row>(
+    sql: string | SqlFragment,
+    paramsOrOptions: QueryParams | QueryOptions = [],
+    maybeOptions: QueryOptions = {},
   ): Promise<QueryResult<T>> {
     await this.ensureReady();
-    return this.engine.query<T>(this.dbHandle, 0, sql, params);
+
+    const { statement, options } = resolveQueryCall(
+      sql,
+      paramsOrOptions,
+      maybeOptions,
+    );
+
+    // Without options the engine's own auto-commit transaction is used, which
+    // is one fewer round trip to the Worker.  With them, the statement has to
+    // run inside a transaction that carries them — matching the Node backend,
+    // which starts one for every query.
+    const rowMode = (options as QueryOptions).rowMode ?? 'object';
+    // `types.binary` asks for Uint8Array values; the side channel is how they
+    // travel. Same result for the caller, without the base64 round trip.
+    const binaryBlobs = this.options.types?.binary === true;
+
+    if (!hasTransactionOptions(options)) {
+      return applyTypes(
+        await this.engine.query<T>(
+          this.dbHandle,
+          0,
+          statement.sql,
+          this.serialize(statement.params),
+          rowMode,
+          binaryBlobs,
+        ),
+        this.options.types,
+        rowMode,
+      );
+    }
+
+    const txHandle = await this.engine.startTransaction(this.dbHandle, options);
+    try {
+      const result = await this.engine.query<T>(
+        this.dbHandle,
+        txHandle,
+        statement.sql,
+        this.serialize(statement.params),
+        rowMode,
+        binaryBlobs,
+      );
+      await this.engine.commit(txHandle);
+      return applyTypes(result, this.options.types, rowMode);
+    } catch (err) {
+      // A failed commit finishes the transaction itself, so only a failure
+      // from the query leaves anything to roll back.
+      await this.engine.rollback(txHandle).catch(() => undefined);
+      throw err;
+    }
+  }
+
+  /**
+   * Describe a statement's shape without running it.
+   *
+   * ```ts
+   * const shape = await db.describeQuery('SELECT id, name FROM items WHERE id = ?');
+   * // shape.params        → [{ type: 496, typeName: 'INTEGER', … }]
+   * // shape.fields        → [{ name: 'ID', … }, { name: 'NAME', … }]
+   * // shape.statementType → 'SELECT'
+   * ```
+   *
+   * The statement is prepared and dropped, so nothing happens: describing an
+   * `INSERT` inserts nothing. Preparing is not free — the engine parses and
+   * plans — but it is the only way to learn a shape, and the alternative,
+   * running the statement to see what comes back, is not one.
+   *
+   * A `` sql`…` `` fragment is accepted and its values ignored; only the text
+   * decides the shape, and a fragment is often what a caller has to hand.
+   */
+  async describeQuery(sql: string | SqlFragment): Promise<QueryDescription> {
+    await this.ensureReady();
+    return this.engine.describe(this.dbHandle, 0, toStatement(sql).sql);
   }
 
   /**
@@ -274,12 +540,17 @@ export class FirebirdBrowser {
    */
   async transaction<T>(
     fn: (tx: FirebirdBrowserTransaction) => Promise<T>,
-    _options: TransactionOptions = {},
+    options: TransactionOptions = {},
   ): Promise<T> {
     await this.ensureReady();
-    const txHandle = await this.engine.startTransaction(this.dbHandle);
+    const txHandle = await this.engine.startTransaction(this.dbHandle, options);
 
-    const tx = new FirebirdBrowserTransaction(this.engine, this.dbHandle, txHandle);
+    const tx = new FirebirdBrowserTransaction(
+      this.engine,
+      this.dbHandle,
+      txHandle,
+      this.options.types,
+    );
 
     let result: T;
     try {
@@ -309,8 +580,31 @@ export class FirebirdBrowser {
    * Persist the in-memory database pages to IndexedDB.
    * Call this periodically or before the page unloads to avoid data loss.
    */
+  /**
+   * The database as bytes, ready to be stored, sent, or handed to
+   * {@link FirebirdBrowserOptions.loadDataDir}.
+   *
+   * ```ts
+   * const bytes = await db.dumpDataDir();
+   * const url = URL.createObjectURL(new Blob([bytes]));
+   * ```
+   *
+   * Read from the **live** database rather than from IndexedDB, which matters
+   * twice over: writes that have not been persisted yet are included, and an
+   * ephemeral `memory://` database has no stored copy to read at all. It is
+   * the same image `persist()` writes, taken the same way.
+   *
+   * A `Uint8Array` rather than a `Blob` — a `Blob` is one constructor away and
+   * exists only in a browser, while this class also runs in Node against a
+   * direct transport.
+   */
+  async dumpDataDir(): Promise<Uint8Array> {
+    await this.ensureReady();
+    return this.engine.readFile(this.dbPath);
+  }
+
   async persist(): Promise<void> {
-    if (!this.dbHandle) return;
+    if (!this.dbHandle || !this.mayPersist) return;
 
     // Two persists must not interleave: both read the image and write the
     // same store, and the later one could finish first and roll the database
@@ -373,7 +667,17 @@ export class FirebirdBrowser {
     }
 
     try {
-      await this.vfs.close();
+      if (this.opfs) {
+        // The mount owns the sync access handle and releases it with the
+        // module; nothing here writes, because nothing was ever buffered.
+      } else if (this.ephemeral) {
+        // Reclaim it: the engine's filesystem outlives this instance — the
+        // module is cached for the whole page — so a long-lived tab that
+        // opened many scratch databases would hold every one of them.
+        await this.engine.unlink(this.dbPath).catch(() => undefined);
+      } else {
+        await this.vfs.close();
+      }
       await this.engine.dispose();
     } finally {
       // Last, and unconditionally: a lock still held after a failed teardown
@@ -391,9 +695,28 @@ export class FirebirdBrowser {
 
   // ── Automatic persistence ─────────────────────────────────────────────
 
+  /**
+   * Whether this tab may write the database image to IndexedDB.
+   *
+   * In shared mode only the leader may: a follower has no engine, and its
+   * `readFile` would fetch the image across the channel only to race the
+   * leader writing the same store — reintroducing the whole-image overwrite
+   * that multi-tab safety exists to prevent.
+   */
+  private get mayPersist(): boolean {
+    // Ephemeral first: there is nowhere to persist to, so persist() is a
+    // no-op and markDirty() schedules nothing. A caller who writes code that
+    // works for both kinds should not have to branch.
+    //
+    // OPFS for the opposite reason: the engine's writes already went to the
+    // file, so there is nothing left to copy and a persist would be pure cost.
+    if (this.ephemeral || this.opfs) return false;
+    return this.shared === null || this.shared.isLeader;
+  }
+
   /** Note that the database has changed and schedule a persist. */
   private markDirty(): void {
-    if (!this.autoPersist || this.closed) return;
+    if (!this.autoPersist || this.closed || !this.mayPersist) return;
 
     if (this.persistTimer !== null) {
       clearTimeout(this.persistTimer);
@@ -490,24 +813,85 @@ export class FirebirdBrowser {
         timeoutMs: this.lockTimeoutMs,
       });
     }
+    // 'shared' deliberately takes no lock here: the transport's election holds
+    // it, and a second request from the same tab would queue behind itself.
 
     await this.engine.init();
+    if (this.opfs) {
+      // The mount both opens the file and decides where it lives, so the path
+      // comes back rather than being assumed on this side.
+      this.opfsPath = await this.engine.mountOpfs(this.fileName);
+    } else if (!this.ephemeral) {
+      // An ephemeral database never touches IndexedDB, so the store is not
+      // opened at all — opening it would create an empty one on disk for a
+      // database whose whole point is leaving nothing behind.
+      await this.vfs.open(this.dbName);
+    }
+    await this.openDatabase();
+    this.attachLifecycleListeners();
+  }
 
+  /**
+   * Restore the stored image if this tab owns the engine, then attach.
+   *
+   * Separate from init() because it has to run again whenever the engine
+   * changes underneath us — in shared mode a leadership change replaces the
+   * engine, and every handle it issued dies with it.
+   *
+   * The restore is guarded by {@link mayPersist} for the same reason
+   * persistence is: a follower writing its IndexedDB snapshot into the
+   * filesystem would be overwriting the leader's *live* database with a
+   * possibly older image.
+   */
+  private async openDatabase(): Promise<void> {
     await this.engine.mkdir('/data');
 
-    // Restore any previously persisted image into the engine's filesystem
-    // before attaching, so a reload reopens the same database.
-    await this.vfs.open(this.dbName);
-    const stored = await this.vfs.exportDatabase();
-    if (stored.byteLength > 0) {
-      await this.engine.writeFile(this.dbPath, stored);
+    if (this.mayPersist) {
+      const stored = await this.vfs.exportDatabase();
+      if (stored.byteLength > 0) {
+        await this.engine.writeFile(this.dbPath, stored);
+      }
     }
 
+    // After the stored image, never before it: `loadDataDir` is what to start
+    // from when there is nothing, not what to overwrite with.
+    const seed = this.options.loadDataDir;
+    if (seed && !(await this.engine.exists(this.dbPath))) {
+      if (seed.byteLength === 0) {
+        throw new RangeError(
+          'loadDataDir is empty; pass the bytes from dumpDataDir() or omit it',
+        );
+      }
+      await this.engine.writeFile(this.dbPath, seed);
+    }
+
+    // Works unchanged for OPFS: that filesystem reports a file as existing
+    // only once it has bytes, so a database that has never been written is
+    // absent here rather than present and empty.
     this.dbHandle = (await this.engine.exists(this.dbPath))
       ? await this.engine.attachDatabase(this.dbPath)
       : await this.engine.createDatabase(this.dbPath);
+  }
 
-    this.attachLifecycleListeners();
+  /**
+   * The engine behind this connection was replaced; attach to the new one.
+   *
+   * Called on every tab after a leadership change, promoted or not. Silence
+   * here would leave the caller holding a handle from an engine that no longer
+   * exists, and writes through it would go nowhere — visibly succeeding.
+   */
+  private async reopenAfterEngineChange(): Promise<void> {
+    if (this.closed) return;
+    this.dbHandle = 0;
+    try {
+      await this.openDatabase();
+    } catch (err) {
+      this.onPersistError(
+        err instanceof Error
+          ? err
+          : new Error(`could not reopen after a leadership change: ${String(err)}`),
+      );
+    }
   }
 }
 
@@ -528,6 +912,7 @@ export class FirebirdBrowserTransaction {
     private readonly engine: EngineTransport,
     private readonly dbHandle: EngineHandle,
     private readonly txHandle: EngineHandle,
+    private readonly types?: TypeOptions,
   ) {}
 
   /** Whether this transaction has already been rolled back. */
@@ -559,23 +944,51 @@ export class FirebirdBrowserTransaction {
    *
    * @returns the number of rows affected.
    */
-  async exec(sql: string, params: QueryParams = []): Promise<ExecResult> {
+  async exec(
+    sql: string | SqlFragment,
+    params: QueryParams = [],
+  ): Promise<ExecResult> {
     this.assertUsable();
+    const statement = toStatement(sql, params);
     const affectedRows = await this.engine.execute(
       this.dbHandle,
       this.txHandle,
-      sql,
-      params,
+      statement.sql,
+      applySerializers(statement.params, this.types?.serializers),
     );
     return { affectedRows };
   }
 
   /** Execute a SELECT inside this transaction and return rows. */
+  async query(
+    sql: string | SqlFragment,
+    params: QueryParams | undefined,
+    options: ArrayModeOptions,
+  ): Promise<QueryResult<ArrayRow>>;
   async query<T extends Row = Row>(
-    sql: string,
+    sql: string | SqlFragment,
+    params?: QueryParams,
+    options?: { rowMode?: RowMode },
+  ): Promise<QueryResult<T>>;
+  async query<T = Row>(
+    sql: string | SqlFragment,
     params: QueryParams = [],
+    options: { rowMode?: RowMode } = {},
   ): Promise<QueryResult<T>> {
     this.assertUsable();
-    return this.engine.query<T>(this.dbHandle, this.txHandle, sql, params);
+    const statement = toStatement(sql, params);
+    const rowMode = options.rowMode ?? 'object';
+    return applyTypes(
+      await this.engine.query<T>(
+        this.dbHandle,
+        this.txHandle,
+        statement.sql,
+        applySerializers(statement.params, this.types?.serializers),
+        rowMode,
+        this.types?.binary === true,
+      ),
+      this.types,
+      rowMode,
+    );
   }
 }

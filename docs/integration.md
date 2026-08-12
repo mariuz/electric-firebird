@@ -299,6 +299,36 @@ Number(rows[0].PRICE) + 1;      // 21.25     ← loses exactness for big values
 
 Use a decimal library, or do the arithmetic in SQL where it stays exact.
 
+### Richer types, opt-in
+
+`types` converts values on the way out. Off by default, because each conversion
+gives something up:
+
+```ts
+const db = new FirebirdBrowser('mydb', {
+  worker,
+  types: { bigint: true, binary: true, dates: true },
+});
+```
+
+| Option | Effect | What it costs |
+|--------|--------|---------------|
+| `bigint` | `BIGINT` → `bigint`, always | Nothing, but `NUMERIC` keeps its string — it shares `BIGINT`'s storage and a `bigint` would drop the scale |
+| `binary` | Binary `BLOB` → `Uint8Array` | Nothing. Base64 is 33% larger than the bytes and has to be decoded anyway |
+| `dates` | `DATE`, `TIMESTAMP` → `Date` | **Precision and zone** — see below |
+
+`dates` is the one to think about. Firebird keeps 100 µs and `Date` keeps 1 ms,
+so `11:22:33.4567` becomes `11:22:33.456`. And Firebird's `DATE`/`TIMESTAMP`
+carry no time zone while `Date` is an absolute instant, so one has to be
+chosen: **UTC**, so the same stored value gives the same `Date` everywhere.
+Left to JavaScript's own parsing it would be local for `TIMESTAMP` and UTC for
+`DATE` — machine-dependent, and inconsistent between two types that ought to
+behave alike.
+
+`TIME`, `TIME WITH TIME ZONE` and `TIMESTAMP WITH TIME ZONE` are never
+converted. `new Date('11:22:33')` is `Invalid Date`, and `Date` has nowhere to
+put `Europe/Bucharest`.
+
 To tell an exact number from text, read the column description:
 
 ```ts
@@ -329,6 +359,26 @@ not then try to commit.
 
 Statements issued on `tx` are bound to that transaction. Statements on `db`
 are not, so a rollback will not undo them.
+
+`isolationLevel` and `readOnly` are honoured:
+
+```ts
+await db.transaction(async (tx) => {
+  const { rows } = await tx.query('SELECT SUM(amount) AS total FROM ledger');
+  await tx.exec('INSERT INTO audit (total) VALUES (?)', [rows[0].TOTAL]);
+}, { isolationLevel: 'SNAPSHOT' });
+
+// A read-only transaction is enforced by the engine, not merely advisory.
+await db.query('SELECT * FROM ledger', [], { readOnly: true });
+```
+
+`SNAPSHOT` gives the transaction a stable view: work another transaction
+commits after it starts is invisible to it. `READ_COMMITTED` sees such commits.
+`SNAPSHOT_TABLE_STABILITY` maps to Firebird's `CONSISTENCY`.
+
+Passing options to `query()` runs the statement inside its own transaction
+carrying them, which costs one extra round trip to the Worker. Without options
+the engine's auto-commit transaction is used instead.
 
 ### Multi-statement scripts
 
@@ -500,8 +550,7 @@ server do not apply to a preview build.
 Pass a `worker`.
 
 **`CHARACTER SET "SYSTEM"."SJIS_0208" is not installed`.** Only the built-in
-character sets are compiled in; loadable ones need `dlopen`, which WASM does
-not have. Use `UTF8`.
+character sets are compiled in. Use `UTF8`, which is.
 
 **Arithmetic on a money column produces string concatenation.** See §5.
 

@@ -17,12 +17,22 @@
  */
 
 export { FirebirdLite, FirebirdTransaction } from './firebird';
+
+export { sql, SqlFragment, RawSql, isSqlFragment, toStatement } from './sql-tag';
+export { statementKind } from './statement-types';
+export type { SqlTag, Statement } from './sql-tag';
+
 export type {
   FirebirdLiteOptions,
   QueryResult,
   QueryParams,
   Row,
   FieldInfo,
+  QueryOptions,
+  QueryDescription,
+  StatementKind,
+  RowMode,
+  ArrayRow,
   TransactionOptions,
   IsolationLevel,
 } from './types';

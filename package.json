@@ -8,6 +8,7 @@
   "scripts": {
     "build": "npm run build --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
+    "bench": "npm run bench -w packages/firebird-wasm",
     "lint": "npm run lint --workspaces --if-present",
     "build:demo": "node demo/build.mjs",
     "demo": "node demo/build.mjs --serve",

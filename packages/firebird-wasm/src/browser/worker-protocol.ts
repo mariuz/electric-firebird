@@ -17,13 +17,16 @@ export type EngineOp =
   | 'detachDatabase'
   | 'execute'
   | 'query'
+  | 'describe'
   | 'startTransaction'
   | 'commit'
   | 'rollback'
   | 'mkdir'
   | 'exists'
   | 'readFile'
-  | 'writeFile';
+  | 'writeFile'
+  | 'unlink'
+  | 'mountOpfs';
 
 /** A call from the main thread to the Worker. */
 export interface EngineRequest {

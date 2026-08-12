@@ -53,6 +53,13 @@
      * serialised, so the library still parses the real shape.
      */
     queryResult: { columns: [], rows: [] },
+    // What _fb_describe reports.  Separate from queryResult because a
+    // description is about a statement's shape, not about any rows.
+    description: { params: [], columns: [], statementType: 1 },
+    describeReturnsNull: false,
+    // Bytes the side channel hands back, one Uint8Array per {"$blob":N}
+    // placeholder in queryResult.rows.
+    blobs: [],
     /** When true, `_fb_query` returns a NULL pointer. */
     queryReturnsNull: false,
     /** When true, `_fb_create_database` returns a NULL handle. */
@@ -153,6 +160,38 @@
       return JSON.stringify({ columns: described, rows: stub.queryResult.rows ?? [] });
     }
 
+    /**
+     * Pack `stub.blobs` into the side buffer the real engine would publish:
+     * u32 count, u32 length per blob, then the bytes.  Only when the caller
+     * asked for it — bit 0 of the query flags — exactly as the engine does.
+     */
+    function publishBlobs(flags) {
+      if (lastBlobPtr) {
+        free(lastBlobPtr);
+        lastBlobPtr = 0;
+        lastBlobSize = 0;
+      }
+
+      const blobs = (flags & 1) ? (stub.blobs ?? []) : [];
+      if (blobs.length === 0) return;
+
+      const header = 4 * (1 + blobs.length);
+      const total = header + blobs.reduce((n, b) => n + b.length, 0);
+      const ptr = malloc(total);
+      const view = new DataView(heap.buffer, ptr, total);
+
+      view.setUint32(0, blobs.length, true);
+      let offset = header;
+      blobs.forEach((bytes, i) => {
+        view.setUint32(4 * (1 + i), bytes.length, true);
+        heap.set(bytes, ptr + offset);
+        offset += bytes.length;
+      });
+
+      lastBlobPtr = ptr;
+      lastBlobSize = total;
+    }
+
     /** Decode the packed parameter buffer: u32 count, then per parameter a
      *  null flag and, unless null, a u32 length and UTF-8 bytes. */
     function decodeParams(ptr, length) {
@@ -223,6 +262,10 @@
     // ── Engine state ─────────────────────────────────────────────────────
     const attachments = new Map(); // handle -> path
     const liveResults = new Set(); // result pointers not yet freed
+    // The side buffer for the most recent query.  Engine-owned, like the real
+    // one: replaced on the next query rather than freed by the caller.
+    let lastBlobPtr = 0;
+    let lastBlobSize = 0;
     let nextDbHandle = 1000;
     let nextTxHandle = 5000;
     let initialised = false;
@@ -284,13 +327,41 @@
         return 0;
       },
 
-      _fb_query(handle, txHandle, sqlPtr) {
+      _fb_query(handle, txHandle, sqlPtr, flags) {
         const sql = UTF8ToString(sqlPtr);
-        stub.calls.push({ fn: '_fb_query', args: [handle, txHandle, sql] });
+        stub.calls.push({ fn: '_fb_query', args: [handle, txHandle, sql, flags] });
         if (stub.queryReturnsNull) return 0;
+        publishBlobs(flags);
         const ptr = heapString(serialiseQueryResult());
         liveResults.add(ptr);
         return ptr;
+      },
+
+      /**
+       * Describe without executing.  `stub.description` controls what comes
+       * back; the default is an empty shape, which is what a statement with
+       * no parameters and no columns really reports.
+       */
+      _fb_describe(handle, txHandle, sqlPtr) {
+        const sql = UTF8ToString(sqlPtr);
+        stub.calls.push({ fn: '_fb_describe', args: [handle, txHandle, sql] });
+        if (stub.describeReturnsNull) return 0;
+        const described = {
+          params: stub.description.params ?? [],
+          columns: stub.description.columns ?? [],
+          statementType: stub.description.statementType ?? 1,
+        };
+        const ptr = heapString(JSON.stringify(described));
+        liveResults.add(ptr);
+        return ptr;
+      },
+
+      _fb_last_blobs() {
+        return lastBlobPtr;
+      },
+
+      _fb_last_blobs_size() {
+        return lastBlobSize;
       },
 
       _fb_free_result(resultPtr) {
@@ -301,6 +372,21 @@
 
       _fb_start_transaction(handle) {
         stub.calls.push({ fn: '_fb_start_transaction', args: [handle] });
+        if (stub.startTxFails) return 0;
+        return nextTxHandle++;
+      },
+
+      /**
+       * The real engine builds a TPB from these; the stub only has to record
+       * them, so a test can assert that the isolation a caller asked for
+       * actually reached the ABI.  That is the whole bug this replaced: the
+       * options were accepted by the API and never travelled any further.
+       */
+      _fb_start_transaction_ex(handle, isolation, readOnly) {
+        stub.calls.push({
+          fn: '_fb_start_transaction_ex',
+          args: [handle, isolation, readOnly],
+        });
         if (stub.startTxFails) return 0;
         return nextTxHandle++;
       },
@@ -337,11 +423,15 @@
         return 0;
       },
 
-      _fb_query_params(handle, txHandle, sqlPtr, paramsPtr, paramsLength) {
+      _fb_query_params(handle, txHandle, sqlPtr, paramsPtr, paramsLength, flags) {
         const sql = UTF8ToString(sqlPtr);
         const params = decodeParams(paramsPtr, paramsLength);
-        stub.calls.push({ fn: '_fb_query_params', args: [handle, txHandle, sql, params] });
+        stub.calls.push({
+          fn: '_fb_query_params',
+          args: [handle, txHandle, sql, params, flags],
+        });
         if (stub.queryReturnsNull) return 0;
+        publishBlobs(flags);
         const ptr = heapString(serialiseQueryResult());
         liveResults.add(ptr);
         return ptr;

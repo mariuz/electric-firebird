@@ -2,6 +2,8 @@ import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
 import { FirebirdLite } from '../firebird';
+import { sql } from '../sql-tag';
+import type { SqlFragment } from '../sql-tag';
 
 // Skip tests if Firebird client library is not available or server is not running
 const hasFirebirdLib = (() => {
@@ -123,6 +125,59 @@ describeIfFirebird('FirebirdLite', () => {
     expect(result.rows[0]).toMatchObject({ CNT: 2 });
   });
 
+  it('rolls back explicitly, without raising an error', async () => {
+    await db.exec('CREATE TABLE ledger (id INTEGER, amount INTEGER)');
+    await db.exec('INSERT INTO ledger VALUES (1, 100)');
+
+    // Throwing also rolls back, but it propagates to the caller. Abandoning a
+    // transaction on purpose should not require inventing an error, and the
+    // call that does it must not then be committed on top.
+    const decided = await db.transaction(async (tx) => {
+      await tx.exec('UPDATE ledger SET amount = 999 WHERE id = 1');
+
+      const inside = await tx.query('SELECT amount FROM ledger WHERE id = 1');
+      expect(inside.rows[0]).toMatchObject({ AMOUNT: 999 });
+
+      await tx.rollback();
+      return 'abandoned';
+    });
+
+    // The callback's value is still returned: rolling back is not a failure.
+    expect(decided).toBe('abandoned');
+
+    const after = await db.query('SELECT amount FROM ledger WHERE id = 1');
+    expect(after.rows[0]).toMatchObject({ AMOUNT: 100 });
+  });
+
+  it('refuses to use a transaction after rolling it back', async () => {
+    await db.exec('CREATE TABLE guarded (id INTEGER)');
+
+    await db.transaction(async (tx) => {
+      await tx.rollback();
+
+      // Statements after a rollback would run outside any transaction the
+      // caller believes in, so they fail rather than quietly succeeding.
+      await expect(tx.exec('INSERT INTO guarded VALUES (1)')).rejects.toThrow(
+        'already been rolled back',
+      );
+      await expect(tx.query('SELECT * FROM guarded')).rejects.toThrow(
+        'already been rolled back',
+      );
+
+      expect(tx.isFinished).toBe(true);
+    });
+
+    const rows = await db.query('SELECT COUNT(*) AS CNT FROM guarded');
+    expect(rows.rows[0]).toMatchObject({ CNT: 0 });
+  });
+
+  it('tolerates rollback() being called twice', async () => {
+    await db.transaction(async (tx) => {
+      await tx.rollback();
+      await expect(tx.rollback()).resolves.toBeUndefined();
+    });
+  });
+
   it('rolls back a transaction on error', async () => {
     await db.exec('CREATE TABLE accounts (id INTEGER, balance INTEGER)');
     await db.exec('INSERT INTO accounts VALUES (1, 1000)');
@@ -160,6 +215,259 @@ describeIfFirebird('FirebirdLite', () => {
     await expect(db.query("SELECT 1 FROM RDB$DATABASE")).rejects.toThrow(
       'FirebirdLite instance has been closed',
     );
+  });
+
+  describe('describeQuery', () => {
+    beforeEach(async () => {
+      await db.exec('CREATE TABLE described (id INTEGER, name VARCHAR(20))');
+    });
+
+    it('reports the result columns and the statement kind', async () => {
+      const shape = await db.describeQuery(
+        'SELECT id, name FROM described WHERE id = ?',
+      );
+
+      expect(shape.fields.map((f) => f.name)).toEqual(['ID', 'NAME']);
+      expect(shape.statementType).toBe('SELECT');
+      expect(shape.hasResultSet).toBe(true);
+    });
+
+    it('reports params as undefined, which is not the same as none', async () => {
+      // The native driver exposes no input metadata at all. Returning [] would
+      // say "this statement takes no parameters", which is a different and
+      // wrong claim about a statement with a placeholder in it.
+      const shape = await db.describeQuery('SELECT id FROM described WHERE id = ?');
+
+      expect(shape.params).toBeUndefined();
+    });
+
+    it('describes a statement that returns nothing', async () => {
+      const shape = await db.describeQuery('INSERT INTO described VALUES (?, ?)');
+
+      expect(shape.statementType).toBe('INSERT');
+      expect(shape.hasResultSet).toBe(false);
+      expect(shape.fields).toEqual([]);
+    });
+
+    it('names DDL and UPDATE too', async () => {
+      expect((await db.describeQuery('CREATE TABLE later (id INTEGER)')).statementType)
+        .toBe('DDL');
+      expect((await db.describeQuery('UPDATE described SET name = ?')).statementType)
+        .toBe('UPDATE');
+      expect((await db.describeQuery('DELETE FROM described')).statementType)
+        .toBe('DELETE');
+    });
+
+    it('runs nothing — describing an INSERT inserts nothing', async () => {
+      await db.describeQuery("INSERT INTO described VALUES (1, 'ghost')");
+      await db.describeQuery('DELETE FROM described');
+
+      const after = await db.query<{ N: number }>(
+        'SELECT COUNT(*) AS N FROM described',
+      );
+      expect(after.rows[0].N).toBe(0);
+    });
+
+    it('accepts a fragment, describing its text', async () => {
+      // The values are irrelevant to the shape; only the text decides it.
+      const shape = await db.describeQuery(
+        sql`SELECT id FROM described WHERE id = ${99}`,
+      );
+
+      expect(shape.fields.map((f) => f.name)).toEqual(['ID']);
+      expect(shape.statementType).toBe('SELECT');
+    });
+
+    it('surfaces the engine error for a statement that will not prepare', async () => {
+      await expect(db.describeQuery('SELECT * FROM no_such_table')).rejects.toThrow();
+    });
+  });
+
+  describe('rowMode', () => {
+    beforeEach(async () => {
+      await db.exec('CREATE TABLE shaped (id INTEGER, name VARCHAR(20))');
+      await db.exec("INSERT INTO shaped VALUES (1, 'alpha')");
+      await db.exec("INSERT INTO shaped VALUES (2, 'beta')");
+    });
+
+    it('returns positional rows, with the names still in fields', async () => {
+      const result = await db.query('SELECT id, name FROM shaped ORDER BY id', [], {
+        rowMode: 'array',
+      });
+
+      expect(result.rows).toEqual([
+        [1, 'alpha'],
+        [2, 'beta'],
+      ]);
+      // Nothing is lost: the names are where they always were.
+      expect(result.fields.map((f) => f.name)).toEqual(['ID', 'NAME']);
+    });
+
+    it('defaults to objects', async () => {
+      const result = await db.query('SELECT id, name FROM shaped WHERE id = 1');
+
+      expect(result.rows).toEqual([{ ID: 1, NAME: 'alpha' }]);
+    });
+
+    it('types the rows by the mode, not by hope', async () => {
+      // Compiling is the test. `rows` is unknown[][] here, so indexing it is
+      // allowed and reading a property is not — the overload picked the array
+      // shape from the literal in the options object.
+      const arrays = await db.query('SELECT id, name FROM shaped WHERE id = 1', [], {
+        rowMode: 'array',
+      });
+      const first: unknown[] = arrays.rows[0];
+      expect(first[1]).toBe('alpha');
+
+      const objects = await db.query<{ ID: number }>(
+        'SELECT id FROM shaped WHERE id = 1',
+      );
+      const id: number = objects.rows[0].ID;
+      expect(id).toBe(1);
+    });
+
+    it('keeps both columns when two share a name', async () => {
+      // In object mode `SELECT a.id, b.id` collapses to one ID and the first
+      // value is unreachable. Positional rows keep both, which is the reason
+      // to reach for this mode beyond speed.
+      const result = await db.query(
+        'SELECT a.id, b.id FROM shaped a JOIN shaped b ON b.id = 2 WHERE a.id = 1',
+        [],
+        { rowMode: 'array' },
+      );
+
+      expect(result.rows).toEqual([[1, 2]]);
+      expect(result.fields.map((f) => f.name)).toEqual(['ID', 'ID']);
+    });
+
+    it('works with a fragment and inside a transaction', async () => {
+      const viaFragment = await db.query(sql`SELECT id FROM shaped WHERE id = ${2}`, {
+        rowMode: 'array',
+      });
+      expect(viaFragment.rows).toEqual([[2]]);
+
+      await db.transaction(async (tx) => {
+        const inside = await tx.query('SELECT id, name FROM shaped ORDER BY id', [], {
+          rowMode: 'array',
+        });
+        expect(inside.rows).toEqual([
+          [1, 'alpha'],
+          [2, 'beta'],
+        ]);
+      });
+    });
+  });
+
+  // The unit tests cover what the tag builds; these cover the engine accepting
+  // it — that the `?` placeholders and the parameter order actually line up
+  // once a real statement is prepared.
+  describe('sql`…`', () => {
+    beforeEach(async () => {
+      await db.exec('CREATE TABLE tagged (id INTEGER, name VARCHAR(50))');
+      await db.exec("INSERT INTO tagged VALUES (1, 'first')");
+      await db.exec("INSERT INTO tagged VALUES (2, 'second')");
+    });
+
+    it('runs a tagged query', async () => {
+      const id = 2;
+      const result = await db.query<{ NAME: string }>(
+        sql`SELECT name FROM tagged WHERE id = ${id}`,
+      );
+
+      expect(result.rows).toEqual([{ NAME: 'second' }]);
+    });
+
+    it('binds values in template order', async () => {
+      const result = await db.query<{ ID: number }>(
+        sql`SELECT id FROM tagged WHERE name = ${'first'} AND id = ${1}`,
+      );
+
+      expect(result.rows).toEqual([{ ID: 1 }]);
+    });
+
+    it('expands a list through sql.join', async () => {
+      const result = await db.query<{ ID: number }>(
+        sql`SELECT id FROM tagged WHERE id IN (${sql.join([1, 2])}) ORDER BY id`,
+      );
+
+      expect(result.rows).toEqual([{ ID: 1 }, { ID: 2 }]);
+    });
+
+    it('quotes an identifier the engine then resolves', async () => {
+      // Upper case because `CREATE TABLE tagged` stored TAGGED — the folding
+      // rule sql.identifier deliberately does not paper over.
+      const result = await db.query(
+        sql`SELECT COUNT(*) AS N FROM ${sql.identifier('TAGGED')}`,
+      );
+
+      expect(result.rows[0]).toMatchObject({ N: 2 });
+    });
+
+    it('treats a value that looks like SQL as data', async () => {
+      const hostile = "'; DELETE FROM tagged; --";
+      const result = await db.query(
+        sql`SELECT id FROM tagged WHERE name = ${hostile}`,
+      );
+
+      expect(result.rows).toEqual([]);
+      // The table survived, which is the point.
+      const after = await db.query<{ N: number }>(
+        'SELECT COUNT(*) AS N FROM tagged',
+      );
+      expect(after.rows[0].N).toBe(2);
+    });
+
+    it('runs a tagged statement through exec() and inside a transaction', async () => {
+      await db.exec(sql`INSERT INTO tagged VALUES (${3}, ${'third'})`);
+
+      await db.transaction(async (tx) => {
+        await tx.exec(sql`UPDATE tagged SET name = ${'renamed'} WHERE id = ${3}`);
+        const inside = await tx.query<{ NAME: string }>(
+          sql`SELECT name FROM tagged WHERE id = ${3}`,
+        );
+        expect(inside.rows).toEqual([{ NAME: 'renamed' }]);
+      });
+
+      const result = await db.query<{ NAME: string }>(
+        sql`SELECT name FROM tagged WHERE id = ${3}`,
+      );
+      expect(result.rows).toEqual([{ NAME: 'renamed' }]);
+    });
+
+    it('accepts a statement whose type is string-or-fragment', async () => {
+      // Compiling is half the test: with only the two specific overloads this
+      // is TS2769, so a caller building a statement conditionally had to cast.
+      const useTag = true as boolean;
+      const statement: string | SqlFragment = useTag
+        ? sql`SELECT id FROM tagged WHERE id = ${1}`
+        : 'SELECT id FROM tagged WHERE id = 1';
+
+      const result = await db.query<{ ID: number }>(statement);
+      expect(result.rows).toEqual([{ ID: 1 }]);
+    });
+
+    it('releases the statement when the query fails', async () => {
+      // A statement that throws on execute used to leak its handle, so a
+      // retry loop — the usual response to a lock conflict — leaked one per
+      // attempt. Twenty failures now leave the attachment perfectly usable.
+      for (let i = 0; i < 20; i++) {
+        await expect(db.query('SELECT * FROM no_such_table')).rejects.toThrow();
+      }
+
+      const after = await db.query<{ ID: number }>(
+        sql`SELECT id FROM tagged WHERE id = ${1}`,
+      );
+      expect(after.rows).toEqual([{ ID: 1 }]);
+    });
+
+    it('passes transaction options in the slot parameters would have used', async () => {
+      const result = await db.query<{ ID: number }>(
+        sql`SELECT id FROM tagged WHERE id = ${1}`,
+        { readOnly: true, isolationLevel: 'READ_COMMITTED' },
+      );
+
+      expect(result.rows).toEqual([{ ID: 1 }]);
+    });
   });
 });
 

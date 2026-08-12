@@ -1,0 +1,125 @@
+From: electric-firebird
+Subject: [PATCH] IntlManager: charset tables that match what is linked in
+
+Creating a database instantiates every entry of defaultCharSets and
+defaultCollations — see ini.epp, which loops MetadataCache::newVersion over
+the whole table.  An entry whose implementation is not linked in makes
+CREATE DATABASE fail with "CHARACTER SET ... is not installed".
+
+Two different sets of entries have to go, for two different reasons.
+
+Without the intl module (the default), only the sets handled by
+INTL_builtin_lookup_charset are available: NONE, OCTETS, ASCII, UNICODE_FSS,
+UNICODE_UCS2, UTF8, UTF16 and UTF32.  Everything else lives in src/intl.
+Building with -DFB_WASM_FULL_INTL=ON compiles that in and defines
+FB_WASM_STATIC_INTL, at which point those entries can come back.
+
+Four survive neither way.  TIS620, GBK, CP943C and GB18030 are absent from
+ld.cpp's own table, so LD_lookup_charset() falls through to
+CSICU_charset_init() — an ICU converter.  Emscripten's ICU port does not
+carry their converter data, so they fail to instantiate whether or not the
+intl module is linked.  The other 43 are table-driven and work.
+
+diff --git a/src/jrd/IntlManager.cpp b/src/jrd/IntlManager.cpp
+index 3c4c74c..6d978ae 100644
+--- a/src/jrd/IntlManager.cpp
++++ b/src/jrd/IntlManager.cpp
+@@ -102,6 +102,12 @@ static GlobalPtr<ModulesMap> modules;
+ static GlobalPtr<FullPooledMap<CharSetCollationName, ExternalInfo>> charSetCollations;
+ 
+ 
++// Four of the character sets above are not implemented by the intl module's
++// own tables: LD_lookup_charset() falls through to CSICU_charset_init(), i.e.
++// an ICU converter.  This build's static ICU does not carry their converter
++// data, so instantiating them during CREATE DATABASE fails with
++// "CHARACTER SET ... is not installed".  The other 43 are table-driven and
++// work.
+ const IntlManager::CharSetDefinition IntlManager::defaultCharSets[] =
+ {
+ 	{"NONE", CS_NONE, 1},
+@@ -113,6 +119,16 @@ const IntlManager::CharSetDefinition IntlManager::defaultCharSets[] =
+ 	{"UTF16", CS_UTF16, 4},
+ 	{"UTF32", CS_UTF32, 4},
+ #endif	// FB_NEW_INTL_NOT_READY
++// Only the character sets implemented by INTL_builtin_lookup_charset
++// (src/jrd/intl_builtin.cpp) can exist in a build with no loadable intl
++// module.  Creating a database instantiates every entry of these tables
++// (see ini.epp: MetadataCache::newVersion<Cached::CharSet> over
++// defaultCharSets), so listing a character set whose implementation is not
++// linked in makes CREATE DATABASE fail with "CHARACTER SET ... is not
++// installed".  Without the intl module linked in there is nothing to
++// implement them, so they are compiled out unless FB_WASM_STATIC_INTL says
++// otherwise.
++#if !defined(__EMSCRIPTEN__) || defined(FB_WASM_STATIC_INTL)
+ 	{"SJIS_0208", CS_SJIS, 2},
+ 	{"EUCJ_0208", CS_EUCJ, 2},
+ 	{"DOS437", CS_DOS_437, 1},
+@@ -156,10 +172,19 @@ const IntlManager::CharSetDefinition IntlManager::defaultCharSets[] =
+ 	{"KOI8R", CS_KOI8R, 1},
+ 	{"KOI8U", CS_KOI8U, 1},
+ 	{"WIN1258", CS_WIN1258, 1},
++#ifndef FB_WASM_STATIC_INTL
+ 	{"TIS620", CS_TIS620, 1},
++#endif
++#ifndef FB_WASM_STATIC_INTL
+ 	{"GBK", CS_GBK, 2},
++#endif
++#ifndef FB_WASM_STATIC_INTL
+ 	{"CP943C", CS_CP943C, 2},
++#endif
++#ifndef FB_WASM_STATIC_INTL
+ 	{"GB18030", CS_GB18030, 4},
++#endif
++#endif // !__EMSCRIPTEN__
+ 	{NULL, CS_NONE, 0}
+ };
+ 
+@@ -259,6 +284,16 @@ const IntlManager::CollationDefinition IntlManager::defaultCollations[] =
+ 	{CS_UTF32, CollId(0), "UTF32", NULL, TEXTTYPE_ATTR_PAD_SPACE, NULL},
+ 	{CS_UTF32, CollId(1), "UCS_BASIC", NULL, TEXTTYPE_ATTR_PAD_SPACE, NULL},
+ #endif	// FB_NEW_INTL_NOT_READY
++// Only the character sets implemented by INTL_builtin_lookup_charset
++// (src/jrd/intl_builtin.cpp) can exist in a build with no loadable intl
++// module.  Creating a database instantiates every entry of these tables
++// (see ini.epp: MetadataCache::newVersion<Cached::CharSet> over
++// defaultCharSets), so listing a character set whose implementation is not
++// linked in makes CREATE DATABASE fail with "CHARACTER SET ... is not
++// installed".  Without the intl module linked in there is nothing to
++// implement them, so they are compiled out unless FB_WASM_STATIC_INTL says
++// otherwise.
++#if !defined(__EMSCRIPTEN__) || defined(FB_WASM_STATIC_INTL)
+ 	{CS_SJIS, CollId(0), "SJIS_0208", NULL, TEXTTYPE_ATTR_PAD_SPACE, NULL},
+ 	{CS_EUCJ, CollId(0), "EUCJ_0208", NULL, TEXTTYPE_ATTR_PAD_SPACE, NULL},
+ 	{CS_DOS_437, CollId(0), "DOS437", NULL, TEXTTYPE_ATTR_PAD_SPACE, NULL},
+@@ -403,14 +438,31 @@ const IntlManager::CollationDefinition IntlManager::defaultCollations[] =
+ 	{CS_KOI8U, CollId(0), "KOI8U", NULL, TEXTTYPE_ATTR_PAD_SPACE, NULL},
+ 	{CS_KOI8U, CollId(1), "KOI8U_UA", NULL, TEXTTYPE_ATTR_PAD_SPACE, NULL},
+ 	{CS_WIN1258, CollId(0), "WIN1258", NULL, TEXTTYPE_ATTR_PAD_SPACE, NULL},
++#ifndef FB_WASM_STATIC_INTL
+ 	{CS_TIS620, CollId(0), "TIS620", NULL, TEXTTYPE_ATTR_PAD_SPACE, NULL},
++#endif
++#ifndef FB_WASM_STATIC_INTL
+ 	{CS_TIS620, CollId(1), "TIS620_UNICODE", NULL, TEXTTYPE_ATTR_PAD_SPACE, NULL},
++#endif
++#ifndef FB_WASM_STATIC_INTL
+ 	{CS_GBK, CollId(0), "GBK", NULL, TEXTTYPE_ATTR_PAD_SPACE, NULL},
++#endif
++#ifndef FB_WASM_STATIC_INTL
+ 	{CS_GBK, CollId(1), "GBK_UNICODE", NULL, TEXTTYPE_ATTR_PAD_SPACE, NULL},
++#endif
++#ifndef FB_WASM_STATIC_INTL
+ 	{CS_CP943C, CollId(0), "CP943C", NULL, TEXTTYPE_ATTR_PAD_SPACE, NULL},
++#endif
++#ifndef FB_WASM_STATIC_INTL
+ 	{CS_CP943C, CollId(1), "CP943C_UNICODE", NULL, TEXTTYPE_ATTR_PAD_SPACE, NULL},
++#endif
++#ifndef FB_WASM_STATIC_INTL
+ 	{CS_GB18030, CollId(0), "GB18030", NULL, TEXTTYPE_ATTR_PAD_SPACE, NULL},
++#endif
++#ifndef FB_WASM_STATIC_INTL
+ 	{CS_GB18030, CollId(1), "GB18030_UNICODE", NULL, TEXTTYPE_ATTR_PAD_SPACE, NULL},
++#endif
++#endif // !__EMSCRIPTEN__
+ 	{CS_NONE, CollId(0), NULL, NULL, 0, NULL}
+ };
+ 

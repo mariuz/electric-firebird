@@ -15,6 +15,7 @@
 | [Roadmap](./roadmap.md) | Current status, PGlite feature comparison, and the staged plan |
 | [Contributing](./contributing.md) | How to build, test, and contribute to the project |
 | [Releasing](./releasing.md) | Publishing the package to npm |
+| [Changelog](../CHANGELOG.md) | What changed in each release |
 
 ## At a glance
 

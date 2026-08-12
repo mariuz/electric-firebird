@@ -106,6 +106,20 @@ int g_nextTxHandle = 1;
 std::string g_lastError;
 
 /**
+ * Isolation levels, mirroring the TypeScript `IsolationLevel` union.
+ *
+ * Integers rather than strings because they cross the WASM boundary, where a
+ * string means an allocation and a parse on every transaction.
+ */
+enum FbIsolation
+{
+	FB_ISOLATION_DEFAULT                  = 0,
+	FB_ISOLATION_READ_COMMITTED           = 1,
+	FB_ISOLATION_SNAPSHOT                 = 2,
+	FB_ISOLATION_SNAPSHOT_TABLE_STABILITY = 3
+};
+
+/**
  * Rows affected by the most recent execute.
  *
  * Reported out of band like the error text, because the C entry points return
@@ -113,6 +127,75 @@ std::string g_lastError;
  * next execute overwrites it.
  */
 ISC_INT64 g_lastAffectedRows = 0;
+
+/**
+ * Binary BLOB bytes collected during one query, for the side channel.
+ *
+ * Base64 inside the JSON costs 33% inflation on the wire and a decode pass in
+ * JavaScript, on data that is already bytes.  With the side channel the JSON
+ * carries `{"$blob":N}` and the bytes travel beside it, so the only copy left
+ * is the one out of the WASM heap.
+ *
+ * Off unless the caller asks — `fb_query`'s flags — because the base64 form is
+ * what every existing caller decodes today.
+ */
+/** `flags` bit for fb_query/fb_query_params: binary BLOBs out of band. */
+#define FB_QUERY_BINARY_BLOBS 1
+
+struct BlobSink
+{
+	bool enabled = false;
+	/** Every blob's bytes, concatenated in the order they were read. */
+	std::vector<unsigned char> data;
+	/** Byte length of each blob, in the same order.  Offsets are the running sum. */
+	std::vector<unsigned> lengths;
+};
+
+/** Set by `fb_query` when the side channel is on; owned here, freed on the next query. */
+unsigned char* g_lastBlobBuffer = nullptr;
+unsigned       g_lastBlobSize   = 0;
+
+/**
+ * Publish a sink as the side buffer for the query just finished.
+ *
+ * Layout, all little-endian, which is what WebAssembly is:
+ *
+ *     u32  count
+ *     u32  length × count
+ *     ...  bytes, concatenated in order
+ *
+ * Lengths rather than offsets: the offsets are the running sum, so storing
+ * both would be storing the same information twice and inviting them to
+ * disagree.
+ *
+ * The engine owns this until the next query replaces it, like the error text.
+ * That is what lets the JavaScript side read it without a free() of its own —
+ * and why it has to read it immediately.
+ */
+void publishBlobs(const BlobSink& sink)
+{
+	free(g_lastBlobBuffer);
+	g_lastBlobBuffer = nullptr;
+	g_lastBlobSize = 0;
+
+	if (sink.lengths.empty())
+		return;
+
+	const unsigned count  = static_cast<unsigned>(sink.lengths.size());
+	const unsigned header = static_cast<unsigned>(sizeof(unsigned) * (1 + count));
+	const unsigned total  = header + static_cast<unsigned>(sink.data.size());
+
+	auto* buffer = static_cast<unsigned char*>(malloc(total));
+	if (!buffer)
+		return;
+
+	memcpy(buffer, &count, sizeof(count));
+	memcpy(buffer + sizeof(unsigned), sink.lengths.data(), sizeof(unsigned) * count);
+	memcpy(buffer + header, sink.data.data(), sink.data.size());
+
+	g_lastBlobBuffer = buffer;
+	g_lastBlobSize = total;
+}
 
 /** Buffer returned by fb_query(); freed by fb_free_result(). */
 char* allocCString(const std::string& s)
@@ -356,7 +439,7 @@ void appendDateText(unsigned year, unsigned month, unsigned day, std::string& ou
 
 /** Read a text or binary BLOB in full and append it as a JSON string. */
 void appendBlob(IAttachment* attachment, ITransaction* transaction,
-	ISC_QUAD* blobId, int subType, std::string& out)
+	ISC_QUAD* blobId, int subType, std::string& out, BlobSink* sink)
 {
 	Status status;
 	IBlob* blob = attachment->openBlob(status.ptr(), transaction, blobId, 0, nullptr);
@@ -390,13 +473,29 @@ void appendBlob(IAttachment* attachment, ITransaction* transaction,
 
 	// SUB_TYPE 1 is TEXT; everything else is opaque binary.
 	if (subType == 1)
-		jsonEscape(reinterpret_cast<const char*>(bytes.data()), bytes.size(), out);
-	else
 	{
-		out += '"';
-		base64Encode(bytes, out);
-		out += '"';
+		jsonEscape(reinterpret_cast<const char*>(bytes.data()), bytes.size(), out);
+		return;
 	}
+
+	if (sink && sink->enabled)
+	{
+		// Out of band: the JSON keeps a reference and the bytes go beside it.
+		// The index is the blob's position in the side buffer, which is simply
+		// how many have been collected so far.
+		char placeholder[32];
+		snprintf(placeholder, sizeof(placeholder), "{\"$blob\":%u}",
+			static_cast<unsigned>(sink->lengths.size()));
+		out += placeholder;
+
+		sink->lengths.push_back(static_cast<unsigned>(bytes.size()));
+		sink->data.insert(sink->data.end(), bytes.begin(), bytes.end());
+		return;
+	}
+
+	out += '"';
+	base64Encode(bytes, out);
+	out += '"';
 }
 
 /**
@@ -405,7 +504,7 @@ void appendBlob(IAttachment* attachment, ITransaction* transaction,
  */
 void appendValue(IAttachment* attachment, ITransaction* transaction,
 	unsigned type, int subType, int scale, unsigned length,
-	const unsigned char* data, std::string& out)
+	const unsigned char* data, std::string& out, BlobSink* sink)
 {
 	switch (type)
 	{
@@ -642,7 +741,7 @@ void appendValue(IAttachment* attachment, ITransaction* transaction,
 		{
 			ISC_QUAD blobId;
 			memcpy(&blobId, data, sizeof(blobId));
-			appendBlob(attachment, transaction, &blobId, subType, out);
+			appendBlob(attachment, transaction, &blobId, subType, out, sink);
 			break;
 		}
 
@@ -1179,10 +1278,70 @@ IProvider* locateProvider()
  * input message is supplied.  `cursor` is an out-parameter so the caller's
  * cleanup owns it on every exit path, including the error ones.
  */
+/**
+ * Append a JSON array describing every field of `meta`.
+ *
+ * The same shape the result-set encoder emits for its columns, so one decoder
+ * on the JS side reads both. A null `meta` — which is what a statement with no
+ * parameters or no output reports — is an empty array, not an error.
+ */
+bool describeMetadata(IMessageMetadata* meta, std::string& json)
+{
+	Status status;
+
+	json += '[';
+
+	if (meta)
+	{
+		const unsigned count = meta->getCount(status.ptr());
+		if (status.failed())
+		{
+			setErrorFromStatus("could not read metadata count", status.ptr());
+			return false;
+		}
+
+		for (unsigned i = 0; i < count; i++)
+		{
+			if (i)
+				json += ',';
+
+			// Prefer the alias, as the result-set encoder does. Input
+			// parameters have neither, and come back as "".
+			const char* name = meta->getAlias(status.ptr(), i);
+			if (status.failed() || !name || !*name)
+				name = meta->getField(status.ptr(), i);
+
+			const unsigned type     = meta->getType(status.ptr(), i);
+			const int      subType  = meta->getSubType(status.ptr(), i);
+			const int      scale    = meta->getScale(status.ptr(), i);
+			const unsigned length   = meta->getLength(status.ptr(), i);
+			const FB_BOOLEAN nullable = meta->isNullable(status.ptr(), i);
+
+			if (status.failed())
+			{
+				setErrorFromStatus("could not read field metadata", status.ptr());
+				return false;
+			}
+
+			json += "{\"name\":";
+			jsonEscape(name ? name : "", name ? strlen(name) : 0, json);
+
+			char described[128];
+			snprintf(described, sizeof(described),
+				",\"type\":%u,\"subType\":%d,\"scale\":%d,\"length\":%u,\"nullable\":%s}",
+				type, subType, scale, length, nullable ? "true" : "false");
+			json += described;
+		}
+	}
+
+	json += ']';
+	return true;
+}
+
 bool serialiseCursor(IAttachment* attachment, ITransaction* transaction,
 	IStatement* statement, IMessageMetadata* metadata, unsigned columnCount,
 	IMessageMetadata* inMeta, void* inBuffer,
-	IResultSet*& cursor, std::string& json)
+	IResultSet*& cursor, std::string& json, BlobSink* sink)
 {
 	Status status;
 
@@ -1190,6 +1349,31 @@ bool serialiseCursor(IAttachment* attachment, ITransaction* transaction,
 
 	// A statement with no output columns (INSERT, DDL, …) still succeeds; it
 	// simply yields an empty result set rather than an error.
+	//
+	// It has to be *executed* to do that, which is what openCursor does for a
+	// SELECT below and what nothing did here: the statement was prepared, the
+	// empty result serialised, and the transaction committed, so
+	// `query('INSERT …')` reported success having written nothing. The Node
+	// backend has always run the same statement through `stmt.execute()`, so
+	// the two backends disagreed about whether the row was there.
+	if (!columnCount)
+	{
+		statement->execute(status.ptr(), transaction, inMeta, inBuffer, nullptr, nullptr);
+
+		if (status.failed())
+		{
+			setErrorFromStatus("could not execute statement", status.ptr());
+			return false;
+		}
+
+		Status affectedStatus;
+		const ISC_UINT64 affected = statement->getAffectedRecords(affectedStatus.ptr());
+		// DDL reports no count, which is not a failure — it simply has none.
+		g_lastAffectedRows = affectedStatus.failed()
+			? 0
+			: static_cast<ISC_INT64>(affected);
+	}
+
 	std::vector<unsigned> types(columnCount);
 	std::vector<int>      subTypes(columnCount);
 	std::vector<int>      scales(columnCount);
@@ -1291,7 +1475,7 @@ bool serialiseCursor(IAttachment* attachment, ITransaction* transaction,
 				else
 				{
 					appendValue(attachment, transaction, types[i], subTypes[i],
-						scales[i], lengths[i], buffer.data() + offsets[i], json);
+						scales[i], lengths[i], buffer.data() + offsets[i], json, sink);
 				}
 			}
 			json += ']';
@@ -1322,6 +1506,14 @@ int fb_init(void)
 
 	if (g_provider)
 		return 0;
+
+#ifdef FB_WASM_STATIC_INTL
+	// IntlManager scans <root>/intl for *.conf.  The artifact embeds one at
+	// /firebird/intl/fbintl.conf, so the root has to be /firebird before the
+	// engine initialises.  Set without overwriting: a host that has already
+	// chosen a root means it deliberately.
+	setenv("FIREBIRD", "/firebird", 0);
+#endif
 
 	g_master = fb_get_master_interface();
 	if (!g_master)
@@ -1542,8 +1734,137 @@ double fb_last_affected_rows(void)
  * `tx_handle` of 0 runs the query in its own transaction, committed once the
  * cursor has been drained.
  */
+/**
+ * Describe a prepared statement without running it.
+ *
+ * Returns `{"params":[…],"columns":[…],"statementType":N}`, where both arrays
+ * carry the same per-field shape the result sets already use. Input parameters
+ * have no names in Firebird — they are positional `?` — so their `name` is the
+ * empty string rather than an invention.
+ *
+ * The statement is prepared and dropped. Preparing is not free (the engine
+ * parses and plans) but it is the only way to learn a statement's shape, and
+ * it is what makes this answerable without side effects: nothing is executed,
+ * so describing an `INSERT` inserts nothing.
+ */
 FB_WASM_EXPORT
-const char* fb_query(int db_handle, int tx_handle, const char* sql)
+const char* fb_describe(int db_handle, int tx_handle, const char* sql)
+{
+	clearError();
+
+	IAttachment* attachment = lookupAttachment(db_handle);
+	if (!attachment)
+	{
+		setError("fb_describe: unknown database handle");
+		return nullptr;
+	}
+
+	ITransaction* transaction = nullptr;
+	bool ownTransaction = false;
+
+	if (tx_handle)
+	{
+		transaction = lookupTransaction(tx_handle);
+		if (!transaction)
+		{
+			setError("fb_describe: unknown transaction handle");
+			return nullptr;
+		}
+	}
+	else
+	{
+		Status status;
+		transaction = attachment->startTransaction(status.ptr(), 0, nullptr);
+		if (status.failed() || !transaction)
+		{
+			setErrorFromStatus("fb_describe: could not start transaction", status.ptr());
+			return nullptr;
+		}
+		ownTransaction = true;
+	}
+
+	IStatement*       statement = nullptr;
+	IMessageMetadata* inMeta    = nullptr;
+	IMessageMetadata* outMeta   = nullptr;
+
+	auto cleanup = [&]()
+	{
+		if (inMeta)
+			inMeta->release();
+		if (outMeta)
+			outMeta->release();
+		if (statement)
+			statement->free(Status().ptr());
+
+		if (ownTransaction && transaction)
+		{
+			// Nothing ran, so there is nothing to commit — but the transaction
+			// still has to be finished or it leaks.
+			Status s;
+			transaction->commit(s.ptr());
+			transaction = nullptr;
+		}
+	};
+
+	Status status;
+	statement = attachment->prepare(status.ptr(), transaction, 0, sql, SQL_DIALECT_V6,
+		IStatement::PREPARE_PREFETCH_METADATA);
+
+	if (status.failed() || !statement)
+	{
+		setErrorFromStatus("fb_describe: prepare failed", status.ptr());
+		cleanup();
+		return nullptr;
+	}
+
+	inMeta = statement->getInputMetadata(status.ptr());
+	if (status.failed())
+	{
+		setErrorFromStatus("fb_describe: could not read input metadata", status.ptr());
+		cleanup();
+		return nullptr;
+	}
+
+	outMeta = statement->getOutputMetadata(status.ptr());
+	if (status.failed())
+	{
+		setErrorFromStatus("fb_describe: could not read output metadata", status.ptr());
+		cleanup();
+		return nullptr;
+	}
+
+	const unsigned statementType = statement->getType(status.ptr());
+	if (status.failed())
+	{
+		setErrorFromStatus("fb_describe: could not read statement type", status.ptr());
+		cleanup();
+		return nullptr;
+	}
+
+	std::string json = "{\"params\":";
+	if (!describeMetadata(inMeta, json))
+	{
+		cleanup();
+		return nullptr;
+	}
+
+	json += ",\"columns\":";
+	if (!describeMetadata(outMeta, json))
+	{
+		cleanup();
+		return nullptr;
+	}
+
+	char tail[64];
+	snprintf(tail, sizeof(tail), ",\"statementType\":%u}", statementType);
+	json += tail;
+
+	cleanup();
+	return allocCString(json);
+}
+
+FB_WASM_EXPORT
+const char* fb_query(int db_handle, int tx_handle, const char* sql, int flags)
 {
 	clearError();
 
@@ -1637,17 +1958,41 @@ const char* fb_query(int db_handle, int tx_handle, const char* sql)
 		return nullptr;
 	}
 
+	BlobSink sink;
+	sink.enabled = (flags & FB_QUERY_BINARY_BLOBS) != 0;
+
 	std::string json;
 	if (!serialiseCursor(attachment, transaction, statement, metadata, columnCount,
-			nullptr, nullptr, cursor, json))
+			nullptr, nullptr, cursor, json, &sink))
 	{
 		cleanup(false);
 		return nullptr;
 	}
 
 	cleanup(true);
+	publishBlobs(sink);
 
 	return allocCString(json);
+}
+
+/**
+ * Pointer to the binary BLOB side buffer for the most recent query, or 0.
+ *
+ * Owned by the engine and replaced by the next query, exactly like the error
+ * text — read it immediately, and do not free it.  See {@link publishBlobs}
+ * for the layout.
+ */
+FB_WASM_EXPORT
+const unsigned char* fb_last_blobs()
+{
+	return g_lastBlobBuffer;
+}
+
+/** Byte length of the buffer {@link fb_last_blobs} points at; 0 when there is none. */
+FB_WASM_EXPORT
+unsigned fb_last_blobs_size()
+{
+	return g_lastBlobSize;
 }
 
 /** Release a result set returned by fb_query(). */
@@ -1841,7 +2186,28 @@ int fb_events_cancel(int event_handle)
  * Returns a transaction handle (>0) on success, 0 on failure.
  */
 FB_WASM_EXPORT
+int fb_start_transaction_ex(int db_handle, int isolation, int read_only);
+
 int fb_start_transaction(int db_handle)
+{
+	// The engine's own defaults, which is what this used to do unconditionally.
+	return fb_start_transaction_ex(db_handle, FB_ISOLATION_DEFAULT, 0);
+}
+
+/**
+ * Start a transaction with an explicit isolation level and access mode.
+ *
+ * @param isolation  One of the FB_ISOLATION_* values.
+ * @param read_only  Non-zero for a read-only transaction.
+ *
+ * Passing a null transaction parameter buffer — which fb_start_transaction()
+ * did for every transaction — silently gives the engine's defaults. That is
+ * fine as a default and wrong as the *only* behaviour: the Node backend has
+ * always honoured isolationLevel and readOnly, so the same call through the
+ * browser backend quietly did something different.
+ */
+FB_WASM_EXPORT
+int fb_start_transaction_ex(int db_handle, int isolation, int read_only)
 {
 	clearError();
 
@@ -1853,7 +2219,63 @@ int fb_start_transaction(int db_handle)
 	}
 
 	Status status;
-	ITransaction* transaction = attachment->startTransaction(status.ptr(), 0, nullptr);
+	ITransaction* transaction = nullptr;
+
+	if (isolation == FB_ISOLATION_DEFAULT && !read_only)
+	{
+		// Nothing to say, so say nothing: a null TPB is not the same as an
+		// empty one, and the engine's default is what the caller asked for.
+		transaction = attachment->startTransaction(status.ptr(), 0, nullptr);
+	}
+	else
+	{
+		IXpbBuilder* tpb = g_util->getXpbBuilder(status.ptr(), IXpbBuilder::TPB,
+			nullptr, 0);
+		if (status.failed() || !tpb)
+		{
+			setErrorFromStatus("fb_start_transaction: could not build a TPB",
+				status.ptr());
+			return 0;
+		}
+
+		switch (isolation)
+		{
+		case FB_ISOLATION_READ_COMMITTED:
+			tpb->insertTag(status.ptr(), isc_tpb_read_committed);
+			// Without a version tag the engine picks one, and which one it
+			// picks has changed across releases.  Record versions is the
+			// behaviour callers expect from READ COMMITTED.
+			tpb->insertTag(status.ptr(), isc_tpb_rec_version);
+			break;
+		case FB_ISOLATION_SNAPSHOT:
+			tpb->insertTag(status.ptr(), isc_tpb_concurrency);
+			break;
+		case FB_ISOLATION_SNAPSHOT_TABLE_STABILITY:
+			tpb->insertTag(status.ptr(), isc_tpb_consistency);
+			break;
+		case FB_ISOLATION_DEFAULT:
+			break;   // read_only alone brought us here
+		default:
+			tpb->dispose();
+			setError("fb_start_transaction: unknown isolation level");
+			return 0;
+		}
+
+		tpb->insertTag(status.ptr(), read_only ? isc_tpb_read : isc_tpb_write);
+
+		if (status.failed())
+		{
+			tpb->dispose();
+			setErrorFromStatus("fb_start_transaction: could not fill the TPB",
+				status.ptr());
+			return 0;
+		}
+
+		transaction = attachment->startTransaction(status.ptr(),
+			tpb->getBufferLength(status.ptr()), tpb->getBuffer(status.ptr()));
+
+		tpb->dispose();
+	}
 
 	if (status.failed() || !transaction)
 	{
@@ -2052,7 +2474,7 @@ int fb_execute_params(int db_handle, int tx_handle, const char* sql,
  */
 FB_WASM_EXPORT
 const char* fb_query_params(int db_handle, int tx_handle, const char* sql,
-	const unsigned char* params, int params_length)
+	const unsigned char* params, int params_length, int flags)
 {
 	clearError();
 
@@ -2159,15 +2581,19 @@ const char* fb_query_params(int db_handle, int tx_handle, const char* sql,
 		return nullptr;
 	}
 
+	BlobSink sink;
+	sink.enabled = (flags & FB_QUERY_BINARY_BLOBS) != 0;
+
 	std::string json;
 	if (!serialiseCursor(attachment, transaction, statement, metadata, columnCount,
-			input.meta(), input.data(), cursor, json))
+			input.meta(), input.data(), cursor, json, &sink))
 	{
 		cleanup(false);
 		return nullptr;
 	}
 
 	cleanup(true);
+	publishBlobs(sink);
 	return allocCString(json);
 }
 

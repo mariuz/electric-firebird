@@ -71,8 +71,15 @@ export interface FirebirdWasmModule {
    * on failure.  Release it with `_fb_free_result`.
    *
    * @param txHandle - transaction to run in, or 0 for a self-contained one.
+   * @param flags - bit 0 sends binary BLOBs through the side channel instead
+   *                of base64 inside the JSON.  See `BLOB_SIDE_CHANNEL`.
    */
-  _fb_query(handle: FbHandle, txHandle: FbHandle, sqlPtr: number): number;
+  _fb_query(
+    handle: FbHandle,
+    txHandle: FbHandle,
+    sqlPtr: number,
+    flags: number,
+  ): number;
   /**
    * Execute a statement with bound parameters.
    *
@@ -96,6 +103,7 @@ export interface FirebirdWasmModule {
     sqlPtr: number,
     paramsPtr: number,
     paramsLength: number,
+    flags: number,
   ): number;
   /**
    * Rows affected by the most recent execute.
@@ -105,10 +113,43 @@ export interface FirebirdWasmModule {
    * doubles, which keeps counts above 2^31 intact.
    */
   _fb_last_affected_rows(): number;
+  /**
+   * Pointer to the binary BLOB side buffer for the most recent query, or 0.
+   *
+   * Owned by the engine and replaced by the next query, like the error text —
+   * read it immediately and do not free it.  Layout, little-endian:
+   * a `u32` count, then one `u32` length per blob, then the bytes.
+   */
+  _fb_last_blobs(): number;
+  /** Byte length of the buffer `_fb_last_blobs` points at; 0 when there is none. */
+  _fb_last_blobs_size(): number;
+  /**
+   * Describe a statement without running it.
+   *
+   * Returns a pointer to JSON — `{params, columns, statementType}` — or 0 on
+   * failure.  Released with `_fb_free_result`, like a result set.
+   */
+  _fb_describe(
+    dbHandle: FbHandle,
+    txHandle: FbHandle,
+    sqlPtr: number,
+  ): number;
   /** Free a result set returned by `_fb_query`. */
   _fb_free_result(resultPtr: number): void;
   /** Start a new transaction and return a transaction handle (0 = failed). */
   _fb_start_transaction(handle: FbHandle): FbHandle;
+  /**
+   * Start a transaction with an explicit isolation level.
+   *
+   * `isolation` is an {@link IsolationCode}; `readOnly` is 0 or 1.
+   * Integers rather than strings: this crosses the WASM boundary on
+   * every transaction, and a string would mean an allocation each time.
+   */
+  _fb_start_transaction_ex(
+    handle: FbHandle,
+    isolation: number,
+    readOnly: number,
+  ): FbHandle;
   /** Commit a transaction.  The handle is invalid afterwards either way. */
   _fb_commit(txHandle: FbHandle): number;
   /** Rollback a transaction.  The handle is invalid afterwards either way. */

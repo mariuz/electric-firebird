@@ -139,7 +139,7 @@ const WASM_TEST_HTML = `<!DOCTYPE html>
 
         const resultPtr = withSql(
           'SELECT id, name FROM items ORDER BY id',
-          (p) => mod._fb_query(dbHandle, 0, p),
+          (p) => mod._fb_query(dbHandle, 0, p, 0),
         );
         if (resultPtr === 0) {
           throw new Error('_fb_query() returned a null pointer');
@@ -212,7 +212,7 @@ const engineError = (mod) => {
     }
 
     const resultPtr = withSql(mod, 'SELECT id, name FROM items ORDER BY id',
-      (p) => mod._fb_query(db, 0, p));
+      (p) => mod._fb_query(db, 0, p, 0));
     if (!resultPtr) throw new Error('query failed: ' + engineError(mod));
 
     const json = mod.UTF8ToString(resultPtr);

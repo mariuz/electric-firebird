@@ -44,11 +44,18 @@ Key design decisions:
 - **Isolation mapping** — the `IsolationLevel` strings are mapped to the
   Firebird-specific `TransactionIsolation` enum values:
 
-  | `IsolationLevel` | Firebird isolation |
-  |------------------|--------------------|
-  | `READ_COMMITTED` | `READ_COMMITTED` |
-  | `SNAPSHOT` | `SNAPSHOT` |
-  | `SNAPSHOT_TABLE_STABILITY` | `CONSISTENCY` |
+  | `IsolationLevel` | Firebird isolation | TPB tag (WASM backend) |
+  |------------------|--------------------|------------------------|
+  | `READ_COMMITTED` | `READ_COMMITTED` | `isc_tpb_read_committed` + `isc_tpb_rec_version` |
+  | `SNAPSHOT` | `SNAPSHOT` | `isc_tpb_concurrency` |
+  | `SNAPSHOT_TABLE_STABILITY` | `CONSISTENCY` | `isc_tpb_consistency` |
+
+  Both backends honour the same options. They did not always: the WASM backend
+  accepted `TransactionOptions` and dropped them, so identical code asking for
+  `SNAPSHOT` got it on Node and quietly got the engine default in the browser.
+  The browser path now builds a transaction parameter buffer through
+  `IXpbBuilder` — see `fb_start_transaction_ex` in `wasm/fb_wasm_api.cpp`, and
+  `src/browser/isolation.ts` for the codes that cross the WASM boundary.
 
 ---
 

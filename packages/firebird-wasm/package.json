@@ -1,6 +1,6 @@
 {
   "name": "firebird-wasm",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Firebird embedded database in WebAssembly \u2014 runs in the browser and Node, like PGlite for PostgreSQL",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -19,6 +19,7 @@
     "build": "tsc -p tsconfig.build.json",
     "build:wasm": "bash wasm/build.sh",
     "test": "jest --forceExit",
+    "bench": "node bench/decode-bench.js",
     "lint": "eslint src --ext .ts",
     "clean": "rm -rf dist",
     "prepublishOnly": "node scripts/check-publish.mjs"
@@ -75,6 +76,7 @@
   "files": [
     "dist",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "optionalDependencies": {

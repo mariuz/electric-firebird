@@ -7,13 +7,22 @@ dist/
 
 # Test artifacts
 coverage/
-playwright-report/
-playwright-report-wasm/
+# A glob, not two names: the demo config writes a third folder
+# (playwright-report-demo) that the two literals missed, and the next config
+# would have missed the next one.
+playwright-report*/
 test-results/
+bench-results/
 
 # Firebird database files
 *.fdb
 *.fdb-journal
+
+# Upstream ICU data, downloaded rather than authored: 3.4 MB of third-party
+# binary that nothing on main references. The trimmed package and the script
+# that produces it live on the icu-collation branch — that is what would be
+# committed, not this.
+packages/firebird-wasm/wasm/icu-data/
 
 # WASM build artifacts
 # build-* covers the debug/sanitizer trees (build-asan, build-emu, …) as well

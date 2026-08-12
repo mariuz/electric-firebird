@@ -12,9 +12,19 @@
 export { FirebirdBrowser, FirebirdBrowserTransaction } from './firebird-browser';
 export type { FirebirdBrowserOptions, ExecResult } from './firebird-browser';
 
+export { sql, SqlFragment, RawSql, isSqlFragment, toStatement } from '../sql-tag';
+export type { SqlTag, Statement } from '../sql-tag';
+
 export { encodeParams, encodeParamValue } from './params';
 
 export { firebirdTypeName } from './field-types';
+export { statementKind } from '../statement-types';
+export { decodeDescription, attachBlobs, BLOB_SIDE_CHANNEL } from './engine-transport';
+
+export { isolationCode, hasTransactionOptions } from './isolation';
+
+export { applyTypes, applySerializers, hasTypeOptions } from './value-types';
+export type { TypeOptions, Parser, Serializer } from './value-types';
 
 export {
   acquireDatabaseLock,
@@ -32,6 +42,12 @@ export type {
   EngineHandle,
   DirectTransportOptions,
 } from './engine-transport';
+
+export { SharedEngineTransport } from './shared-transport';
+export type { SharedEngineTransportOptions } from './shared-transport';
+
+export { electLeader } from './leader-election';
+export type { LeaderElection, LeaderElectionOptions } from './leader-election';
 
 export { WorkerTransport } from './worker-transport';
 export type { WorkerTransportOptions } from './worker-transport';
@@ -62,6 +78,11 @@ export type {
   Row,
   FieldInfo,
   FirebirdTypeName,
+  QueryOptions,
+  QueryDescription,
+  StatementKind,
+  RowMode,
+  ArrayRow,
   TransactionOptions,
   IsolationLevel,
 } from '../types';
