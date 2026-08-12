@@ -1,7 +1,7 @@
 {
   "name": "firebird-wasm",
-  "version": "0.2.0",
-  "description": "Firebird embedded database in WebAssembly \u2014 runs in the browser and Node, like PGlite for PostgreSQL",
+  "version": "0.3.0",
+  "description": "Firebird embedded database in WebAssembly — runs in the browser and Node, like PGlite for PostgreSQL",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "browser": "dist/browser/index.js",
