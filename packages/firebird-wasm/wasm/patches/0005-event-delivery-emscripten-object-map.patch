@@ -1,0 +1,80 @@
+From: electric-firebird
+Subject: [PATCH] event.cpp: keep the process block in the primary mapping under Emscripten
+
+Firebird delivered exactly one event under Emscripten and then never
+again.  The watcher thread was blocked in eventWait forever while the
+poster kept incrementing a counter it could not see.
+
+SharedMemoryBase::mapObject() mmaps the shared-memory file a second
+time, at the object's page-aligned offset, and returns a pointer into
+that new mapping.  On a real OS both mappings are MAP_SHARED views of
+the same pages, so a write through one is visible through the other.
+Under Emscripten a second mmap of the same fd is a private copy:
+measured directly — write 42 through the first mapping and the second
+still reads 0.
+
+EventManager caches m_process from mapObject, so it pointed into that
+copy.  watcher_thread then mixed the two: it recomputed `process` from
+SRQ_ABS_PTR (the real block) to clear the event and to test PRB_pending,
+but waited on m_process->prb_event (the copy).  The first delivery
+worked because PRB_pending was already set and it delivered before ever
+waiting; from then on the poster advanced the real counter while the
+watcher blocked on the copy's.  The destructor's shutdown wake-up posted
+to the copy too, so teardown hung as well.
+
+Firebird already supports building without object mapping, and that is
+the correct configuration here: a single-process embedded engine has no
+second process to map for, and the primary mapping is genuinely shared
+between threads.  This takes that path under __EMSCRIPTEN__ only.
+
+The watcher additionally waits on the pointer it just cleared rather
+than on the cached one.  They are the same object after this change, but
+that form is also the one that survives the region being remapped
+underneath the loop — which is why the clear recomputes it every time.
+
+Measured after: five POST_EVENTs from an AFTER INSERT trigger produce
+five deliveries, with the engine's count advancing 1..5, and shutdown
+completes.
+---
+diff --git a/src/jrd/event.cpp b/src/jrd/event.cpp
+index 59b8139..e1844c4 100644
+--- a/src/jrd/event.cpp
++++ b/src/jrd/event.cpp
+@@ -103,7 +103,7 @@ EventManager::~EventManager()
+ 		(void) m_sharedMemory->eventPost(&m_process->prb_event);
+ 		m_cleanupSync.waitForCompletion();
+ 
+-#ifdef HAVE_OBJECT_MAP
++#if defined(HAVE_OBJECT_MAP) && !defined(__EMSCRIPTEN__)
+ 		m_sharedMemory->unmapObject(&localStatus, &m_process);
+ #else
+ 		m_process = NULL;
+@@ -617,7 +617,14 @@ void EventManager::create_process()
+ 
+ 	m_processOffset = SRQ_REL_PTR(process);
+ 
+-#ifdef HAVE_OBJECT_MAP
++// Emscripten: mapObject() mmaps the shared file a second time, and a second
++// MAP_SHARED mmap of one fd is a private copy there rather than an alias —
++// measured directly. Every use of m_process would then be reading and writing
++// memory no other thread touches: the watcher waited on a counter in the copy
++// while the poster advanced the real one, which is why exactly one event was
++// ever delivered. The primary mapping is genuinely shared between threads, and
++// a single-process engine has no second process to map for.
++#if defined(HAVE_OBJECT_MAP) && !defined(__EMSCRIPTEN__)
+ 	LocalStatus ls;
+ 	CheckStatusWrapper localStatus(&ls);
+ 	m_process = m_sharedMemory->mapObject<prb>(&localStatus, m_processOffset);
+@@ -1335,7 +1342,11 @@ void EventManager::watcher_thread()
+ 			if (m_exiting)
+ 				break;
+ 
+-			(void) m_sharedMemory->eventWait(&m_process->prb_event, value, 0);
++			// Wait on the pointer this iteration cleared rather than on the
++			// cached one. They are the same object now, but this form is also
++			// the one that survives the region being remapped underneath the
++			// loop — which is why the clear above recomputes it every time.
++			(void) m_sharedMemory->eventWait(&process->prb_event, value, 0);
+ 		}
+ 	}
+ 	catch (const Exception& ex)

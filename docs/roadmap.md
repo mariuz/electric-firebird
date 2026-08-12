@@ -576,8 +576,8 @@ Legend: ✅ shipped · 🟡 partial · ❌ missing · n/a not applicable
 |---|---|---|---|
 | Multi-tab sharing (worker + leader election) | ✅ `PGliteWorker` | ✅ | `multiTab: 'shared'` elects one tab over the existing Web Lock and proxies the rest to it over `BroadcastChannel`. The default `'exclusive'` refuses the second tab rather than letting it overwrite the first, so neither mode corrupts anything |
 | Web Worker offloading | ✅ | ✅ | Required rather than optional: the build uses pthreads and Firebird blocks on mutexes while opening a database, so an engine on the main thread deadlocks the page. `WorkerTransport` forwards to `serveEngine` |
-| Live / reactive queries | ✅ `live` extension | ❌ | Attempted; blocked on event delivery, see §1. A polling fallback is possible without it |
-| `listen()` / `notify()` | ✅ | ❌ | `POST_EVENT` is the right fit and the C API is written, but the engine delivers only the first event under Emscripten — see §1 |
+| Live / reactive queries | ✅ `live` extension | 🟡 | **Unblocked.** Event delivery is fixed (patch 0005); the JavaScript `live()` layer over `fb_events_poll` is what remains |
+| `listen()` / `notify()` | ✅ | 🟡 | **Unblocked.** `POST_EVENT` now delivers every event, not just the first; the C API works and needs a TypeScript surface |
 | Sync with a server | ✅ (ElectricSQL) | ❌ | This is the "electric" in the project name |
 
 ### Packaging & ecosystem
