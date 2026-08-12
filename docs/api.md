@@ -373,6 +373,39 @@ class FirebirdBrowser {
 | `options.vfs.prefix` | `string` | `'firebird_'` | IndexedDB database name prefix. |
 | `options.types` | [`TypeOptions`](#typeoptions) | `{}` | How values convert on the way in and out. All off by default. |
 
+#### `db.listen(names, onEvent, options?)` / `db.notify(name)`
+
+The event pair, without a query attached.
+
+```ts
+const sub = await db.listen('items_changed', (counts) => {
+  console.log(`fired ${counts['items_changed']} times`);
+});
+
+await db.notify('items_changed');   // post without writing a trigger
+await sub.unsubscribe();
+```
+
+`names` may be one name or several; the handler receives **only the names that
+fired**, each with a count.  Firebird reports counts rather than individual
+events, so two posts in quick succession arrive as one call with a count of 2 —
+a listener is told *that* something happened and *how often*, not replayed a
+queue.
+
+`notify()` binds the name rather than interpolating it, and posts through an
+`EXECUTE BLOCK`.  Delivery is after the posting transaction commits.
+
+> A trigger is still the better place for anything tied to data changing:
+> `POST_EVENT` in an `AFTER INSERT` fires however the row arrived, including
+> from another connection, while `notify()` fires only where it is called.
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `pollIntervalMs` | `number` | `250` | How often to ask whether anything fired. |
+| `onError` | `(e: Error) => void` | `console.error` | A poll or handler threw.  Polling continues. |
+
+Closing the database unsubscribes every listener on it.
+
 #### `db.live(sql, options, onChange)`
 
 Re-run a query whenever named events fire.
@@ -410,6 +443,10 @@ refresh only ever sees data that survived.
 **The event names are yours to supply.**  Nothing in Firebird connects a posted
 event to the tables a statement reads, so inferring them would be guesswork
 dressed as convenience.
+
+`live()` is built on [`listen()`](#dblistennames-onevent-options--dbnotifyname):
+the subscription, the polling and the teardown are the same machinery, with a
+query re-run on top.
 
 This polls rather than pushes: the engine's callback runs on an engine thread
 and re-arming the subscription has to happen off it.  A tick that finds nothing

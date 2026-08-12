@@ -54,6 +54,34 @@ type ArrayModeOptions = QueryOptions & { rowMode: 'array' };
 // Public types
 // ---------------------------------------------------------------------------
 
+/** A running subscription.  Returned by {@link FirebirdBrowser.listen}. */
+export interface EventSubscription {
+  /** Stop listening and release the subscription.  Safe to call twice. */
+  unsubscribe(): Promise<void>;
+}
+
+/** Options for {@link FirebirdBrowser.listen}. */
+export interface ListenOptions {
+  /**
+   * How often to ask the engine whether anything fired, in milliseconds.
+   *
+   * This is a poll because the engine's callback runs on an engine thread and
+   * re-arming has to happen off it — see `fb_events_poll`. The cost of a tick
+   * that finds nothing is one round trip to the Worker.
+   *
+   * @default 250
+   */
+  pollIntervalMs?: number;
+  /**
+   * Called when a poll or a handler throws.
+   *
+   * A subscription outlives the call that created it, so an error has nowhere
+   * else to go. Defaults to `console.error`; polling continues, because one
+   * failure does not mean the next will fail.
+   */
+  onError?: (error: Error) => void;
+}
+
 /** Options for {@link FirebirdBrowser.live}. */
 export interface LiveQueryOptions {
   /**
@@ -586,6 +614,94 @@ export class FirebirdBrowser {
    * posted event to the tables a statement reads, so inferring them would be
    * guesswork dressed as convenience.
    */
+  async listen(
+    names: string | string[],
+    onEvent: (counts: Record<string, number>) => void,
+    options: ListenOptions = {},
+  ): Promise<EventSubscription> {
+    await this.ensureReady();
+
+    const watched = typeof names === 'string' ? [names] : names;
+    if (watched.length === 0) {
+      throw new RangeError('listen() needs at least one event name');
+    }
+
+    const pollIntervalMs = options.pollIntervalMs ?? 250;
+    const onError =
+      options.onError ??
+      ((error: Error) => console.error('[firebird-wasm] event listener failed', error));
+
+    const handle = await this.engine.eventsSubscribe(this.dbHandle, watched);
+
+    let stopped = false;
+    let timer: ReturnType<typeof setInterval> | null = null;
+    // One tick at a time: a handler slower than the interval would otherwise
+    // pile up, and a later poll could re-arm before an earlier handler had
+    // finished with what it delivered.
+    let running = false;
+
+    const tick = async (): Promise<void> => {
+      if (stopped || running) return;
+      running = true;
+      try {
+        const counts = await this.engine.eventsPoll(handle);
+        // Polling re-arms whether or not anything fired, so the empty case
+        // still has to reach the engine — it is not a wasted call.
+        const fired = Object.fromEntries(
+          Object.entries(counts).filter(([, count]) => count > 0),
+        );
+        if (Object.keys(fired).length > 0 && !stopped) onEvent(fired);
+      } catch (err) {
+        if (!stopped) onError(err instanceof Error ? err : new Error(String(err)));
+      } finally {
+        running = false;
+      }
+    };
+
+    const subscription: EventSubscription = {
+      unsubscribe: async () => {
+        if (stopped) return;
+        stopped = true;
+        if (timer !== null) clearInterval(timer);
+        this.liveQueries.delete(subscription);
+        // Best effort: the engine may already be gone if the database was
+        // closed first, and a subscription on a closed database is not
+        // something a caller can act on.
+        await this.engine.eventsCancel(handle).catch(() => undefined);
+      },
+    };
+
+    timer = setInterval(() => void tick(), pollIntervalMs);
+    this.liveQueries.add(subscription);
+
+    return subscription;
+  }
+
+  /**
+   * Post an event, without writing a trigger to do it.
+   *
+   * ```ts
+   * await db.notify('items_changed');
+   * ```
+   *
+   * The event is delivered **after the transaction posting it commits**, which
+   * here is the statement's own auto-commit — so listeners hear about it only
+   * once it has actually happened.
+   *
+   * A trigger remains the better place for anything tied to data changing:
+   * `POST_EVENT` in an `AFTER INSERT` fires however the row arrived, including
+   * from another connection, while this fires only where it is called.
+   */
+  async notify(name: string): Promise<void> {
+    // The name is bound, not interpolated: EXECUTE BLOCK's body is SQL text
+    // like any other, and a name reaching it unchecked would be an injection
+    // with a trigger's privileges.
+    await this.query(
+      'EXECUTE BLOCK (event_name VARCHAR(31) = ?) AS BEGIN POST_EVENT :event_name; END',
+      [name],
+    );
+  }
+
   async live<T extends Row = Row>(
     sql: string | SqlFragment,
     options: LiveQueryOptions,
@@ -601,19 +717,12 @@ export class FirebirdBrowser {
     }
 
     const statement = toStatement(sql, options.params ?? []);
-    const pollIntervalMs = options.pollIntervalMs ?? 250;
     const onError =
       options.onError ??
       ((error: Error) => console.error('[firebird-wasm] live query failed', error));
 
-    const subscription = await this.engine.eventsSubscribe(
-      this.dbHandle,
-      options.events,
-    );
-
     let rows: T[] = [];
     let stopped = false;
-    let timer: ReturnType<typeof setInterval> | null = null;
     // One refresh at a time: a statement slower than the interval would
     // otherwise pile up, and the last to finish would win rather than the
     // latest to start.
@@ -625,22 +734,28 @@ export class FirebirdBrowser {
       onChange(rows, result);
     };
 
-    const tick = async (): Promise<void> => {
-      if (stopped || running) return;
-      running = true;
-      try {
-        const counts = await this.engine.eventsPoll(subscription);
-        // Polling re-arms the subscription whether or not anything fired, so
-        // the empty case still has to reach the engine.
-        if (Object.values(counts).some((count) => count > 0)) {
-          await run();
-        }
-      } catch (err) {
-        if (!stopped) onError(err instanceof Error ? err : new Error(String(err)));
-      } finally {
-        running = false;
-      }
-    };
+    // The first results before returning, so a caller that awaits live() has
+    // rendered once by the time it continues.
+    await run();
+
+    // Built on listen() rather than beside it: the subscription, the polling,
+    // the one-at-a-time rule and the teardown are the same problem, and a
+    // second copy would be a second thing to keep correct.
+    const subscription = await this.listen(
+      options.events,
+      () => {
+        if (running || stopped) return;
+        running = true;
+        void run()
+          .catch((err) => {
+            if (!stopped) onError(err instanceof Error ? err : new Error(String(err)));
+          })
+          .finally(() => {
+            running = false;
+          });
+      },
+      { pollIntervalMs: options.pollIntervalMs, onError },
+    );
 
     const live: LiveQuery<T> = {
       get rows() {
@@ -652,21 +767,9 @@ export class FirebirdBrowser {
       unsubscribe: async () => {
         if (stopped) return;
         stopped = true;
-        if (timer !== null) clearInterval(timer);
-        this.liveQueries.delete(live);
-        // Best effort: the engine may already be gone if the database was
-        // closed first, and failing to cancel a subscription on a closed
-        // database is not something a caller can act on.
-        await this.engine.eventsCancel(subscription).catch(() => undefined);
+        await subscription.unsubscribe();
       },
     };
-
-    // The first results before returning, so a caller that awaits live() has
-    // rendered once by the time it continues.
-    await run();
-
-    timer = setInterval(() => void tick(), pollIntervalMs);
-    this.liveQueries.add(live);
 
     return live;
   }

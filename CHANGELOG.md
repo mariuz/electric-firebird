@@ -8,6 +8,14 @@ API may still move between minor releases.
 
 ### Added
 
+- **`db.listen(names, cb)` and `db.notify(name)`.** The event pair on its own:
+  `listen()` reports only the names that fired, each with a count — Firebird
+  counts events rather than queueing them, so two posts in quick succession
+  arrive as one call with a count of 2 — and `notify()` posts one without
+  needing a trigger, binding the name rather than interpolating it. `live()` is
+  now built on `listen()` rather than beside it, so the subscription, polling
+  and teardown exist once.
+
 - **Live queries — `db.live(sql, { events }, onChange)`.** Re-runs a statement
   when a named `POST_EVENT` fires, with `onChange` called once immediately so
   there is no separate initial-value path. Event names are the caller's to

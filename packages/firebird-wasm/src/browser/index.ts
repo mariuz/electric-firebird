@@ -15,6 +15,8 @@ export type {
   ExecResult,
   LiveQuery,
   LiveQueryOptions,
+  EventSubscription,
+  ListenOptions,
 } from './firebird-browser';
 
 export { sql, SqlFragment, RawSql, isSqlFragment, toStatement } from '../sql-tag';

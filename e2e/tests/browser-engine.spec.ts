@@ -478,6 +478,60 @@ test.describe('FirebirdBrowser against the real engine', () => {
     expect(result.numUnchanged).toBe('1234.5678');
   });
 
+  test('hears notify() through listen(), and counts rather than events', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('listen-engine', {
+        worker: new Worker('/firebird-engine-worker.js'),
+        autoPersist: false,
+      });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+
+      const heard: Record<string, number>[] = [];
+      const sub = await db.listen('ping', (counts) => heard.push(counts), {
+        pollIntervalMs: 80,
+      });
+
+      // No trigger anywhere: notify() posts it.
+      await db.notify('ping');
+      await new Promise((r) => setTimeout(r, 600));
+
+      // Two in quick succession, which the engine reports as one delivery of
+      // two rather than two deliveries — counts, not events.
+      await db.notify('ping');
+      await db.notify('ping');
+      await new Promise((r) => setTimeout(r, 600));
+
+      const before = heard.length;
+      await sub.unsubscribe();
+      await db.notify('ping');
+      await new Promise((r) => setTimeout(r, 600));
+      const quiet = heard.length === before;
+
+      // A subscription to two names reports only the one that fired.
+      const other: Record<string, number>[] = [];
+      const sub2 = await db.listen(['alpha', 'beta'], (c) => other.push(c), {
+        pollIntervalMs: 80,
+      });
+      await db.notify('beta');
+      await new Promise((r) => setTimeout(r, 600));
+      await sub2.unsubscribe();
+
+      await db.close();
+      return {
+        total: heard.reduce((n, c) => n + (c['ping'] ?? 0), 0),
+        quiet,
+        other,
+      };
+    });
+
+    expect(result.total).toBe(3);
+    expect(result.quiet).toBe(true);
+    // Only the name that fired, and with its count.
+    expect(result.other).toEqual([{ beta: 1 }]);
+  });
+
   test('re-runs a live query when its event fires', async ({ page }) => {
     const result = await page.evaluate(async () => {
       const db = new window.FB.FirebirdBrowser('live-engine', {
