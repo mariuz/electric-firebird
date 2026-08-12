@@ -373,6 +373,50 @@ class FirebirdBrowser {
 | `options.vfs.prefix` | `string` | `'firebird_'` | IndexedDB database name prefix. |
 | `options.types` | [`TypeOptions`](#typeoptions) | `{}` | How values convert on the way in and out. All off by default. |
 
+#### `db.live(sql, options, onChange)`
+
+Re-run a query whenever named events fire.
+
+```ts
+// A trigger does the posting:
+//   CREATE TRIGGER items_ai FOR items AFTER INSERT
+//   AS BEGIN POST_EVENT 'items_changed'; END
+
+const live = await db.live(
+  'SELECT id, name FROM items ORDER BY id',
+  { events: ['items_changed'] },
+  (rows) => render(rows),
+);
+
+live.rows;              // the latest rows
+await live.refresh();   // re-run now, without waiting for an event
+await live.unsubscribe();
+```
+
+`onChange` is called **once immediately** with the current rows, so it is the
+only place results need handling — there is no separate initial value to treat
+differently.
+
+Firebird delivers events **after the posting transaction commits**, so a
+refresh only ever sees data that survived.
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `events` | `string[]` | — | Event names to watch.  Required. |
+| `params` | `QueryParams` | `[]` | Parameters for the statement. |
+| `pollIntervalMs` | `number` | `250` | How often to ask whether anything fired. |
+| `onError` | `(e: Error) => void` | `console.error` | A refresh failed.  Polling continues. |
+
+**The event names are yours to supply.**  Nothing in Firebird connects a posted
+event to the tables a statement reads, so inferring them would be guesswork
+dressed as convenience.
+
+This polls rather than pushes: the engine's callback runs on an engine thread
+and re-arming the subscription has to happen off it.  A tick that finds nothing
+costs one round trip to the Worker.
+
+Closing the database unsubscribes every live query on it.
+
 #### `db.dumpDataDir()`
 
 The database as bytes, ready to store, send, or hand back to `loadDataDir`.

@@ -134,6 +134,23 @@ export interface FirebirdWasmModule {
     txHandle: FbHandle,
     sqlPtr: number,
   ): number;
+  /**
+   * Subscribe to one or more comma-separated event names.
+   *
+   * Returns a subscription handle, or 0 on failure.
+   */
+  _fb_events_subscribe(dbHandle: FbHandle, namesPtr: number): number;
+  /**
+   * Counts that have arrived since the last poll, as a JSON object keyed by
+   * event name.  `{}` means nothing fired.  Released with `_free`.
+   *
+   * Polling also re-arms the subscription, which is why it exists at all: the
+   * engine's callback runs on an engine thread, and re-arming from there would
+   * mean calling into the engine from its own callback.
+   */
+  _fb_events_poll(subscriptionHandle: number): number;
+  /** Cancel a subscription.  The handle is invalid afterwards. */
+  _fb_events_cancel(subscriptionHandle: number): number;
   /** Free a result set returned by `_fb_query`. */
   _fb_free_result(resultPtr: number): void;
   /** Start a new transaction and return a transaction handle (0 = failed). */

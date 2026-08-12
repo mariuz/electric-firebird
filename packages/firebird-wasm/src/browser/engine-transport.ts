@@ -107,6 +107,17 @@ export interface EngineTransport {
   writeFile(path: string, data: Uint8Array): Promise<void>;
   /** Remove a file.  Used to discard an ephemeral database on close. */
   unlink(path: string): Promise<void>;
+  /** Subscribe to named events; returns a subscription handle. */
+  eventsSubscribe(dbHandle: EngineHandle, names: string[]): Promise<number>;
+  /**
+   * Counts that have arrived since the last poll, keyed by event name.
+   *
+   * Empty when nothing fired, which is the common case. Polling re-arms the
+   * subscription, so it has to keep being called for delivery to continue.
+   */
+  eventsPoll(subscription: number): Promise<Record<string, number>>;
+  /** Cancel a subscription. */
+  eventsCancel(subscription: number): Promise<void>;
   /**
    * Mount an OPFS-backed filesystem holding one database, and return the path
    * the engine should open.
@@ -661,6 +672,35 @@ export class DirectTransport implements EngineTransport {
     if (this.module.FS.analyzePath(path).exists) {
       this.module.FS.unlink(path);
     }
+  }
+
+  async eventsSubscribe(dbHandle: EngineHandle, names: string[]): Promise<number> {
+    const mod = this.module;
+    return this.withString(names.join(','), (namesPtr) => {
+      const handle = mod._fb_events_subscribe(dbHandle, namesPtr);
+      if (handle === 0) {
+        throw engineError(mod, `Could not subscribe to events: ${names.join(', ')}`);
+      }
+      return handle;
+    });
+  }
+
+  async eventsPoll(subscription: number): Promise<Record<string, number>> {
+    const mod = this.module;
+    const ptr = mod._fb_events_poll(subscription);
+    if (ptr === 0) {
+      throw engineError(mod, 'Could not poll events');
+    }
+
+    const json = mod.UTF8ToString(ptr);
+    mod._free(ptr);
+    return JSON.parse(json) as Record<string, number>;
+  }
+
+  async eventsCancel(subscription: number): Promise<void> {
+    // A subscription that is already gone is not an error worth raising: the
+    // caller is unsubscribing, and it is unsubscribed.
+    this.module._fb_events_cancel(subscription);
   }
 
   async mountOpfs(dbName: string): Promise<string> {

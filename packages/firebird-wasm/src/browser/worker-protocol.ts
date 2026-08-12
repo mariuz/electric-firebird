@@ -26,7 +26,10 @@ export type EngineOp =
   | 'readFile'
   | 'writeFile'
   | 'unlink'
-  | 'mountOpfs';
+  | 'mountOpfs'
+  | 'eventsSubscribe'
+  | 'eventsPoll'
+  | 'eventsCancel';
 
 /** A call from the main thread to the Worker. */
 export interface EngineRequest {

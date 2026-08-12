@@ -576,8 +576,8 @@ Legend: ✅ shipped · 🟡 partial · ❌ missing · n/a not applicable
 |---|---|---|---|
 | Multi-tab sharing (worker + leader election) | ✅ `PGliteWorker` | ✅ | `multiTab: 'shared'` elects one tab over the existing Web Lock and proxies the rest to it over `BroadcastChannel`. The default `'exclusive'` refuses the second tab rather than letting it overwrite the first, so neither mode corrupts anything |
 | Web Worker offloading | ✅ | ✅ | Required rather than optional: the build uses pthreads and Firebird blocks on mutexes while opening a database, so an engine on the main thread deadlocks the page. `WorkerTransport` forwards to `serveEngine` |
-| Live / reactive queries | ✅ `live` extension | 🟡 | **Unblocked.** Event delivery is fixed (patch 0005); the JavaScript `live()` layer over `fb_events_poll` is what remains |
-| `listen()` / `notify()` | ✅ | 🟡 | **Unblocked.** `POST_EVENT` now delivers every event, not just the first; the C API works and needs a TypeScript surface |
+| Live / reactive queries | ✅ `live` extension | ✅ | `db.live(sql, { events }, onChange)` re-runs the statement when a named event fires. Event names are the caller's to give: nothing in Firebird connects a posted event to the tables a query reads |
+| `listen()` / `notify()` | ✅ | ✅ | `POST_EVENT` from a trigger is the notify; `live()` and the `fb_events_*` C API are the listen. Delivery is after the posting transaction commits, so a subscriber only sees data that survived |
 | Sync with a server | ✅ (ElectricSQL) | ❌ | This is the "electric" in the project name |
 
 ### Packaging & ecosystem

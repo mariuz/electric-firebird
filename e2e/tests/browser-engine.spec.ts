@@ -478,6 +478,100 @@ test.describe('FirebirdBrowser against the real engine', () => {
     expect(result.numUnchanged).toBe('1234.5678');
   });
 
+  test('re-runs a live query when its event fires', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('live-engine', {
+        worker: new Worker('/firebird-engine-worker.js'),
+        autoPersist: false,
+      });
+
+      await db.exec('CREATE TABLE items (id INTEGER, name VARCHAR(30))');
+      // SET TERM, because the trigger body's own semicolon would split it.
+      await db.exec(`
+        SET TERM ^ ;
+        CREATE TRIGGER items_ai FOR items AFTER INSERT AS
+        BEGIN
+          POST_EVENT 'items_changed';
+        END^
+        SET TERM ; ^
+      `);
+
+      const seen: number[] = [];
+      const live = await db.live<{ ID: number; NAME: string }>(
+        'SELECT id, name FROM items ORDER BY id',
+        { events: ['items_changed'], pollIntervalMs: 100 },
+        (rows) => seen.push(rows.length),
+      );
+
+      // Called once up front, so a caller has rendered by the time live()
+      // resolves and never needs a separate "initial value" path.
+      const initial = [...seen];
+
+      const settle = async (want: number) => {
+        for (let i = 0; i < 60; i++) {
+          if (live.rows.length === want) return true;
+          await new Promise((r) => setTimeout(r, 100));
+        }
+        return false;
+      };
+
+      await db.exec("INSERT INTO items VALUES (1, 'first')");
+      const sawFirst = await settle(1);
+
+      await db.exec("INSERT INTO items VALUES (2, 'second')");
+      const sawSecond = await settle(2);
+
+      await live.unsubscribe();
+      const callsBefore = seen.length;
+
+      // After unsubscribing the trigger still posts, and nothing should react.
+      await db.exec("INSERT INTO items VALUES (3, 'ignored')");
+      await new Promise((r) => setTimeout(r, 800));
+      const callsAfter = seen.length;
+
+      await db.close();
+      return {
+        initial,
+        sawFirst,
+        sawSecond,
+        rowsAtEnd: live.rows.length,
+        quietAfterUnsubscribe: callsBefore === callsAfter,
+      };
+    });
+
+    // One immediate call with the empty table.
+    expect(result.initial).toEqual([0]);
+    expect(result.sawFirst).toBe(true);
+    expect(result.sawSecond).toBe(true);
+    // The last refresh saw both rows, and unsubscribing stopped the watching
+    // rather than merely stopping the callback.
+    expect(result.rowsAtEnd).toBe(2);
+    expect(result.quietAfterUnsubscribe).toBe(true);
+  });
+
+  test('does not fire a live query for an event nobody posts', async ({ page }) => {
+    const calls = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('live-quiet', {
+        worker: new Worker('/firebird-engine-worker.js'),
+        autoPersist: false,
+      });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+
+      let count = 0;
+      await db.live('SELECT id FROM t', { events: ['never_posted'], pollIntervalMs: 50 },
+        () => { count += 1; });
+
+      // Registering a subscription produces one delivery from the engine before
+      // anything is posted. If that reached the caller, this would refresh
+      // spuriously — a phantom change on every live query at startup.
+      await new Promise((r) => setTimeout(r, 1000));
+      await db.close();
+      return count;
+    });
+
+    expect(calls).toBe(1); // the initial call, and nothing else
+  });
+
   test('stores an opfs:// database in a real OPFS file', async ({ page }) => {
     const result = await page.evaluate(async () => {
       const opfsSize = async (name: string) => {

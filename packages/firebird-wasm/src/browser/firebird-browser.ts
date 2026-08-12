@@ -54,6 +54,48 @@ type ArrayModeOptions = QueryOptions & { rowMode: 'array' };
 // Public types
 // ---------------------------------------------------------------------------
 
+/** Options for {@link FirebirdBrowser.live}. */
+export interface LiveQueryOptions {
+  /**
+   * Event names to watch, as posted by `POST_EVENT`.
+   *
+   * Required, and deliberately not inferred from the statement. Firebird
+   * delivers events a trigger chose to post; nothing connects them to the
+   * tables a query reads, so guessing which events matter would be guessing.
+   */
+  events: string[];
+  /** Parameters for the statement, as `query()` takes them. */
+  params?: QueryParams;
+  /**
+   * How often to ask the engine whether anything fired, in milliseconds.
+   *
+   * This is a poll because the engine's callback runs on an engine thread and
+   * re-arming has to happen off it — see `fb_events_poll`. The cost of a tick
+   * that finds nothing is one round trip to the Worker.
+   *
+   * @default 250
+   */
+  pollIntervalMs?: number;
+  /**
+   * Called when a refresh fails.
+   *
+   * A live query outlives the call that created it, so an error has nowhere
+   * else to go. Defaults to `console.error`; polling continues, because one
+   * failed refresh — a lock conflict, say — does not mean the next will fail.
+   */
+  onError?: (error: Error) => void;
+}
+
+/** A running live query.  Returned by {@link FirebirdBrowser.live}. */
+export interface LiveQuery<T> {
+  /** The most recent rows.  Replaced, not mutated, on each refresh. */
+  readonly rows: T[];
+  /** Re-run the statement now, without waiting for an event. */
+  refresh(): Promise<void>;
+  /** Stop watching and release the subscription.  Safe to call twice. */
+  unsubscribe(): Promise<void>;
+}
+
 /** What a statement did.  Returned by `exec()`. */
 export interface ExecResult {
   /** Rows affected — for INSERT, UPDATE and DELETE.  0 for DDL. */
@@ -259,6 +301,8 @@ export class FirebirdBrowser {
   private readonly lockTimeoutMs: number;
   /** Held for the connection's lifetime; released by close(). */
   private lock: DatabaseLock | null = null;
+  /** Live queries to tear down with the connection. */
+  private readonly liveQueries = new Set<{ unsubscribe(): Promise<void> }>();
   /** Set only in shared mode; owns the election and the channel. */
   private shared: SharedEngineTransport | null = null;
 
@@ -513,6 +557,121 @@ export class FirebirdBrowser {
   }
 
   /**
+   * Re-run a query whenever named events fire.
+   *
+   * ```ts
+   * // A trigger does the posting:
+   * //   CREATE TRIGGER items_ai FOR items AFTER INSERT
+   * //   AS BEGIN POST_EVENT 'items_changed'; END
+   *
+   * const live = await db.live(
+   *   'SELECT id, name FROM items ORDER BY id',
+   *   { events: ['items_changed'] },
+   *   (rows) => render(rows),
+   * );
+   * // …later
+   * await live.unsubscribe();
+   * ```
+   *
+   * `onChange` is called once immediately with the current rows, so it is the
+   * only place results need handling — there is no separate "initial value" to
+   * deal with differently.
+   *
+   * Firebird delivers events **after the posting transaction commits**, so a
+   * refresh only ever sees data that survived. That is worth more than
+   * immediacy: a live query that showed uncommitted rows would show rows that
+   * can vanish.
+   *
+   * The event names are the caller's to supply. Nothing in Firebird connects a
+   * posted event to the tables a statement reads, so inferring them would be
+   * guesswork dressed as convenience.
+   */
+  async live<T extends Row = Row>(
+    sql: string | SqlFragment,
+    options: LiveQueryOptions,
+    onChange: (rows: T[], result: QueryResult<T>) => void,
+  ): Promise<LiveQuery<T>> {
+    await this.ensureReady();
+
+    if (options.events.length === 0) {
+      throw new RangeError(
+        'live() needs at least one event name to watch; without one it would ' +
+          'never refresh, which a plain query() already does better',
+      );
+    }
+
+    const statement = toStatement(sql, options.params ?? []);
+    const pollIntervalMs = options.pollIntervalMs ?? 250;
+    const onError =
+      options.onError ??
+      ((error: Error) => console.error('[firebird-wasm] live query failed', error));
+
+    const subscription = await this.engine.eventsSubscribe(
+      this.dbHandle,
+      options.events,
+    );
+
+    let rows: T[] = [];
+    let stopped = false;
+    let timer: ReturnType<typeof setInterval> | null = null;
+    // One refresh at a time: a statement slower than the interval would
+    // otherwise pile up, and the last to finish would win rather than the
+    // latest to start.
+    let running = false;
+
+    const run = async (): Promise<void> => {
+      const result = await this.query<T>(statement.sql, statement.params);
+      rows = result.rows;
+      onChange(rows, result);
+    };
+
+    const tick = async (): Promise<void> => {
+      if (stopped || running) return;
+      running = true;
+      try {
+        const counts = await this.engine.eventsPoll(subscription);
+        // Polling re-arms the subscription whether or not anything fired, so
+        // the empty case still has to reach the engine.
+        if (Object.values(counts).some((count) => count > 0)) {
+          await run();
+        }
+      } catch (err) {
+        if (!stopped) onError(err instanceof Error ? err : new Error(String(err)));
+      } finally {
+        running = false;
+      }
+    };
+
+    const live: LiveQuery<T> = {
+      get rows() {
+        return rows;
+      },
+      refresh: async () => {
+        if (!stopped) await run();
+      },
+      unsubscribe: async () => {
+        if (stopped) return;
+        stopped = true;
+        if (timer !== null) clearInterval(timer);
+        this.liveQueries.delete(live);
+        // Best effort: the engine may already be gone if the database was
+        // closed first, and failing to cancel a subscription on a closed
+        // database is not something a caller can act on.
+        await this.engine.eventsCancel(subscription).catch(() => undefined);
+      },
+    };
+
+    // The first results before returning, so a caller that awaits live() has
+    // rendered once by the time it continues.
+    await run();
+
+    timer = setInterval(() => void tick(), pollIntervalMs);
+    this.liveQueries.add(live);
+
+    return live;
+  }
+
+  /**
    * Describe a statement's shape without running it.
    *
    * ```ts
@@ -655,6 +814,12 @@ export class FirebirdBrowser {
       } catch {
         // Already reported through onPersistError.
       }
+    }
+
+    // Before the handle goes: each one holds a subscription on it, and a
+    // timer that would otherwise keep firing at a closed database.
+    for (const live of [...this.liveQueries]) {
+      await live.unsubscribe().catch(() => undefined);
     }
 
     this.closed = true;

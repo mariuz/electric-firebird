@@ -8,6 +8,13 @@ API may still move between minor releases.
 
 ### Added
 
+- **Live queries — `db.live(sql, { events }, onChange)`.** Re-runs a statement
+  when a named `POST_EVENT` fires, with `onChange` called once immediately so
+  there is no separate initial-value path. Event names are the caller's to
+  give: nothing in Firebird connects a posted event to the tables a query
+  reads. Unblocked by fixing event delivery under Emscripten — the engine had
+  delivered exactly one event per subscription and then stopped.
+
 - **OPFS storage — `opfs://name`.** The engine's own page reads and writes land
   in an Origin Private File System file, through a custom Emscripten filesystem
   backed by `FileSystemSyncAccessHandle`. Unlike the IndexedDB path there is no

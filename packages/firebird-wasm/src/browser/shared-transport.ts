@@ -537,6 +537,18 @@ export class SharedEngineTransport implements EngineTransport {
     return this.call<void>('unlink', path);
   }
 
+  eventsSubscribe(dbHandle: EngineHandle, names: string[]): Promise<number> {
+    return this.call<number>('eventsSubscribe', dbHandle, names);
+  }
+
+  eventsPoll(subscription: number): Promise<Record<string, number>> {
+    return this.call<Record<string, number>>('eventsPoll', subscription);
+  }
+
+  eventsCancel(subscription: number): Promise<void> {
+    return this.call<void>('eventsCancel', subscription);
+  }
+
   mountOpfs(dbName: string): Promise<string> {
     // The mount happens on the far side; only the resulting path comes back.
     return this.call<string>('mountOpfs', dbName);

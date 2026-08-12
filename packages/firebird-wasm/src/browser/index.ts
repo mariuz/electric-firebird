@@ -10,7 +10,12 @@
  */
 
 export { FirebirdBrowser, FirebirdBrowserTransaction } from './firebird-browser';
-export type { FirebirdBrowserOptions, ExecResult } from './firebird-browser';
+export type {
+  FirebirdBrowserOptions,
+  ExecResult,
+  LiveQuery,
+  LiveQueryOptions,
+} from './firebird-browser';
 
 export { sql, SqlFragment, RawSql, isSqlFragment, toStatement } from '../sql-tag';
 export type { SqlTag, Statement } from '../sql-tag';

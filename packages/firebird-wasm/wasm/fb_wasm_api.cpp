@@ -1000,10 +1000,14 @@ private:
  *    has *already seen*, and the engine calls back when its own count moves
  *    past them.  Re-arming with zeros would therefore re-deliver everything
  *    immediately, forever.  eventBlock() encodes the last seen counts.
- *  - Registration does **not** produce a baseline callback here.  The first
- *    delivery is a real event — measured: one POST_EVENT produced exactly one
- *    callback carrying a count of 1.  Treating it as a baseline, which is what
- *    this code did first, silently discarded the first event of every
+ *  - Registration **does** produce a baseline callback, and it is absorbed.
+ *    An earlier revision of this comment said the opposite, on the strength of
+ *    "one POST_EVENT produced exactly one callback carrying a count of 1" —
+ *    which was measured when delivery was broken and exactly one callback was
+ *    all any subscription ever got.  With delivery fixed the two are easy to
+ *    tell apart: a subscription to an event that is never posted still gets
+ *    one delivery of 1.  What that earlier revision got right is the cost of
+ *    guessing wrong, which is silently discarding the first event of every
  *    subscription.
  *
  *  A delivery also disarms the queue: until queEvents() is called again,
@@ -1056,10 +1060,22 @@ public:
 
 		std::lock_guard<std::mutex> guard(m_mutex);
 		parseCounts(events, length, m_seen);
-		fprintf(stderr, "[DIAG] callback:");
-		for (size_t i = 0; i < m_seen.size(); ++i)
-			fprintf(stderr, " %s=%u", m_names[i].c_str(), m_seen[i]);
-		fprintf(stderr, "\n");
+
+		// Registering produces one delivery before anything has been posted:
+		// queEvents() is armed with "I have seen zero of these", the engine's
+		// own counter for a never-posted event is already 1, and it reports the
+		// difference immediately.  Measured with a subscription to an event
+		// nothing ever posts: exactly one delivery of 1, then silence.
+		//
+		// So the first counts are a starting point, not news.  Adopting them as
+		// already-reported means the caller hears about what happens next,
+		// which is what subscribing means.
+		if (!m_baselined)
+		{
+			m_baselined = true;
+			m_reported = m_seen;
+		}
+
 		m_disarmed = true;
 	}
 
@@ -1145,6 +1161,7 @@ private:
 	std::vector<unsigned>     m_seen;       // latest counts from the engine
 	std::vector<unsigned>     m_reported;   // counts already handed to JS
 	bool                      m_disarmed  = false;
+	bool                      m_baselined = false;  // first delivery absorbed
 };
 
 /** A live subscription: the callback, its queue handle, and its attachment. */
@@ -1172,9 +1189,6 @@ bool armEvents(EventEntry& entry)
 
 	Status status;
 	const std::vector<unsigned char> block = entry.subscription->eventBlock();
-	fprintf(stderr, "[DIAG] arming, block bytes:");
-	for (size_t i = 0; i < block.size(); ++i) fprintf(stderr, " %02x", block[i]);
-	fprintf(stderr, "\n");
 
 	entry.queue = entry.attachment->queEvents(
 		status.ptr(), entry.subscription,
