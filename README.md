@@ -29,6 +29,12 @@ put the engine in your own app, see the
 
 ## Quick start
 
+```bash
+npm install firebird-wasm
+```
+
+The compiled engine ships in the package, so nothing needs building.
+
 ### Node.js (native driver)
 
 ```ts
@@ -67,9 +73,24 @@ await db.exec('INSERT INTO items VALUES (?, ?)', [1, 'hello']);
 const result = await db.query('SELECT * FROM items WHERE id = ?', [1]);
 console.log(result.rows); // [ { ID: 1, NAME: 'hello' } ]
 
-// Persist to IndexedDB before page unload
+// Writes are saved automatically after a short debounce; persist() forces one.
 await db.persist();
 await db.close();
+```
+
+Two other names change where the database lives — `opfs://mydb` writes through
+to a file with no persist step at all, and `memory://` keeps nothing — and a
+statement can re-run itself when the data changes:
+
+```ts
+// Given a trigger that does: POST_EVENT 'items_changed';
+const live = await db.live(
+  'SELECT id, name FROM items ORDER BY id',
+  { events: ['items_changed'] },
+  (rows) => render(rows),
+);
+
+await live.unsubscribe();
 ```
 
 ## Setup
@@ -94,6 +115,17 @@ npm run build -w packages/firebird-wasm
 ```bash
 FIREBIRD_PASSWORD=<password> npm test -w packages/firebird-wasm
 ```
+
+### Run the decode benchmark
+
+```bash
+npm run bench                              # print the table
+npm run bench -- bench-results/decode.json # …and record it
+```
+
+CI runs this and **fails on a regression**. It asserts ratios against the row
+construction it replaced rather than wall-clock limits, so a slow runner
+changes the numbers without changing the verdict. Needs `npm run build` first.
 
 ### Run e2e tests
 
@@ -149,8 +181,10 @@ The library provides two execution backends:
    [node-firebird-driver-native](https://github.com/asfernandes/node-firebird-drivers/tree/master/packages/node-firebird-driver-native).
 
 2. **Browser (WASM)** – Compiles the Firebird embedded engine (`libfbembed`) to
-   WebAssembly via [Emscripten](https://emscripten.org).  Database pages are
-   persisted to **IndexedDB** so data survives page reloads.
+   WebAssembly via [Emscripten](https://emscripten.org).  Three places to keep
+   the database: **IndexedDB** by default, **OPFS** (`opfs://name`) where the
+   engine writes its pages straight to a file with no image copy, and
+   **memory** (`memory://`) for a scratch database that leaves nothing behind.
 
 ```
 ┌─────────────────────────────────────────────────┐
@@ -160,7 +194,7 @@ The library provides two execution backends:
 │  (Node.js native)  │  (WASM + IndexedDB)        │
 ├────────────────────┼────────────────────────────┤
 │  libfbclient.so    │  firebird-embedded.wasm    │
-│                    │  + IndexedDB VFS            │
+│                    │  + IndexedDB / OPFS / memory│
 └────────────────────┴────────────────────────────┘
 ```
 
@@ -176,7 +210,7 @@ The library provides two execution backends:
 > ROWS: {"columns":[{"name":"ID","type":496,"subType":0,"scale":0,"length":4,"nullable":true},{"name":"NAME","type":448,"subType":0,"scale":0,"length":128,"nullable":true}],"rows":[[1,"alpha"],[2,"beta"]]}
 > ```
 >
-> Verified in Node (13 integration tests) **and in Chromium** through the
+> Verified in Node (15 integration tests) **and in Chromium** through the
 > public `FirebirdBrowser` API — including transactions and data surviving a
 > page reload via IndexedDB.  The engine runs inside a Web Worker, which is
 > required because the build uses pthreads and a browser main thread cannot
@@ -195,14 +229,14 @@ The library provides two execution backends:
 - [x] Enable C++ exceptions (`-fwasm-exceptions`) — Firebird reports every error by throwing
 - [x] Threads (`-pthread` + a pre-spawned worker pool), real `sem_timedwait`, realistic stack sizes
 - [x] Attach threads to the libcds hazard-pointer GC, which the metadata cache requires
-- [x] **The engine runs: create database, DDL, DML, SELECT** (13 Node integration tests)
+- [x] **The engine runs: create database, DDL, DML, SELECT** (15 Node integration tests)
 - [x] Run the engine in a Web Worker (verified in Chromium end to end)
 - [x] Point `FirebirdBrowser` at the Worker (real SQL through the public API, verified in Chromium)
 - [x] Parameterised queries (`?` placeholders) on both backends
-- [ ] Incremental, atomic IndexedDB persistence
-- [ ] Web Worker + multi-tab safety
+- [x] Incremental, atomic IndexedDB persistence (one transaction, changed pages only)
+- [x] Web Worker + multi-tab safety, and multi-tab *sharing* (`multiTab: 'shared'`)
 - [x] Pre-built WASM binary published to npm — `npm install firebird-wasm`
-- [ ] Live queries / `POST_EVENT`-based notifications
+- [x] Live queries / `POST_EVENT`-based notifications (`live()`, `listen()`, `notify()`)
 
 See [docs/roadmap.md](./docs/roadmap.md) for the full status audit, a
 feature-by-feature comparison with PGlite, and the staged plan.
@@ -214,9 +248,11 @@ Both CI workflows use the official
 
 | Workflow | Job | Trigger |
 |----------|-----|---------|
-| [CI](.github/workflows/ci.yml) | Build & unit tests | push / PR |
+| [CI](.github/workflows/ci.yml) | Build, unit tests, decode benchmark | push / PR |
 | [E2E](.github/workflows/e2e.yml) | Playwright browser tests (no Firebird needed) | push / PR |
 | [E2E](.github/workflows/e2e.yml) | Playwright e2e tests (against Firebird) | push / PR |
+| [Build WASM](.github/workflows/build-wasm.yml) | Compiles the engine from source, then runs every suite that needs the artifact — including the real-engine browser tests | push / PR |
+| [Deploy demo](.github/workflows/deploy-demo.yml) | Publishes the playground to GitHub Pages | push to `main` |
 
 ## License
 
