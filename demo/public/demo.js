@@ -6,7 +6,7 @@
  * while opening a database — doing that on the main thread deadlocks the page.
  */
 
-import { FirebirdBrowser } from './firebird-browser.mjs';
+import { FirebirdBrowser, sql } from './firebird-browser.mjs';
 
 const DB_NAME = 'demo';
 
@@ -186,6 +186,116 @@ const after = await db.query('SELECT COUNT(*) AS n FROM employees');
 report('before', before.rows[0].N);
 report('after rollback', after.rows[0].N);`,
   },
+  {
+    id: 'live',
+    title: 'Live query',
+    blurb: 'A result that re-runs itself when the data changes.',
+    mode: 'js',
+    sql: `// Firebird posts events from a trigger, delivered after the posting
+// transaction commits — so a live query only ever sees data that survived.
+await db.exec(\`
+  SET TERM ^ ;
+  CREATE OR ALTER TRIGGER employees_ai FOR employees AFTER INSERT AS
+  BEGIN
+    POST_EVENT 'employees_changed';
+  END^
+  SET TERM ; ^
+\`);
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let refreshes = 0;
+
+const live = await db.live(
+  'SELECT COUNT(*) AS n FROM employees',
+  { events: ['employees_changed'], pollIntervalMs: 100 },
+  (rows) => report(refreshes++ === 0 ? 'initial' : 'refreshed', rows[0].N),
+);
+
+await db.exec("INSERT INTO employees VALUES (101, 'First Hire', 1, 1, 50000.00, '2026-01-01')");
+await sleep(400);
+await db.exec("INSERT INTO employees VALUES (102, 'Second Hire', 1, 1, 50000.00, '2026-01-02')");
+await sleep(400);
+
+await live.unsubscribe();
+await db.exec("INSERT INTO employees VALUES (103, 'After Unsubscribe', 1, 1, 50000.00, '2026-01-03')");
+await sleep(400);
+report('after unsubscribe', 'no further refreshes');
+
+await db.exec('DELETE FROM employees WHERE id IN (101, 102, 103)');`,
+  },
+  {
+    id: 'sql-tag',
+    title: 'Injection, refused',
+    blurb: 'The sql`…` tag binds every value it interpolates.',
+    mode: 'js',
+    sql: `// A value that would end the statement if it were pasted into one.
+const hostile = "'; DELETE FROM employees; --";
+
+const fragment = sql\`SELECT name FROM employees WHERE name = \${hostile}\`;
+report('statement sent', fragment.sql);
+report('value bound', JSON.stringify(fragment.params));
+
+const matched = await db.query(fragment);
+report('rows matching that name', matched.rows.length);
+
+const survivors = await db.query('SELECT COUNT(*) AS n FROM employees');
+report('employees still here', survivors.rows[0].N);
+
+// Names cannot be parameters, so they have their own escape.
+const counted = await db.query(sql\`SELECT COUNT(*) AS n FROM \${sql.identifier('EMPLOYEES')}\`);
+report('via sql.identifier', counted.rows[0].N);
+
+// And a list needs expanding: one placeholder binds one value.
+const chosen = await db.query(sql\`SELECT name FROM employees WHERE id IN (\${sql.join([1, 3, 5])})\`);
+report('IN list', chosen.rows.map((r) => r.NAME).join(', '));`,
+  },
+  {
+    id: 'describe',
+    title: 'Describe without running',
+    blurb: 'What a statement is, before executing it.',
+    mode: 'js',
+    sql: `const shape = await db.describeQuery(
+  'SELECT id, name, salary FROM employees WHERE dept_id = ?',
+);
+
+report('statement type', shape.statementType);
+report('parameters', shape.params.map((p) => p.typeName).join(', '));
+report('columns', shape.fields.map((f) => f.name + ' ' + f.typeName).join(', '));
+
+// Nothing is executed — describing an INSERT inserts nothing.
+const before = await db.query('SELECT COUNT(*) AS n FROM employees');
+const insert = await db.describeQuery(
+  "INSERT INTO employees VALUES (999, 'Ghost', 1, 1, 1.00, '2026-01-01')",
+);
+const after = await db.query('SELECT COUNT(*) AS n FROM employees');
+
+report('the INSERT describes as', insert.statementType + ', ' + insert.params.length + ' parameters');
+report('rows before / after describing it', before.rows[0].N + ' / ' + after.rows[0].N);`,
+  },
+  {
+    id: 'rowmode',
+    title: 'Rows as arrays',
+    blurb: 'Positional rows, and the columns object mode cannot keep.',
+    mode: 'js',
+    sql: `const objects = await db.query('SELECT id, name FROM employees WHERE id = 1');
+report('object mode', JSON.stringify(objects.rows[0]));
+
+const arrays = await db.query('SELECT id, name FROM employees WHERE id = 1', [], {
+  rowMode: 'array',
+});
+report('array mode', JSON.stringify(arrays.rows[0]));
+report('names are still in fields', arrays.fields.map((f) => f.name).join(', '));
+
+// Two columns, one name. An object can only keep the last of them.
+const joined =
+  'SELECT e.id, m.id FROM employees e JOIN employees m ON m.id = e.manager_id WHERE e.id = 2';
+
+const collapsed = await db.query(joined);
+report('object mode, colliding names', JSON.stringify(collapsed.rows[0]));
+
+const kept = await db.query(joined, [], { rowMode: 'array' });
+report('array mode keeps both', JSON.stringify(kept.rows[0]));`,
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -332,8 +442,8 @@ async function runScript(source) {
   const report = (label, value) => lines.push({ label, value });
 
   const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
-  const fn = new AsyncFunction('db', 'report', source);
-  await fn(db, report);
+  const fn = new AsyncFunction('db', 'report', 'sql', source);
+  await fn(db, report, sql);
 
   renderRows({
     fields: [{ name: 'STEP' }, { name: 'VALUE' }],

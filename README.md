@@ -145,7 +145,7 @@ FIREBIRD_PASSWORD=<password> npx playwright test
 ```bash
 npm run build:wasm -w packages/firebird-wasm   # once; slow
 npm run demo                                    # http://localhost:4173
-npm run test:demo                               # 16 Playwright tests
+npm run test:demo                               # 20 Playwright tests
 ```
 
 The local server sends no COOP/COEP headers, exactly like GitHub Pages, so the

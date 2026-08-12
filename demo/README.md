@@ -55,7 +55,7 @@ early.
 npm run test:demo
 ```
 
-16 Playwright tests drive the built site against the real engine. The first
+20 Playwright tests drive the built site against the real engine. The first
 one asserts that the server is *not* sending COOP/COEP before checking that
 the page is isolated anyway — otherwise every other test could pass without
 the service worker doing anything at all.

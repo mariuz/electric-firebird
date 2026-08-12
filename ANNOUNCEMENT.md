@@ -228,7 +228,7 @@ npm run demo        # http://localhost:4173
 
 ## Verification
 
-238 automated tests: 125 in a real browser under Playwright, 16 more against
+242 automated tests: 125 in a real browser under Playwright, 20 more against
 the demo as GitHub Pages actually serves it, and 97 in Node — the last
 including a suite that runs against a real Firebird server through the native
 driver.

@@ -333,4 +333,75 @@ test.describe('Demo site', () => {
     await runExample(page, 'filter');
     await expect(page.locator('.message.error')).toContainText(/EMPLOYEES/i);
   });
+  // These four examples are JavaScript rather than SQL, so a broken one is a
+  // syntax error inside a string that nothing else parses — the demo boots,
+  // the example "runs", and the grid is silently empty. Every one of them is
+  // therefore executed here and read for its actual output.
+
+  test('runs the live-query example, which refreshes itself', async ({ page }) => {
+    await openDemo(page);
+    await runExample(page, 'schema');
+    await runExample(page, 'live');
+
+    const { rows } = await readTable(page);
+    const steps = rows.map((r) => r[0]);
+    const values = Object.fromEntries(rows.map((r) => [r[0], r[1]]));
+
+    // One immediate call, then one per insert while subscribed.
+    expect(steps.filter((s) => s === 'refreshed')).toHaveLength(2);
+    expect(Number(values['initial'])).toBeGreaterThan(0);
+    // The counts climb: the query really re-ran against new data.
+    const refreshed = rows.filter((r) => r[0] === 'refreshed').map((r) => Number(r[1]));
+    expect(refreshed[1]).toBe(refreshed[0]! + 1);
+    // And the insert after unsubscribing produced no further call.
+    expect(steps[steps.length - 1]).toBe('after unsubscribe');
+  });
+
+  test('runs the injection example, and the table survives', async ({ page }) => {
+    await openDemo(page);
+    await runExample(page, 'schema');
+    await runExample(page, 'sql-tag');
+
+    const { rows } = await readTable(page);
+    const values = Object.fromEntries(rows.map((r) => [r[0], r[1]]));
+
+    // The hostile text was bound, so the statement carries a placeholder and
+    // no DELETE, and every employee is still there.
+    expect(values['statement sent']).toContain('WHERE name = ?');
+    expect(values['statement sent']).not.toContain('DELETE');
+    expect(values['rows matching that name']).toBe('0');
+    expect(values['employees still here']).toBe('8');
+    expect(values['via sql.identifier']).toBe('8');
+    expect(values['IN list']).toContain('Ada Lovelace');
+  });
+
+  test('runs the describe example without executing anything', async ({ page }) => {
+    await openDemo(page);
+    await runExample(page, 'schema');
+    await runExample(page, 'describe');
+
+    const { rows } = await readTable(page);
+    const values = Object.fromEntries(rows.map((r) => [r[0], r[1]]));
+
+    expect(values['statement type']).toBe('SELECT');
+    expect(values['columns']).toContain('SALARY NUMERIC');
+    // The row count is unchanged either side of describing an INSERT.
+    expect(values['rows before / after describing it']).toBe('8 / 8');
+  });
+
+  test('runs the rowMode example, showing what object mode cannot keep', async ({
+    page,
+  }) => {
+    await openDemo(page);
+    await runExample(page, 'schema');
+    await runExample(page, 'rowmode');
+
+    const { rows } = await readTable(page);
+    const values = Object.fromEntries(rows.map((r) => [r[0], r[1]]));
+
+    expect(values['array mode']).toBe('[1,"Ada Lovelace"]');
+    // Two columns named ID collapse to one in an object and survive as an array.
+    expect(values['object mode, colliding names']).toBe('{"ID":1}');
+    expect(values['array mode keeps both']).toBe('[2,1]');
+  });
 });
