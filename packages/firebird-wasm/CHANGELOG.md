@@ -4,7 +4,7 @@ All notable changes to `firebird-wasm`. This project follows
 [semantic versioning](https://semver.org/); while the major version is 0 the
 API may still move between minor releases.
 
-## Unreleased
+## 0.3.0 — 2026-08-12
 
 ### Added
 
@@ -128,6 +128,49 @@ API may still move between minor releases.
   afterwards, the callback's return value is still returned, statements issued
   after a rollback throw rather than running outside any transaction, and
   `tx.isFinished` reports the state.
+
+### Fixed
+
+- **`query()` silently discarded `INSERT`, `UPDATE`, `DELETE` and DDL on the
+  browser backend.** `fb_query` prepared such a statement, serialised the empty
+  result and committed — without ever executing it — so the call reported
+  success and wrote nothing. The Node backend has always executed them, so the
+  same code wrote the row there and lost it in the browser. Found by a test
+  written against the real engine.
+
+- **Only the first event of a subscription was ever delivered.** Firebird's
+  event manager caches the process block from `mapObject`, which mmaps the
+  shared-memory file a second time; under Emscripten a second mmap of one fd is
+  a private copy rather than an alias, so the watcher thread waited on a counter
+  no poster could reach. It now uses the primary mapping (patch 0005), and
+  delivery continues for the life of a subscription. This unblocked live
+  queries and `listen()`/`notify()`.
+
+- **Subscribing reported a phantom event.** Registration produces one delivery
+  before anything is posted, which reached callers as a spurious change at
+  startup and left every subsequent count one behind. The first delivery is now
+  absorbed as the baseline it is.
+
+- **`FirebirdLite.query()` leaked its prepared statement and result set when a
+  statement failed.** A retry loop — the usual response to a lock conflict —
+  leaked one per attempt until the attachment refused new statements. Both are
+  released in `finally` now, in the transaction class as well.
+
+- **A custom parser could run twice on one value**, when a result set names two
+  columns the same (`SELECT a.ID, b.ID`) and the row holds one `ID`.
+
+- **A parser registered with the nullable bit set never fired.** `580` and
+  `581` name the same type; registration keys are normalised now, and
+  registering both throws rather than leaving one silently dead.
+
+- **`toStatement()` sent a `{ sql, params }` look-alike to the engine as
+  statement text**, which reached it as `[object Object]` with the values
+  dropped. A fragment does not survive `structuredClone` or JSON — it carries a
+  symbol brand — so one posted from a Worker arrived as exactly such an object.
+  It throws now, and names the clone boundary.
+
+- **`query('… WHERE id = ?', 5)` ran with no parameters at all**, because a
+  non-array second argument was taken for transaction options. It throws now.
 
 ## 0.2.0
 
