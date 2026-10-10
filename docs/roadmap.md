@@ -927,12 +927,54 @@ be built:
 - [x] Publish the prebuilt artifact to npm. Shipped in `firebird-wasm@0.1.0`.
 - [ ] A size budget and a default `locateFile` for CDN use; the 9 MB artifact
       is currently unbudgeted and every consumer wires `locateFile` by hand.
-- [ ] Live queries built on `POST_EVENT`; a `listen()` / `notify()` API.
-      **Blocked**, not merely unstarted — the subscription C API is written
-      (`events-wip`) and the engine delivers exactly one event and then stops.
-      §1 records what was measured and where to resume. A polling
-      implementation is unblocked if the push one stays stuck.
+- [x] Live queries built on `POST_EVENT`; a `listen()` / `notify()` API.
+      Shipped in 0.3.0 (`db.listen`, `db.notify`, `db.live`), once event
+      delivery under Emscripten was fixed: the engine had delivered exactly one
+      event per subscription and then stopped (§1 records how it was found).
 - [ ] Verified Vite and webpack example apps in CI.
+
+### M6 — What a consumer measured
+
+`firebird-quake2` (Quake 2 simulated in PSQL on this package, about 20 queries
+a frame at 20 tics a second) has been the heaviest user so far. These are the
+gaps it ran into, with its numbers, in rough order of what they would buy.
+
+- [ ] **Per-call overhead.** A one-row primary-key `SELECT` through
+      `db.query` costs 55–75 µs; the same fetch inside one PSQL loop costs
+      3–5 µs. About half of the difference is the autocommit transaction (the
+      same calls inside `db.transaction()` cost ~40 µs each), the rest is the
+      prepare, the transport and the JSON. A consumer that sends the same
+      statements every frame pays the prepare every time. Two ways out, either
+      enough: a prepared-statement handle (`const st = db.prepare(sql);
+      st.query(params)`, freed with `st.close()`), or a small statement cache
+      in the C bridge keyed by the SQL text, which needs no API change. Then
+      measure what the transport and the JSON cost on their own.
+- [ ] **A read-only transaction kept open for reads.** Autocommit starts and
+      commits a transaction around every `query()`, half of a cheap query's
+      cost. An option to run reads in a long-lived read-committed read-only
+      transaction would remove it for the common case.
+- [ ] **`execBatch` on the Node backend.** It prepares once and loops, one
+      execute per row; the browser's runs as one `IBatch` request, 15 % faster
+      than a PSQL loop over the same `INSERT` on a 90,000-row load. The native
+      client has `IBatch` too: the two backends should behave alike.
+- [ ] **A build that survives a rebuild.** Three things stopped a clean local
+      build on a stock Ubuntu machine: the native bootstrap needs the host's
+      ICU headers and failed deep inside a compile without saying so; CMake
+      3.28's generate step refuses a generated `parse.cpp` that does not exist
+      yet; and a rebuild after deleting `build-native-config` compiled the
+      native `gpre_boot` against the source tree's 32-bit-edited
+      `autoconfig.h` (git-ignored, so it survives a cleaned submodule). Fixed
+      in the `build-bootstrap` branch; CI only ever builds once, from a fresh
+      checkout, which is why none of these showed there. A CI job that builds
+      twice would keep it so.
+- [ ] **The linter runs.** `npm run lint` had a script and its dependencies
+      but no configuration, so it never ran. Fixed in the `lint-config`
+      branch, with a CI step.
+- [ ] **No `SharedArrayBuffer` requirement.** Every static-hosted consumer
+      carries a service worker that only adds COOP/COEP. See
+      [plans/sab-free-build.md](./plans/sab-free-build.md); step 1, the list
+      of threads this build actually starts, is a day's work and decides the
+      rest.
 
 ### M5 — Ecosystem
 
