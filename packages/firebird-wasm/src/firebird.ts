@@ -1,8 +1,4 @@
 import {
-  createNativeClient,
-  getDefaultLibraryFilename,
-} from 'node-firebird-driver-native';
-import {
   TransactionIsolation,
 } from 'node-firebird-driver';
 import type {
@@ -27,6 +23,33 @@ import { statementKind } from './statement-types';
 import { toStatement, resolveQueryCall } from './sql-tag';
 import type { SqlFragment } from './sql-tag';
 
+type NativeDriver = typeof import('node-firebird-driver-native');
+let nativeDriver: NativeDriver | undefined;
+
+/**
+ * The native driver, loaded on first use rather than at import.
+ *
+ * It is an optional dependency: a browser-only install (`--omit=optional`) has
+ * none, and a top-level import made the whole root entry fail to load there,
+ * `sql` and `loadFirebirdWasm` included, with a bare MODULE_NOT_FOUND.
+ */
+function loadNativeDriver(): NativeDriver {
+  if (!nativeDriver) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      nativeDriver = require('node-firebird-driver-native') as NativeDriver;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'MODULE_NOT_FOUND') throw err;
+      throw new Error(
+        "FirebirdLite needs the optional dependency 'node-firebird-driver-native', which is not " +
+          'installed (an install with --omit=optional skips it). Install it, or use the WASM ' +
+          "engine from 'firebird-wasm/browser'.",
+      );
+    }
+  }
+  return nativeDriver;
+}
+
 /** `QueryOptions` with the array mode pinned, for the overloads below. */
 type ArrayModeOptions = QueryOptions & { rowMode: 'array' };
 
@@ -48,7 +71,7 @@ type ArrayModeOptions = QueryOptions & { rowMode: 'array' };
  */
 export class FirebirdLite {
   private readonly dbPath: string;
-  private readonly libraryPath: string;
+  private readonly libraryPath: string | undefined;
   private readonly connectOptions: { username?: string; password?: string; charSetForNONE?: string };
   private client: Client | null = null;
   private attachment: Attachment | null = null;
@@ -56,7 +79,7 @@ export class FirebirdLite {
 
   constructor(dbPath: string, options: FirebirdLiteOptions = {}) {
     this.dbPath = dbPath;
-    this.libraryPath = options.libraryPath ?? getDefaultLibraryFilename();
+    this.libraryPath = options.libraryPath;
     this.connectOptions = {
       username: options.username,
       password: options.password,
@@ -73,7 +96,8 @@ export class FirebirdLite {
       throw new Error('FirebirdLite instance has been closed');
     }
 
-    this.client = createNativeClient(this.libraryPath);
+    const { createNativeClient, getDefaultLibraryFilename } = loadNativeDriver();
+    this.client = createNativeClient(this.libraryPath ?? getDefaultLibraryFilename());
 
     try {
       this.attachment = await this.client.connect(this.dbPath, this.connectOptions);

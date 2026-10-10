@@ -6,6 +6,23 @@ API may still move between minor releases.
 
 ## Unreleased
 
+### Added
+
+- **`_fb_read_transaction(on)`: autocommit reads in a shared read-only
+  transaction.** Off by default. When on, an autocommit `SELECT` runs in a
+  READ COMMITTED READ CONSISTENCY read-only transaction each database keeps
+  open, instead of starting and committing one around the call; each
+  statement still reads everything committed before it starts. Measured from
+  Node on the `firebird-quake2` demo1 database, off and on alternating, three
+  rounds each: a primary-key `SELECT` 44–45 µs a call off, 20–22 µs on; a
+  trivial `SELECT` 37–41 µs off, 15–16 µs on. A `SELECT` that writes is run
+  again in its own transaction and remembered (its non-transactional effects,
+  such as `RDB$SET_CONTEXT`, happen twice on that first call), and rows left
+  in an `ON COMMIT DELETE ROWS` table outlive the call: see `docs/api.md`.
+  Needs a rebuilt artifact.
+
+## 0.5.0 — 2026-10-10
+
 ### Changed
 
 - **Prepared statements are kept, per database, by their SQL text.** Each
@@ -23,20 +40,16 @@ API may still move between minor releases.
   is also how to drop statements made stale by DDL run inside an
   `EXECUTE STATEMENT`, which the cache cannot see. Needs a rebuilt artifact.
 
-### Added
+### Fixed
 
-- **`_fb_read_transaction(on)`: autocommit reads in a shared read-only
-  transaction.** Off by default. When on, an autocommit `SELECT` runs in a
-  READ COMMITTED READ CONSISTENCY read-only transaction each database keeps
-  open, instead of starting and committing one around the call; each
-  statement still reads everything committed before it starts. Measured from
-  Node on the `firebird-quake2` demo1 database, off and on alternating, three
-  rounds each: a primary-key `SELECT` 44–45 µs a call off, 20–22 µs on; a
-  trivial `SELECT` 37–41 µs off, 15–16 µs on. A `SELECT` that writes is run
-  again in its own transaction and remembered (its non-transactional effects,
-  such as `RDB$SET_CONTEXT`, happen twice on that first call), and rows left
-  in an `ON COMMIT DELETE ROWS` table outlive the call: see `docs/api.md`.
-  Needs a rebuilt artifact.
+- **The root entry loads without the native driver.** `firebird-wasm` imported
+  `node-firebird-driver-native` at the top of the module, so an install with
+  `--omit=optional` (the one the README recommends for the browser engine)
+  could not `require('firebird-wasm')` at all: `sql`, `statementKind` and
+  `loadFirebirdWasm` failed with a bare `MODULE_NOT_FOUND` along with
+  `FirebirdLite`. The driver is now loaded when a `FirebirdLite` first
+  connects, and its absence there is an error that names the package and the
+  `firebird-wasm/browser` alternative.
 
 ## 0.4.2 — 2026-10-10
 
