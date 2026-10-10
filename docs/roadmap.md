@@ -956,14 +956,16 @@ gaps it ran into, with its numbers, in rough order of what they would buy.
       the transaction per call is now the larger part — the next item.
 - [x] **A read-only transaction kept open for reads.** Autocommit started
       and committed a transaction around every `query()`, half of a cheap
-      query's cost. `_fb_read_transaction(1)` runs an autocommit `SELECT` in a
+      query's cost. `sharedReads: true` (on `FirebirdBrowser` and on
+      `FirebirdLite`) runs an autocommit `SELECT` in a
       READ COMMITTED READ CONSISTENCY read-only transaction each database
       keeps open: a primary-key `SELECT` from 44–45 to 20–22 µs a call, a
       trivial one from 37–41 to 15–16. Off by default, because a `SELECT`
       that writes is tried there first (once per SQL text) and rows left in
-      an `ON COMMIT DELETE ROWS` table outlive the call. Still to do: an
-      option on `FirebirdBrowser` and the Node backend rather than the module
-      call alone.
+      an `ON COMMIT DELETE ROWS` table outlive the call. On Node against a
+      local Firebird 3 server: 1.4–1.8 to 0.9–1.0 ms, the shared transaction
+      ending before anything but a read (a server refuses `DROP TABLE` while
+      one that has read the table is open).
 - [ ] **`execBatch` on the Node backend.** It prepares once and loops, one
       execute per row; the browser's runs as one `IBatch` request, 15 % faster
       than a PSQL loop over the same `INSERT` on a 90,000-row load. The native

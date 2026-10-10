@@ -213,6 +213,24 @@ export interface FirebirdBrowserOptions {
    */
   multiTab?: 'exclusive' | 'shared' | 'allow-unsafe';
   /**
+   * Run `query()` calls made outside `transaction()` that are a `SELECT` in
+   * one read-only transaction the engine keeps open, instead of starting and
+   * committing a transaction around each.
+   *
+   * Every statement still reads everything committed before it starts. It
+   * halves a cheap query (a primary-key `SELECT` from 44–45 to 20–22 µs in
+   * Node). Off by default because two things differ: a `SELECT` that writes (a
+   * selectable procedure that updates a table) is tried there first, fails,
+   * and is run again in its own transaction — once per SQL text, after which
+   * it goes there directly — so what it did outside transaction control before
+   * the failed write (a sequence, `RDB$SET_CONTEXT`) happens twice on that
+   * first call; and rows a `SELECT` leaves in an `ON COMMIT DELETE ROWS`
+   * temporary table stay until the shared transaction ends.
+   *
+   * @default false
+   */
+  sharedReads?: boolean;
+  /**
    * How long to wait for another tab to release the database, in
    * milliseconds.  `Infinity` waits indefinitely.
    *
@@ -369,6 +387,10 @@ export class FirebirdBrowser {
       ((error) => console.error('[firebird-wasm] background persist failed', error));
 
     this.engine = options.transport ?? this.createEngine();
+    // Refused here, before anything is opened, rather than after an attach.
+    if (options.sharedReads && !this.engine.setSharedReads) {
+      throw new Error('sharedReads needs a transport with setSharedReads; this one has none');
+    }
   }
 
   /** Build the real engine for this tab: a Worker if given one, else direct. */
@@ -1181,6 +1203,12 @@ export class FirebirdBrowser {
     this.dbHandle = (await this.engine.exists(this.dbPath))
       ? await this.engine.attachDatabase(this.dbPath)
       : await this.engine.createDatabase(this.dbPath);
+
+    // On every open, so a tab re-attaching after a leadership change gets it
+    // again: the switch belongs to the handle, which the old engine took with it.
+    if (this.options.sharedReads) {
+      await this.engine.setSharedReads!(this.dbHandle, true);
+    }
   }
 
   /**

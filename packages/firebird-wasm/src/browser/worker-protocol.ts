@@ -19,6 +19,7 @@ export type EngineOp =
   | 'executeBatch'
   | 'query'
   | 'describe'
+  | 'setSharedReads'
   | 'startTransaction'
   | 'commit'
   | 'rollback'

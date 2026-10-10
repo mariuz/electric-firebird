@@ -504,6 +504,10 @@ export class SharedEngineTransport implements EngineTransport {
     );
   }
 
+  setSharedReads(dbHandle: EngineHandle, on: boolean): Promise<void> {
+    return this.call<void>('setSharedReads', dbHandle, on);
+  }
+
   describe(
     dbHandle: EngineHandle,
     txHandle: EngineHandle,

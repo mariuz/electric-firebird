@@ -106,15 +106,13 @@ struct DbEntry
 {
 	IAttachment* attachment = nullptr;
 	std::list<CachedStatement> statements;
-	ITransaction* readTransaction = nullptr;   // shared by autocommit SELECTs (fb_read_transaction)
+	bool sharedReads = false;                  // autocommit SELECTs share readTransaction (fb_read_transaction)
+	ITransaction* readTransaction = nullptr;
 	std::set<std::string> writers;             // SELECTs that wrote: they get their own transaction
 };
 
 /** How many prepared statements each database keeps; 0 turns the cache off (fb_statement_cache). */
 unsigned g_statementCacheSize = 64;
-
-/** Whether autocommit SELECTs share a read-only transaction (fb_read_transaction); off by default. */
-bool g_readTransaction = false;
 
 std::map<int, DbEntry>       g_databases;
 std::map<int, ITransaction*> g_transactions;
@@ -394,7 +392,7 @@ bool cacheableType(unsigned type)
 //
 // With a tx_handle of 0, a query used to start a transaction, run, and commit:
 // with the statement kept prepared, that start and commit were half of what a
-// cheap SELECT cost.  When fb_read_transaction(1) asks for it, an autocommit
+// cheap SELECT cost.  When fb_read_transaction(db, 1) asks for it, an autocommit
 // SELECT instead runs in a READ COMMITTED READ CONSISTENCY read-only
 // transaction that the database keeps open between calls.  Each statement
 // still reads everything committed before it starts, as a fresh transaction
@@ -449,7 +447,7 @@ ITransaction* sharedReadTransaction(DbEntry& entry)
 /** Whether an autocommit query of `sql` should try the shared read transaction. */
 bool wantsSharedRead(DbEntry* entry, const char* sql)
 {
-	return g_readTransaction && entry && !entry->writers.count(sql);
+	return entry && entry->sharedReads && !entry->writers.count(sql);
 }
 
 /** `sql` wrote in the shared read transaction: it gets a transaction of its own from now on. */
@@ -2141,24 +2139,30 @@ int fb_statement_cache(int size)
 }
 
 /**
- * Whether a query with a tx_handle of 0 that is a SELECT runs in a read-only
- * transaction each database keeps open (1), or in one of its own committed
- * after it (0, the default).  Returns the previous setting.  Turning it off
- * ends the shared transactions.  See "The shared read transaction" above for
- * the two ways it differs.
+ * Whether a query on this database with a tx_handle of 0 that is a SELECT
+ * runs in a read-only transaction the database keeps open (1), or in one of
+ * its own committed after it (0, the default).  Returns the previous setting,
+ * or -1 for an unknown handle.  Turning it off ends the shared transaction.
+ * See "The shared read transaction" above for the two ways it differs.
  */
 FB_WASM_EXPORT
-int fb_read_transaction(int on)
+int fb_read_transaction(int db_handle, int on)
 {
-	const int previous = g_readTransaction ? 1 : 0;
-	g_readTransaction = on != 0;
-	if (!g_readTransaction)
+	clearError();
+
+	DbEntry* entry = lookupEntry(db_handle);
+	if (!entry)
 	{
-		for (auto& db : g_databases)
-		{
-			endReadTransaction(db.second);
-			db.second.writers.clear();
-		}
+		setError("fb_read_transaction: unknown database handle");
+		return -1;
+	}
+
+	const int previous = entry->sharedReads ? 1 : 0;
+	entry->sharedReads = on != 0;
+	if (!entry->sharedReads)
+	{
+		endReadTransaction(*entry);
+		entry->writers.clear();
 	}
 	return previous;
 }

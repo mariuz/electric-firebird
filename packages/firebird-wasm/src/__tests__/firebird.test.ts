@@ -30,7 +30,7 @@ const hasFirebirdLib = (() => {
  *   FIREBIRD_USER     – Firebird user  (default: SYSDBA)
  *   FIREBIRD_PASSWORD – Firebird password
  */
-function makeDb(dbName: string): FirebirdLite {
+function makeDb(dbName: string, options: { sharedReads?: boolean } = {}): FirebirdLite {
   const host = process.env['FIREBIRD_HOST'] ?? 'localhost';
   const user = process.env['FIREBIRD_USER'] ?? 'SYSDBA';
   const password = process.env['FIREBIRD_PASSWORD'] ?? '';
@@ -38,7 +38,7 @@ function makeDb(dbName: string): FirebirdLite {
   const dbPath = path.join(tmpDir, dbName);
   const uri = `${host}:${dbPath}`;
 
-  return new FirebirdLite(uri, { username: user, password });
+  return new FirebirdLite(uri, { username: user, password, ...options });
 }
 
 function tmpDbName(name: string): string {
@@ -486,6 +486,83 @@ describeIfFirebird('FirebirdLite', () => {
 
       expect(result.rows).toEqual([{ ID: 1 }]);
     });
+  });
+});
+
+describeIfFirebird('FirebirdLite with sharedReads', () => {
+  let db: FirebirdLite;
+  let dbPath: string;
+
+  beforeEach(() => {
+    const name = tmpDbName('shared-reads');
+    dbPath = path.join(os.tmpdir(), name);
+    db = makeDb(name, { sharedReads: true });
+  });
+
+  afterEach(async () => {
+    await db.close();
+    if (fs.existsSync(dbPath)) {
+      try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+    }
+  });
+
+  it('reads every commit, and nothing uncommitted', async () => {
+    await db.exec('CREATE TABLE c (id INTEGER)');
+    expect((await db.query('SELECT COUNT(*) AS N FROM c')).rows).toEqual([{ N: 0 }]);
+    await db.exec('INSERT INTO c VALUES (?)', [1]);
+    expect((await db.query('SELECT COUNT(*) AS N FROM c')).rows).toEqual([{ N: 1 }]);
+    await db.transaction(async (tx) => {
+      await tx.exec('INSERT INTO c VALUES (?)', [2]);
+      expect((await db.query('SELECT COUNT(*) AS N FROM c')).rows).toEqual([{ N: 1 }]);
+    });
+    expect((await db.query('SELECT COUNT(*) AS N FROM c')).rows).toEqual([{ N: 2 }]);
+    // A failed read leaves the next one working.
+    await expect(db.query('SELECT 1 / 0 FROM c')).rejects.toThrow();
+    expect((await db.query('SELECT COUNT(*) AS N FROM c')).rows).toEqual([{ N: 2 }]);
+  });
+
+  it('runs a SELECT that writes in a transaction of its own, and remembers it', async () => {
+    await db.exec('CREATE TABLE w (id INTEGER)');
+    await db.exec(
+      'CREATE PROCEDURE add_row RETURNS (n INTEGER) AS BEGIN ' +
+        "RDB$SET_CONTEXT('USER_SESSION', 'RUNS', " +
+        "COALESCE(CAST(RDB$GET_CONTEXT('USER_SESSION', 'RUNS') AS INTEGER), 0) + 1); " +
+        'INSERT INTO w VALUES (1); SELECT COUNT(*) FROM w INTO n; SUSPEND; END',
+    );
+    const runs = async () =>
+      (await db.query(
+        "SELECT CAST(RDB$GET_CONTEXT('USER_SESSION', 'RUNS') AS INTEGER) FROM RDB$DATABASE",
+        [],
+        { rowMode: 'array' },
+      )).rows[0][0];
+
+    expect((await db.query('SELECT n FROM add_row', [], { rowMode: 'array' })).rows).toEqual([[1]]);
+    expect(await runs()).toBe(2); // the read-only try, then its own transaction
+    expect((await db.query('SELECT n FROM add_row', [], { rowMode: 'array' })).rows).toEqual([[2]]);
+    expect(await runs()).toBe(3); // straight to its own transaction
+  });
+
+  it('runs what is not a SELECT as before', async () => {
+    await db.exec(
+      'CREATE PROCEDURE add_two (a INTEGER, b INTEGER) RETURNS (total INTEGER) ' +
+        'AS BEGIN total = a + b; END',
+    );
+    expect((await db.query('EXECUTE PROCEDURE add_two(?, ?)', [2, 3])).rows).toEqual([{ TOTAL: 5 }]);
+    await db.exec('CREATE TABLE i (id INTEGER)');
+    await db.query('INSERT INTO i VALUES (?)', [7]);
+    expect((await db.query('SELECT id FROM i')).rows).toEqual([{ ID: 7 }]);
+  });
+
+  it('lets DDL change what shared reads read', async () => {
+    await db.exec('CREATE TABLE d (id INTEGER)');
+    await db.exec('INSERT INTO d VALUES (1)');
+    expect((await db.query('SELECT id FROM d')).rows).toEqual([{ ID: 1 }]);
+    await db.exec('DROP TABLE d');
+    await db.exec('CREATE TABLE d (id INTEGER, w INTEGER)');
+    await db.exec('INSERT INTO d VALUES (7, 8)');
+    expect((await db.query('SELECT id, w FROM d')).rows).toEqual([{ ID: 7, W: 8 }]);
+    await db.exec('ALTER TABLE d ADD v INTEGER');
+    expect((await db.query('SELECT id, w, v FROM d')).rows).toEqual([{ ID: 7, W: 8, V: null }]);
   });
 });
 

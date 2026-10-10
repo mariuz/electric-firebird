@@ -8,8 +8,16 @@ API may still move between minor releases.
 
 ### Added
 
-- **`_fb_read_transaction(on)`: autocommit reads in a shared read-only
-  transaction.** Off by default. When on, an autocommit `SELECT` runs in a
+- **`sharedReads`: autocommit reads in a shared read-only transaction.** An
+  option on `new FirebirdBrowser(name, { sharedReads: true })` and
+  `new FirebirdLite(path, { sharedReads: true })`, off by default; on the
+  module it is `_fb_read_transaction(dbHandle, on)`, per database (an
+  `EngineTransport` supports it through the optional `setSharedReads`). On
+  Node against a local Firebird 3 server a primary-key `SELECT` went from
+  1.4–1.8 to 0.9–1.0 ms; there the shared transaction lives across
+  consecutive reads only, because an open transaction that has read a table
+  makes a server refuse `DROP TABLE` and `exec()` does not know it is running
+  DDL. In the browser engine, when on, an autocommit `SELECT` runs in a
   READ COMMITTED READ CONSISTENCY read-only transaction each database keeps
   open, instead of starting and committing one around the call; each
   statement still reads everything committed before it starts. Measured from

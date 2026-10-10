@@ -90,6 +90,13 @@ export interface EngineTransport {
     rowMode?: RowMode,
     binaryBlobs?: boolean,
   ): Promise<QueryResult<T>>;
+  /**
+   * Run this database's autocommit SELECTs in a read-only transaction it
+   * keeps open (`true`), or each in one of its own (`false`, the default).
+   * Optional, so a transport written before it still type-checks;
+   * `FirebirdBrowser` refuses `sharedReads` on one without it.
+   */
+  setSharedReads?(dbHandle: EngineHandle, on: boolean): Promise<void>;
   /** Describe a statement's shape without executing it. */
   describe(
     dbHandle: EngineHandle,
@@ -631,6 +638,13 @@ export class DirectTransport implements EngineTransport {
       return blobs ? attachBlobs(result, blobs, rowMode) : result;
       }),
     );
+  }
+
+  async setSharedReads(dbHandle: EngineHandle, on: boolean): Promise<void> {
+    const mod = this.module;
+    if (mod._fb_read_transaction(dbHandle, on ? 1 : 0) < 0) {
+      throw engineError(mod, 'Firebird could not change shared reads');
+    }
   }
 
   async describe(
