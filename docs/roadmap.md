@@ -973,6 +973,35 @@ gaps it ran into, with its numbers, in rough order of what they would buy.
       another connection's `DROP TABLE` wait and keeps a procedure's old body
       after another connection's `ALTER`, neither of which this connection
       can see.
+- [x] **What a call costs, layer by layer.** `npm run bench:calls`
+      (`bench/call-cost.js`) times one query five ways, each a layer thinner:
+      `FirebirdBrowser.query`, `DirectTransport.query`, the raw C call, the
+      decode alone, and the same fetch looped inside one `EXECUTE BLOCK` (the
+      engine's own work). With the statement kept and `sharedReads` on, in
+      µs per call, three rounds:
+
+      | shape | browser | transport | C call | decode | engine |
+      |---|---|---|---|---|---|
+      | one value | 19–32 | 18–36 | 13–30 | 1.9–4.1 | 3.0–10 |
+      | one row, 10 columns | 41–70 | 44–83 | 30–49 | 7.1–19 | 4.4–14 |
+      | no row, 10 columns | 32–58 | 35–46 | 19–38 | 6.9–12 | 1.1–1.9 |
+      | 100 rows, 5 columns | 555–675 | 509–565 | 435–539 | 40–48 | 180–196 |
+      | 1000 rows, 5 columns | 5282–6427 | 4878–6216 | 4315–5205 | 355–468 | 1189–1403 |
+
+      The C bridge is the cost, not the transport and not `JSON.parse`. The
+      no-row line shows it: ten columns cost 19–38 µs in C with no value to
+      write, against 1–2 µs of engine work, because every call describes
+      every column again (name, type, scale, length, nullable), about 2–3 µs
+      a column, and the JS decodes that description again, about 0.7 µs a
+      column. Writing a value costs about 0.5–0.65 µs in C and decoding it
+      about 0.1 µs in JS. The JS around the call (parameters, heap copies)
+      is 1–5 µs and `FirebirdBrowser`'s own layer a few more.
+- [ ] **Describe a kept statement's columns once.** Its columns cannot change
+      while it is kept, so the C bridge can write their JSON once, keep it
+      with the statement, and the JS can keep the decoded field list by that
+      text. From the numbers above, a one-row query of ten columns would drop
+      from 41–70 µs to roughly 20–30. After that, the cost per value in C
+      (`snprintf` for doubles and timestamps is the likely part) is next.
 - [ ] **`execBatch` on the Node backend.** It prepares once and loops, one
       execute per row; the browser's runs as one `IBatch` request, 15 % faster
       than a PSQL loop over the same `INSERT` on a 90,000-row load. The native

@@ -20,6 +20,7 @@
     "build:wasm": "bash wasm/build.sh",
     "test": "jest --forceExit",
     "bench": "node bench/decode-bench.js",
+    "bench:calls": "node bench/call-cost.js",
     "lint": "eslint src --ext .ts",
     "clean": "rm -rf dist",
     "prepublishOnly": "node scripts/check-publish.mjs"
