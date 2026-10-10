@@ -644,6 +644,34 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
       }
     });
 
+    it('returns the outputs of EXECUTE PROCEDURE as one row', () => {
+      const db = freshDatabase('exec-proc-outputs');
+      expect(exec(db, 0, `CREATE PROCEDURE add_two (a INTEGER, b INTEGER)
+        RETURNS (total INTEGER, label VARCHAR(10)) AS BEGIN total = a + b; label = 'sum'; END`)).toBe(0);
+      expect(queryRows(db, 'EXECUTE PROCEDURE add_two(2, 3)')).toEqual([[5, 'sum']]);
+
+      // Inside a caller's transaction, and with the shared read transaction on
+      // (which an EXECUTE PROCEDURE never uses).
+      const sqlPtr = allocString(mod, 'EXECUTE PROCEDURE add_two(4, 5)');
+      try {
+        const tx = mod._fb_start_transaction(db);
+        const resultPtr = mod._fb_query(db, tx, sqlPtr, 0);
+        expect({ pointer: resultPtr > 0, error: errorText() }).toEqual({ pointer: true, error: '' });
+        expect((JSON.parse(mod.UTF8ToString(resultPtr)) as { rows: unknown[][] }).rows).toEqual([[9, 'sum']]);
+        mod._fb_free_result(resultPtr);
+        expect(mod._fb_commit(tx)).toBe(0);
+      } finally {
+        mod._free(sqlPtr);
+      }
+      mod._fb_read_transaction(1);
+      try {
+        expect(queryRows(db, 'EXECUTE PROCEDURE add_two(6, 7)')).toEqual([[13, 'sum']]);
+      } finally {
+        mod._fb_read_transaction(0);
+      }
+      expect(mod._fb_detach_database(db)).toBe(0);
+    });
+
     it('reports a readable message for invalid SQL', () => {
       mod._fb_init();
 

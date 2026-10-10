@@ -1813,31 +1813,11 @@ bool serialiseCursor(IAttachment* attachment, ITransaction* transaction,
 			return false;
 		}
 
-		cursor = statement->openCursor(status.ptr(), transaction, inMeta, inBuffer,
-			metadata, 0);
-
-		if (status.failed() || !cursor)
-		{
-			setErrorFromStatus("could not open cursor", status.ptr());
-			return false;
-		}
-
 		std::vector<unsigned char> buffer(messageLength);
 		bool firstRow = true;
 
-		for (;;)
+		const auto appendRow = [&]()
 		{
-			const int rc = cursor->fetchNext(status.ptr(), buffer.data());
-
-			if (status.failed())
-			{
-				setErrorFromStatus("fetch failed", status.ptr());
-				return false;
-			}
-
-			if (rc != IStatus::RESULT_OK)
-				break;
-
 			if (!firstRow)
 				json += ',';
 			firstRow = false;
@@ -1860,6 +1840,52 @@ bool serialiseCursor(IAttachment* attachment, ITransaction* transaction,
 				}
 			}
 			json += ']';
+		};
+
+		// EXECUTE PROCEDURE has output columns but no cursor: opening one is
+		// refused ("Cannot open cursor for non-SELECT statement").  It runs
+		// once and fills one row, which is its result.
+		Status flagStatus;
+		const unsigned statementFlags = statement->getFlags(flagStatus.ptr());
+		if (!flagStatus.failed() && !(statementFlags & IStatement::FLAG_HAS_CURSOR))
+		{
+			statement->execute(status.ptr(), transaction, inMeta, inBuffer,
+				metadata, buffer.data());
+
+			if (status.failed())
+			{
+				setErrorFromStatus("could not execute statement", status.ptr());
+				return false;
+			}
+
+			appendRow();
+		}
+		else
+		{
+			cursor = statement->openCursor(status.ptr(), transaction, inMeta, inBuffer,
+				metadata, 0);
+
+			if (status.failed() || !cursor)
+			{
+				setErrorFromStatus("could not open cursor", status.ptr());
+				return false;
+			}
+
+			for (;;)
+			{
+				const int rc = cursor->fetchNext(status.ptr(), buffer.data());
+
+				if (status.failed())
+				{
+					setErrorFromStatus("fetch failed", status.ptr());
+					return false;
+				}
+
+				if (rc != IStatus::RESULT_OK)
+					break;
+
+				appendRow();
+			}
 		}
 	}
 

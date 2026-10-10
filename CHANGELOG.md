@@ -21,6 +21,17 @@ API may still move between minor releases.
   in an `ON COMMIT DELETE ROWS` table outlive the call: see `docs/api.md`.
   Needs a rebuilt artifact.
 
+### Fixed
+
+- **`query('EXECUTE PROCEDURE …')` returns the procedure's outputs.** A
+  procedure with output parameters has columns but no cursor. The browser
+  engine opened a cursor for any statement with columns, so the call failed
+  with "Cannot open cursor for non-SELECT statement"; the Node backend ran it
+  as a plain execute and returned no rows, and inside `transaction()` its
+  `executeQuery` refused it. Both now run it once and return its outputs as
+  one row, in autocommit and inside a transaction. The browser fix needs a
+  rebuilt artifact.
+
 ## 0.5.0 — 2026-10-10
 
 ### Changed
