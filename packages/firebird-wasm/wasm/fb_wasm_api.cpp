@@ -55,6 +55,7 @@
 #include <list>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -97,6 +98,7 @@ struct CachedStatement
 {
 	std::string sql;
 	IStatement* statement = nullptr;
+	unsigned type = 0;
 };
 
 /** An attached database, and the statements kept prepared for it, most recently used first. */
@@ -104,10 +106,15 @@ struct DbEntry
 {
 	IAttachment* attachment = nullptr;
 	std::list<CachedStatement> statements;
+	ITransaction* readTransaction = nullptr;   // shared by autocommit SELECTs (fb_read_transaction)
+	std::set<std::string> writers;             // SELECTs that wrote: they get their own transaction
 };
 
 /** How many prepared statements each database keeps; 0 turns the cache off (fb_statement_cache). */
 unsigned g_statementCacheSize = 64;
+
+/** Whether autocommit SELECTs share a read-only transaction (fb_read_transaction); off by default. */
+bool g_readTransaction = false;
 
 std::map<int, DbEntry>       g_databases;
 std::map<int, ITransaction*> g_transactions;
@@ -116,6 +123,8 @@ int g_nextDbHandle = 1;
 int g_nextTxHandle = 1;
 
 std::string g_lastError;
+/** The last error said "attempted update during read-only transaction". */
+bool g_lastErrorReadOnly = false;
 
 /**
  * Isolation levels, mirroring the TypeScript `IsolationLevel` union.
@@ -231,6 +240,20 @@ void setError(const std::string& message)
 void clearError()
 {
 	g_lastError.clear();
+	g_lastErrorReadOnly = false;
+}
+
+/** Whether a status vector carries the error `code` anywhere in its chain. */
+bool statusHasError(IStatus* status, ISC_STATUS code)
+{
+	const ISC_STATUS* v = status ? status->getErrors() : nullptr;
+	while (v && *v != isc_arg_end)
+	{
+		if (v[0] == isc_arg_gds && v[1] == code)
+			return true;
+		v += v[0] == isc_arg_cstring ? 3 : 2;
+	}
+	return false;
 }
 
 /** Turn an IStatus carrying errors into readable text. */
@@ -238,6 +261,7 @@ void setErrorFromStatus(const char* context, IStatus* status)
 {
 	char buffer[2048];
 	buffer[0] = '\0';
+	g_lastErrorReadOnly = statusHasError(status, isc_read_only_trans);
 
 	if (g_util && status)
 		g_util->formatStatus(buffer, sizeof(buffer), status);
@@ -364,6 +388,90 @@ bool cacheableType(unsigned type)
 	}
 }
 
+// ---------------------------------------------------------------------------
+// The shared read transaction
+// ---------------------------------------------------------------------------
+//
+// With a tx_handle of 0, a query used to start a transaction, run, and commit:
+// with the statement kept prepared, that start and commit were half of what a
+// cheap SELECT cost.  When fb_read_transaction(1) asks for it, an autocommit
+// SELECT instead runs in a READ COMMITTED READ CONSISTENCY read-only
+// transaction that the database keeps open between calls.  Each statement
+// still reads everything committed before it starts, as a fresh transaction
+// did, and a read-only read-committed transaction holds no garbage back.
+//
+// Two things differ, and are why it is an option.  A SELECT that writes (a
+// selectable procedure that updates a table) fails there with "attempted
+// update during read-only transaction"; it is then run again in a transaction
+// of its own, and its text is remembered so later calls go there directly,
+// but whatever it did outside transaction control before the failed write (a
+// sequence, RDB$SET_CONTEXT) happened twice on that first call.  And rows a
+// SELECT leaves in an ON COMMIT DELETE ROWS temporary table stay until the
+// shared transaction ends, not until the call does.
+
+void endReadTransaction(DbEntry& entry)
+{
+	if (!entry.readTransaction)
+		return;
+	Status status;
+	entry.readTransaction->commit(status.ptr());
+	if (status.failed())
+	{
+		Status rollbackStatus;
+		entry.readTransaction->rollback(rollbackStatus.ptr());
+	}
+	entry.readTransaction = nullptr;
+}
+
+/** The database's shared read transaction, started if need be; null if it cannot be. */
+ITransaction* sharedReadTransaction(DbEntry& entry)
+{
+	if (entry.readTransaction)
+		return entry.readTransaction;
+
+	Status status;
+	IXpbBuilder* tpb = g_util->getXpbBuilder(status.ptr(), IXpbBuilder::TPB, nullptr, 0);
+	if (status.failed() || !tpb)
+		return nullptr;
+	tpb->insertTag(status.ptr(), isc_tpb_read_committed);
+	tpb->insertTag(status.ptr(), isc_tpb_read_consistency);
+	tpb->insertTag(status.ptr(), isc_tpb_read);
+	ITransaction* transaction = nullptr;
+	if (!status.failed())
+		transaction = entry.attachment->startTransaction(status.ptr(),
+			tpb->getBufferLength(status.ptr()), tpb->getBuffer(status.ptr()));
+	tpb->dispose();
+
+	entry.readTransaction = status.failed() ? nullptr : transaction;
+	return entry.readTransaction;
+}
+
+/** Whether an autocommit query of `sql` should try the shared read transaction. */
+bool wantsSharedRead(DbEntry* entry, const char* sql)
+{
+	return g_readTransaction && entry && !entry->writers.count(sql);
+}
+
+/** `sql` wrote in the shared read transaction: it gets a transaction of its own from now on. */
+void rememberWriter(DbEntry& entry, const char* sql)
+{
+	if (entry.writers.size() >= 1024)
+		entry.writers.clear();
+	entry.writers.insert(sql);
+}
+
+/**
+ * DDL is about to run: drop what was built on the old metadata.  The kept
+ * statements go, the shared read transaction ends, and the remembered writers
+ * are forgotten (an altered procedure may no longer write).
+ */
+void forgetMetadata(DbEntry& entry)
+{
+	flushStatements(entry);
+	endReadTransaction(entry);
+	entry.writers.clear();
+}
+
 /**
  * The prepared statement for `sql`: the kept one if there is one, else a new
  * prepare (kept when its kind allows).  `cached` says whether the cache owns
@@ -371,9 +479,11 @@ bool cacheableType(unsigned type)
  * holds the error and the result is null.
  */
 IStatement* acquireStatement(int db_handle, IAttachment* attachment, ITransaction* transaction,
-	const char* sql, Status& status, bool& cached)
+	const char* sql, Status& status, bool& cached, unsigned* typeOut = nullptr)
 {
 	cached = false;
+	if (typeOut)
+		*typeOut = 0;
 	DbEntry* entry = lookupEntry(db_handle);
 
 	if (entry && g_statementCacheSize)
@@ -384,6 +494,8 @@ IStatement* acquireStatement(int db_handle, IAttachment* attachment, ITransactio
 			{
 				entry->statements.splice(entry->statements.begin(), entry->statements, it);
 				cached = true;
+				if (typeOut)
+					*typeOut = entry->statements.front().type;
 				return entry->statements.front().statement;
 			}
 		}
@@ -398,13 +510,15 @@ IStatement* acquireStatement(int db_handle, IAttachment* attachment, ITransactio
 	const unsigned type = statement->getType(typeStatus.ptr());
 	if (typeStatus.failed())
 		return statement;   // unknown kind: used once, not kept
+	if (typeOut)
+		*typeOut = type;
 
 	if (type == isc_info_sql_stmt_ddl && entry)
-		flushStatements(*entry);
+		forgetMetadata(*entry);
 
 	if (entry && g_statementCacheSize && cacheableType(type))
 	{
-		entry->statements.push_front(CachedStatement{sql, statement});
+		entry->statements.push_front(CachedStatement{sql, statement, type});
 		cached = true;
 		while (entry->statements.size() > g_statementCacheSize)
 		{
@@ -1947,8 +2061,10 @@ int fb_detach_database(int db_handle)
 		ev = g_events.erase(ev);
 	}
 
-	// The kept statements belong to this attachment and go before it does.
+	// The kept statements and the shared read transaction belong to this
+	// attachment and go before it does.
 	flushStatements(it->second);
+	endReadTransaction(it->second);
 
 	Status status;
 	attachment->detach(status.ptr());
@@ -1995,6 +2111,29 @@ int fb_statement_cache(int size)
 	g_statementCacheSize = size < 0 ? 0u : static_cast<unsigned>(size);
 	for (auto& db : g_databases)
 		flushStatements(db.second);
+	return previous;
+}
+
+/**
+ * Whether a query with a tx_handle of 0 that is a SELECT runs in a read-only
+ * transaction each database keeps open (1), or in one of its own committed
+ * after it (0, the default).  Returns the previous setting.  Turning it off
+ * ends the shared transactions.  See "The shared read transaction" above for
+ * the two ways it differs.
+ */
+FB_WASM_EXPORT
+int fb_read_transaction(int on)
+{
+	const int previous = g_readTransaction ? 1 : 0;
+	g_readTransaction = on != 0;
+	if (!g_readTransaction)
+	{
+		for (auto& db : g_databases)
+		{
+			endReadTransaction(db.second);
+			db.second.writers.clear();
+		}
+	}
 	return previous;
 }
 
@@ -2163,6 +2302,23 @@ const char* fb_query(int db_handle, int tx_handle, const char* sql, int flags)
 
 	ITransaction* transaction = nullptr;
 	bool ownTransaction = false;
+	DbEntry* entry = lookupEntry(db_handle);
+	bool shared = false;   // in the database's shared read transaction
+
+	// A transaction of its own, committed by cleanup(true).
+	auto startOwnTransaction = [&]()
+	{
+		Status status;
+		transaction = attachment->startTransaction(status.ptr(), 0, nullptr);
+		if (status.failed() || !transaction)
+		{
+			transaction = nullptr;
+			setErrorFromStatus("fb_query: could not start transaction", status.ptr());
+			return false;
+		}
+		ownTransaction = true;
+		return true;
+	};
 
 	if (tx_handle)
 	{
@@ -2173,17 +2329,10 @@ const char* fb_query(int db_handle, int tx_handle, const char* sql, int flags)
 			return nullptr;
 		}
 	}
-	else
-	{
-		Status status;
-		transaction = attachment->startTransaction(status.ptr(), 0, nullptr);
-		if (status.failed() || !transaction)
-		{
-			setErrorFromStatus("fb_query: could not start transaction", status.ptr());
-			return nullptr;
-		}
-		ownTransaction = true;
-	}
+	else if (wantsSharedRead(entry, sql) && (transaction = sharedReadTransaction(*entry)))
+		shared = true;
+	else if (!startOwnTransaction())
+		return nullptr;
 
 	// Cleanup helper — the cursor, statement and (optional) transaction must be
 	// released on every exit path, including the error ones.
@@ -2192,7 +2341,8 @@ const char* fb_query(int db_handle, int tx_handle, const char* sql, int flags)
 	IMessageMetadata* metadata  = nullptr;
 	bool              cached    = false;
 
-	auto cleanup = [&](bool commit)
+	// `keep` leaves a kept statement kept although the call failed.
+	auto cleanup = [&](bool commit, bool keep = false)
 	{
 		if (cursor)
 		{
@@ -2202,7 +2352,7 @@ const char* fb_query(int db_handle, int tx_handle, const char* sql, int flags)
 		}
 		if (metadata)
 			metadata->release();
-		releaseStatement(db_handle, statement, cached, !commit);
+		releaseStatement(db_handle, statement, cached, !commit && !keep);
 		if (ownTransaction && transaction)
 		{
 			Status s;
@@ -2214,13 +2364,27 @@ const char* fb_query(int db_handle, int tx_handle, const char* sql, int flags)
 	};
 
 	Status status;
-	statement = acquireStatement(db_handle, attachment, transaction, sql, status, cached);
+	unsigned type = 0;
+	statement = acquireStatement(db_handle, attachment, transaction, sql, status, cached, &type);
 
 	if (status.failed() || !statement)
 	{
 		setErrorFromStatus("fb_query: prepare failed", status.ptr());
 		cleanup(false);
 		return nullptr;
+	}
+
+	// Only a SELECT reads in the shared transaction: anything else (EXECUTE
+	// PROCEDURE, SELECT ... FOR UPDATE) gets one of its own, as before.
+	if (shared && type != isc_info_sql_stmt_select)
+	{
+		shared = false;
+		transaction = nullptr;
+		if (!startOwnTransaction())
+		{
+			cleanup(false);
+			return nullptr;
+		}
 	}
 
 	metadata = statement->getOutputMetadata(status.ptr());
@@ -2246,7 +2410,16 @@ const char* fb_query(int db_handle, int tx_handle, const char* sql, int flags)
 	if (!serialiseCursor(attachment, transaction, statement, metadata, columnCount,
 			nullptr, nullptr, cursor, json, &sink))
 	{
+		if (shared && g_lastErrorReadOnly)
+		{
+			// A SELECT that writes: again, in a transaction of its own.
+			rememberWriter(*entry, sql);
+			cleanup(false, true);
+			return fb_query(db_handle, 0, sql, flags);
+		}
 		cleanup(false);
+		if (shared)
+			endReadTransaction(*entry);   // whatever failed, the next read starts afresh
 		return nullptr;
 	}
 
@@ -3034,6 +3207,23 @@ const char* fb_query_params(int db_handle, int tx_handle, const char* sql,
 
 	ITransaction* transaction = nullptr;
 	bool ownTransaction = false;
+	DbEntry* entry = lookupEntry(db_handle);
+	bool shared = false;   // in the database's shared read transaction
+
+	// A transaction of its own, committed by cleanup(true).
+	auto startOwnTransaction = [&]()
+	{
+		Status status;
+		transaction = attachment->startTransaction(status.ptr(), 0, nullptr);
+		if (status.failed() || !transaction)
+		{
+			transaction = nullptr;
+			setErrorFromStatus("fb_query_params: could not start transaction", status.ptr());
+			return false;
+		}
+		ownTransaction = true;
+		return true;
+	};
 
 	if (tx_handle)
 	{
@@ -3044,24 +3234,18 @@ const char* fb_query_params(int db_handle, int tx_handle, const char* sql,
 			return nullptr;
 		}
 	}
-	else
-	{
-		Status status;
-		transaction = attachment->startTransaction(status.ptr(), 0, nullptr);
-		if (status.failed() || !transaction)
-		{
-			setErrorFromStatus("fb_query_params: could not start transaction", status.ptr());
-			return nullptr;
-		}
-		ownTransaction = true;
-	}
+	else if (wantsSharedRead(entry, sql) && (transaction = sharedReadTransaction(*entry)))
+		shared = true;
+	else if (!startOwnTransaction())
+		return nullptr;
 
 	IResultSet*       cursor    = nullptr;
 	IStatement*       statement = nullptr;
 	IMessageMetadata* metadata  = nullptr;
 	bool              cached    = false;
 
-	auto cleanup = [&](bool commit)
+	// `keep` leaves a kept statement kept although the call failed.
+	auto cleanup = [&](bool commit, bool keep = false)
 	{
 		if (cursor)
 		{
@@ -3071,7 +3255,7 @@ const char* fb_query_params(int db_handle, int tx_handle, const char* sql,
 		}
 		if (metadata)
 			metadata->release();
-		releaseStatement(db_handle, statement, cached, !commit);
+		releaseStatement(db_handle, statement, cached, !commit && !keep);
 		if (ownTransaction && transaction)
 		{
 			Status s;
@@ -3083,13 +3267,27 @@ const char* fb_query_params(int db_handle, int tx_handle, const char* sql,
 	};
 
 	Status status;
-	statement = acquireStatement(db_handle, attachment, transaction, sql, status, cached);
+	unsigned type = 0;
+	statement = acquireStatement(db_handle, attachment, transaction, sql, status, cached, &type);
 
 	if (status.failed() || !statement)
 	{
 		setErrorFromStatus("fb_query_params: prepare failed", status.ptr());
 		cleanup(false);
 		return nullptr;
+	}
+
+	// Only a SELECT reads in the shared transaction: anything else (EXECUTE
+	// PROCEDURE, SELECT ... FOR UPDATE) gets one of its own, as before.
+	if (shared && type != isc_info_sql_stmt_select)
+	{
+		shared = false;
+		transaction = nullptr;
+		if (!startOwnTransaction())
+		{
+			cleanup(false);
+			return nullptr;
+		}
 	}
 
 	InputMessage input;
@@ -3122,7 +3320,16 @@ const char* fb_query_params(int db_handle, int tx_handle, const char* sql,
 	if (!serialiseCursor(attachment, transaction, statement, metadata, columnCount,
 			input.meta(), input.data(), cursor, json, &sink))
 	{
+		if (shared && g_lastErrorReadOnly)
+		{
+			// A SELECT that writes: again, in a transaction of its own.
+			rememberWriter(*entry, sql);
+			cleanup(false, true);
+			return fb_query_params(db_handle, 0, sql, params, params_length, flags);
+		}
 		cleanup(false);
+		if (shared)
+			endReadTransaction(*entry);   // whatever failed, the next read starts afresh
 		return nullptr;
 	}
 
