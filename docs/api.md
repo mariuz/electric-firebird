@@ -49,8 +49,25 @@ call to `exec()`, `query()`, or `transaction()`.
 | `options.libraryPath` | `string` | system default | Override the path to `libfbclient.so` / `fbclient.dll`. |
 | `options.charset` | `string` | — | Character set for `NONE`-charset columns (passed as `charSetForNONE`). |
 | `options.sharedReads` | `boolean` | `false` | Run `query()` calls that are a `SELECT` in one read-only transaction kept open across consecutive reads. See [shared reads](#reads-can-share-a-transaction-opt-in). |
+| `options.statementCache` | `number` | `0` | Keep this many prepared statements by their SQL text. See below. |
 
 If the database file does not exist it is created automatically.
+
+**Kept statements (opt-in).** `statementCache: 64` keeps the connection's last
+64 prepared statements by their SQL text, so a statement sent again skips the
+prepare, a round trip to the server: against a local Firebird 3 server a
+primary-key `SELECT` went from 1.3–2.1 to 1.0–1.1 ms, an `UPDATE` through
+`exec()` from 2.2–2.3 to 1.6–1.9 ms (and the `SELECT` to 0.25–0.43 ms with
+`sharedReads` too). Only `SELECT`, `INSERT`, `UPDATE`, `DELETE` and
+`EXECUTE PROCEDURE` / `EXECUTE BLOCK` are kept; DDL run through this
+connection empties the cache first, a statement whose execution fails is
+dropped, and two concurrent calls with the same text never share one. It is
+off by default, unlike the browser engine's, because a server has other
+connections, and they feel what this one keeps: another connection's
+`DROP TABLE` of a table a kept statement reads waits until the statement is
+released, and a kept statement goes on running a procedure's old body after
+another connection alters it. Turn it on where this process is the only one
+changing the schema while it runs.
 
 #### `db.exec(sql, params?)`
 
@@ -725,6 +742,7 @@ interface FirebirdLiteOptions {
   username?: string;
   password?: string;
   sharedReads?: boolean;
+  statementCache?: number;
 }
 ```
 

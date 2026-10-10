@@ -27,6 +27,20 @@ export interface FirebirdLiteOptions {
    * @default false
    */
   sharedReads?: boolean;
+  /**
+   * How many prepared statements to keep by their SQL text, so a statement
+   * sent again skips the prepare (a round trip to the server). DDL run here
+   * empties the cache first. 0 keeps none.
+   *
+   * Off by default because what this connection keeps, other connections
+   * feel: a kept statement makes another connection's `DROP TABLE` of a table
+   * it reads wait until it is released, and keeps running a procedure's old
+   * body after another connection alters it. Turn it on where this process
+   * is the only one changing the schema while it runs.
+   *
+   * @default 0
+   */
+  statementCache?: number;
 }
 
 /**

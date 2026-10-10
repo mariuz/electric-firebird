@@ -8,6 +8,20 @@ API may still move between minor releases.
 
 ### Added
 
+- **`statementCache` on `FirebirdLite`: prepared statements kept on Node.**
+  `new FirebirdLite(path, { statementCache: 64 })` keeps the connection's
+  last 64 prepared statements by SQL text, as the browser engine has since
+  0.5.0, so a repeated statement skips the prepare, a round trip to the
+  server. Measured against a local Firebird 3 server, off and with the cache
+  alternating, three rounds each: a primary-key `SELECT` 1.3–2.1 ms off,
+  1.0–1.1 ms with it (0.25–0.43 ms with `sharedReads` as well); an `UPDATE`
+  through `exec()` 2.2–2.3 ms off, 1.6–1.9 ms with it. DDL run through the
+  connection empties the cache first, a failed statement is dropped, and
+  concurrent calls with the same text each get their own statement. Off by
+  default: on a server, another connection's `DROP TABLE` waits while a
+  kept statement reads the table, and a kept statement keeps running a
+  procedure's old body after another connection alters it.
+
 - **`sharedReads`: autocommit reads in a shared read-only transaction.** An
   option on `new FirebirdBrowser(name, { sharedReads: true })` and
   `new FirebirdLite(path, { sharedReads: true })`, off by default; on the
