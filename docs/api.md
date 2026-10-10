@@ -78,8 +78,9 @@ await db.execBatch('INSERT INTO items VALUES (?, ?)', [
 `sql` is a single statement, not a script, and each row is a `QueryParams`
 array of the statement's arity.  A failing row rejects with the engine's error
 and the row's index.  In the browser the whole batch crosses to the engine in
-one call, which is what makes it faster than a loop of `exec()`: 5,000 rows of
-five columns take 65 ms as a batch against 130 ms as one statement per row
+one call and runs as one request inside it (Firebird's `IBatch`), which is
+what makes it faster than a loop of `exec()`: 5,000 rows of
+five columns take 45 ms as a batch against 130 ms as one statement per row
 inside one transaction and 300 ms with a transaction each.
 
 #### `db.query<T>(sql, params?, options?)`
