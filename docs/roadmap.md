@@ -954,10 +954,16 @@ gaps it ran into, with its numbers, in rough order of what they would buy.
       cache before it runs). A primary-key `SELECT` inside a transaction went
       from 45–47 to 25–36 µs a call; in autocommit from 60–63 to 46–47, where
       the transaction per call is now the larger part — the next item.
-- [ ] **A read-only transaction kept open for reads.** Autocommit starts and
-      commits a transaction around every `query()`, half of a cheap query's
-      cost. An option to run reads in a long-lived read-committed read-only
-      transaction would remove it for the common case.
+- [x] **A read-only transaction kept open for reads.** Autocommit started
+      and committed a transaction around every `query()`, half of a cheap
+      query's cost. `_fb_read_transaction(1)` runs an autocommit `SELECT` in a
+      READ COMMITTED READ CONSISTENCY read-only transaction each database
+      keeps open: a primary-key `SELECT` from 44–45 to 20–22 µs a call, a
+      trivial one from 37–41 to 15–16. Off by default, because a `SELECT`
+      that writes is tried there first (once per SQL text) and rows left in
+      an `ON COMMIT DELETE ROWS` table outlive the call. Still to do: an
+      option on `FirebirdBrowser` and the Node backend rather than the module
+      call alone.
 - [ ] **`execBatch` on the Node backend.** It prepares once and loops, one
       execute per row; the browser's runs as one `IBatch` request, 15 % faster
       than a PSQL loop over the same `INSERT` on a 90,000-row load. The native

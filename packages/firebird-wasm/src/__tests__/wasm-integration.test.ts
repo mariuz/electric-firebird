@@ -618,9 +618,8 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
         expect(queryRows(db, 'SELECT n FROM add_row')).toEqual([[2]]);
         expect(runs()).toBe(3);   // straight to its own transaction
         // EXECUTE PROCEDURE never tries the shared transaction.
-        expect(exec(db, 0, `CREATE PROCEDURE add_one RETURNS (n INTEGER) AS BEGIN
-          INSERT INTO w VALUES (2); SELECT COUNT(*) FROM w INTO n; END`)).toBe(0);
-        expect(queryRows(db, 'EXECUTE PROCEDURE add_one')).toEqual([[3]]);
+        expect(exec(db, 0, 'CREATE PROCEDURE add_one AS BEGIN INSERT INTO w VALUES (2); END')).toBe(0);
+        expect(queryRows(db, 'EXECUTE PROCEDURE add_one')).toEqual([]);
         expect(queryRows(db, 'SELECT COUNT(*) FROM w')).toEqual([[3]]);
         expect(mod._fb_detach_database(db)).toBe(0);
       } finally {
