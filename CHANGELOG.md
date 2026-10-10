@@ -4,6 +4,26 @@ All notable changes to `firebird-wasm`. This project follows
 [semantic versioning](https://semver.org/); while the major version is 0 the
 API may still move between minor releases.
 
+## Unreleased
+
+### Changed
+
+- **`execBatch` on Node sends up to 200 rows per round trip.** The Node
+  driver binds no `IBatch` (nor does upstream `master`), so `FirebirdLite`
+  packed nothing: one execute and one round trip per row. It now runs the rows
+  as `EXECUTE BLOCK`s of up to 200, each repeating the statement with its
+  parameters declared as the types the driver binds, so the values and their
+  conversions are the ones a row-by-row execute makes. Against a local
+  Firebird 3 server, alternating with the old loop, three rounds: three
+  columns 152–174 µs a row before, 18–35 µs now; ten columns with a text
+  `BLOB` 504–585 before, 245–319 now (each `BLOB` value still costs a round
+  trip of its own). `INSERT`, `UPDATE`, `DELETE` and `EXECUTE PROCEDURE`
+  without `RETURNING`; anything else runs row by row as before. A block that
+  will not prepare is halved until it does, and a failing block's rows run one
+  by one, so the error is the failing row's own and the batch stays all or
+  nothing. The parameter types are read from the driver's statement
+  internals; if those ever change shape, `execBatch` falls back to the loop.
+
 ## 0.6.0 — 2026-10-10
 
 ### Added

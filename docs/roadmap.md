@@ -973,10 +973,15 @@ gaps it ran into, with its numbers, in rough order of what they would buy.
       another connection's `DROP TABLE` wait and keeps a procedure's old body
       after another connection's `ALTER`, neither of which this connection
       can see.
-- [ ] **`execBatch` on the Node backend.** It prepares once and loops, one
-      execute per row; the browser's runs as one `IBatch` request, 15 % faster
-      than a PSQL loop over the same `INSERT` on a 90,000-row load. The native
-      client has `IBatch` too: the two backends should behave alike.
+- [x] **`execBatch` on the Node backend.** It prepared once and looped, one
+      execute and one round trip per row; the browser's runs as one `IBatch`
+      request. The Node driver binds no `IBatch`: not node-firebird-native-api
+      3.3.0, nor upstream `master` (asfernandes/node-firebird-drivers,
+      checked at 0ddf615, August 2026, the new wire driver included). So rows
+      now go in `EXECUTE BLOCK`s of up to 200, their parameters declared as
+      the driver binds them: three columns from 152–174 to 18–35 µs a row
+      against a local Firebird 3 server. Still possible: `IBatch` bound
+      upstream, which would also take a BLOB value's own round trips away.
 - [ ] **A build that survives a rebuild.** Three things stopped a clean local
       build on a stock Ubuntu machine: the native bootstrap needs the host's
       ICU headers and failed deep inside a compile without saying so; CMake

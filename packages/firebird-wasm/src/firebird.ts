@@ -22,6 +22,8 @@ import type {
 } from './types';
 import { statementKind } from './statement-types';
 import { toStatement, resolveQueryCall } from './sql-tag';
+import { blockParamType, buildBlock, placeholderOffsets } from './batch-block';
+import type { CharacterSet, ParamDescriptor } from './batch-block';
 import type { SqlFragment } from './sql-tag';
 
 type NativeDriver = typeof import('node-firebird-driver-native');
@@ -516,12 +518,93 @@ export class FirebirdTransaction {
     const lease = await this.statements.acquire(this.transaction, sql);
     let failed = true;
     try {
-      for (const row of rows) {
-        await lease.stmt.execute(this.transaction, row);
+      const plan = rows.length > 1 ? await this.blockPlan(sql, lease.stmt) : undefined;
+      if (plan) {
+        await this.executeInBlocks(lease.stmt, plan, rows);
+      } else {
+        for (const row of rows) {
+          await lease.stmt.execute(this.transaction, row);
+        }
       }
       failed = false;
     } finally {
       await lease.release(failed);
+    }
+  }
+
+  /**
+   * How to run `sql` as an `EXECUTE BLOCK` over many rows, or `undefined` to
+   * run it row by row: it is not plain DML or a procedure call, it returns
+   * something, or a parameter's type cannot be declared. See batch-block.ts.
+   */
+  private async blockPlan(
+    sql: string,
+    stmt: Statement,
+  ): Promise<{ build: (rows: number) => string } | undefined> {
+    const type = await stmt.type;
+    // INSERT, UPDATE, DELETE, EXECUTE PROCEDURE; nothing with a result.
+    if (![2, 3, 4, 8].includes(type) || stmt.hasResultSet) return undefined;
+    if ((await stmt.columnLabels).length > 0) return undefined;
+
+    const params = await inputParams(stmt);
+    const offsets = placeholderOffsets(sql);
+    if (!params || params.length === 0 || !offsets || offsets.length !== params.length) {
+      return undefined;
+    }
+    const charsets = await characterSets(this.attachment, this.transaction);
+    const types = params.map((p) => blockParamType(p, charsets));
+    if (types.some((t) => t === undefined)) return undefined;
+    return { build: (rows) => buildBlock(sql, offsets, types as string[], rows) };
+  }
+
+  /**
+   * Run `rows` through blocks of up to {@link BLOCK_ROWS} rows each.
+   *
+   * A block that will not prepare (more contexts than the engine's 256,
+   * a message or BLR too long) is halved until it does; at one row the
+   * statement itself runs. A block that fails while running was undone as
+   * one statement, so its rows run again one by one: the failing row then
+   * throws exactly the error the row-by-row loop would have thrown.
+   */
+  private async executeInBlocks(
+    single: Statement,
+    plan: { build: (rows: number) => string },
+    rows: QueryParams[],
+  ): Promise<void> {
+    let size = Math.min(BLOCK_ROWS, rows.length);
+    let current: { rows: number; lease: StatementLease } | undefined;
+    try {
+      for (let at = 0; at < rows.length; ) {
+        const chunk = rows.slice(at, at + size);
+        if (chunk.length === 1) {
+          await single.execute(this.transaction, chunk[0]);
+          at += 1;
+          continue;
+        }
+        if (current?.rows !== chunk.length) {
+          await current?.lease.release(false);
+          current = undefined;
+          try {
+            current = {
+              rows: chunk.length,
+              lease: await this.statements.acquire(this.transaction, plan.build(chunk.length)),
+            };
+          } catch {
+            size = Math.max(1, chunk.length >> 1);
+            continue;
+          }
+        }
+        try {
+          await current.lease.stmt.execute(this.transaction, chunk.flat());
+        } catch {
+          for (const row of chunk) {
+            await single.execute(this.transaction, row);
+          }
+        }
+        at += chunk.length;
+      }
+    } finally {
+      await current?.lease.release(false);
     }
   }
 
@@ -572,6 +655,80 @@ export class FirebirdTransaction {
 // ---------------------------------------------------------------------------
 // Module-level helpers
 // ---------------------------------------------------------------------------
+
+/** Rows per `EXECUTE BLOCK` in `execBatch`: a single-table statement uses
+ * one of the engine's 256 contexts per row, so 200 leaves room. */
+const BLOCK_ROWS = 200;
+
+/**
+ * The driver's description of a statement's `?` parameters: its input
+ * metadata, after the driver's own rewrites (integers bound as doubles,
+ * CHAR as VARCHAR). Not public API: read from the native statement's
+ * fields, and `undefined` whenever they are not there, so a driver that
+ * changes shape makes `execBatch` fall back to one execute per row.
+ */
+async function inputParams(stmt: Statement): Promise<ParamDescriptor[] | undefined> {
+  interface Metadata {
+    getCountSync(status: unknown): number;
+    getTypeSync(status: unknown, i: number): number;
+    getSubTypeSync(status: unknown, i: number): number;
+    getLengthSync(status: unknown, i: number): number;
+    getScaleSync(status: unknown, i: number): number;
+    getCharSetSync(status: unknown, i: number): number;
+  }
+  const internal = stmt as unknown as {
+    inMetadata?: Metadata;
+    attachment?: { client?: { statusAction?: <T>(fn: (status: unknown) => Promise<T>) => Promise<T> } };
+  };
+  const meta = internal.inMetadata;
+  const client = internal.attachment?.client;
+  if (!meta || typeof meta.getCountSync !== 'function' || typeof client?.statusAction !== 'function') {
+    return undefined;
+  }
+  try {
+    return await client.statusAction(async (status) => {
+      const params: ParamDescriptor[] = [];
+      for (let i = 0, n = meta.getCountSync(status); i < n; i++) {
+        params.push({
+          type: meta.getTypeSync(status, i),
+          subType: meta.getSubTypeSync(status, i),
+          length: meta.getLengthSync(status, i),
+          scale: meta.getScaleSync(status, i),
+          charSet: meta.getCharSetSync(status, i),
+        });
+      }
+      return params;
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+/** Character sets by id, read once per connection. */
+const charsetCache = new WeakMap<Attachment, Map<number, CharacterSet>>();
+
+async function characterSets(
+  attachment: Attachment,
+  transaction: Transaction,
+): Promise<Map<number, CharacterSet>> {
+  let charsets = charsetCache.get(attachment);
+  if (!charsets) {
+    const resultSet = await attachment.executeQuery(
+      transaction,
+      'SELECT RDB$CHARACTER_SET_ID, TRIM(RDB$CHARACTER_SET_NAME), RDB$BYTES_PER_CHARACTER FROM RDB$CHARACTER_SETS',
+    );
+    try {
+      charsets = new Map();
+      for (const [id, name, bytes] of (await resultSet.fetch()) as [number, string, number][]) {
+        charsets.set(id, { name, bytesPerCharacter: bytes });
+      }
+    } finally {
+      await resultSet.close().catch(() => undefined);
+    }
+    charsetCache.set(attachment, charsets);
+  }
+  return charsets;
+}
 
 /** Statement types (`isc_info_sql_stmt_*`) the cache keeps: plain DML, SELECT, procedures. */
 const CACHEABLE_TYPES: ReadonlySet<number> = new Set([1, 2, 3, 4, 8, 12]);
