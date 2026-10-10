@@ -4,6 +4,37 @@ All notable changes to `firebird-wasm`. This project follows
 [semantic versioning](https://semver.org/); while the major version is 0 the
 API may still move between minor releases.
 
+## Unreleased
+
+### Added
+
+- **Typed (binary) parameter binding in the browser.** A `number` or an
+  in-range `bigint` now crosses to the engine with its binary form beside its
+  text, and the engine binds the binary form where it is the exact one: a
+  double for a `DOUBLE PRECISION`/`FLOAT` parameter, an `INT64` for a
+  `SMALLINT`/`INTEGER`/`BIGINT` one. Everything else keeps the text, so a
+  `NUMERIC`, `VARCHAR` or date destination is bound exactly as before. The
+  reason: Firebird's text-to-double conversion is off by one ulp for about one
+  value in six (490 of 3,000 measured), which a consumer had been working
+  around by sending every double as mantissa and exponent. The packed
+  buffer's per-parameter null byte became a flags byte: the new bridge still
+  reads buffers from older TypeScript, but an older artifact cannot read the
+  new buffer, so `dist/wasm` must be from this build or later.
+
+- **`db.execBatch(sql, rows)` and `tx.execBatch(sql, rows)`.** One statement,
+  prepared once, run for every row of parameters in one transaction, all or
+  nothing, with a failing row named in the error. In the browser every row
+  crosses to the engine in a single call (`fb_execute_batch`): 5,000 rows of
+  five columns take 65 ms, against 130 ms as one `exec()` per row inside a
+  transaction. On the Node backend it prepares once and loops.
+
+### Documented
+
+- [`docs/plans/sab-free-build.md`](docs/plans/sab-free-build.md): what a
+  build without `SharedArrayBuffer` would take, why it is not a link flag, and
+  the route to one. Such a build would free consumers from COOP/COEP headers
+  and the service workers that exist only to supply them.
+
 ## 0.3.0 — 2026-08-12
 
 ### Added

@@ -101,6 +101,15 @@ export class FirebirdLite {
   }
 
   /**
+   * Execute one statement once per row of parameters: a batch, prepared once
+   * and executed per row in one transaction, all or nothing.  The same call
+   * as the browser backend's.
+   */
+  async execBatch(sql: string, rows: QueryParams[]): Promise<void> {
+    await this.transaction((tx) => tx.execBatch(sql, rows));
+  }
+
+  /**
    * Execute a (parameterised) SQL statement and return the result rows.
    *
    * For SELECT queries the rows are returned as plain objects keyed by the
@@ -355,6 +364,26 @@ export class FirebirdTransaction {
       }
     } else {
       await this.attachment.execute(this.transaction, statement.sql);
+    }
+  }
+
+  /**
+   * Execute one statement once per row of parameters inside this
+   * transaction: prepared once, executed per row.
+   */
+  async execBatch(sql: string, rows: QueryParams[]): Promise<void> {
+    this.assertUsable();
+    if (!Array.isArray(rows)) {
+      throw new TypeError('execBatch takes an array of parameter rows');
+    }
+    if (rows.length === 0) return;
+    const stmt = await this.attachment.prepare(this.transaction, sql);
+    try {
+      for (const row of rows) {
+        await stmt.execute(this.transaction, row);
+      }
+    } finally {
+      await stmt.dispose().catch(() => undefined);
     }
   }
 

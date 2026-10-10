@@ -142,6 +142,7 @@ export interface SharedEngineTransportOptions {
 /** Ops that change the database, and so make the leader's image dirty. */
 const MUTATING: ReadonlySet<SharedOp> = new Set<SharedOp>([
   'execute',
+  'executeBatch',
   'commit',
   'createDatabase',
   'writeFile',
@@ -468,6 +469,15 @@ export class SharedEngineTransport implements EngineTransport {
     params: QueryParams = [],
   ): Promise<number> {
     return this.call<number>('execute', dbHandle, txHandle, sql, params);
+  }
+
+  executeBatch(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    sql: string,
+    rows: QueryParams[],
+  ): Promise<number> {
+    return this.call<number>('executeBatch', dbHandle, txHandle, sql, rows);
   }
 
   query<T = Row>(

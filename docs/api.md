@@ -21,6 +21,7 @@ class FirebirdLite {
   constructor(dbPath: string, options?: FirebirdLiteOptions)
 
   exec(sql: string | SqlFragment, params?: QueryParams): Promise<void>
+  execBatch(sql: string, rows: QueryParams[]): Promise<void>
   query<T extends Row = Row>(sql: SqlFragment, options?: TransactionOptions): Promise<QueryResult<T>>
   query<T extends Row = Row>(
     sql: string,
@@ -60,6 +61,26 @@ await db.exec('CREATE TABLE items (id INTEGER, name VARCHAR(100))');
 await db.exec("INSERT INTO items VALUES (1, 'hello')");
 await db.exec(sql`INSERT INTO items VALUES (${2}, ${'world'})`);
 ```
+
+#### `db.execBatch(sql, rows)`
+
+Execute one DML statement once per row of parameters, prepared once, in a
+single transaction: either every row is applied or none is.  Returns
+`Promise<void>`.
+
+```ts
+await db.execBatch('INSERT INTO items VALUES (?, ?)', [
+  [1, 'hello'],
+  [2, 'world'],
+]);
+```
+
+`sql` is a single statement, not a script, and each row is a `QueryParams`
+array of the statement's arity.  A failing row rejects with the engine's error
+and the row's index.  In the browser the whole batch crosses to the engine in
+one call, which is what makes it faster than a loop of `exec()`: 5,000 rows of
+five columns take 65 ms as a batch against 130 ms as one statement per row
+inside one transaction and 300 ms with a transaction each.
 
 #### `db.query<T>(sql, params?, options?)`
 
@@ -128,6 +149,7 @@ A handle to an active transaction, passed to the callback of
 ```ts
 class FirebirdTransaction {
   exec(sql: string | SqlFragment, params?: QueryParams): Promise<void>
+  execBatch(sql: string, rows: QueryParams[]): Promise<void>
   query<T extends Row = Row>(
     sql: string | SqlFragment,
     params?: QueryParams,
@@ -138,6 +160,11 @@ class FirebirdTransaction {
 #### `tx.exec(sql, params?)`
 
 Execute a DDL or DML statement inside the active transaction.
+
+#### `tx.execBatch(sql, rows)`
+
+As `db.execBatch()`, inside the active transaction: the rows are committed or
+rolled back with the rest of its work.
 
 #### `tx.query<T>(sql, params?)`
 
@@ -347,6 +374,7 @@ class FirebirdBrowser {
   constructor(dbName: string, options?: FirebirdBrowserOptions)
 
   exec(sql: string | SqlFragment, params?: QueryParams): Promise<ExecResult[]>
+  execBatch(sql: string, rows: QueryParams[]): Promise<ExecResult>
   query<T extends Row = Row>(sql: SqlFragment, options?: TransactionOptions): Promise<QueryResult<T>>
   query<T extends Row = Row>(
     sql: string,
@@ -571,6 +599,7 @@ Returned by `FirebirdBrowser.transaction()`.  Mirrors `FirebirdTransaction`.
 ```ts
 class FirebirdBrowserTransaction {
   exec(sql: string | SqlFragment, params?: QueryParams): Promise<ExecResult>
+  execBatch(sql: string, rows: QueryParams[]): Promise<ExecResult>
   query<T extends Row = Row>(
     sql: string | SqlFragment,
     params?: QueryParams,
@@ -683,6 +712,19 @@ type Row = Record<string, unknown>;
 ```ts
 type QueryParams = unknown[];
 ```
+
+**How a value crosses to the engine (browser).**  Every parameter travels as
+its SQL text, and the engine converts the text to the parameter's declared
+type, so a `string`, `boolean`, `Date` or `bigint` binds to whatever column it
+meets.  A `number` or a `bigint` within `INT64` also carries its binary form
+beside the text, and the engine uses that form where it is the exact one:
+a double for a `DOUBLE PRECISION` or `FLOAT` destination, an `INT64` for a
+whole-number destination (`SMALLINT`, `INTEGER`, `BIGINT`).  That matters
+because Firebird's own text-to-double conversion is off by one ulp for about
+one value in six; `0.1` bound this way comes back as `0.1`, bit for bit.  A
+`NUMERIC`/`DECIMAL`, `VARCHAR` or date destination still takes the text, so
+`1.1` into a `NUMERIC(18,2)` is `1.10`, not a rounded double.  The Node backend
+binds through the native driver, which has always been typed.
 
 #### `tx.rollback()`
 

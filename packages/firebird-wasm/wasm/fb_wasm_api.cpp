@@ -762,9 +762,11 @@ void appendValue(IAttachment* attachment, ITransaction* transaction,
 //
 //     u32  count
 //     per parameter:
-//       u8   isNull
-//       u32  byteLength    (absent when isNull)
-//       ...  UTF-8 bytes   (absent when isNull)
+//       u8   flags         bit 0: SQL NULL; bit 1: a binary form follows the text
+//       u32  byteLength    (absent when NULL)
+//       ...  UTF-8 bytes   (absent when NULL)
+//       u8   kind          (only with bit 1) 1: INT64, 2: DOUBLE
+//       8    the value     (only with bit 1) little-endian
 //
 // Every value is sent as text and the input message is described as VARCHAR
 // UTF-8, letting Firebird convert to the column's actual type.  That is what
@@ -779,11 +781,21 @@ void appendValue(IAttachment* attachment, ITransaction* transaction,
  */
 constexpr unsigned FB_CS_UTF8 = 4;
 
-/** One bound parameter: SQL NULL, or text for the engine to convert. */
+/**
+ * One bound parameter: SQL NULL, or text for the engine to convert, with the
+ * number it came from beside it when the caller had one (a JavaScript number
+ * or bigint).  The text is what every destination but a floating-point or
+ * whole-number column gets, so a NUMERIC(18,2) still sees "1.1" and a VARCHAR
+ * "1.5"; those two kinds of column take the binary form, exactly.
+ */
 struct ParamValue
 {
-	bool        isNull = true;
-	std::string text;
+	bool          isNull = true;
+	std::string   text;
+	/** 0: text only; 1: the value is in `i64`; 2: in `dbl`. */
+	unsigned char binaryKind = 0;
+	ISC_INT64     i64 = 0;
+	double        dbl = 0;
 };
 
 /** Read a little-endian u32 without assuming alignment. */
@@ -802,16 +814,15 @@ unsigned readU32(const unsigned char* p)
  * JS/WASM boundary, and a malformed buffer must produce an error rather than
  * an out-of-bounds read.
  */
-bool parseParams(const unsigned char* data, unsigned length,
+bool parseParamsAt(const unsigned char* data, unsigned length, unsigned& pos,
 	std::vector<ParamValue>& out)
 {
 	out.clear();
 
-	if (!data || length < 4)
-		return length == 0;   // no parameters at all is valid
+	if (pos + 4 > length)
+		return false;
 
-	unsigned pos = 0;
-	const unsigned count = readU32(data);
+	const unsigned count = readU32(data + pos);
 	pos += 4;
 
 	out.reserve(count);
@@ -822,7 +833,8 @@ bool parseParams(const unsigned char* data, unsigned length,
 			return false;
 
 		ParamValue value;
-		value.isNull = data[pos++] != 0;
+		const unsigned char flags = data[pos++];
+		value.isNull = (flags & 1) != 0;
 
 		if (!value.isNull)
 		{
@@ -839,10 +851,38 @@ bool parseParams(const unsigned char* data, unsigned length,
 			pos += len;
 		}
 
+		if (flags & 2)
+		{
+			if (pos + 9 > length)
+				return false;
+
+			value.binaryKind = data[pos++];
+			// wasm32 is little-endian, as the buffer is: the bytes are the value
+			if (value.binaryKind == 1)
+				memcpy(&value.i64, data + pos, sizeof(value.i64));
+			else if (value.binaryKind == 2)
+				memcpy(&value.dbl, data + pos, sizeof(value.dbl));
+			else
+				return false;
+			pos += 8;
+		}
+
 		out.push_back(std::move(value));
 	}
 
 	return true;
+}
+
+bool parseParams(const unsigned char* data, unsigned length,
+	std::vector<ParamValue>& out)
+{
+	out.clear();
+
+	if (!data || length < 4)
+		return length == 0;   // no parameters at all is valid
+
+	unsigned pos = 0;
+	return parseParamsAt(data, length, pos, out);
 }
 
 /**
@@ -869,12 +909,12 @@ public:
 	void* data() noexcept { return buffer.empty() ? nullptr : buffer.data(); }
 
 	/**
-	 * Describe `values` as VARCHAR UTF-8 and pack them into a message.
-	 *
-	 * `statement` supplies the parameter count, so a mismatch is reported
-	 * before the engine sees it.
+	 * Take the statement's input message format: the parameter count, the
+	 * message length and each parameter's descriptor.  Once per statement;
+	 * fill() then packs a set of values into it, as many times as there are
+	 * rows to execute.
 	 */
-	bool build(IStatement* statement, const std::vector<ParamValue>& values)
+	bool describe(IStatement* statement)
 	{
 		Status status;
 
@@ -890,12 +930,61 @@ public:
 			return false;
 		}
 
-		const unsigned expected = metadata->getCount(status.ptr());
+		expected = metadata->getCount(status.ptr());
 		if (status.failed())
 		{
 			setErrorFromStatus("could not count parameters", status.ptr());
 			return false;
 		}
+
+		if (expected == 0)
+			return true;   // nothing to bind, ever
+
+		const unsigned messageLength = metadata->getMessageLength(status.ptr());
+		if (status.failed())
+		{
+			setErrorFromStatus("could not size the parameter message", status.ptr());
+			return false;
+		}
+
+		buffer.assign(messageLength, 0);
+		fields.resize(expected);
+
+		for (unsigned i = 0; i < expected; i++)
+		{
+			fields[i].type       = metadata->getType(status.ptr(), i) & ~1u;
+			fields[i].scale      = metadata->getScale(status.ptr(), i);
+			fields[i].length     = metadata->getLength(status.ptr(), i);
+			fields[i].offset     = metadata->getOffset(status.ptr(), i);
+			fields[i].nullOffset = metadata->getNullOffset(status.ptr(), i);
+
+			if (status.failed())
+			{
+				setErrorFromStatus("could not read a parameter descriptor", status.ptr());
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	/**
+	 * Pack `values` into the message described.
+	 *
+	 * A value's text is presented as VARCHAR and Firebird converts it to the
+	 * declared type — the same conversion SQL string literals get, so
+	 * integers, decimals, dates and booleans all follow the engine's own rules
+	 * rather than a reimplementation of them.  A value that came with its
+	 * binary form (a JavaScript number or bigint) is presented as DOUBLE or
+	 * INT64 instead where the destination is floating-point, or a whole number
+	 * of scale 0: no text is parsed on the way, and a double arrives bit for
+	 * bit (text-to-double conversion is off by an ulp for about one value in
+	 * six).  Everything else — NUMERIC and DECIMAL with their exact decimal
+	 * conversion, text, dates — keeps the text.
+	 */
+	bool fill(const std::vector<ParamValue>& values)
+	{
+		Status status;
 
 		if (expected != values.size())
 		{
@@ -907,65 +996,57 @@ public:
 			return false;
 		}
 
-		if (expected == 0)
-			return true;   // nothing to bind
-
-		const unsigned messageLength = metadata->getMessageLength(status.ptr());
-		if (status.failed())
-		{
-			setErrorFromStatus("could not size the parameter message", status.ptr());
-			return false;
-		}
-
-		buffer.assign(messageLength, 0);
-
 		for (unsigned i = 0; i < expected; i++)
 		{
-			const unsigned type       = metadata->getType(status.ptr(), i);
-			const int      scale      = metadata->getScale(status.ptr(), i);
-			const unsigned length     = metadata->getLength(status.ptr(), i);
-			const unsigned offset     = metadata->getOffset(status.ptr(), i);
-			const unsigned nullOffset = metadata->getNullOffset(status.ptr(), i);
-
-			if (status.failed())
-			{
-				setErrorFromStatus("could not read a parameter descriptor", status.ptr());
-				return false;
-			}
+			const Field& f = fields[i];
 
 			const short nullFlag = values[i].isNull ? -1 : 0;
-			memcpy(buffer.data() + nullOffset, &nullFlag, sizeof(nullFlag));
+			memcpy(buffer.data() + f.nullOffset, &nullFlag, sizeof(nullFlag));
 
 			if (values[i].isNull)
 				continue;
 
-			// Present the value as VARCHAR and let Firebird convert it to the
-			// declared type — the same conversion SQL string literals get, so
-			// integers, decimals, dates and booleans all follow the engine's
-			// own rules rather than a reimplementation of them.
-			const std::string& text = values[i].text;
+			const bool floating = f.type == SQL_DOUBLE || f.type == SQL_FLOAT || f.type == SQL_D_FLOAT;
+			const bool whole    = (f.type == SQL_SHORT || f.type == SQL_LONG || f.type == SQL_INT64) && f.scale == 0;
 
-			if (text.size() > 0xFFFF)
+			if (values[i].binaryKind == 2 && floating)
 			{
-				setError("parameter is too long to bind as text");
-				return false;
+				g_util->convert(status.ptr(),
+					SQL_DOUBLE, 0, sizeof(double), &values[i].dbl,
+					f.type, f.scale, f.length, buffer.data() + f.offset);
 			}
+			else if (values[i].binaryKind == 1 && (floating || whole))
+			{
+				g_util->convert(status.ptr(),
+					SQL_INT64, 0, sizeof(ISC_INT64), &values[i].i64,
+					f.type, f.scale, f.length, buffer.data() + f.offset);
+			}
+			else
+			{
+				const std::string& text = values[i].text;
 
-			std::vector<unsigned char> source(sizeof(unsigned short) + text.size());
-			const unsigned short textLength = static_cast<unsigned short>(text.size());
-			memcpy(source.data(), &textLength, sizeof(textLength));
-			memcpy(source.data() + sizeof(textLength), text.data(), text.size());
+				if (text.size() > 0xFFFF)
+				{
+					setError("parameter is too long to bind as text");
+					return false;
+				}
 
-			g_util->convert(status.ptr(),
-				SQL_VARYING, 0,
-				static_cast<unsigned>(source.size()), source.data(),
-				type & ~1u, scale, length, buffer.data() + offset);
+				std::vector<unsigned char> source(sizeof(unsigned short) + text.size());
+				const unsigned short textLength = static_cast<unsigned short>(text.size());
+				memcpy(source.data(), &textLength, sizeof(textLength));
+				memcpy(source.data() + sizeof(textLength), text.data(), text.size());
+
+				g_util->convert(status.ptr(),
+					SQL_VARYING, 0,
+					static_cast<unsigned>(source.size()), source.data(),
+					f.type, f.scale, f.length, buffer.data() + f.offset);
+			}
 
 			if (status.failed())
 			{
 				char context[160];
 				snprintf(context, sizeof(context),
-					"could not convert parameter %u (\"%.60s\")", i, text.c_str());
+					"could not convert parameter %u (\"%.60s\")", i, values[i].text.c_str());
 				setErrorFromStatus(context, status.ptr());
 				return false;
 			}
@@ -974,8 +1055,25 @@ public:
 		return true;
 	}
 
+	/** describe() and fill() in one: the single-statement case. */
+	bool build(IStatement* statement, const std::vector<ParamValue>& values)
+	{
+		return describe(statement) && fill(values);
+	}
+
 private:
+	struct Field
+	{
+		unsigned type = 0;
+		int      scale = 0;
+		unsigned length = 0;
+		unsigned offset = 0;
+		unsigned nullOffset = 0;
+	};
+
 	IMessageMetadata*          metadata = nullptr;
+	unsigned                   expected = 0;
+	std::vector<Field>         fields;
 	std::vector<unsigned char> buffer;
 };
 
@@ -2475,6 +2573,158 @@ int fb_execute_params(int db_handle, int tx_handle, const char* sql,
 		if (commitStatus.failed())
 		{
 			setErrorFromStatus("fb_execute_params: commit failed", commitStatus.ptr());
+			return 7;
+		}
+	}
+
+	return 0;
+}
+
+/**
+ * Execute one statement once per row of parameters: prepared once, bound and
+ * executed per row, in one transaction.  `rows` is a u32 row count followed
+ * by that many parameter buffers (each as fb_execute_params takes one), back
+ * to back.
+ *
+ * With `tx_handle` 0 the rows run in their own transaction, committed when
+ * every row went in and rolled back when any failed: a batch is all or
+ * nothing.  Inside a caller's transaction the rows before a failure stay, as
+ * statements run one by one would, and the caller decides.  The error names
+ * the row.  fb_last_affected_rows() then reports the rows affected over the
+ * whole batch.
+ *
+ * Returns 0 on success, non-zero on failure.
+ */
+FB_WASM_EXPORT
+int fb_execute_batch(int db_handle, int tx_handle, const char* sql,
+	const unsigned char* rows, int rows_length)
+{
+	clearError();
+	g_lastAffectedRows = 0;
+
+	IAttachment* attachment = lookupAttachment(db_handle);
+	if (!attachment)
+	{
+		setError("fb_execute_batch: unknown database handle");
+		return 1;
+	}
+
+	const unsigned length = static_cast<unsigned>(rows_length < 0 ? 0 : rows_length);
+	if (!rows || length < 4)
+	{
+		setError("fb_execute_batch: malformed row buffer");
+		return 2;
+	}
+
+	unsigned pos = 0;
+	const unsigned rowCount = readU32(rows);
+	pos += 4;
+
+	ITransaction* transaction = nullptr;
+	bool ownTransaction = false;
+
+	if (tx_handle)
+	{
+		transaction = lookupTransaction(tx_handle);
+		if (!transaction)
+		{
+			setError("fb_execute_batch: unknown transaction handle");
+			return 3;
+		}
+	}
+	else
+	{
+		Status status;
+		transaction = attachment->startTransaction(status.ptr(), 0, nullptr);
+		if (status.failed() || !transaction)
+		{
+			setErrorFromStatus("fb_execute_batch: could not start transaction", status.ptr());
+			return 4;
+		}
+		ownTransaction = true;
+	}
+
+	Status status;
+	IStatement* statement = attachment->prepare(status.ptr(), transaction, 0, sql,
+		SQL_DIALECT_V6, IStatement::PREPARE_PREFETCH_METADATA);
+
+	if (status.failed() || !statement)
+	{
+		setErrorFromStatus("fb_execute_batch: prepare failed", status.ptr());
+		if (ownTransaction)
+		{
+			Status rollbackStatus;
+			transaction->rollback(rollbackStatus.ptr());
+		}
+		return 5;
+	}
+
+	InputMessage input;
+	bool ok = input.describe(statement);
+	ISC_INT64 total = 0;
+	std::vector<ParamValue> values;
+
+	for (unsigned row = 0; ok && row < rowCount; row++)
+	{
+		if (!parseParamsAt(rows, length, pos, values))
+		{
+			setError("fb_execute_batch: malformed row buffer");
+			ok = false;
+			break;
+		}
+
+		if (!input.fill(values))
+		{
+			char context[64];
+			snprintf(context, sizeof(context), "fb_execute_batch: row %u: ", row);
+			setError(context + g_lastError);
+			ok = false;
+			break;
+		}
+
+		statement->execute(status.ptr(), transaction, input.meta(), input.data(),
+			nullptr, nullptr);
+
+		if (status.failed())
+		{
+			char context[64];
+			snprintf(context, sizeof(context), "fb_execute_batch: row %u", row);
+			setErrorFromStatus(context, status.ptr());
+			ok = false;
+			break;
+		}
+
+		Status affectedStatus;
+		const ISC_UINT64 affected = statement->getAffectedRecords(affectedStatus.ptr());
+		if (!affectedStatus.failed())
+			total += static_cast<ISC_INT64>(affected);
+	}
+
+	{
+		Status freeStatus;
+		statement->free(freeStatus.ptr());
+	}
+	statement->release();
+
+	if (!ok)
+	{
+		if (ownTransaction)
+		{
+			Status rollbackStatus;
+			transaction->rollback(rollbackStatus.ptr());
+		}
+		return 6;
+	}
+
+	g_lastAffectedRows = total;
+
+	if (ownTransaction)
+	{
+		Status commitStatus;
+		transaction->commit(commitStatus.ptr());
+		if (commitStatus.failed())
+		{
+			setErrorFromStatus("fb_execute_batch: commit failed", commitStatus.ptr());
 			return 7;
 		}
 	}

@@ -31,7 +31,7 @@ import type {
   TransactionOptions,
 } from '../types';
 import { isolationCode } from './isolation';
-import { encodeParams } from './params';
+import { encodeParams, encodeParamRows } from './params';
 import { firebirdTypeName } from './field-types';
 import { statementKind } from '../statement-types';
 import {
@@ -70,6 +70,17 @@ export interface EngineTransport {
     txHandle: EngineHandle,
     sql: string,
     params?: QueryParams,
+  ): Promise<number>;
+  /**
+   * Execute one statement once per row of parameters, prepared once: a
+   * batch.  With no transaction the rows are all or nothing.  Returns the
+   * rows affected over the batch.
+   */
+  executeBatch(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    sql: string,
+    rows: QueryParams[],
   ): Promise<number>;
   query<T = Row>(
     dbHandle: EngineHandle,
@@ -552,6 +563,31 @@ export class DirectTransport implements EngineTransport {
     );
     if (rc !== 0) {
       throw engineError(mod, `Firebird exec failed for: ${sql}`, rc);
+    }
+    return mod._fb_last_affected_rows();
+  }
+
+  async executeBatch(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    sql: string,
+    rows: QueryParams[],
+  ): Promise<number> {
+    if (rows.length === 0) return 0;
+    const mod = this.module;
+    const packed = encodeParamRows(rows);
+    const ptr = mod._malloc(packed.length);
+    let rc: number;
+    try {
+      mod.HEAPU8.set(packed, ptr);
+      rc = this.withString(sql, (sqlPtr) =>
+        mod._fb_execute_batch(dbHandle, txHandle, sqlPtr, ptr, packed.length),
+      );
+    } finally {
+      mod._free(ptr);
+    }
+    if (rc !== 0) {
+      throw engineError(mod, `Firebird batch failed for: ${sql}`, rc);
     }
     return mod._fb_last_affected_rows();
   }

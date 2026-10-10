@@ -74,6 +74,10 @@
     failReadFile: null,
     /** What `_fb_last_affected_rows()` reports. */
     affectedRows: 0,
+    /** Return code of `_fb_execute_batch` (non-zero = failure). */
+    batchRc: 0,
+    /** The binary forms the last parameter buffer carried: [{ index, kind, value }]. */
+    lastBinaryParams: [],
 
     // Inspection helpers (defined once the module is built).
     /** Names of the logged calls, in order. */
@@ -194,25 +198,63 @@
 
     /** Decode the packed parameter buffer: u32 count, then per parameter a
      *  null flag and, unless null, a u32 length and UTF-8 bytes. */
+    /**
+     * Decode one parameter set from `pos`, as the C side does: the text of
+     * each parameter (null for SQL NULL) into `out`, and its binary form, when
+     * it has one, into `binary` as { kind, value } (value a BigInt for INT64,
+     * a number for DOUBLE).  Returns the position after the set.
+     */
+    function decodeParamsAt(view, ptr, pos, out, binary) {
+      const count = view.getUint32(pos, true);
+      pos += 4;
+      for (let i = 0; i < count; i++) {
+        const flags = view.getUint8(pos);
+        pos += 1;
+        if (flags & 1) {
+          out.push(null);
+        } else {
+          const len = view.getUint32(pos, true);
+          pos += 4;
+          out.push(decoder.decode(heap.subarray(ptr + pos, ptr + pos + len)));
+          pos += len;
+        }
+        if (flags & 2) {
+          const kind = view.getUint8(pos);
+          pos += 1;
+          binary.push({
+            index: i,
+            kind,
+            value: kind === 1 ? view.getBigInt64(pos, true) : view.getFloat64(pos, true),
+          });
+          pos += 8;
+        }
+      }
+      return pos;
+    }
+
     function decodeParams(ptr, length) {
       if (!ptr || length < 4) return [];
       const view = new DataView(heap.buffer, ptr, length);
-      const count = view.getUint32(0, true);
       const out = [];
-      let pos = 4;
-      for (let i = 0; i < count; i++) {
-        const isNull = view.getUint8(pos) !== 0;
-        pos += 1;
-        if (isNull) {
-          out.push(null);
-          continue;
-        }
-        const len = view.getUint32(pos, true);
-        pos += 4;
-        out.push(decoder.decode(heap.subarray(ptr + pos, ptr + pos + len)));
-        pos += len;
-      }
+      const binary = [];
+      decodeParamsAt(view, ptr, 0, out, binary);
+      stub.lastBinaryParams = binary;
       return out;
+    }
+
+    /** The rows of a batch buffer, each a parameter set as decodeParams gives one. */
+    function decodeParamRows(ptr, length) {
+      if (!ptr || length < 4) return [];
+      const view = new DataView(heap.buffer, ptr, length);
+      const rowCount = view.getUint32(0, true);
+      const rows = [];
+      let pos = 4;
+      for (let r = 0; r < rowCount; r++) {
+        const out = [];
+        pos = decodeParamsAt(view, ptr, pos, out, []);
+        rows.push(out);
+      }
+      return rows;
     }
 
     /** Copy a JS string onto the heap and return the pointer (engine-owned). */
@@ -420,6 +462,18 @@
         const path = attachments.get(handle);
         const img = path ? files.get(path) : undefined;
         if (img) img[1] = (img[1] + 1) & 0xff;
+        return 0;
+      },
+
+      _fb_execute_batch(handle, txHandle, sqlPtr, rowsPtr, rowsLength) {
+        const sql = UTF8ToString(sqlPtr);
+        const rows = decodeParamRows(rowsPtr, rowsLength);
+        stub.calls.push({ fn: '_fb_execute_batch', args: [handle, txHandle, sql, rows] });
+        if (stub.batchRc !== 0) return stub.batchRc;
+        const path = attachments.get(handle);
+        const img = path ? files.get(path) : undefined;
+        if (img) img[1] = (img[1] + rows.length) & 0xff;
+        stub.affectedRows = rows.length;
         return 0;
       },
 

@@ -153,6 +153,15 @@ export class WorkerTransport implements EngineTransport {
     return this.call<number>('execute', dbHandle, txHandle, sql, params);
   }
 
+  executeBatch(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    sql: string,
+    rows: QueryParams[],
+  ): Promise<number> {
+    return this.call<number>('executeBatch', dbHandle, txHandle, sql, rows);
+  }
+
   query<T = Row>(
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
