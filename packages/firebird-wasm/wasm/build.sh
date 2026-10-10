@@ -47,6 +47,18 @@ fi
 
 echo "Using Emscripten: $(emcc --version | head -1)"
 
+# ── Verify the host's ICU headers ────────────────────────────────────────────
+# The native bootstrap (gpre_boot, below) compiles Firebird's unicode_util.cpp with the host
+# compiler, which needs ICU's headers.  Without them the build used to die deep inside that compile
+# with "unicode/ucnv.h: No such file"; say what is missing before spending minutes on the rest.
+if [[ ! -f /usr/include/unicode/ucnv.h ]]; then
+  echo "Error: the host's ICU headers are missing (/usr/include/unicode/ucnv.h)." >&2
+  echo "       The native bootstrap compiles Firebird's unicode support with the host compiler." >&2
+  echo "       Install them: apt-get install libicu-dev (Debian/Ubuntu), dnf install libicu-devel," >&2
+  echo "       brew install icu4c (and point ICU_INCLUDE_DIR at its include directory)." >&2
+  exit 1
+fi
+
 # ── Verify the Emscripten version ────────────────────────────────────────────
 # The toolchain version is not a detail here.  CI once built against a
 # different Emscripten from the vendored one and produced an artifact that
@@ -208,6 +220,13 @@ fi
 if [[ ! -f "${NATIVE_BUILD_DIR}/CMakeCache.txt" ]]; then
   echo "Configuring native Firebird build (host compiler)…"
   mkdir -p "${NATIVE_BUILD_DIR}"
+  # engine_common lists dsql/parse.cpp, which the "parse" target generates into the build
+  # directory later.  CMake 3.28's Generate step checks the file exists and stops ("Cannot find
+  # source file … parse.cpp", "No SOURCES given to target: engine_common"), leaving no Makefile at
+  # all; newer CMake versions accept it.  An empty placeholder satisfies the check, and the parse
+  # target overwrites it (Step 2 refuses to copy it while it is still empty).
+  mkdir -p "${NATIVE_BUILD_DIR}/src/dsql"
+  [[ -f "${NATIVE_BUILD_DIR}/src/dsql/parse.cpp" ]] || : > "${NATIVE_BUILD_DIR}/src/dsql/parse.cpp"
   # Firebird's top-level CMakeLists.txt still declares
   # cmake_minimum_required(VERSION 2.8.12).  CMake 4 removed compatibility
   # with < 3.5 and refuses to configure at all.  CMAKE_POLICY_VERSION_MINIMUM
@@ -237,17 +256,20 @@ if [[ ! -f "${NATIVE_BUILD_DIR}/CMakeCache.txt" ]]; then
 fi
 
 # ── Step 1: autoconfig.h ─────────────────────────────────────────────────────
-if [[ ! -f "${AUTOCONFIG_SRC}" ]]; then
-  echo "Copying autoconfig.h from native build…"
-  if [[ -f "${AUTOCONFIG_NATIVE}" ]]; then
-    mkdir -p "${FIREBIRD_SRC}/src/include/gen"
-    cp "${AUTOCONFIG_NATIVE}" "${AUTOCONFIG_SRC}"
-    echo "autoconfig.h generated and copied to source tree."
-  else
-    echo "Error: native CMake configure did not produce autoconfig.h." >&2
-    echo "       Ensure cmake and a host C++ compiler (gcc/clang) are installed." >&2
-    exit 1
-  fi
+# Copied from the native build on every run, not only when absent.  The copy in the source tree
+# is edited for 32-bit WASM after Step 3 (SIZEOF_LONG 4 and the rest), and it is git-ignored, so
+# it survives a cleaned submodule: a rebuild that had to make gpre_boot again (build-native-config
+# deleted, say) then compiled that native tool against the 32-bit edits and failed with
+# "conflicting declaration 'typedef int ISC_LONG'".  The edits below are idempotent and run on
+# every build, so refreshing the native copy here costs nothing.
+if [[ -f "${AUTOCONFIG_NATIVE}" ]]; then
+  mkdir -p "${FIREBIRD_SRC}/src/include/gen"
+  cp "${AUTOCONFIG_NATIVE}" "${AUTOCONFIG_SRC}"
+  echo "autoconfig.h copied from the native build (the WASM edits follow after Step 3)."
+else
+  echo "Error: native CMake configure did not produce autoconfig.h." >&2
+  echo "       Ensure cmake and a host C++ compiler (gcc/clang) are installed." >&2
+  exit 1
 fi
 
 # ── Step 2: parse.h + parse.cpp (btyacc parser generation) ──────────────────
@@ -276,7 +298,7 @@ if [[ ! -f "${PARSE_H_SRC}" ]]; then
     exit 1
   fi
 
-  if [[ -f "${PARSE_CPP_NATIVE}" ]]; then
+  if [[ -s "${PARSE_CPP_NATIVE}" ]]; then   # -s: not the empty placeholder the configure step left
     cp "${PARSE_CPP_NATIVE}" "${PARSE_CPP_SRC}"
     echo "parse.cpp generated and copied to source tree."
   else
