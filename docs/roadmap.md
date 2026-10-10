@@ -852,11 +852,15 @@ be built:
       (`firebird-quake2`) had been sending every double as mantissa and
       exponent, `CAST(? AS DOUBLE PRECISION) * POWER(2e0, ?)`, to get it
       back exactly.
-- [x] `execBatch(sql, rows)`: one statement, prepared once, run per row in one
-      transaction, the rows crossing to the engine in a single call. 5,000
-      rows of five columns: 65 ms as a batch, 130 ms as one `exec()` per row
-      inside one transaction, 300 ms with a transaction each. On both
-      backends; the Node one prepares once and loops.
+- [x] `execBatch(sql, rows)`: one statement, prepared once, every row's
+      message in one buffer and one `IBatch` request to the engine, in one
+      transaction. 5,000 rows of five columns: 45 ms as a batch, 130 ms as one
+      `exec()` per row inside one transaction, 300 ms with a transaction each.
+      The first version executed the prepared statement once per row, which a
+      consumer measured 13 % slower than a PSQL loop over the same `INSERT`
+      (a statement execute per row against a node of one compiled request);
+      the `IBatch` version is 5 % faster than that loop. On both backends;
+      the Node one prepares once and loops.
 - [x] Thread `txHandle` through `fb_execute`/`fb_query`.
 - [x] Add an explicit `tx.rollback()`. Browser in `4380ce7`, Node in `b6accb4`.
 - [ ] Replace the JSON ABI with a typed encoding. **Half done, and the other
