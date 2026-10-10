@@ -31,6 +31,14 @@ API may still move between minor releases.
 
 ### Fixed
 
+- **Closing one database no longer rolls back another's transactions.**
+  `fb_detach_database` rolled back every open transaction in the engine,
+  not only the closing database's: the transaction table did not record
+  which database a transaction was started on. With two databases open in
+  one engine (two `FirebirdBrowser`s sharing a worker or a transport, or two
+  handles on the module), closing one lost the other's work still open in a
+  `transaction()`, and its commit then failed with "unknown transaction
+  handle". Needs a rebuilt artifact.
 - **`query('EXECUTE PROCEDURE …')` returns the procedure's outputs.** A
   procedure with output parameters has columns but no cursor. The browser
   engine opened a cursor for any statement with columns, so the call failed

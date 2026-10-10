@@ -487,6 +487,22 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
       expect(mod._fb_detach_database(db)).toBe(0);
     });
 
+    it('closing one database leaves another database\'s transactions open', () => {
+      const a = freshDatabase('detach-a');
+      const b = freshDatabase('detach-b');
+      expect(execParams(b, 0, 'CREATE TABLE t (id INTEGER)', [])).toBe(0);
+      const txA = mod._fb_start_transaction(a);
+      const txB = mod._fb_start_transaction(b);
+      expect(execParams(b, txB, 'INSERT INTO t VALUES (?)', [1])).toBe(0);
+
+      // A's own transaction goes with it; B's must not.
+      expect(mod._fb_detach_database(a)).toBe(0);
+      expect(mod._fb_rollback(txA)).not.toBe(0);   // already gone
+      expect(`${mod._fb_commit(txB)} ${errorText()}`).toBe('0 ');
+      expect(queryRows(b, 'SELECT COUNT(*) FROM t')).toEqual([[1]]);
+      expect(mod._fb_detach_database(b)).toBe(0);
+    });
+
     // ── The statement cache ─────────────────────────────────────────────
     //
     // Statements are kept prepared per database, keyed by their SQL text.  These
