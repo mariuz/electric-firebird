@@ -4,6 +4,25 @@ All notable changes to `firebird-wasm`. This project follows
 [semantic versioning](https://semver.org/); while the major version is 0 the
 API may still move between minor releases.
 
+## Unreleased
+
+### Changed
+
+- **Prepared statements are kept, per database, by their SQL text.** Each
+  database keeps its last 64 prepared statements, most recently used first,
+  and `query()`, `exec()` and their transaction forms take them from there
+  instead of preparing on every call. Only `SELECT`, `INSERT`, `UPDATE`,
+  `DELETE` and `EXECUTE PROCEDURE` / `EXECUTE BLOCK` are kept; DDL is never
+  kept and empties the database's cache before it runs, a statement whose
+  execution fails is dropped, and closing frees them all. Measured on a
+  one-row primary-key `SELECT` from Node (two runs each, alternating with
+  0.4.2): inside a transaction 45–47 µs a call before, 25–36 µs now; in
+  autocommit, where starting and committing a transaction per call is now the
+  larger cost, 60–63 µs before and 46–47 µs now. `_fb_statement_cache(size)`
+  on the module sets the size (0 turns it off) and empties the caches, which
+  is also how to drop statements made stale by DDL run inside an
+  `EXECUTE STATEMENT`, which the cache cannot see. Needs a rebuilt artifact.
+
 ## 0.4.2 — 2026-10-10
 
 A maintenance release: the published TypeScript and the engine artifact behave
