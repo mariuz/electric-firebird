@@ -114,8 +114,15 @@ struct DbEntry
 /** How many prepared statements each database keeps; 0 turns the cache off (fb_statement_cache). */
 unsigned g_statementCacheSize = 64;
 
-std::map<int, DbEntry>       g_databases;
-std::map<int, ITransaction*> g_transactions;
+/** A started transaction and the database it was started on. */
+struct TxEntry
+{
+	ITransaction* transaction = nullptr;
+	int db_handle = 0;
+};
+
+std::map<int, DbEntry> g_databases;
+std::map<int, TxEntry> g_transactions;
 
 int g_nextDbHandle = 1;
 int g_nextTxHandle = 1;
@@ -328,7 +335,7 @@ IAttachment* lookupAttachment(int handle)
 ITransaction* lookupTransaction(int handle)
 {
 	const auto it = g_transactions.find(handle);
-	return it == g_transactions.end() ? nullptr : it->second;
+	return it == g_transactions.end() ? nullptr : it->second.transaction;
 }
 
 // ---------------------------------------------------------------------------
@@ -2053,11 +2060,18 @@ int fb_detach_database(int db_handle)
 	}
 
 	// Transactions outlive the JS objects that started them; leaving one open
-	// would keep the attachment alive and the database file locked.
+	// would keep the attachment alive and the database file locked.  Only this
+	// database's: every transaction used to go, so closing one database rolled
+	// back work still open on another in the same engine.
 	for (auto tx = g_transactions.begin(); tx != g_transactions.end(); )
 	{
+		if (tx->second.db_handle != db_handle)
+		{
+			++tx;
+			continue;
+		}
 		Status rollbackStatus;
-		tx->second->rollback(rollbackStatus.ptr());
+		tx->second.transaction->rollback(rollbackStatus.ptr());
 		tx = g_transactions.erase(tx);
 	}
 
@@ -2768,7 +2782,7 @@ int fb_start_transaction_ex(int db_handle, int isolation, int read_only)
 	}
 
 	const int handle = g_nextTxHandle++;
-	g_transactions[handle] = transaction;
+	g_transactions[handle] = TxEntry{transaction, db_handle};
 	return handle;
 }
 
@@ -2786,7 +2800,7 @@ int fb_commit(int tx_handle)
 	}
 
 	Status status;
-	ITransaction* transaction = it->second;
+	ITransaction* transaction = it->second.transaction;
 	transaction->commit(status.ptr());
 
 	if (status.failed())
@@ -2820,7 +2834,7 @@ int fb_rollback(int tx_handle)
 	}
 
 	Status status;
-	it->second->rollback(status.ptr());
+	it->second.transaction->rollback(status.ptr());
 	g_transactions.erase(it);
 
 	if (status.failed())
