@@ -560,6 +560,90 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
       expect(mod._fb_detach_database(db)).toBe(0);
     });
 
+    // ── The shared read transaction ─────────────────────────────────────
+    //
+    // With it on, an autocommit SELECT runs in a read-only transaction the
+    // database keeps open.  It must read what a transaction of its own would.
+
+    it('exports the read transaction switch, off by default', () => {
+      expect(typeof mod._fb_read_transaction).toBe('function');
+      expect(mod._fb_read_transaction(1)).toBe(0);
+      expect(mod._fb_read_transaction(0)).toBe(1);
+    });
+
+    it('reads every commit, and nothing uncommitted, between shared reads', () => {
+      const db = freshDatabase('read-commits');
+      expect(exec(db, 0, 'CREATE TABLE c (id INTEGER)')).toBe(0);
+      mod._fb_read_transaction(1);
+      try {
+        expect(queryRows(db, 'SELECT COUNT(*) FROM c')).toEqual([[0]]);
+        expect(execParams(db, 0, 'INSERT INTO c VALUES (?)', [1])).toBe(0);
+        expect(queryRows(db, 'SELECT COUNT(*) FROM c')).toEqual([[1]]);
+        const tx = mod._fb_start_transaction(db);
+        expect(execParams(db, tx, 'INSERT INTO c VALUES (?)', [2])).toBe(0);
+        expect(queryRows(db, 'SELECT COUNT(*) FROM c')).toEqual([[1]]);
+        expect(mod._fb_commit(tx)).toBe(0);
+        expect(queryRows(db, 'SELECT COUNT(*) FROM c')).toEqual([[2]]);
+        // A failed read leaves the next one working.
+        const sqlPtr = allocString(mod, 'SELECT 1 / 0 FROM c');
+        try {
+          expect(mod._fb_query(db, 0, sqlPtr, 0)).toBe(0);
+        } finally {
+          mod._free(sqlPtr);
+        }
+        expect(queryRows(db, 'SELECT COUNT(*) FROM c')).toEqual([[2]]);
+        expect(mod._fb_detach_database(db)).toBe(0);
+      } finally {
+        mod._fb_read_transaction(0);
+      }
+    });
+
+    it('runs a SELECT that writes in a transaction of its own, and remembers it', () => {
+      const db = freshDatabase('read-writer');
+      expect(exec(db, 0, 'CREATE TABLE w (id INTEGER)')).toBe(0);
+      // Counts its runs in a context variable, which no rollback undoes, then writes.
+      expect(exec(db, 0, `CREATE PROCEDURE add_row RETURNS (n INTEGER) AS BEGIN
+        RDB$SET_CONTEXT('USER_SESSION', 'RUNS',
+          COALESCE(CAST(RDB$GET_CONTEXT('USER_SESSION', 'RUNS') AS INTEGER), 0) + 1);
+        INSERT INTO w VALUES (1);
+        SELECT COUNT(*) FROM w INTO n;
+        SUSPEND;
+      END`)).toBe(0);
+      const runs = () => queryRows(db,
+        "SELECT CAST(RDB$GET_CONTEXT('USER_SESSION', 'RUNS') AS INTEGER) FROM RDB$DATABASE")[0][0];
+      mod._fb_read_transaction(1);
+      try {
+        expect(queryRows(db, 'SELECT n FROM add_row')).toEqual([[1]]);
+        expect(runs()).toBe(2);   // the read-only try, then its own transaction
+        expect(queryRows(db, 'SELECT n FROM add_row')).toEqual([[2]]);
+        expect(runs()).toBe(3);   // straight to its own transaction
+        // EXECUTE PROCEDURE never tries the shared transaction.
+        expect(exec(db, 0, 'CREATE PROCEDURE add_one AS BEGIN INSERT INTO w VALUES (2); END')).toBe(0);
+        expect(queryRows(db, 'EXECUTE PROCEDURE add_one')).toEqual([]);
+        expect(queryRows(db, 'SELECT COUNT(*) FROM w')).toEqual([[3]]);
+        expect(mod._fb_detach_database(db)).toBe(0);
+      } finally {
+        mod._fb_read_transaction(0);
+      }
+    });
+
+    it('lets DDL change what shared reads read', () => {
+      const db = freshDatabase('read-ddl');
+      expect(exec(db, 0, 'CREATE TABLE d (id INTEGER)')).toBe(0);
+      expect(exec(db, 0, 'INSERT INTO d VALUES (1)')).toBe(0);
+      mod._fb_read_transaction(1);
+      try {
+        expect(queryRows(db, 'SELECT id FROM d')).toEqual([[1]]);
+        expect(`${exec(db, 0, 'DROP TABLE d')} ${errorText()}`).toBe('0 ');
+        expect(exec(db, 0, 'CREATE TABLE d (id INTEGER, w INTEGER)')).toBe(0);
+        expect(exec(db, 0, 'INSERT INTO d VALUES (7, 8)')).toBe(0);
+        expect(queryRows(db, 'SELECT id, w FROM d')).toEqual([[7, 8]]);
+        expect(mod._fb_detach_database(db)).toBe(0);
+      } finally {
+        mod._fb_read_transaction(0);
+      }
+    });
+
     it('reports a readable message for invalid SQL', () => {
       mod._fb_init();
 

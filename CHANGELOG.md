@@ -4,6 +4,23 @@ All notable changes to `firebird-wasm`. This project follows
 [semantic versioning](https://semver.org/); while the major version is 0 the
 API may still move between minor releases.
 
+## Unreleased
+
+### Added
+
+- **`_fb_read_transaction(on)`: autocommit reads in a shared read-only
+  transaction.** Off by default. When on, an autocommit `SELECT` runs in a
+  READ COMMITTED READ CONSISTENCY read-only transaction each database keeps
+  open, instead of starting and committing one around the call; each
+  statement still reads everything committed before it starts. Measured from
+  Node on the `firebird-quake2` demo1 database, off and on alternating, three
+  rounds each: a primary-key `SELECT` 44–45 µs a call off, 20–22 µs on; a
+  trivial `SELECT` 37–41 µs off, 15–16 µs on. A `SELECT` that writes is run
+  again in its own transaction and remembered (its non-transactional effects,
+  such as `RDB$SET_CONTEXT`, happen twice on that first call), and rows left
+  in an `ON COMMIT DELETE ROWS` table outlive the call: see `docs/api.md`.
+  Needs a rebuilt artifact.
+
 ## 0.5.0 — 2026-10-10
 
 ### Changed
