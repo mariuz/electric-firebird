@@ -17,6 +17,16 @@ export interface FirebirdLiteOptions {
   username?: string;
   /** Firebird user password. */
   password?: string;
+  /**
+   * Run `query()` calls that are a `SELECT` in one read-only READ COMMITTED
+   * transaction kept open, instead of starting and committing a transaction
+   * around each. The browser backend's option of the same name; see
+   * `FirebirdBrowserOptions.sharedReads` for the two things that differ.
+   * A call that passes `isolationLevel` or `readOnly` keeps its own.
+   *
+   * @default false
+   */
+  sharedReads?: boolean;
 }
 
 /**

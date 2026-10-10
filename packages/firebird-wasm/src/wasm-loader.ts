@@ -132,11 +132,12 @@ export interface FirebirdWasmModule {
    */
   _fb_statement_cache(size: number): number;
   /**
-   * 1 runs an autocommit SELECT in a read-only transaction each database
-   * keeps open, 0 (the default) in one of its own; returns the previous
-   * setting.  A SELECT that writes is run again in its own transaction.
+   * 1 runs this database's autocommit SELECTs in a read-only transaction it
+   * keeps open, 0 (the default) each in one of its own; returns the previous
+   * setting, or -1 for an unknown handle.  A SELECT that writes is run again
+   * in its own transaction.
    */
-  _fb_read_transaction(on: number): number;
+  _fb_read_transaction(dbHandle: number, on: number): number;
   /**
    * Pointer to the binary BLOB side buffer for the most recent query, or 0.
    *

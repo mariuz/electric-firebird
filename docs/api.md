@@ -48,6 +48,7 @@ call to `exec()`, `query()`, or `transaction()`.
 | `options.password` | `string` | — | Firebird user password. |
 | `options.libraryPath` | `string` | system default | Override the path to `libfbclient.so` / `fbclient.dll`. |
 | `options.charset` | `string` | — | Character set for `NONE`-charset columns (passed as `charSetForNONE`). |
+| `options.sharedReads` | `boolean` | `false` | Run `query()` calls that are a `SELECT` in one read-only transaction kept open across consecutive reads. See [shared reads](#reads-can-share-a-transaction-opt-in). |
 
 If the database file does not exist it is created automatically.
 
@@ -400,20 +401,38 @@ placeholders (or the `sql` tag) so it is kept once rather than once per value.
 `mod._fb_statement_cache(size)` on the module sets the size (0 turns it off)
 and empties the caches, as DDL run inside `EXECUTE STATEMENT` is not seen.
 
-**Reads can share a transaction (opt-in).** `mod._fb_read_transaction(1)` runs
-each autocommit `SELECT` (a `query()` outside `transaction()`) in a READ
-COMMITTED READ CONSISTENCY read-only transaction the database keeps open,
-instead of starting and committing one per call; it returns the previous
-setting, and `0` (the default) ends the shared transactions. Every statement
-still reads everything committed before it starts. It halves a cheap query: a
-primary-key `SELECT` from 44–45 to 20–22 µs. Two things differ. A `SELECT`
-that writes (a selectable procedure that updates a table) fails there and is
-run again in its own transaction, and its text is remembered so later calls go
-there directly; whatever it did outside transaction control before the failed
-write (a sequence, `RDB$SET_CONTEXT`) happens twice on that first call. And
-rows a `SELECT` leaves in an `ON COMMIT DELETE ROWS` temporary table stay until
-the shared transaction ends (at DDL, on closing, or when turned off). Other
-statements, and everything inside `transaction()`, are unchanged.
+#### Reads can share a transaction (opt-in)
+
+`new FirebirdBrowser(name, { sharedReads: true })` (and `new FirebirdLite(path,
+{ sharedReads: true })` on Node) runs each `query()` outside `transaction()`
+that is a `SELECT` in a READ COMMITTED read-only transaction kept open, instead
+of starting and committing one per call. Every statement still reads everything
+committed before it starts. It halves a cheap query: in the browser engine a
+primary-key `SELECT` went from 44–45 to 20–22 µs, on Node against a local
+Firebird 3 server from 1.4–1.8 to 0.9–1.0 ms.
+
+Two things differ, which is why it is off by default:
+
+- A `SELECT` that writes (a selectable procedure that updates a table) fails
+  there and is run again in its own transaction; its text is remembered, so
+  later calls go there directly. Whatever it did outside transaction control
+  before the failed write (a sequence, `RDB$SET_CONTEXT`) happens twice on that
+  first call.
+- Rows a `SELECT` leaves in an `ON COMMIT DELETE ROWS` temporary table stay
+  until the shared transaction ends, not until the call does.
+
+When it ends: the browser engine ends it at DDL, on closing, and when turned
+off. The Node backend cannot see DDL coming (`exec()` does not prepare), and an
+open transaction that has read a table makes `DROP TABLE` fail there with
+"object in use", so it ends the shared transaction before anything other than a
+shared read runs: a run of reads keeps it, a write between two reads costs what
+it always did. A `query()` that passes `isolationLevel` or `readOnly` keeps a
+transaction of its own on both.
+
+On the module, the switch is `mod._fb_read_transaction(dbHandle, 1)`, per
+database; it returns the previous setting, or -1 for an unknown handle. A
+custom `EngineTransport` supports `sharedReads` by implementing the optional
+`setSharedReads(dbHandle, on)`.
 
 #### `new FirebirdBrowser(dbName, options?)`
 
@@ -425,6 +444,7 @@ statements, and everything inside `transaction()`, are unchanged.
 | `options.vfs.pageSize` | `number` | `8192` | Firebird page size in bytes. Must match the database. |
 | `options.vfs.prefix` | `string` | `'firebird_'` | IndexedDB database name prefix. |
 | `options.types` | [`TypeOptions`](#typeoptions) | `{}` | How values convert on the way in and out. All off by default. |
+| `options.sharedReads` | `boolean` | `false` | Run `query()` calls outside `transaction()` that are a `SELECT` in one read-only transaction kept open. See [shared reads](#reads-can-share-a-transaction-opt-in). |
 
 #### `db.listen(names, onEvent, options?)` / `db.notify(name)`
 
@@ -704,6 +724,7 @@ interface FirebirdLiteOptions {
   charset?: string;
   username?: string;
   password?: string;
+  sharedReads?: boolean;
 }
 ```
 

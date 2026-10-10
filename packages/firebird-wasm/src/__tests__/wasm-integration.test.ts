@@ -19,6 +19,9 @@ import { loadFirebirdWasm, allocString, lastError } from '../wasm-loader';
 import type { FirebirdWasmModule } from '../wasm-loader';
 import { encodeParams, encodeParamRows } from '../browser/params';
 import type { QueryParams } from '../types';
+import { FirebirdBrowser } from '../browser/firebird-browser';
+import { DirectTransport } from '../browser/engine-transport';
+import type { EngineTransport } from '../browser/engine-transport';
 
 // The WASM artifact lives at dist/wasm/ after `npm run build:wasm` +
 // `npm run build`.  Skip the whole suite if the binary is absent.
@@ -565,16 +568,24 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
     // With it on, an autocommit SELECT runs in a read-only transaction the
     // database keeps open.  It must read what a transaction of its own would.
 
-    it('exports the read transaction switch, off by default', () => {
+    it('exports the read transaction switch, per database and off by default', () => {
       expect(typeof mod._fb_read_transaction).toBe('function');
-      expect(mod._fb_read_transaction(1)).toBe(0);
-      expect(mod._fb_read_transaction(0)).toBe(1);
+      const a = freshDatabase('read-switch-a');
+      const b = freshDatabase('read-switch-b');
+      expect(mod._fb_read_transaction(a, 1)).toBe(0);
+      expect(mod._fb_read_transaction(b, 1)).toBe(0);   // the other database's is its own
+      expect(mod._fb_read_transaction(a, 0)).toBe(1);
+      expect(mod._fb_read_transaction(b, 0)).toBe(1);
+      expect(mod._fb_read_transaction(999999, 1)).toBe(-1);
+      expect(errorText()).toContain('unknown database handle');
+      expect(mod._fb_detach_database(a)).toBe(0);
+      expect(mod._fb_detach_database(b)).toBe(0);
     });
 
     it('reads every commit, and nothing uncommitted, between shared reads', () => {
       const db = freshDatabase('read-commits');
       expect(exec(db, 0, 'CREATE TABLE c (id INTEGER)')).toBe(0);
-      mod._fb_read_transaction(1);
+      mod._fb_read_transaction(db, 1);
       try {
         expect(queryRows(db, 'SELECT COUNT(*) FROM c')).toEqual([[0]]);
         expect(execParams(db, 0, 'INSERT INTO c VALUES (?)', [1])).toBe(0);
@@ -594,7 +605,7 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
         expect(queryRows(db, 'SELECT COUNT(*) FROM c')).toEqual([[2]]);
         expect(mod._fb_detach_database(db)).toBe(0);
       } finally {
-        mod._fb_read_transaction(0);
+        mod._fb_read_transaction(db, 0);
       }
     });
 
@@ -611,7 +622,7 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
       END`)).toBe(0);
       const runs = () => queryRows(db,
         "SELECT CAST(RDB$GET_CONTEXT('USER_SESSION', 'RUNS') AS INTEGER) FROM RDB$DATABASE")[0][0];
-      mod._fb_read_transaction(1);
+      mod._fb_read_transaction(db, 1);
       try {
         expect(queryRows(db, 'SELECT n FROM add_row')).toEqual([[1]]);
         expect(runs()).toBe(2);   // the read-only try, then its own transaction
@@ -623,7 +634,7 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
         expect(queryRows(db, 'SELECT COUNT(*) FROM w')).toEqual([[3]]);
         expect(mod._fb_detach_database(db)).toBe(0);
       } finally {
-        mod._fb_read_transaction(0);
+        mod._fb_read_transaction(db, 0);
       }
     });
 
@@ -631,7 +642,7 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
       const db = freshDatabase('read-ddl');
       expect(exec(db, 0, 'CREATE TABLE d (id INTEGER)')).toBe(0);
       expect(exec(db, 0, 'INSERT INTO d VALUES (1)')).toBe(0);
-      mod._fb_read_transaction(1);
+      mod._fb_read_transaction(db, 1);
       try {
         expect(queryRows(db, 'SELECT id FROM d')).toEqual([[1]]);
         expect(`${exec(db, 0, 'DROP TABLE d')} ${errorText()}`).toBe('0 ');
@@ -640,8 +651,34 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
         expect(queryRows(db, 'SELECT id, w FROM d')).toEqual([[7, 8]]);
         expect(mod._fb_detach_database(db)).toBe(0);
       } finally {
-        mod._fb_read_transaction(0);
+        mod._fb_read_transaction(db, 0);
       }
+    });
+
+    it('takes sharedReads as a FirebirdBrowser option', async () => {
+      const db = new FirebirdBrowser('memory://shared-reads-option', {
+        transport: new DirectTransport(),
+        sharedReads: true,
+      });
+      try {
+        await db.exec('CREATE TABLE o (id INTEGER)');
+        expect((await db.query('SELECT COUNT(*) AS N FROM o')).rows).toEqual([{ N: 0 }]);
+        await db.exec('INSERT INTO o VALUES (?)', [1]);
+        expect((await db.query('SELECT COUNT(*) AS N FROM o')).rows).toEqual([{ N: 1 }]);
+        // query(), not exec(): exec() splits a script on semicolons.
+        await db.query('CREATE PROCEDURE ins RETURNS (n INTEGER) AS BEGIN ' +
+          'INSERT INTO o VALUES (2); SELECT COUNT(*) FROM o INTO n; SUSPEND; END');
+        expect((await db.query('SELECT n FROM ins')).rows).toEqual([{ N: 2 }]);
+        expect((await db.query('SELECT COUNT(*) AS N FROM o')).rows).toEqual([{ N: 2 }]);
+      } finally {
+        await db.close();
+      }
+    });
+
+    it('refuses sharedReads on a transport that cannot do it', () => {
+      const bare = {} as EngineTransport;
+      expect(() => new FirebirdBrowser('memory://shared-reads-bare', { transport: bare, sharedReads: true }))
+        .toThrow('setSharedReads');
     });
 
     it('returns the outputs of EXECUTE PROCEDURE as one row', () => {
@@ -663,11 +700,11 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
       } finally {
         mod._free(sqlPtr);
       }
-      mod._fb_read_transaction(1);
+      mod._fb_read_transaction(db, 1);
       try {
         expect(queryRows(db, 'EXECUTE PROCEDURE add_two(6, 7)')).toEqual([[13, 'sum']]);
       } finally {
-        mod._fb_read_transaction(0);
+        mod._fb_read_transaction(db, 0);
       }
       expect(mod._fb_detach_database(db)).toBe(0);
     });

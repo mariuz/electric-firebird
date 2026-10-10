@@ -25,6 +25,9 @@ import { toStatement, resolveQueryCall } from './sql-tag';
 import type { SqlFragment } from './sql-tag';
 
 type NativeDriver = typeof import('node-firebird-driver-native');
+
+/** `isc_info_sql_stmt_select`: the statement type the shared read transaction runs. */
+const STMT_SELECT = 1;
 let nativeDriver: NativeDriver | undefined;
 
 /**
@@ -77,6 +80,11 @@ export class FirebirdLite {
   private client: Client | null = null;
   private attachment: Attachment | null = null;
   private closed = false;
+  private readonly sharedReads: boolean;
+  /** The read-only transaction `query()` shares when `sharedReads` is on. */
+  private readTransaction: Transaction | null = null;
+  /** SQL texts that are not a SELECT, or that wrote: they get a transaction of their own. */
+  private readonly ownTransaction = new Set<string>();
 
   constructor(dbPath: string, options: FirebirdLiteOptions = {}) {
     this.dbPath = dbPath;
@@ -86,6 +94,7 @@ export class FirebirdLite {
       password: options.password,
       charSetForNONE: options.charset,
     };
+    this.sharedReads = options.sharedReads ?? false;
   }
 
   /**
@@ -183,6 +192,17 @@ export class FirebirdLite {
     const rowMode: RowMode = (options as QueryOptions).rowMode ?? 'object';
     const attachment = this.attachment!;
 
+    if (
+      this.sharedReads &&
+      options.isolationLevel === undefined &&
+      options.readOnly === undefined &&
+      !this.ownTransaction.has(statement.sql)
+    ) {
+      const shared = await this.sharedRead<T>(statement.sql, statement.params, rowMode);
+      if (shared) return shared;
+    }
+    await this.endReadTransaction();
+
     const txOptions = buildTransactionOptions(options);
     const transaction = await attachment.startTransaction(txOptions);
 
@@ -216,6 +236,78 @@ export class FirebirdLite {
       await transaction.rollback().catch(() => undefined);
       throw err;
     }
+  }
+
+  /**
+   * Run a SELECT in the shared read-only transaction, starting it if need be.
+   *
+   * `undefined` means "run it in a transaction of its own": the statement is
+   * not a SELECT, or it tried to write ("attempted update during read-only
+   * transaction"). Either way its text is remembered, so the next call goes
+   * there directly. Any other failure ends the shared transaction, so the
+   * next read starts afresh, and is thrown.
+   */
+  private async sharedRead<T>(
+    sql: string,
+    params: QueryParams,
+    rowMode: RowMode,
+  ): Promise<QueryResult<T> | undefined> {
+    const attachment = this.attachment!;
+    this.readTransaction ??= await attachment.startTransaction({
+      isolation: TransactionIsolation.READ_COMMITTED,
+      readCommittedMode: 'RECORD_VERSION',
+      accessMode: 'READ_ONLY',
+    });
+    const transaction = this.readTransaction;
+
+    let stmt;
+    try {
+      stmt = await attachment.prepare(transaction, sql);
+    } catch (err) {
+      await this.endReadTransaction();
+      throw err;
+    }
+    try {
+      if ((await stmt.type) !== STMT_SELECT) {
+        this.remember(sql);
+        return undefined;
+      }
+      const fields: FieldInfo[] = (await stmt.columnLabels).map((label) => ({
+        name: label.toUpperCase(),
+      }));
+      const rawRows = await fetchRows(stmt, transaction, params, fields.length);
+      return { rows: shapeRows<T>(rawRows, fields, rowMode), fields };
+    } catch (err) {
+      // The native driver's errors carry only the message text.
+      if (/attempted update during read-only transaction/.test(String((err as Error)?.message))) {
+        this.remember(sql);
+        return undefined;
+      }
+      await this.endReadTransaction();
+      throw err;
+    } finally {
+      await stmt.dispose().catch(() => undefined);
+    }
+  }
+
+  private remember(sql: string): void {
+    if (this.ownTransaction.size >= 1024) this.ownTransaction.clear();
+    this.ownTransaction.add(sql);
+  }
+
+  /**
+   * End the shared read transaction, before anything but a shared read runs.
+   *
+   * On a server, an open transaction that has read a table makes `DROP TABLE`
+   * fail with "object in use", and `exec()` runs DDL without preparing it, so
+   * this cannot be kept to DDL as the WASM engine does: the shared transaction
+   * lives across consecutive reads only. A run of reads keeps it; a write
+   * between two reads costs what a transaction per read used to.
+   */
+  private async endReadTransaction(): Promise<void> {
+    const transaction = this.readTransaction;
+    this.readTransaction = null;
+    if (transaction) await transaction.commit().catch(() => transaction.rollback().catch(() => undefined));
   }
 
   /**
@@ -278,9 +370,12 @@ export class FirebirdLite {
     await this.ensureReady();
     const attachment = this.attachment!;
     const txOptions = buildTransactionOptions(options);
+    await this.endReadTransaction();
     const transaction = await attachment.startTransaction(txOptions);
 
-    const tx = new FirebirdTransaction(attachment, transaction);
+    // A shared read made from inside the callback starts the shared
+    // transaction again; each statement here ends it first.
+    const tx = new FirebirdTransaction(attachment, transaction, () => this.endReadTransaction());
 
     let result: T;
     try {
@@ -310,6 +405,7 @@ export class FirebirdLite {
     if (this.closed) return;
     this.closed = true;
 
+    await this.endReadTransaction();
     if (this.attachment) {
       await this.attachment.disconnect().catch(() => undefined);
       this.attachment = null;
@@ -331,6 +427,7 @@ export class FirebirdTransaction {
   constructor(
     private readonly attachment: Attachment,
     private readonly transaction: Transaction,
+    private readonly beforeStatement: () => Promise<void> = async () => undefined,
   ) {}
 
   /** Whether this transaction has already been rolled back. */
@@ -362,6 +459,7 @@ export class FirebirdTransaction {
    */
   async exec(sql: string | SqlFragment, params: QueryParams = []): Promise<void> {
     this.assertUsable();
+    await this.beforeStatement();
     const statement = toStatement(sql, params);
     if (statement.params.length > 0) {
       const stmt = await this.attachment.prepare(this.transaction, statement.sql);
@@ -381,6 +479,7 @@ export class FirebirdTransaction {
    */
   async execBatch(sql: string, rows: QueryParams[]): Promise<void> {
     this.assertUsable();
+    await this.beforeStatement();
     if (!Array.isArray(rows)) {
       throw new TypeError('execBatch takes an array of parameter rows');
     }
@@ -414,6 +513,7 @@ export class FirebirdTransaction {
     options: { rowMode?: RowMode } = {},
   ): Promise<QueryResult<T>> {
     this.assertUsable();
+    await this.beforeStatement();
     const statement = toStatement(sql, params);
     const rowMode = options.rowMode ?? 'object';
 
