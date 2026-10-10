@@ -16,6 +16,7 @@ export type EngineOp =
   | 'attachDatabase'
   | 'detachDatabase'
   | 'execute'
+  | 'executeBatch'
   | 'query'
   | 'describe'
   | 'startTransaction'

@@ -17,6 +17,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { loadFirebirdWasm, allocString, lastError } from '../wasm-loader';
 import type { FirebirdWasmModule } from '../wasm-loader';
+import { encodeParams, encodeParamRows } from '../browser/params';
+import type { QueryParams } from '../types';
 
 // The WASM artifact lives at dist/wasm/ after `npm run build:wasm` +
 // `npm run build`.  Skip the whole suite if the binary is absent.
@@ -47,6 +49,9 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
         '_fb_detach_database',
         '_fb_execute',
         '_fb_query',
+        '_fb_execute_params',
+        '_fb_query_params',
+        '_fb_execute_batch',
         '_fb_free_result',
         '_fb_start_transaction',
         '_fb_commit',
@@ -334,6 +339,148 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
       expect(mod._fb_start_transaction_ex(db, 99, 0)).toBe(0);
       expect(errorText()).toContain('unknown isolation level');
 
+      expect(mod._fb_detach_database(db)).toBe(0);
+    });
+
+    // ── Typed parameter binding and batches ─────────────────────────────
+
+    /** Create a fresh database for one test and return its handle. */
+    const freshDatabase = (name: string): number => {
+      mod._fb_init();
+      if (!mod.FS.analyzePath('/data').exists) mod.FS.mkdir('/data');
+      const dbPath = `/data/${name}.fdb`;
+      if (mod.FS.analyzePath(dbPath).exists) mod.FS.unlink(dbPath);
+      const pathPtr = allocString(mod, dbPath);
+      try {
+        const db = mod._fb_create_database(pathPtr);
+        expect({ handle: db > 0, error: errorText() }).toEqual({ handle: true, error: '' });
+        return db;
+      } finally {
+        mod._free(pathPtr);
+      }
+    };
+
+    /** Copy a packed buffer onto the heap and hand it to one ABI call. */
+    const withHeapBytes = <T>(bytes: Uint8Array, fn: (ptr: number, len: number) => T): T => {
+      const ptr = mod._malloc(bytes.length);
+      try {
+        mod.HEAPU8.set(bytes, ptr);
+        return fn(ptr, bytes.length);
+      } finally {
+        mod._free(ptr);
+      }
+    };
+
+    const execParams = (db: number, tx: number, sql: string, params: QueryParams): number => {
+      const sqlPtr = allocString(mod, sql);
+      try {
+        return withHeapBytes(encodeParams(params), (ptr, len) =>
+          mod._fb_execute_params(db, tx, sqlPtr, ptr, len));
+      } finally {
+        mod._free(sqlPtr);
+      }
+    };
+
+    const execBatch = (db: number, tx: number, sql: string, rows: QueryParams[]): number => {
+      const sqlPtr = allocString(mod, sql);
+      try {
+        return withHeapBytes(encodeParamRows(rows), (ptr, len) =>
+          mod._fb_execute_batch(db, tx, sqlPtr, ptr, len));
+      } finally {
+        mod._free(sqlPtr);
+      }
+    };
+
+    const queryRows = (db: number, sql: string): unknown[][] => {
+      const sqlPtr = allocString(mod, sql);
+      try {
+        const resultPtr = mod._fb_query(db, 0, sqlPtr, 0);
+        expect({ pointer: resultPtr > 0, error: errorText() })
+          .toEqual({ pointer: true, error: '' });
+        const parsed = JSON.parse(mod.UTF8ToString(resultPtr)) as { rows: unknown[][] };
+        mod._fb_free_result(resultPtr);
+        return parsed.rows;
+      } finally {
+        mod._free(sqlPtr);
+      }
+    };
+
+    it('binds a double from its binary form, bit for bit', () => {
+      const db = freshDatabase('typed-double');
+      expect(execParams(db, 0, 'CREATE TABLE d (id INTEGER, v DOUBLE PRECISION)', [])).toBe(0);
+
+      // Firebird's text-to-double conversion is off by one ulp for roughly one
+      // value in six, which is what the binary form exists to bypass.  A few
+      // hundred deterministic doubles across the exponent range would catch
+      // the text path with certainty; the binary path must return every one
+      // of them unchanged.  %.17g on the way out is exact for a double.
+      const values: number[] = [];
+      let seed = 0x2545f491;
+      for (let i = 0; i < 300; i++) {
+        seed = (Math.imul(seed, 1103515245) + 12345) >>> 0;
+        const mantissa = seed / 0x100000000 + 1; // [1, 2)
+        const exponent = (i % 60) - 30;
+        values.push((i % 2 ? -1 : 1) * mantissa * 2 ** exponent * (1 + i / 7));
+      }
+      values.push(0.1, 0.2, 0.3, 1 / 3, Math.PI, 1e-300, -1.5e300, 2 ** 53);
+
+      const rows = values.map((v, i) => [i, v]);
+      expect(`${execBatch(db, 0, 'INSERT INTO d VALUES (?, ?)', rows)} ${errorText()}`).toBe('0 ');
+      expect(mod._fb_last_affected_rows()).toBe(values.length);
+
+      const back = queryRows(db, 'SELECT v FROM d ORDER BY id').map((r) => r[0]);
+      const wrong = values.filter((v, i) => !Object.is(v, back[i]));
+      expect(wrong).toEqual([]);
+      expect(mod._fb_detach_database(db)).toBe(0);
+    });
+
+    it('binds a whole number from its INT64 form and keeps text where it is exact', () => {
+      const db = freshDatabase('typed-mixed');
+      expect(execParams(db, 0,
+        'CREATE TABLE m (i BIGINT, n NUMERIC(18,2), s VARCHAR(20), f FLOAT)', [])).toBe(0);
+
+      // 2^53 + 1 cannot be a JS number but is a bigint, and must arrive whole.
+      // 1.1 bound to NUMERIC(18,2) must stay the text 1.1 → 1.10, not a double
+      // rounded on the way in; 1.5 bound to a VARCHAR is still the text '1.5'.
+      const rc = execParams(db, 0, 'INSERT INTO m VALUES (?, ?, ?, ?)',
+        [9007199254740993n, 1.1, 1.5, 0.1]);
+      expect(`${rc} ${errorText()}`).toBe('0 ');
+
+      const [row] = queryRows(db,
+        'SELECT CAST(i AS VARCHAR(30)), CAST(n AS VARCHAR(30)), s, CAST(f AS DOUBLE PRECISION) FROM m');
+      expect(row).toEqual(['9007199254740993', '1.10', '1.5', Math.fround(0.1)]);
+      expect(mod._fb_detach_database(db)).toBe(0);
+    });
+
+    it('runs a batch as one prepared statement, all rows or none', () => {
+      const db = freshDatabase('batch');
+      expect(execParams(db, 0, 'CREATE TABLE b (id INTEGER NOT NULL PRIMARY KEY, name VARCHAR(16))', []))
+        .toBe(0);
+
+      const rows: QueryParams[] = [];
+      for (let i = 0; i < 1000; i++) rows.push([i, `row ${i}`]);
+      expect(`${execBatch(db, 0, 'INSERT INTO b VALUES (?, ?)', rows)} ${errorText()}`).toBe('0 ');
+      expect(mod._fb_last_affected_rows()).toBe(1000);
+      expect(queryRows(db, 'SELECT COUNT(*), MAX(id) FROM b')).toEqual([[1000, 999]]);
+
+      // The second row collides with an existing key: the whole batch is
+      // rolled back, and the error says which row failed.
+      const rc = execBatch(db, 0, 'INSERT INTO b VALUES (?, ?)', [[5000, 'new'], [0, 'dup']]);
+      expect(rc).not.toBe(0);
+      expect(errorText()).toContain('row 1');
+      expect(queryRows(db, 'SELECT COUNT(*) FROM b')).toEqual([[1000]]);
+
+      // Inside a caller's transaction the batch is its work: a rollback undoes it.
+      const tx = mod._fb_start_transaction(db);
+      expect(tx).toBeGreaterThan(0);
+      expect(execBatch(db, tx, 'INSERT INTO b VALUES (?, ?)', [[6000, 'a'], [6001, 'b']])).toBe(0);
+      expect(mod._fb_rollback(tx)).toBe(0);
+      expect(queryRows(db, 'SELECT COUNT(*) FROM b')).toEqual([[1000]]);
+
+      // A row that is not an array of the statement's arity is refused before
+      // anything runs.
+      expect(execBatch(db, 0, 'INSERT INTO b VALUES (?, ?)', [[7000]])).not.toBe(0);
+      expect(queryRows(db, 'SELECT COUNT(*) FROM b')).toEqual([[1000]]);
       expect(mod._fb_detach_database(db)).toBe(0);
     });
 

@@ -94,6 +94,18 @@ export interface FirebirdWasmModule {
     paramsLength: number,
   ): number;
   /**
+   * Execute one statement once per row of parameters (see `encodeParamRows`),
+   * prepared once.  Returns 0 on success; `_fb_last_affected_rows` then
+   * counts the whole batch.
+   */
+  _fb_execute_batch(
+    handle: FbHandle,
+    txHandle: FbHandle,
+    sqlPtr: number,
+    rowsPtr: number,
+    rowsLength: number,
+  ): number;
+  /**
    * Execute a query with bound parameters.  Returns a pointer to the JSON
    * result set, or 0 on failure.  Release it with `_fb_free_result`.
    */

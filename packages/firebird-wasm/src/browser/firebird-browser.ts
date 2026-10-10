@@ -489,6 +489,48 @@ export class FirebirdBrowser {
   }
 
   /**
+   * Execute one statement once per row of parameters: a batch.
+   *
+   * The statement is prepared once and executed for each row, in one
+   * transaction that commits when every row went in and rolls back when any
+   * failed — a batch is all or nothing.  Loading 100,000 rows this way costs
+   * the inserts, not 100,000 prepares and transactions; a failure names the
+   * row.  One statement only: a script cannot say which rows belong to which.
+   *
+   * ```ts
+   * await db.execBatch('INSERT INTO t (id, name) VALUES (?, ?)', [[1, 'a'], [2, 'b']]);
+   * ```
+   *
+   * @returns the rows affected over the whole batch.
+   */
+  async execBatch(sql: string, rows: QueryParams[]): Promise<ExecResult> {
+    await this.ensureReady();
+
+    if (!Array.isArray(rows)) {
+      throw new TypeError('execBatch takes an array of parameter rows');
+    }
+    const statements = splitStatements(sql);
+    if (statements.length !== 1) {
+      throw new Error(
+        `A batch runs one statement, not a script (${statements.length} statements found)`,
+      );
+    }
+
+    const affectedRows = await this.engine.executeBatch(
+      this.dbHandle,
+      0,
+      statements[0].sql,
+      rows.map((row) => this.serialize(row)),
+    );
+
+    if (rows.length > 0) {
+      this.markDirty();
+    }
+
+    return { affectedRows };
+  }
+
+  /**
    * Execute a SQL query and return the result rows.
    *
    * Parameters are bound with `?` placeholders, as in the Node.js backend, or
@@ -1223,6 +1265,27 @@ export class FirebirdBrowserTransaction {
       this.txHandle,
       statement.sql,
       applySerializers(statement.params, this.types?.serializers),
+    );
+    return { affectedRows };
+  }
+
+  /**
+   * Execute one statement once per row of parameters inside this
+   * transaction: prepared once, executed per row.  The rows before a failure
+   * stay, as statements run one by one would; the transaction decides.
+   *
+   * @returns the rows affected over the whole batch.
+   */
+  async execBatch(sql: string, rows: QueryParams[]): Promise<ExecResult> {
+    this.assertUsable();
+    if (!Array.isArray(rows)) {
+      throw new TypeError('execBatch takes an array of parameter rows');
+    }
+    const affectedRows = await this.engine.executeBatch(
+      this.dbHandle,
+      this.txHandle,
+      sql,
+      rows.map((row) => applySerializers(row, this.types?.serializers)),
     );
     return { affectedRows };
   }

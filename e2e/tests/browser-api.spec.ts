@@ -28,6 +28,8 @@ interface StubControl {
   calls: Array<{ fn: string; args: unknown[] }>;
   initRc: number;
   execRc: number;
+  batchRc: number;
+  lastBinaryParams: Array<{ index: number; kind: number; value: unknown }>;
   queryResult: {
     // A column may be named only, or described in full when a test needs to
     // control the type code the library sees.
@@ -600,6 +602,96 @@ test.describe('Row construction', () => {
 // ===========================================================================
 // The sql`…` template tag, through the real browser query path
 // ===========================================================================
+// Typed parameters and batches, through the real browser path
+// ===========================================================================
+
+test.describe('typed parameters', () => {
+  test('a number or bigint travels with its binary form beside the text', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('typed-params', { autoPersist: false });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      window.__stub.resetCalls();
+      await db.exec('INSERT INTO t VALUES (?, ?, ?, ?, ?, ?, ?)', [7, 1.5, 'x', 10n, true, null, 2n ** 70n]);
+      await db.close();
+      const call = window.__stub.firstCall('_fb_execute_params');
+      return {
+        params: call?.args[3],
+        binary: window.__stub.lastBinaryParams.map((b) => ({ ...b, value: String(b.value) })),
+      };
+    });
+    // The text is there for every column that wants it…
+    expect(result.params).toEqual(['7', '1.5', 'x', '10', 'TRUE', null, '1180591620717411303424']);
+    // …and the number beside it: a safe integer and a bigint as INT64 (1), any
+    // other number as DOUBLE (2); a bigint beyond 64 bits has only its text.
+    expect(result.binary).toEqual([
+      { index: 0, kind: 1, value: '7' },
+      { index: 1, kind: 2, value: '1.5' },
+      { index: 3, kind: 1, value: '10' },
+    ]);
+  });
+});
+
+test.describe('execBatch', () => {
+  test('sends every row with one statement, prepared once', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('batch', { autoPersist: false });
+      await db.exec('CREATE TABLE t (id INTEGER, name VARCHAR(10))');
+      window.__stub.resetCalls();
+      const r = await db.execBatch('INSERT INTO t VALUES (?, ?)', [[1, 'a'], [2, null], [3, 'c']]);
+      await db.close();
+      const call = window.__stub.firstCall('_fb_execute_batch');
+      return { affected: r.affectedRows, sql: call?.args[2], rows: call?.args[3], names: window.__stub.callNames() };
+    });
+    expect(result.sql).toBe('INSERT INTO t VALUES (?, ?)');
+    expect(result.rows).toEqual([['1', 'a'], ['2', null], ['3', 'c']]);
+    expect(result.affected).toBe(3);
+    expect(result.names.filter((n) => n === '_fb_execute_params')).toEqual([]);
+  });
+
+  test('runs inside a transaction with its handle, and refuses a script', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('batch-tx', { autoPersist: false });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      window.__stub.resetCalls();
+      await db.transaction(async (tx) => {
+        await tx.execBatch('INSERT INTO t VALUES (?)', [[1], [2]]);
+      });
+      let scriptError = '';
+      try {
+        await db.execBatch('INSERT INTO t VALUES (?); INSERT INTO t VALUES (?)', [[1, 2]]);
+      } catch (err) {
+        scriptError = (err as Error).message;
+      }
+      await db.close();
+      const call = window.__stub.firstCall('_fb_execute_batch');
+      return { tx: call?.args[1], rows: call?.args[3], scriptError };
+    });
+    expect(result.tx).not.toBe(0);
+    expect(result.rows).toEqual([['1'], ['2']]);
+    expect(result.scriptError).toContain('one statement');
+  });
+
+  test('a failing batch surfaces the engine error and sends nothing more', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('batch-fail', { autoPersist: false });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+      window.__stub.batchRc = 6;
+      window.__stub.lastError = 'fb_execute_batch: row 1: could not convert parameter 0';
+      let message = '';
+      try {
+        await db.execBatch('INSERT INTO t VALUES (?)', [[1], ['x']]);
+      } catch (err) {
+        message = (err as Error).message;
+      }
+      window.__stub.batchRc = 0;
+      await db.close();
+      return message;
+    });
+    expect(result).toContain('row 1');
+  });
+});
+
+// ===========================================================================
 
 test.describe('sql`…` tag', () => {
   test('sends placeholders and binds the values separately', async ({ page }) => {
@@ -621,7 +713,8 @@ test.describe('sql`…` tag', () => {
     });
 
     expect(result.sql).toBe('SELECT id FROM t WHERE id = ? AND name = ?');
-    // Sent as text, which is how this parameter encoding works — but as a
+    // Sent as text (with the number's binary form beside it, which the engine
+    // uses for a floating-point or whole-number column) — but as a
     // *parameter*, which is the property that matters.
     expect(result.params).toEqual(['7', "'; DROP TABLE t; --"]);
   });

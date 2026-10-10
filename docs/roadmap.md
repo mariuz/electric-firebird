@@ -295,7 +295,12 @@ multi-tab safety have all landed since this list was written; what remains:
   tab to run the engine and serves the rest over a `BroadcastChannel`. The
   default is still `'exclusive'`, so sharing is opt-in.
 - A typed *binary* result encoding, so exact numerics need not travel as
-  strings at all.
+  strings at all. (Parameters already go the other way in binary where it is
+  exact; see M2.)
+- A build without `SharedArrayBuffer`, so a page could run the engine without
+  COOP/COEP headers or a service worker to fake them. Not a link flag: the
+  engine starts threads and blocks on them. What it would take is in
+  [plans/sab-free-build.md](./plans/sab-free-build.md).
 - `loadFirebirdWasm()` caches one module process-wide with no way to dispose
   it; `close()` does not release the WASM heap.
 - Only the built-in character sets are compiled in, and the UNICODE collations
@@ -837,6 +842,21 @@ be built:
 - [x] `fb_execute_params` / `fb_query_params`. Bound through the statement's
       *declared* metadata plus `IUtil::convert`, not `IMetadataBuilder` — the
       builder approach failed with a bare "internal error" and was abandoned.
+- [x] Typed (binary) parameter binding. A `number` or an in-range `bigint`
+      travels with its binary form beside the text, and the engine binds the
+      binary form where it is the exact one: a double for a floating
+      destination, an `INT64` for a whole-number one. Text stays authoritative
+      everywhere else, so `NUMERIC`, `VARCHAR` and date destinations are
+      unchanged. Measured on 3,000 doubles: 490 came back an ulp off through
+      the text path, none through the binary one. The consumer that found it
+      (`firebird-quake2`) had been sending every double as mantissa and
+      exponent, `CAST(? AS DOUBLE PRECISION) * POWER(2e0, ?)`, to get it
+      back exactly.
+- [x] `execBatch(sql, rows)`: one statement, prepared once, run per row in one
+      transaction, the rows crossing to the engine in a single call. 5,000
+      rows of five columns: 65 ms as a batch, 130 ms as one `exec()` per row
+      inside one transaction, 300 ms with a transaction each. On both
+      backends; the Node one prepares once and loops.
 - [x] Thread `txHandle` through `fb_execute`/`fb_query`.
 - [x] Add an explicit `tx.rollback()`. Browser in `4380ce7`, Node in `b6accb4`.
 - [ ] Replace the JSON ABI with a typed encoding. **Half done, and the other
