@@ -11,7 +11,7 @@
  * contains is not one to trust. See {@link TypeOptions} for what each costs.
  */
 
-import type { FieldInfo, QueryParams, QueryResult, Row, RowMode } from '../types';
+import type { FieldInfo, QueryParams, QueryResult, RowMode } from '../types';
 
 // Firebird type codes, from firebird/impl/sqlda_pub.h.
 const SQL_TIMESTAMP = 510;

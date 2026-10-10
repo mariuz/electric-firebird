@@ -142,6 +142,9 @@ source of stub breakage, so check against the tree you are building.
 npm run lint -w packages/firebird-wasm
 ```
 
+The rules are `eslint:recommended` and `@typescript-eslint/recommended` (`packages/firebird-wasm/.eslintrc.cjs`); an
+unused parameter that an interface requires is named with a leading underscore. CI runs the linter on every pull request.
+
 ---
 
 ## Submitting a pull request
