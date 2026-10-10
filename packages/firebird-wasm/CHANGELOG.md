@@ -4,6 +4,64 @@ All notable changes to `firebird-wasm`. This project follows
 [semantic versioning](https://semver.org/); while the major version is 0 the
 API may still move between minor releases.
 
+## 0.6.0 — 2026-10-10
+
+### Added
+
+- **`statementCache` on `FirebirdLite`: prepared statements kept on Node.**
+  `new FirebirdLite(path, { statementCache: 64 })` keeps the connection's
+  last 64 prepared statements by SQL text, as the browser engine has since
+  0.5.0, so a repeated statement skips the prepare, a round trip to the
+  server. Measured against a local Firebird 3 server, off and with the cache
+  alternating, three rounds each: a primary-key `SELECT` 1.3–2.1 ms off,
+  1.0–1.1 ms with it (0.25–0.43 ms with `sharedReads` as well); an `UPDATE`
+  through `exec()` 2.2–2.3 ms off, 1.6–1.9 ms with it. DDL run through the
+  connection empties the cache first, a failed statement is dropped, and
+  concurrent calls with the same text each get their own statement. Off by
+  default: on a server, another connection's `DROP TABLE` waits while a
+  kept statement reads the table, and a kept statement keeps running a
+  procedure's old body after another connection alters it.
+
+- **`sharedReads`: autocommit reads in a shared read-only transaction.** An
+  option on `new FirebirdBrowser(name, { sharedReads: true })` and
+  `new FirebirdLite(path, { sharedReads: true })`, off by default; on the
+  module it is `_fb_read_transaction(dbHandle, on)`, per database (an
+  `EngineTransport` supports it through the optional `setSharedReads`). On
+  Node against a local Firebird 3 server a primary-key `SELECT` went from
+  1.4–1.8 to 0.9–1.0 ms; there the shared transaction lives across
+  consecutive reads only, because an open transaction that has read a table
+  makes a server refuse `DROP TABLE` and `exec()` does not know it is running
+  DDL. In the browser engine, when on, an autocommit `SELECT` runs in a
+  READ COMMITTED READ CONSISTENCY read-only transaction each database keeps
+  open, instead of starting and committing one around the call; each
+  statement still reads everything committed before it starts. Measured from
+  Node on the `firebird-quake2` demo1 database, off and on alternating, three
+  rounds each: a primary-key `SELECT` 44–45 µs a call off, 20–22 µs on; a
+  trivial `SELECT` 37–41 µs off, 15–16 µs on. A `SELECT` that writes is run
+  again in its own transaction and remembered (its non-transactional effects,
+  such as `RDB$SET_CONTEXT`, happen twice on that first call), and rows left
+  in an `ON COMMIT DELETE ROWS` table outlive the call: see `docs/api.md`.
+  Needs a rebuilt artifact.
+
+### Fixed
+
+- **Closing one database no longer rolls back another's transactions.**
+  `fb_detach_database` rolled back every open transaction in the engine,
+  not only the closing database's: the transaction table did not record
+  which database a transaction was started on. With two databases open in
+  one engine (two `FirebirdBrowser`s sharing a worker or a transport, or two
+  handles on the module), closing one lost the other's work still open in a
+  `transaction()`, and its commit then failed with "unknown transaction
+  handle". Needs a rebuilt artifact.
+- **`query('EXECUTE PROCEDURE …')` returns the procedure's outputs.** A
+  procedure with output parameters has columns but no cursor. The browser
+  engine opened a cursor for any statement with columns, so the call failed
+  with "Cannot open cursor for non-SELECT statement"; the Node backend ran it
+  as a plain execute and returned no rows, and inside `transaction()` its
+  `executeQuery` refused it. Both now run it once and return its outputs as
+  one row, in autocommit and inside a transaction. The browser fix needs a
+  rebuilt artifact.
+
 ## 0.5.0 — 2026-10-10
 
 ### Changed
