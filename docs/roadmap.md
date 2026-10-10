@@ -939,7 +939,7 @@ be built:
 a frame at 20 tics a second) has been the heaviest user so far. These are the
 gaps it ran into, with its numbers, in rough order of what they would buy.
 
-- [ ] **Per-call overhead.** A one-row primary-key `SELECT` through
+- [x] **Per-call overhead.** A one-row primary-key `SELECT` through
       `db.query` costs 55–75 µs; the same fetch inside one PSQL loop costs
       3–5 µs. About half of the difference is the autocommit transaction (the
       same calls inside `db.transaction()` cost ~40 µs each), the rest is the
@@ -949,6 +949,11 @@ gaps it ran into, with its numbers, in rough order of what they would buy.
       st.query(params)`, freed with `st.close()`), or a small statement cache
       in the C bridge keyed by the SQL text, which needs no API change. Then
       measure what the transport and the JSON cost on their own.
+      **Done for the prepare:** the bridge keeps each database's last 64
+      prepared statements by SQL text (DDL never kept, and it empties the
+      cache before it runs). A primary-key `SELECT` inside a transaction went
+      from 45–47 to 25–36 µs a call; in autocommit from 60–63 to 46–47, where
+      the transaction per call is now the larger part — the next item.
 - [ ] **A read-only transaction kept open for reads.** Autocommit starts and
       commits a transaction around every `query()`, half of a cheap query's
       cost. An option to run reads in a long-lived read-committed read-only

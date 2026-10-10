@@ -391,6 +391,15 @@ class FirebirdBrowser {
 }
 ```
 
+**Prepared statements are kept.** The engine keeps each database's last 64
+prepared statements by their SQL text, so a statement sent again (the same
+text, any parameters, any transaction) skips the prepare. DDL is never kept and
+empties the cache before it runs; a failed statement is dropped; closing frees
+them. Write a statement that varies with its values as one text with `?`
+placeholders (or the `sql` tag) so it is kept once rather than once per value.
+`mod._fb_statement_cache(size)` on the module sets the size (0 turns it off)
+and empties the caches, as DDL run inside `EXECUTE STATEMENT` is not seen.
+
 #### `new FirebirdBrowser(dbName, options?)`
 
 | Parameter | Type | Default | Description |
