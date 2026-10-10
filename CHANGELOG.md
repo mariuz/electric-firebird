@@ -23,6 +23,17 @@ API may still move between minor releases.
   is also how to drop statements made stale by DDL run inside an
   `EXECUTE STATEMENT`, which the cache cannot see. Needs a rebuilt artifact.
 
+### Fixed
+
+- **The root entry loads without the native driver.** `firebird-wasm` imported
+  `node-firebird-driver-native` at the top of the module, so an install with
+  `--omit=optional` (the one the README recommends for the browser engine)
+  could not `require('firebird-wasm')` at all: `sql`, `statementKind` and
+  `loadFirebirdWasm` failed with a bare `MODULE_NOT_FOUND` along with
+  `FirebirdLite`. The driver is now loaded when a `FirebirdLite` first
+  connects, and its absence there is an error that names the package and the
+  `firebird-wasm/browser` alternative.
+
 ## 0.4.2 — 2026-10-10
 
 A maintenance release: the published TypeScript and the engine artifact behave
