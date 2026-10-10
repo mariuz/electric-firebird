@@ -9,6 +9,8 @@ import type { SqlFragment } from '../sql-tag';
 const hasFirebirdLib = (() => {
   try {
     // Try actually creating a client to verify the library can be loaded
+    // a synchronous probe inside try: an import would fail the whole file when the library is missing
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
     const { createNativeClient, getDefaultLibraryFilename } = require('node-firebird-driver-native');
     const client = createNativeClient(getDefaultLibraryFilename());
     // If we get here without throwing, the library loaded successfully

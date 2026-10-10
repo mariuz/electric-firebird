@@ -52,6 +52,10 @@ jobs:
       - name: Build packages
         run: npm run build -w packages/firebird-wasm
 
+      # ESLint over the package's TypeScript (it had a script and dependencies but no configuration)
+      - name: Lint
+        run: npm run lint
+
       - name: Run unit tests
         working-directory: packages/firebird-wasm
         env:
