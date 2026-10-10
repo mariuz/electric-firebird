@@ -664,6 +664,100 @@ describeIfFirebird('FirebirdLite with statementCache', () => {
   });
 });
 
+describeIfFirebird('FirebirdLite.execBatch in blocks', () => {
+  let db: FirebirdLite;
+  let dbPath: string;
+
+  beforeEach(() => {
+    const name = tmpDbName('batch-block');
+    dbPath = path.join(os.tmpdir(), name);
+    db = makeDb(name);
+  });
+
+  afterEach(async () => {
+    await db.close();
+    if (fs.existsSync(dbPath)) {
+      try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+    }
+  });
+
+  const COLUMNS =
+    '(id INTEGER NOT NULL PRIMARY KEY, big BIGINT, money NUMERIC(18,2), d DOUBLE PRECISION, ' +
+    "s VARCHAR(20) CHARACTER SET UTF8, c CHAR(5), dt DATE, ts TIMESTAMP, ok BOOLEAN, note BLOB SUB_TYPE TEXT CHARACTER SET UTF8)";
+
+  it('stores every row exactly as one execute per row would', async () => {
+    await db.exec(`CREATE TABLE blocked ${COLUMNS}`);
+    await db.exec(`CREATE TABLE looped ${COLUMNS}`);
+    const rows = Array.from({ length: 450 }, (_, i) => [
+      i,
+      i % 7 === 0 ? null : 9007199254740 + i,
+      i % 5 === 0 ? null : i + 0.25,
+      i / 3,
+      i % 3 === 0 ? `ñandú ✓ ${i}` : `row ${i}`,
+      i % 4 === 0 ? null : `c${i % 10}`,
+      new Date(Date.UTC(2026, 9, (i % 28) + 1)),
+      new Date(Date.UTC(2026, 9, 10, 12, i % 60, i % 60, 500)),
+      i % 2 === 0,
+      i % 6 === 0 ? null : Buffer.from(`note ${i} ✓`), // the driver takes a Buffer for a BLOB
+    ]);
+
+    await db.execBatch('INSERT INTO blocked VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', rows);
+    await db.transaction(async (tx) => {
+      for (const row of rows) await tx.exec('INSERT INTO looped VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', row);
+    });
+
+    const read = async (table: string) =>
+      (await db.query(
+        `SELECT id, big, money, d, s, c, dt, ts, ok, CAST(note AS VARCHAR(100) CHARACTER SET UTF8) FROM ${table} ORDER BY id`,
+        [],
+        { rowMode: 'array' },
+      )).rows;
+    const blocked = await read('blocked');
+    expect(blocked).toHaveLength(450);
+    expect(blocked).toEqual(await read('looped'));
+    expect(blocked[3][4]).toBe('ñandú ✓ 3');
+    expect(blocked[1][3]).toBe(1 / 3);
+  });
+
+  it('is all or nothing, and fails with the row-by-row error', async () => {
+    await db.exec('CREATE TABLE k (id INTEGER NOT NULL PRIMARY KEY)');
+    const rows = Array.from({ length: 300 }, (_, i) => [i]);
+    rows[250] = [3]; // a duplicate key, in the second block
+    await expect(db.execBatch('INSERT INTO k VALUES (?)', rows)).rejects.toThrow(/PRIMARY or UNIQUE KEY/);
+    expect((await db.query('SELECT COUNT(*) AS N FROM k')).rows).toEqual([{ N: 0 }]);
+  });
+
+  it('runs UPDATE and EXECUTE PROCEDURE batches', async () => {
+    await db.exec('CREATE TABLE u (id INTEGER NOT NULL PRIMARY KEY, v INTEGER)');
+    await db.execBatch('INSERT INTO u VALUES (?, ?)', Array.from({ length: 250 }, (_, i) => [i, 0]));
+    await db.execBatch('UPDATE u SET v = ? WHERE id = ?', Array.from({ length: 250 }, (_, i) => [i * 2, i]));
+    expect((await db.query('SELECT SUM(v) AS S FROM u')).rows).toEqual([{ S: 249 * 250 }]);
+
+    await db.query('CREATE PROCEDURE bump (i INTEGER) AS BEGIN UPDATE u SET v = v + 1 WHERE id = :i; END');
+    await db.execBatch('EXECUTE PROCEDURE bump(?)', Array.from({ length: 250 }, (_, i) => [i]));
+    expect((await db.query('SELECT SUM(v) AS S FROM u')).rows).toEqual([{ S: 249 * 250 + 250 }]);
+  });
+
+  it('halves a block that uses too many contexts to prepare', async () => {
+    await db.exec('CREATE TABLE m (id INTEGER, name VARCHAR(10))');
+    // Three contexts a row: 200 rows would need 600 of the engine's 256.
+    const sql =
+      'INSERT INTO m SELECT ?, ? FROM RDB$DATABASE r1 JOIN RDB$DATABASE r2 ON 1 = 1 JOIN RDB$DATABASE r3 ON 1 = 1';
+    await db.execBatch(sql, Array.from({ length: 300 }, (_, i) => [i, `n${i}`]));
+    expect((await db.query('SELECT COUNT(*) AS N, SUM(id) AS S FROM m')).rows).toEqual([{ N: 300, S: 299 * 150 }]);
+  });
+
+  it('leaves a ? inside a string alone', async () => {
+    await db.exec('CREATE TABLE q (id INTEGER, note VARCHAR(10))');
+    await db.execBatch("INSERT INTO q VALUES (?, 'why?')", [[1], [2], [3]]);
+    expect((await db.query('SELECT id, note FROM q ORDER BY id', [], { rowMode: 'array' })).rows).toEqual([
+      [1, 'why?'],
+      [2, 'why?'],
+      [3, 'why?'],
+    ]);
+  });
+});
+
 describe('FirebirdLite (no Firebird installed)', () => {
   it('exports FirebirdLite class', async () => {
     const { FirebirdLite: FB } = await import('../index');

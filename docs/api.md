@@ -101,6 +101,19 @@ what makes it faster than a loop of `exec()`: 5,000 rows of
 five columns take 45 ms as a batch against 130 ms as one statement per row
 inside one transaction and 300 ms with a transaction each.
 
+On Node the driver has no `IBatch` to call, so `FirebirdLite` packs the rows
+into `EXECUTE BLOCK`s of up to 200 rows, each repeating the statement with its
+parameters declared as the types the driver binds: one round trip per block
+instead of one per row. Against a local Firebird 3 server, three columns went
+from 152–174 to 18–35 µs a row. A `BLOB` value still costs a round trip of its
+own, so rows with one gain less (504–585 to 245–319 µs with a text blob among
+ten columns). It applies to `INSERT`, `UPDATE`, `DELETE` and
+`EXECUTE PROCEDURE` without `RETURNING`; anything else, or a parameter with no
+type to declare, runs one execute per row as before. A block that will not
+prepare (a statement touching several tables uses more of the engine's 256
+contexts per row) is halved until it does, and a block that fails runs its
+rows one by one, so the error is the failing row's own.
+
 #### `db.query<T>(sql, params?, options?)`
 
 Execute a (parameterised) SQL statement and return the result.
