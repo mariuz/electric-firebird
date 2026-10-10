@@ -966,6 +966,13 @@ gaps it ran into, with its numbers, in rough order of what they would buy.
       local Firebird 3 server: 1.4–1.8 to 0.9–1.0 ms, the shared transaction
       ending before anything but a read (a server refuses `DROP TABLE` while
       one that has read the table is open).
+- [x] **Kept statements on the Node backend.** `FirebirdLite` prepared and
+      disposed every statement, a round trip each. `statementCache: n` keeps
+      them by SQL text (a primary-key `SELECT` against a local server from
+      1.3–2.1 to 1.0–1.1 ms). Opt-in there, because a kept statement makes
+      another connection's `DROP TABLE` wait and keeps a procedure's old body
+      after another connection's `ALTER`, neither of which this connection
+      can see.
 - [ ] **`execBatch` on the Node backend.** It prepares once and loops, one
       execute per row; the browser's runs as one `IBatch` request, 15 % faster
       than a PSQL loop over the same `INSERT` on a 90,000-row load. The native

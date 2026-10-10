@@ -30,7 +30,10 @@ const hasFirebirdLib = (() => {
  *   FIREBIRD_USER     – Firebird user  (default: SYSDBA)
  *   FIREBIRD_PASSWORD – Firebird password
  */
-function makeDb(dbName: string, options: { sharedReads?: boolean } = {}): FirebirdLite {
+function makeDb(
+  dbName: string,
+  options: { sharedReads?: boolean; statementCache?: number } = {},
+): FirebirdLite {
   const host = process.env['FIREBIRD_HOST'] ?? 'localhost';
   const user = process.env['FIREBIRD_USER'] ?? 'SYSDBA';
   const password = process.env['FIREBIRD_PASSWORD'] ?? '';
@@ -563,6 +566,101 @@ describeIfFirebird('FirebirdLite with sharedReads', () => {
     expect((await db.query('SELECT id, w FROM d')).rows).toEqual([{ ID: 7, W: 8 }]);
     await db.exec('ALTER TABLE d ADD v INTEGER');
     expect((await db.query('SELECT id, w, v FROM d')).rows).toEqual([{ ID: 7, W: 8, V: null }]);
+  });
+});
+
+describeIfFirebird('FirebirdLite with statementCache', () => {
+  let db: FirebirdLite;
+  let dbPath: string;
+
+  const open = (options: { sharedReads?: boolean; statementCache?: number }) => {
+    const name = tmpDbName('stmt-cache');
+    dbPath = path.join(os.tmpdir(), name);
+    db = makeDb(name, options);
+  };
+
+  afterEach(async () => {
+    await db.close();
+    if (fs.existsSync(dbPath)) {
+      try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+    }
+  });
+
+  it('runs a kept statement again with new parameters and in another transaction', async () => {
+    open({ statementCache: 16 });
+    await db.exec('CREATE TABLE r (id INTEGER NOT NULL PRIMARY KEY, v VARCHAR(10))');
+    for (let i = 0; i < 5; i++) await db.exec('INSERT INTO r VALUES (?, ?)', [i, `v${i}`]);
+    await db.transaction(async (tx) => {
+      await tx.exec('INSERT INTO r VALUES (?, ?)', [9, 'v9']);
+      await tx.rollback();
+    });
+    expect((await db.query('SELECT COUNT(*) AS N FROM r')).rows).toEqual([{ N: 5 }]);
+    expect((await db.query('SELECT v FROM r WHERE id = ?', [3])).rows).toEqual([{ V: 'v3' }]);
+    expect((await db.query('SELECT v FROM r WHERE id = ?', [4])).rows).toEqual([{ V: 'v4' }]);
+  });
+
+  it('drops a kept statement whose execution failed, and the next call works', async () => {
+    open({ statementCache: 16 });
+    await db.exec('CREATE TABLE f (id INTEGER NOT NULL PRIMARY KEY)');
+    await db.exec('INSERT INTO f VALUES (?)', [1]);
+    await expect(db.exec('INSERT INTO f VALUES (?)', [1])).rejects.toThrow();
+    await db.exec('INSERT INTO f VALUES (?)', [2]);
+    expect((await db.query('SELECT COUNT(*) AS N FROM f')).rows).toEqual([{ N: 2 }]);
+  });
+
+  it('empties itself before DDL: an altered procedure, a dropped and recreated table', async () => {
+    open({ statementCache: 16 });
+    await db.exec('CREATE PROCEDURE p RETURNS (v INTEGER) AS BEGIN v = 1; SUSPEND; END');
+    expect((await db.query('SELECT v FROM p')).rows).toEqual([{ V: 1 }]);
+    await db.exec('ALTER PROCEDURE p RETURNS (v INTEGER) AS BEGIN v = 2; SUSPEND; END');
+    expect((await db.query('SELECT v FROM p')).rows).toEqual([{ V: 2 }]);
+
+    await db.exec('CREATE TABLE d (id INTEGER)');
+    await db.exec('INSERT INTO d VALUES (1)');
+    expect((await db.query('SELECT * FROM d')).rows).toEqual([{ ID: 1 }]);
+    await db.exec('DROP TABLE d'); // "object in use" if the SELECT were still kept
+    await db.exec('CREATE TABLE d (id INTEGER, w INTEGER)');
+    await db.exec('INSERT INTO d VALUES (7, 8)');
+    expect((await db.query('SELECT * FROM d')).rows).toEqual([{ ID: 7, W: 8 }]);
+  });
+
+  it('keeps no more than its size', async () => {
+    open({ statementCache: 2 });
+    await db.exec('CREATE TABLE s (id INTEGER)');
+    await db.exec('INSERT INTO s VALUES (?)', [1]);
+    for (let round = 0; round < 2; round++) {
+      for (let i = 0; i < 6; i++) {
+        expect((await db.query(`SELECT id + ${i} AS X FROM s`)).rows).toEqual([{ X: 1 + i }]);
+      }
+    }
+  });
+
+  it('gives concurrent calls with the same text a statement each', async () => {
+    open({ statementCache: 16 });
+    await db.exec('CREATE TABLE c (id INTEGER)');
+    for (let i = 0; i < 5; i++) await db.exec('INSERT INTO c VALUES (?)', [i]);
+    const results = await Promise.all(
+      [0, 1, 2, 3, 4].map((i) => db.query('SELECT id FROM c WHERE id = ?', [i], { rowMode: 'array' })),
+    );
+    expect(results.map((r) => r.rows)).toEqual([[[0]], [[1]], [[2]], [[3]], [[4]]]);
+  });
+
+  it('works with sharedReads, a writing SELECT included', async () => {
+    open({ statementCache: 16, sharedReads: true });
+    await db.exec('CREATE TABLE w (id INTEGER)');
+    await db.query(
+      'CREATE PROCEDURE add_row RETURNS (n INTEGER) AS BEGIN ' +
+        'INSERT INTO w VALUES (1); SELECT COUNT(*) FROM w INTO n; SUSPEND; END',
+    );
+    expect((await db.query('SELECT n FROM add_row')).rows).toEqual([{ N: 1 }]);
+    expect((await db.query('SELECT n FROM add_row')).rows).toEqual([{ N: 2 }]);
+    expect((await db.query('SELECT COUNT(*) AS N FROM w')).rows).toEqual([{ N: 2 }]);
+  });
+
+  it('refuses a size that is not a whole number of statements', () => {
+    expect(() => makeDb('never-opened', { statementCache: -1 })).toThrow(RangeError);
+    expect(() => makeDb('never-opened', { statementCache: 1.5 })).toThrow(RangeError);
+    db = makeDb('never-opened');
   });
 });
 

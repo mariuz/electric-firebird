@@ -85,6 +85,9 @@ export class FirebirdLite {
   private readTransaction: Transaction | null = null;
   /** SQL texts that are not a SELECT, or that wrote: they get a transaction of their own. */
   private readonly ownTransaction = new Set<string>();
+  private readonly statementCacheSize: number;
+  /** Statements kept prepared by their SQL text, once connected (`statementCache`). */
+  private statements: StatementCache | null = null;
 
   constructor(dbPath: string, options: FirebirdLiteOptions = {}) {
     this.dbPath = dbPath;
@@ -95,6 +98,11 @@ export class FirebirdLite {
       charSetForNONE: options.charset,
     };
     this.sharedReads = options.sharedReads ?? false;
+    const size = options.statementCache ?? 0;
+    if (!Number.isInteger(size) || size < 0) {
+      throw new RangeError('statementCache is a whole number of statements, 0 or more');
+    }
+    this.statementCacheSize = size;
   }
 
   /**
@@ -115,6 +123,7 @@ export class FirebirdLite {
       // Database does not exist yet – create it.
       this.attachment = await this.client.createDatabase(this.dbPath, this.connectOptions);
     }
+    this.statements = new StatementCache(this.attachment, this.statementCacheSize);
   }
 
   /**
@@ -207,14 +216,16 @@ export class FirebirdLite {
     const transaction = await attachment.startTransaction(txOptions);
 
     try {
-      const stmt = await attachment.prepare(transaction, statement.sql);
+      const lease = await this.statements!.acquire(transaction, statement.sql);
+      const stmt = lease.stmt;
 
       let rows: T[];
       let fields: FieldInfo[];
-      // Disposed in `finally`, not after the fetch: a statement that throws on
+      // Released in `finally`, not after the fetch: a statement that throws on
       // execute — a lock conflict, an overflow, a wrong parameter count — would
       // otherwise leak its handle, and the retry loop such failures are usually
       // wrapped in leaks one per attempt until the attachment refuses more.
+      let failed = true;
       try {
         const columnLabels = await stmt.columnLabels;
         fields = columnLabels.map((label) => ({ name: label.toUpperCase() }));
@@ -224,8 +235,9 @@ export class FirebirdLite {
           fields,
           rowMode,
         );
+        failed = false;
       } finally {
-        await stmt.dispose().catch(() => undefined);
+        await lease.release(failed);
       }
 
       // After the statement is disposed, as before — the commit is the last
@@ -260,13 +272,16 @@ export class FirebirdLite {
     });
     const transaction = this.readTransaction;
 
-    let stmt;
+    let lease: StatementLease;
     try {
-      stmt = await attachment.prepare(transaction, sql);
+      lease = await this.statements!.acquire(transaction, sql);
     } catch (err) {
       await this.endReadTransaction();
       throw err;
     }
+    const stmt = lease.stmt;
+    // A writing SELECT stays kept: only the transaction was wrong for it.
+    let failed = false;
     try {
       if ((await stmt.type) !== STMT_SELECT) {
         this.remember(sql);
@@ -283,10 +298,11 @@ export class FirebirdLite {
         this.remember(sql);
         return undefined;
       }
+      failed = true;
       await this.endReadTransaction();
       throw err;
     } finally {
-      await stmt.dispose().catch(() => undefined);
+      await lease.release(failed);
     }
   }
 
@@ -375,7 +391,12 @@ export class FirebirdLite {
 
     // A shared read made from inside the callback starts the shared
     // transaction again; each statement here ends it first.
-    const tx = new FirebirdTransaction(attachment, transaction, () => this.endReadTransaction());
+    const tx = new FirebirdTransaction(
+      attachment,
+      transaction,
+      () => this.endReadTransaction(),
+      this.statements ?? undefined,
+    );
 
     let result: T;
     try {
@@ -406,6 +427,8 @@ export class FirebirdLite {
     this.closed = true;
 
     await this.endReadTransaction();
+    await this.statements?.flush();
+    this.statements = null;
     if (this.attachment) {
       await this.attachment.disconnect().catch(() => undefined);
       this.attachment = null;
@@ -428,6 +451,7 @@ export class FirebirdTransaction {
     private readonly attachment: Attachment,
     private readonly transaction: Transaction,
     private readonly beforeStatement: () => Promise<void> = async () => undefined,
+    private readonly statements: StatementCache = new StatementCache(attachment, 0),
   ) {}
 
   /** Whether this transaction has already been rolled back. */
@@ -461,12 +485,17 @@ export class FirebirdTransaction {
     this.assertUsable();
     await this.beforeStatement();
     const statement = toStatement(sql, params);
-    if (statement.params.length > 0) {
-      const stmt = await this.attachment.prepare(this.transaction, statement.sql);
+    // With the cache off, a statement without parameters runs as it always
+    // did. With it on, every statement goes through the cache, which is also
+    // what sees DDL coming and empties itself first.
+    if (statement.params.length > 0 || this.statements.enabled) {
+      const lease = await this.statements.acquire(this.transaction, statement.sql);
+      let failed = true;
       try {
-        await stmt.execute(this.transaction, statement.params);
+        await lease.stmt.execute(this.transaction, statement.params);
+        failed = false;
       } finally {
-        await stmt.dispose().catch(() => undefined);
+        await lease.release(failed);
       }
     } else {
       await this.attachment.execute(this.transaction, statement.sql);
@@ -484,13 +513,15 @@ export class FirebirdTransaction {
       throw new TypeError('execBatch takes an array of parameter rows');
     }
     if (rows.length === 0) return;
-    const stmt = await this.attachment.prepare(this.transaction, sql);
+    const lease = await this.statements.acquire(this.transaction, sql);
+    let failed = true;
     try {
       for (const row of rows) {
-        await stmt.execute(this.transaction, row);
+        await lease.stmt.execute(this.transaction, row);
       }
+      failed = false;
     } finally {
-      await stmt.dispose().catch(() => undefined);
+      await lease.release(failed);
     }
   }
 
@@ -517,10 +548,12 @@ export class FirebirdTransaction {
     const statement = toStatement(sql, params);
     const rowMode = options.rowMode ?? 'object';
 
-    const stmt = await this.attachment.prepare(this.transaction, statement.sql);
+    const lease = await this.statements.acquire(this.transaction, statement.sql);
+    const stmt = lease.stmt;
     // Same leak as FirebirdLite.query had: a statement or result set that
     // throws must still be released. More so here, because a transaction
     // callback that catches its own errors goes on using the same attachment.
+    let failed = true;
     try {
       const columnLabels = await stmt.columnLabels;
       const fields: FieldInfo[] = columnLabels.map((label) => ({
@@ -528,9 +561,10 @@ export class FirebirdTransaction {
       }));
 
       const rawRows = await fetchRows(stmt, this.transaction, statement.params, fields.length);
+      failed = false;
       return { rows: shapeRows<T>(rawRows, fields, rowMode), fields };
     } finally {
-      await stmt.dispose().catch(() => undefined);
+      await lease.release(failed);
     }
   }
 }
@@ -538,6 +572,121 @@ export class FirebirdTransaction {
 // ---------------------------------------------------------------------------
 // Module-level helpers
 // ---------------------------------------------------------------------------
+
+/** Statement types (`isc_info_sql_stmt_*`) the cache keeps: plain DML, SELECT, procedures. */
+const CACHEABLE_TYPES: ReadonlySet<number> = new Set([1, 2, 3, 4, 8, 12]);
+/** `isc_info_sql_stmt_ddl`. */
+const STMT_DDL = 5;
+
+/** A statement handed out by {@link StatementCache.acquire}; release it once, when done. */
+interface StatementLease {
+  stmt: Statement;
+  /** `failed` drops a kept statement, in case it went stale. */
+  release(failed: boolean): Promise<void>;
+}
+
+interface KeptStatement {
+  stmt: Statement;
+  busy: boolean;
+  /** False once evicted or flushed while busy: disposed on release instead. */
+  kept: boolean;
+}
+
+/**
+ * Prepared statements kept per connection, keyed by their SQL text, the most
+ * recently used last: what the WASM bridge does in C (`fb_statement_cache`),
+ * for the Node backend, where every prepare is a round trip to the server.
+ *
+ * A Firebird statement belongs to the attachment, not to the transaction it
+ * was prepared in, so a kept one runs in whichever transaction comes next.
+ * Only SELECT, INSERT, UPDATE, DELETE and EXECUTE PROCEDURE / BLOCK are kept.
+ * DDL is never kept, and empties the cache before it runs: a kept statement
+ * makes this connection's `DROP TABLE` fail with "object in use", and keeps
+ * running a procedure's old body after it is altered. A statement whose
+ * execution fails is dropped. One busy with a call still running is not
+ * handed to a second, concurrent call, which prepares its own.
+ *
+ * Size 0, the default, keeps nothing: each statement is prepared and disposed
+ * as before, and its type is never asked for.
+ */
+class StatementCache {
+  private readonly kept = new Map<string, KeptStatement>();
+
+  constructor(
+    private readonly attachment: Attachment,
+    private readonly size: number,
+  ) {}
+
+  get enabled(): boolean {
+    return this.size > 0;
+  }
+
+  async acquire(transaction: Transaction, sql: string): Promise<StatementLease> {
+    const hit = this.kept.get(sql);
+    if (hit && !hit.busy) {
+      // Most recently used last: a Map iterates in insertion order.
+      this.kept.delete(sql);
+      this.kept.set(sql, hit);
+      hit.busy = true;
+      return this.lease(hit);
+    }
+
+    const stmt = await this.attachment.prepare(transaction, sql);
+    if (!this.enabled) {
+      return { stmt, release: () => stmt.dispose().catch(() => undefined) };
+    }
+
+    const type = await stmt.type;
+    if (type === STMT_DDL) await this.flush();
+
+    const entry: KeptStatement = { stmt, busy: true, kept: false };
+    if (!hit && CACHEABLE_TYPES.has(type)) {
+      entry.kept = true;
+      this.kept.set(sql, entry);
+      await this.evictBeyondSize();
+    }
+    return this.lease(entry);
+  }
+
+  /** Dispose every kept statement; those still busy go when released. */
+  async flush(): Promise<void> {
+    const entries = [...this.kept.values()];
+    this.kept.clear();
+    for (const entry of entries) {
+      entry.kept = false;
+      if (!entry.busy) await entry.stmt.dispose().catch(() => undefined);
+    }
+  }
+
+  private lease(entry: KeptStatement): StatementLease {
+    return {
+      stmt: entry.stmt,
+      release: async (failed: boolean) => {
+        entry.busy = false;
+        if (entry.kept && failed) {
+          entry.kept = false;
+          for (const [sql, e] of this.kept) {
+            if (e === entry) {
+              this.kept.delete(sql);
+              break;
+            }
+          }
+        }
+        if (!entry.kept) await entry.stmt.dispose().catch(() => undefined);
+      },
+    };
+  }
+
+  private async evictBeyondSize(): Promise<void> {
+    for (const [sql, entry] of this.kept) {
+      if (this.kept.size <= this.size) return;
+      if (entry.busy) continue;
+      this.kept.delete(sql);
+      entry.kept = false;
+      await entry.stmt.dispose().catch(() => undefined);
+    }
+  }
+}
 
 /**
  * Run a prepared statement and return its rows, positionally.
