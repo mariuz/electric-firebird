@@ -211,6 +211,22 @@ describeIfFirebird('FirebirdLite', () => {
     expect(result.fields[1].name).toBe('PRICE');
   });
 
+  it('returns the outputs of EXECUTE PROCEDURE as one row', async () => {
+    await db.exec(
+      'CREATE PROCEDURE add_two (a INTEGER, b INTEGER) RETURNS (total INTEGER, label VARCHAR(10)) ' +
+        "AS BEGIN total = a + b; label = 'sum'; END",
+    );
+
+    const result = await db.query('EXECUTE PROCEDURE add_two(?, ?)', [2, 3]);
+    expect(result.rows).toEqual([{ TOTAL: 5, LABEL: 'sum' }]);
+    expect(result.fields.map((f) => f.name)).toEqual(['TOTAL', 'LABEL']);
+
+    const inTx = await db.transaction((tx) =>
+      tx.query('EXECUTE PROCEDURE add_two(?, ?)', [4, 5], { rowMode: 'array' }),
+    );
+    expect(inTx.rows).toEqual([[9, 'sum']]);
+  });
+
   it('throws after close()', async () => {
     await db.query("SELECT 1 FROM RDB$DATABASE");
     await db.close();

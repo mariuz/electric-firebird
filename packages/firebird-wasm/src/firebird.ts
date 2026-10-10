@@ -4,6 +4,7 @@ import {
 import type {
   Client,
   Attachment,
+  Statement,
   Transaction,
   TransactionOptions as NativeTransactionOptions,
 } from 'node-firebird-driver';
@@ -198,28 +199,11 @@ export class FirebirdLite {
         const columnLabels = await stmt.columnLabels;
         fields = columnLabels.map((label) => ({ name: label.toUpperCase() }));
 
-        if (stmt.hasResultSet) {
-          const resultSet = await stmt.executeQuery(transaction, statement.params);
-          // Same reasoning one level down: a failing fetch must still close.
-          try {
-            const rawRows = await resultSet.fetch();
-            // The driver already hands back positional rows, so array mode is
-            // the shape that costs nothing — object mode is the one that
-            // builds.
-            rows = (
-              rowMode === 'array'
-                ? rawRows
-                : rawRows.map((cols) =>
-                    Object.fromEntries(fields.map((f, i) => [f.name, cols[i]])),
-                  )
-            ) as T[];
-          } finally {
-            await resultSet.close().catch(() => undefined);
-          }
-        } else {
-          await stmt.execute(transaction, statement.params);
-          rows = [];
-        }
+        rows = shapeRows<T>(
+          await fetchRows(stmt, transaction, statement.params, fields.length),
+          fields,
+          rowMode,
+        );
       } finally {
         await stmt.dispose().catch(() => undefined);
       }
@@ -443,23 +427,8 @@ export class FirebirdTransaction {
         name: label.toUpperCase(),
       }));
 
-      const resultSet = await stmt.executeQuery(this.transaction, statement.params);
-      let rawRows: unknown[][];
-      try {
-        rawRows = await resultSet.fetch();
-      } finally {
-        await resultSet.close().catch(() => undefined);
-      }
-
-      const rows = (
-        rowMode === 'array'
-          ? rawRows
-          : rawRows.map((cols) =>
-              Object.fromEntries(fields.map((f, i) => [f.name, cols[i]])),
-            )
-      ) as T[];
-
-      return { rows, fields };
+      const rawRows = await fetchRows(stmt, this.transaction, statement.params, fields.length);
+      return { rows: shapeRows<T>(rawRows, fields, rowMode), fields };
     } finally {
       await stmt.dispose().catch(() => undefined);
     }
@@ -469,6 +438,49 @@ export class FirebirdTransaction {
 // ---------------------------------------------------------------------------
 // Module-level helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Run a prepared statement and return its rows, positionally.
+ *
+ * A SELECT has a cursor and is fetched. `EXECUTE PROCEDURE` has output
+ * columns but no cursor: it runs once, and its outputs are one row — run as
+ * a plain execute, they were dropped (`query()` returned no rows), and
+ * `executeQuery` refused it outright inside a transaction. Anything else
+ * runs and returns nothing.
+ */
+async function fetchRows(
+  stmt: Statement,
+  transaction: Transaction,
+  params: QueryParams,
+  columnCount: number,
+): Promise<unknown[][]> {
+  if (stmt.hasResultSet) {
+    const resultSet = await stmt.executeQuery(transaction, params);
+    // A failing fetch must still close.
+    try {
+      return await resultSet.fetch();
+    } finally {
+      await resultSet.close().catch(() => undefined);
+    }
+  }
+  if (columnCount > 0) {
+    return [await stmt.executeSingleton(transaction, params)];
+  }
+  await stmt.execute(transaction, params);
+  return [];
+}
+
+/**
+ * The driver hands back positional rows, so array mode is the shape that
+ * costs nothing — object mode is the one that builds.
+ */
+function shapeRows<T>(rawRows: unknown[][], fields: FieldInfo[], rowMode: RowMode): T[] {
+  return (
+    rowMode === 'array'
+      ? rawRows
+      : rawRows.map((cols) => Object.fromEntries(fields.map((f, i) => [f.name, cols[i]])))
+  ) as T[];
+}
 
 function buildTransactionOptions(
   options: TransactionOptions,
