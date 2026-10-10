@@ -4,6 +4,24 @@ All notable changes to `firebird-wasm`. This project follows
 [semantic versioning](https://semver.org/); while the major version is 0 the
 API may still move between minor releases.
 
+## 0.4.1 — 2026-10-10
+
+### Changed
+
+- **`execBatch` runs on Firebird's `IBatch`.** The rows' messages are packed
+  at the metadata's aligned stride into one buffer and handed to the engine as
+  one batch request, where 0.4.0 executed the prepared statement once per row.
+  Measured in Node on the same artifact build: 5,000 rows of five columns take
+  41–55 ms (65–71 ms in 0.4.0; 127–136 ms as one `exec()` per row inside a
+  transaction). In `firebird-quake2`'s map load, which 0.4.0's batch had left
+  13 % slower than its PSQL chunk loaders (each row was still a statement
+  execute inside the engine, while a procedure's `INSERT` is a node of one
+  compiled request), the batch is now 5 % faster than those loaders, with
+  the 37,000-row `face_verts` table a quarter faster. The row that fails is
+  still named, the record count still covers the whole batch, and a statement
+  without parameters still runs once per row. Needs a rebuilt artifact: the
+  TypeScript is unchanged.
+
 ## 0.4.0 — 2026-10-10
 
 ### Added
