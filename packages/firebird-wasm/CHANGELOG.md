@@ -4,6 +4,33 @@ All notable changes to `firebird-wasm`. This project follows
 [semantic versioning](https://semver.org/); while the major version is 0 the
 API may still move between minor releases.
 
+## 0.4.2 — 2026-10-10
+
+A maintenance release: the published TypeScript and the engine artifact behave
+exactly as in 0.4.1. What changed is building and checking the project.
+
+### Fixed
+
+- **`wasm/build.sh` survives a rebuild on a stock machine.** It checks for the
+  host's ICU headers before the native bootstrap and names the package to
+  install, where the build used to die minutes in with `unicode/ucnv.h: No such
+  file`. An empty `dsql/parse.cpp` placeholder lets CMake 3.28's generate step
+  pass (it stopped with no Makefile at all); the parse target overwrites it.
+  And `autoconfig.h` is refreshed from the native build on every run, so a
+  rebuild that has to make `gpre_boot` again no longer compiles that native
+  tool against the 32-bit WASM edits (`conflicting declaration 'typedef int
+  ISC_LONG'`).
+
+### Internal
+
+- **The linter runs.** `npm run lint` had a script and dependencies but no
+  configuration; `.eslintrc.cjs` now applies `eslint:recommended` and
+  `@typescript-eslint/recommended`, and CI runs it on every pull request. Its
+  two findings are fixed: an unused type import, and a deliberate `require` in
+  the Node test that now says why.
+- **Roadmap** updated with what `firebird-quake2` measured, and live queries
+  marked done.
+
 ## 0.4.1 — 2026-10-10
 
 ### Changed
