@@ -52,6 +52,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <list>
 #include <map>
 #include <mutex>
 #include <string>
@@ -91,11 +92,22 @@ IUtil*     g_util     = nullptr;
  */
 IPluginSet* g_pluginSet = nullptr;
 
-/** An attached database plus the transaction used for auto-commit work. */
+/** A statement kept prepared for its SQL text (see acquireStatement). */
+struct CachedStatement
+{
+	std::string sql;
+	IStatement* statement = nullptr;
+};
+
+/** An attached database, and the statements kept prepared for it, most recently used first. */
 struct DbEntry
 {
 	IAttachment* attachment = nullptr;
+	std::list<CachedStatement> statements;
 };
+
+/** How many prepared statements each database keeps; 0 turns the cache off (fb_statement_cache). */
+unsigned g_statementCacheSize = 64;
 
 std::map<int, DbEntry>       g_databases;
 std::map<int, ITransaction*> g_transactions;
@@ -295,6 +307,139 @@ ITransaction* lookupTransaction(int handle)
 {
 	const auto it = g_transactions.find(handle);
 	return it == g_transactions.end() ? nullptr : it->second;
+}
+
+// ---------------------------------------------------------------------------
+// The statement cache
+// ---------------------------------------------------------------------------
+//
+// Preparing is most of what a cheap query costs here: a one-row primary-key
+// SELECT through fb_query_params took 55-75 µs where the fetch itself takes
+// 3-5 µs, and a consumer that sends the same statements every frame paid the
+// prepare every time.  So each database keeps its last statements prepared,
+// keyed by their SQL text, and the query and execute paths take them from here.
+//
+// A statement in Firebird's OO API belongs to the attachment, not to the
+// transaction it was prepared in, so a kept statement runs in whichever
+// transaction the next call brings.  Only plain DML, SELECT and EXECUTE
+// PROCEDURE / EXECUTE BLOCK are kept.  DDL is never kept, and it empties the
+// database's cache before it runs: a kept statement holds the metadata the
+// DDL may be about to change (an altered procedure would otherwise keep
+// running its old body here, and a dropped table could be refused as in use).
+// A statement whose execution fails is dropped too, in case it went stale.
+
+void freeStatement(IStatement* statement)
+{
+	Status s;
+	statement->free(s.ptr());
+	statement->release();
+}
+
+DbEntry* lookupEntry(int handle)
+{
+	const auto it = g_databases.find(handle);
+	return it == g_databases.end() ? nullptr : &it->second;
+}
+
+void flushStatements(DbEntry& entry)
+{
+	for (auto& c : entry.statements)
+		freeStatement(c.statement);
+	entry.statements.clear();
+}
+
+bool cacheableType(unsigned type)
+{
+	switch (type)
+	{
+		case isc_info_sql_stmt_select:
+		case isc_info_sql_stmt_insert:
+		case isc_info_sql_stmt_update:
+		case isc_info_sql_stmt_delete:
+		case isc_info_sql_stmt_exec_procedure:
+		case isc_info_sql_stmt_select_for_upd:
+			return true;
+		default:
+			return false;
+	}
+}
+
+/**
+ * The prepared statement for `sql`: the kept one if there is one, else a new
+ * prepare (kept when its kind allows).  `cached` says whether the cache owns
+ * it; pass it to releaseStatement() when done.  On a failed prepare, `status`
+ * holds the error and the result is null.
+ */
+IStatement* acquireStatement(int db_handle, IAttachment* attachment, ITransaction* transaction,
+	const char* sql, Status& status, bool& cached)
+{
+	cached = false;
+	DbEntry* entry = lookupEntry(db_handle);
+
+	if (entry && g_statementCacheSize)
+	{
+		for (auto it = entry->statements.begin(); it != entry->statements.end(); ++it)
+		{
+			if (it->sql == sql)
+			{
+				entry->statements.splice(entry->statements.begin(), entry->statements, it);
+				cached = true;
+				return entry->statements.front().statement;
+			}
+		}
+	}
+
+	IStatement* statement = attachment->prepare(status.ptr(), transaction, 0, sql,
+		SQL_DIALECT_V6, IStatement::PREPARE_PREFETCH_METADATA);
+	if (status.failed() || !statement)
+		return nullptr;
+
+	Status typeStatus;
+	const unsigned type = statement->getType(typeStatus.ptr());
+	if (typeStatus.failed())
+		return statement;   // unknown kind: used once, not kept
+
+	if (type == isc_info_sql_stmt_ddl && entry)
+		flushStatements(*entry);
+
+	if (entry && g_statementCacheSize && cacheableType(type))
+	{
+		entry->statements.push_front(CachedStatement{sql, statement});
+		cached = true;
+		while (entry->statements.size() > g_statementCacheSize)
+		{
+			freeStatement(entry->statements.back().statement);
+			entry->statements.pop_back();
+		}
+	}
+
+	return statement;
+}
+
+/** Done with a statement from acquireStatement(): `failed` drops a kept one, in case it went stale. */
+void releaseStatement(int db_handle, IStatement* statement, bool cached, bool failed)
+{
+	if (!statement)
+		return;
+	if (!cached)
+	{
+		freeStatement(statement);
+		return;
+	}
+	if (!failed)
+		return;
+	DbEntry* entry = lookupEntry(db_handle);
+	if (!entry)
+		return;
+	for (auto it = entry->statements.begin(); it != entry->statements.end(); ++it)
+	{
+		if (it->statement == statement)
+		{
+			freeStatement(statement);
+			entry->statements.erase(it);
+			return;
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1802,6 +1947,9 @@ int fb_detach_database(int db_handle)
 		ev = g_events.erase(ev);
 	}
 
+	// The kept statements belong to this attachment and go before it does.
+	flushStatements(it->second);
+
 	Status status;
 	attachment->detach(status.ptr());
 	g_databases.erase(it);
@@ -1832,6 +1980,22 @@ FB_WASM_EXPORT
 int fb_execute(int db_handle, int tx_handle, const char* sql)
 {
 	return fb_execute_params(db_handle, tx_handle, sql, nullptr, 0);
+}
+
+/**
+ * How many prepared statements each database keeps (64 by default), and
+ * returns the previous size.  0 turns the cache off.  Any change empties
+ * every database's cache, so it is also the way to drop statements that DDL
+ * run through EXECUTE STATEMENT, which the cache cannot see, made stale.
+ */
+FB_WASM_EXPORT
+int fb_statement_cache(int size)
+{
+	const int previous = static_cast<int>(g_statementCacheSize);
+	g_statementCacheSize = size < 0 ? 0u : static_cast<unsigned>(size);
+	for (auto& db : g_databases)
+		flushStatements(db.second);
+	return previous;
 }
 
 /**
@@ -2026,6 +2190,7 @@ const char* fb_query(int db_handle, int tx_handle, const char* sql, int flags)
 	IResultSet*       cursor    = nullptr;
 	IStatement*       statement = nullptr;
 	IMessageMetadata* metadata  = nullptr;
+	bool              cached    = false;
 
 	auto cleanup = [&](bool commit)
 	{
@@ -2037,12 +2202,7 @@ const char* fb_query(int db_handle, int tx_handle, const char* sql, int flags)
 		}
 		if (metadata)
 			metadata->release();
-		if (statement)
-		{
-			Status s;
-			statement->free(s.ptr());
-			statement->release();
-		}
+		releaseStatement(db_handle, statement, cached, !commit);
 		if (ownTransaction && transaction)
 		{
 			Status s;
@@ -2054,8 +2214,7 @@ const char* fb_query(int db_handle, int tx_handle, const char* sql, int flags)
 	};
 
 	Status status;
-	statement = attachment->prepare(status.ptr(), transaction, 0, sql, SQL_DIALECT_V6,
-		IStatement::PREPARE_PREFETCH_METADATA);
+	statement = acquireStatement(db_handle, attachment, transaction, sql, status, cached);
 
 	if (status.failed() || !statement)
 	{
@@ -2523,8 +2682,8 @@ int fb_execute_params(int db_handle, int tx_handle, const char* sql,
 	}
 
 	Status status;
-	IStatement* statement = attachment->prepare(status.ptr(), transaction, 0, sql,
-		SQL_DIALECT_V6, IStatement::PREPARE_PREFETCH_METADATA);
+	bool cached = false;
+	IStatement* statement = acquireStatement(db_handle, attachment, transaction, sql, status, cached);
 
 	if (status.failed() || !statement)
 	{
@@ -2557,11 +2716,7 @@ int fb_execute_params(int db_handle, int tx_handle, const char* sql,
 		}
 	}
 
-	{
-		Status freeStatus;
-		statement->free(freeStatus.ptr());
-	}
-	statement->release();
+	releaseStatement(db_handle, statement, cached, !bound || status.failed());
 
 	if (!bound || status.failed())
 	{
@@ -2904,6 +3059,7 @@ const char* fb_query_params(int db_handle, int tx_handle, const char* sql,
 	IResultSet*       cursor    = nullptr;
 	IStatement*       statement = nullptr;
 	IMessageMetadata* metadata  = nullptr;
+	bool              cached    = false;
 
 	auto cleanup = [&](bool commit)
 	{
@@ -2915,12 +3071,7 @@ const char* fb_query_params(int db_handle, int tx_handle, const char* sql,
 		}
 		if (metadata)
 			metadata->release();
-		if (statement)
-		{
-			Status s;
-			statement->free(s.ptr());
-			statement->release();
-		}
+		releaseStatement(db_handle, statement, cached, !commit);
 		if (ownTransaction && transaction)
 		{
 			Status s;
@@ -2932,8 +3083,7 @@ const char* fb_query_params(int db_handle, int tx_handle, const char* sql,
 	};
 
 	Status status;
-	statement = attachment->prepare(status.ptr(), transaction, 0, sql, SQL_DIALECT_V6,
-		IStatement::PREPARE_PREFETCH_METADATA);
+	statement = acquireStatement(db_handle, attachment, transaction, sql, status, cached);
 
 	if (status.failed() || !statement)
 	{

@@ -484,6 +484,82 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
       expect(mod._fb_detach_database(db)).toBe(0);
     });
 
+    // ── The statement cache ─────────────────────────────────────────────
+    //
+    // Statements are kept prepared per database, keyed by their SQL text.  These
+    // are the cases a cache could get wrong.
+
+    const exec = (db: number, tx: number, sql: string): number => execParams(db, tx, sql, []);
+
+    it('exports the cache size control, 64 by default, 0 to turn it off', () => {
+      expect(typeof mod._fb_statement_cache).toBe('function');
+      expect(mod._fb_statement_cache(0)).toBe(64);
+      expect(mod._fb_statement_cache(64)).toBe(0);
+    });
+
+    it('runs a kept statement again with new parameters and in another transaction', () => {
+      const db = freshDatabase('cache-reuse');
+      expect(exec(db, 0, 'CREATE TABLE r (id INTEGER NOT NULL PRIMARY KEY, v VARCHAR(10))')).toBe(0);
+      for (let i = 0; i < 5; i++) expect(execParams(db, 0, 'INSERT INTO r VALUES (?, ?)', [i, `v${i}`])).toBe(0);
+      expect(queryRows(db, 'SELECT COUNT(*) FROM r')).toEqual([[5]]);
+      // the same INSERT inside a transaction that is rolled back: kept, and the rollback holds
+      const tx = mod._fb_start_transaction(db);
+      expect(execParams(db, tx, 'INSERT INTO r VALUES (?, ?)', [9, 'v9'])).toBe(0);
+      expect(mod._fb_rollback(tx)).toBe(0);
+      expect(queryRows(db, 'SELECT COUNT(*) FROM r')).toEqual([[5]]);
+      expect(mod._fb_detach_database(db)).toBe(0);
+    });
+
+    it('drops a kept statement whose execution failed, and the next call works', () => {
+      const db = freshDatabase('cache-fail');
+      expect(exec(db, 0, 'CREATE TABLE f (id INTEGER NOT NULL PRIMARY KEY)')).toBe(0);
+      expect(execParams(db, 0, 'INSERT INTO f VALUES (?)', [1])).toBe(0);
+      expect(execParams(db, 0, 'INSERT INTO f VALUES (?)', [1])).not.toBe(0);   // duplicate key
+      expect(execParams(db, 0, 'INSERT INTO f VALUES (?)', [2])).toBe(0);
+      expect(queryRows(db, 'SELECT COUNT(*) FROM f')).toEqual([[2]]);
+      expect(mod._fb_detach_database(db)).toBe(0);
+    });
+
+    it('runs the new body of a procedure altered after a kept call', () => {
+      const db = freshDatabase('cache-ddl');
+      expect(exec(db, 0, 'CREATE OR ALTER PROCEDURE p RETURNS (v INTEGER) AS BEGIN v = 1; SUSPEND; END')).toBe(0);
+      expect(queryRows(db, 'SELECT v FROM p')).toEqual([[1]]);
+      expect(exec(db, 0, 'CREATE OR ALTER PROCEDURE p RETURNS (v INTEGER) AS BEGIN v = 2; SUSPEND; END')).toBe(0);
+      expect(queryRows(db, 'SELECT v FROM p')).toEqual([[2]]);
+      expect(mod._fb_detach_database(db)).toBe(0);
+    });
+
+    it('lets DDL drop a table a kept statement reads', () => {
+      const db = freshDatabase('cache-drop');
+      expect(exec(db, 0, 'CREATE TABLE d (id INTEGER)')).toBe(0);
+      expect(exec(db, 0, 'INSERT INTO d VALUES (1)')).toBe(0);
+      expect(queryRows(db, 'SELECT id FROM d')).toEqual([[1]]);
+      expect(`${exec(db, 0, 'DROP TABLE d')} ${errorText()}`).toBe('0 ');
+      const sqlPtr = allocString(mod, 'SELECT id FROM d');
+      try {
+        expect(mod._fb_query(db, 0, sqlPtr, 0)).toBe(0);   // gone, not answered from a kept statement
+        expect(errorText().toUpperCase()).toContain('D');
+      } finally {
+        mod._free(sqlPtr);
+      }
+      expect(exec(db, 0, 'CREATE TABLE d (id INTEGER, w INTEGER)')).toBe(0);
+      expect(exec(db, 0, 'INSERT INTO d VALUES (7, 8)')).toBe(0);
+      expect(queryRows(db, 'SELECT id FROM d')).toEqual([[7]]);
+      expect(mod._fb_detach_database(db)).toBe(0);
+    });
+
+    it('keeps no more than its size, and works with the cache off', () => {
+      const db = freshDatabase('cache-size');
+      expect(exec(db, 0, 'CREATE TABLE s (id INTEGER)')).toBe(0);
+      mod._fb_statement_cache(2);
+      for (let i = 0; i < 6; i++) expect(queryRows(db, `SELECT ${i} FROM s`)).toEqual([]);
+      mod._fb_statement_cache(0);
+      for (let i = 0; i < 3; i++) expect(execParams(db, 0, 'INSERT INTO s VALUES (?)', [i])).toBe(0);
+      expect(queryRows(db, 'SELECT COUNT(*) FROM s')).toEqual([[3]]);
+      mod._fb_statement_cache(64);
+      expect(mod._fb_detach_database(db)).toBe(0);
+    });
+
     it('reports a readable message for invalid SQL', () => {
       mod._fb_init();
 

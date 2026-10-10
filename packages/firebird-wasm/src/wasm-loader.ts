@@ -126,6 +126,12 @@ export interface FirebirdWasmModule {
    */
   _fb_last_affected_rows(): number;
   /**
+   * How many prepared statements each database keeps, keyed by their SQL
+   * text (64 by default); returns the previous size.  0 turns the cache off.
+   * Any change empties every database's cache.
+   */
+  _fb_statement_cache(size: number): number;
+  /**
    * Pointer to the binary BLOB side buffer for the most recent query, or 0.
    *
    * Owned by the engine and replaced by the next query, like the error text —
