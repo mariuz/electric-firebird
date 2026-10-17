@@ -113,6 +113,33 @@ afterEach(() => {
   removeLocks();
 });
 
+/**
+ * Another tab taking the database: the Web Lock held directly, as a second
+ * tab's acquireDatabaseLock would hold it.  Not acquireDatabaseLock here: in
+ * this process that is the same page, which is refused before any Web Lock.
+ */
+async function holdInOtherTab(dbName: string): Promise<{ release: () => Promise<void> }> {
+  let release!: () => void;
+  const held = new Promise<void>((r) => {
+    release = r;
+  });
+  let granted!: () => void;
+  const isGranted = new Promise<void>((r) => {
+    granted = r;
+  });
+  const done = manager.request(databaseLockName(dbName), { mode: 'exclusive' }, () => {
+    granted();
+    return held;
+  });
+  await isGranted;
+  return {
+    release: async () => {
+      release();
+      await done;
+    },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -134,10 +161,10 @@ describe('acquireDatabaseLock', () => {
     expect(manager.isHeld(databaseLockName('mydb'))).toBe(false);
   });
 
-  it('holds the lock until released, blocking a second acquirer', async () => {
+  it('waits for another tab to release, then takes the lock', async () => {
     installLocks();
 
-    const first = await acquireDatabaseLock('mydb');
+    const first = await holdInOtherTab('mydb');
 
     let secondGranted = false;
     const second = acquireDatabaseLock('mydb', { timeoutMs: Infinity }).then(
@@ -161,7 +188,7 @@ describe('acquireDatabaseLock', () => {
   it('fails with DatabaseLockedError when the holder does not release in time', async () => {
     installLocks();
 
-    const first = await acquireDatabaseLock('mydb');
+    const first = await holdInOtherTab('mydb');
 
     // The error names the database and says what to do about it: a bare
     // "AbortError" from the lock API would tell an application nothing.
@@ -177,7 +204,7 @@ describe('acquireDatabaseLock', () => {
 
   it('reports how long it waited, and for which database', async () => {
     installLocks();
-    const first = await acquireDatabaseLock('reports');
+    const first = await holdInOtherTab('reports');
 
     let error: unknown;
     try {
@@ -197,7 +224,7 @@ describe('acquireDatabaseLock', () => {
   it('leaves the lock available after a timed-out attempt', async () => {
     installLocks();
 
-    const first = await acquireDatabaseLock('mydb');
+    const first = await holdInOtherTab('mydb');
     await expect(acquireDatabaseLock('mydb', { timeoutMs: 20 })).rejects.toThrow(
       DatabaseLockedError,
     );
@@ -246,6 +273,67 @@ describe('acquireDatabaseLock', () => {
     expect(warnings[0]).toMatch(/Web Locks API is unavailable/);
 
     await expect(lock.release()).resolves.toBeUndefined();
+  });
+
+  it('refuses a name this page already holds at once, and says so', async () => {
+    installLocks();
+    const first = await acquireDatabaseLock('page');
+
+    let error: unknown;
+    const startedAt = Date.now();
+    try {
+      // A long timeout: the refusal must not wait for it.
+      await acquireDatabaseLock('page', { timeoutMs: 10_000 });
+    } catch (e) {
+      error = e;
+    }
+
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    expect(error).toBeInstanceOf(DatabaseLockedError);
+    const locked = error as DatabaseLockedError;
+    expect(locked.heldBy).toBe('this-page');
+    expect(locked.waitedMs).toBe(0);
+    expect(locked.message).toMatch(/already open in this page/);
+    expect(locked.message).not.toMatch(/another tab/);
+
+    // Released, the name can be opened again.
+    await first.release();
+    const again = await acquireDatabaseLock('page');
+    await again.release();
+  });
+
+  it('refuses the second of two instances racing for one name', async () => {
+    installLocks();
+    const [a, b] = await Promise.allSettled([
+      acquireDatabaseLock('race'),
+      acquireDatabaseLock('race'),
+    ]);
+    expect(a.status).toBe('fulfilled');
+    expect(b.status).toBe('rejected');
+    expect((b as PromiseRejectedResult).reason).toMatchObject({ heldBy: 'this-page' });
+    await (a as PromiseFulfilledResult<{ release: () => Promise<void> }>).value.release();
+  });
+
+  it('refuses a second open in this page where the Web Locks API is missing too', async () => {
+    // In Node there is no other tab, but two instances in one process share
+    // one engine filesystem: the same name is the same file.
+    removeLocks();
+    const quiet = { onUnavailable: () => {} };
+    const first = await acquireDatabaseLock('node', quiet);
+    await expect(acquireDatabaseLock('node', quiet)).rejects.toMatchObject({ heldBy: 'this-page' });
+    await first.release();
+    const again = await acquireDatabaseLock('node', quiet);
+    await again.release();
+  });
+
+  it('frees the name when the lock is not granted', async () => {
+    installLocks();
+    const other = await holdInOtherTab('freed');
+    await expect(acquireDatabaseLock('freed', { timeoutMs: 20 })).rejects.toMatchObject({ heldBy: 'other' });
+    await other.release();
+    // Not left recorded as held here by the failed attempt.
+    const lock = await acquireDatabaseLock('freed', { timeoutMs: 50 });
+    await lock.release();
   });
 
   it('surfaces a genuine lock failure instead of calling it contention', async () => {

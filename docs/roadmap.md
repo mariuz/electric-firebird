@@ -805,7 +805,12 @@ be built:
 - [x] Make `FirebirdBrowser.query()` **throw** when passed parameters, until
       the parameterised C ABI exists.
 - [x] Document the multi-tab hazard in `browser.md`.
-- [ ] Refuse a second concurrent open of the same database name within a page.
+- [x] Refuse a second concurrent open of the same database name within a page.
+      The Web Lock did refuse it, after waiting out `lockTimeoutMs` (5 s by
+      default) for a tab that did not exist, and blaming "another tab"; in
+      Node, with no Web Locks, nothing refused it at all. The page now records
+      the names it holds and refuses at once, with `heldBy: 'this-page'`, and
+      an instance that fails to open releases its name.
 - [x] Make `wasm.spec.ts` assert real data instead of stub-satisfiable shapes.
 - [x] Browser test coverage for the layer that *is* real (§5).
 - [x] Fix the `e2e` WASM artifact path resolution.
@@ -828,8 +833,8 @@ be built:
       build: zero undefined, zero duplicate symbols.
 - [x] Compile the metadata layer for real via the boot gpre pass instead of
       stubbing it out.
-- [ ] **Fix the `_fb_create_database()` trap.**  Diagnosed down to the exact
-      member; see "The create-database trap" below.
+- [x] **Fix the `_fb_create_database()` trap.**  Fixed; see "The
+      create-database trap" above.
 - [ ] Re-check the remaining stubs in `fb_wasm_stubs.cpp` once the engine
       executes a statement.
 - **Acceptance:** in Chromium, `CREATE TABLE` → `INSERT` → `SELECT` returns the

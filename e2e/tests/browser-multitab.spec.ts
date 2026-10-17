@@ -118,6 +118,74 @@ test.describe('Multi-tab safety', () => {
     await closeHeld(tabA);
   });
 
+  test('refuses a second open in the same page at once, and says so', async ({
+    context,
+  }) => {
+    const tab = await newTab(context);
+
+    const outcome = await tab.evaluate(async () => {
+      const first = new window.FB.FirebirdBrowser('same-page', { autoPersist: false });
+      await first.exec('CREATE TABLE t (id INTEGER)');
+
+      // A long lock timeout: refusing must not wait it out, because nothing
+      // in another tab is going to release this.
+      const second = new window.FB.FirebirdBrowser('same-page', {
+        autoPersist: false,
+        lockTimeoutMs: 10_000,
+      });
+      const startedAt = performance.now();
+      let refusal = '';
+      try {
+        await second.exec('SELECT 1 FROM RDB$DATABASE');
+      } catch (err) {
+        refusal = (err as Error).message;
+      }
+      const waitedMs = performance.now() - startedAt;
+      await second.close();
+
+      // Closed, the name can be opened again.
+      await first.close();
+      const third = new window.FB.FirebirdBrowser('same-page', { autoPersist: false });
+      await third.exec('SELECT 1 FROM RDB$DATABASE');
+      await third.close();
+      return { refusal, waitedMs };
+    });
+
+    expect(outcome.refusal).toContain('already open in this page');
+    expect(outcome.refusal).toContain('same-page');
+    expect(outcome.refusal).not.toContain('another tab');
+    expect(outcome.waitedMs).toBeLessThan(1_000);
+  });
+
+  test('an instance that failed to open does not keep the name', async ({ context }) => {
+    const tab = await newTab(context);
+
+    const outcome = await tab.evaluate(async () => {
+      window.__stub.initRc = 3;
+      window.__stub.lastError = 'fb_init: simulated failure';
+      const broken = new window.FB.FirebirdBrowser('failed-open', { autoPersist: false });
+      let first = '';
+      try {
+        await broken.exec('SELECT 1 FROM RDB$DATABASE');
+      } catch (err) {
+        first = (err as Error).message;
+      } finally {
+        window.__stub.initRc = 0;
+        window.__stub.lastError = '';
+      }
+      // No close(): the application just tries again with a new instance.
+      const retry = new window.FB.FirebirdBrowser('failed-open', {
+        autoPersist: false,
+        lockTimeoutMs: 300,
+      });
+      await retry.exec('SELECT 1 FROM RDB$DATABASE');
+      await retry.close();
+      return first;
+    });
+
+    expect(outcome).toContain('simulated failure');
+  });
+
   test('does not block a different database', async ({ context }) => {
     const tabA = await newTab(context);
     const tabB = await newTab(context);

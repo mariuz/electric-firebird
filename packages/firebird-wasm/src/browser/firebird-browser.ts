@@ -1157,18 +1157,26 @@ export class FirebirdBrowser {
     // 'shared' deliberately takes no lock here: the transport's election holds
     // it, and a second request from the same tab would queue behind itself.
 
-    await this.engine.init();
-    if (this.opfs) {
-      // The mount both opens the file and decides where it lives, so the path
-      // comes back rather than being assumed on this side.
-      this.opfsPath = await this.engine.mountOpfs(this.fileName);
-    } else if (!this.ephemeral) {
-      // An ephemeral database never touches IndexedDB, so the store is not
-      // opened at all — opening it would create an empty one on disk for a
-      // database whose whole point is leaving nothing behind.
-      await this.vfs.open(this.dbName);
+    try {
+      await this.engine.init();
+      if (this.opfs) {
+        // The mount both opens the file and decides where it lives, so the path
+        // comes back rather than being assumed on this side.
+        this.opfsPath = await this.engine.mountOpfs(this.fileName);
+      } else if (!this.ephemeral) {
+        // An ephemeral database never touches IndexedDB, so the store is not
+        // opened at all — opening it would create an empty one on disk for a
+        // database whose whole point is leaving nothing behind.
+        await this.vfs.open(this.dbName);
+      }
+      await this.openDatabase();
+    } catch (err) {
+      // An instance that failed to open never opens: every later call
+      // rethrows this.  Holding the name past that would keep a fresh
+      // instance, in this page or another tab, from trying again.
+      await this.releaseLock();
+      throw err;
     }
-    await this.openDatabase();
     this.attachLifecycleListeners();
   }
 
