@@ -1044,9 +1044,20 @@ gaps it ran into, with its numbers, in rough order of what they would buy.
       but no configuration, so it never ran. Fixed in #15, with a CI step.
 - [ ] **No `SharedArrayBuffer` requirement.** Every static-hosted consumer
       carries a service worker that only adds COOP/COEP. See
-      [plans/sab-free-build.md](./plans/sab-free-build.md); step 1, the list
-      of threads this build actually starts, is a day's work and decides the
-      rest.
+      [plans/sab-free-build.md](./plans/sab-free-build.md). Step 1 is done
+      (`wasm/trace-threads.sh`): the engine starts five threads, none on a
+      statement's path. Two are per process (a timer, the auth mapping
+      listener), two per database (the cache writer, the garbage collector),
+      and one on the first event (the event watcher). One is configuration,
+      three are small inline patches, and the event watcher becomes a poll:
+      about a week, as planned.
+- [ ] **Cooperative garbage collection.** Found while tracing the threads:
+      under the engine's default `GCPolicy = combined` the statement and the
+      garbage collector thread fight over the same pages, and every handoff
+      is a futex wait and wake between Web Workers. Updating and reading 300
+      rows a round costs 16.7–17.1 ms under `combined`, 2.6 under
+      `cooperative`. The bridge should open every database with
+      `cooperative`, which is also what a build without threads needs.
 
 ### M5 — Ecosystem
 

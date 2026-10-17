@@ -46,6 +46,21 @@ console.log(mod._fb_init());          // 0 = ok
 // _fb_last_error() carries the engine's own message
 ```
 
+## Which threads the engine starts
+
+`./trace-threads.sh` relinks the existing `build/` tree with function names
+into `build-trace/` (half a minute, no recompile), makes the glue log a stack
+at every `pthread_create`, and prints the threads each C API call starts,
+once per `firebird.conf` given:
+
+```bash
+./trace-threads.sh "" "GCPolicy = cooperative"
+```
+
+This build reads `firebird.conf` from `/usr/local/firebird/` (`FB_PREFIX`),
+not from `$FIREBIRD`; the script writes it there in MEMFS before `fb_init`.
+What the trace found is in `docs/plans/sab-free-build.md`.
+
 ## Known WASM-hostile constructs
 
 - `invoke()` in `fun.epp` (legacy UDF dispatch) calls function pointers of

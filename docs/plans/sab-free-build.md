@@ -51,8 +51,8 @@ wrappers, under `src/jrd` and `src/common`):
 Not all of these run in an embedded single-process engine, and not all of the
 ones that run are needed: Firebird's Classic architecture runs with no cache
 writer and cooperative garbage collection, which is a configuration, not a
-patch. But the list has never been measured against *this* build, and that is
-step 1.
+patch. The list has now been measured against this build (step 1, below):
+five threads, all of them classified.
 
 Two other things lean on threads without starting one:
 
@@ -66,6 +66,50 @@ Two other things lean on threads without starting one:
   OPFS backend copies through a scratch buffer (noted under M4 in the
   roadmap). A plain `ArrayBuffer` heap would let those calls take the heap
   view directly.
+
+## Step 1, measured
+
+`wasm/trace-threads.sh` relinks the existing build tree with function names
+(half a minute, no recompile), makes the glue log a stack at every
+`pthread_create`, and drives the C API with `wasm/trace-threads.cjs`
+through a database's life: create, DDL, DML, `SELECT`, an explicit
+transaction, events, detach, attach. Measured in Node in October 2026, engine
+6.0.0 as built here; the Node integration suite against the same artifact
+started nothing the script does not.
+
+| Thread | Started by | On | One per | Without threads |
+|---|---|---|---|---|
+| timer | `Why::TimerImplementation::start`, first called by the trace config storage's touch timer | the first create or attach | process | *Inline*: the touch timer tells other processes the storage is alive, and there are none. The same timer serves statement and idle timeouts, which would not fire. |
+| auth mapping listener | `MappingIpc::setup`, from `Mapping::clearCache` | the first create | process | *Inline*: it waits for other processes' cache resets; one process can clear its own cache directly. |
+| cache writer | `CCH_init2` | every create and attach | database | *Inline*: started only in Super mode, and Super already runs without one for a read-only or security database, so it is a state the engine knows. Pages are written when released and at commit. |
+| garbage collector | `VIO_init` | every create and attach | database | *Configuration*: `GCPolicy = cooperative`. |
+| event watcher | `EventManager::init` | the first `POST_EVENT` or `fb_events_subscribe` | database | *Essential*, polled as planned below. |
+
+Nothing else: no thread starts another; no statement, transaction, commit or
+detach starts one; and `Task.cpp`'s parallel workers, the lock manager, sweep,
+crypt and services never run. This is the short list the plan hoped for.
+
+Three things learned on the way:
+
+- **`ServerMode = Classic` is not the route.** It removes the cache writer
+  and the garbage collector, but its lock manager starts a blocking-action
+  thread on every attach (`LCK_init`). Super with cooperative garbage
+  collection and no cache writer is.
+- **Where `firebird.conf` is read.** This build reads
+  `/usr/local/firebird/firebird.conf` (`FB_PREFIX`; `FB_CONFDIR` is empty),
+  not `$FIREBIRD/firebird.conf`: the engine fixes its root before `fb_init`
+  sets `FIREBIRD`. A file written there in MEMFS before `fb_init` is read,
+  and `RDB$CONFIG` reports it as the source.
+- **The default garbage collection is slow here, threads or not.** With
+  `GCPolicy = combined`, the engine's default in Super, the statement and the
+  garbage collector thread work the same pages, and every handoff between
+  them is a futex wait and wake between Web Workers. Updating and reading
+  300 rows a round, alternating processes, three runs each: `combined` 16.7–
+  17.1 ms a round, `cooperative` 2.6, `background` 2.6–2.7, flat from the
+  first round to the last. A CPU profile of `combined` spends 42 % of the
+  time in `_do_futex_wait` and 12 % in `emscripten_futex_wake`. Shipping
+  `cooperative` is worth doing for the threaded build on its own, and it is
+  the policy a build without threads needs anyway.
 
 ## What it is not
 
@@ -81,7 +125,8 @@ Two other things lean on threads without starting one:
 
 ## The route
 
-1. **Measure which threads this build actually starts.** Build once with a
+1. **Measure which threads this build actually starts.** *Done: see
+   "Step 1, measured" above.* Build once with a
    `pthread_create` wrapper (`-Wl,--wrap=pthread_create`) that logs the entry
    point and the calling site and then calls through. Run the Node integration
    suite and the e2e suite against it. The log is the list of threads an
@@ -139,12 +184,16 @@ Two other things lean on threads without starting one:
 
 ## Cost and risk
 
-Step 1 is a day and decides the rest. If the list is garbage collector, cache
-writer and event watcher, steps 2 to 5 are about a week: two configuration
-lines, one inline patch, one polling patch, a CMake option, a loader option and
-the test matrix. If `Task.cpp` workers or the lock manager turn out to be on
-the path of an ordinary statement, the inline work is larger and should be
-re-costed before continuing.
+Step 1 decided the rest, and it came out at the cheap end: the garbage
+collector, the cache writer and the event watcher, plus two process-wide
+helpers (the timer and the auth mapping listener), and neither `Task.cpp`
+workers nor the lock manager on any statement's path. Steps 2 to 5 stay about
+a week: one configuration line (worth shipping in the threaded build first,
+for its own speed), three small inline patches (the trace touch timer, the
+mapping listener, the cache writer), one polling patch, a CMake option, a
+loader option and the test matrix. The one behaviour lost is statement and
+idle timeouts, which need the timer thread; a build without threads documents
+that rather than emulating it.
 
 The risk to carry is a second artifact to build, publish and test, with the
 patched code paths exercised only by it. Keeping the threaded build the
