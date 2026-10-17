@@ -408,6 +408,27 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
       }
     };
 
+    it('collects garbage cooperatively, on create and on attach', () => {
+      // The engine's default in Super ("combined") has the statement and a
+      // collector thread fight over the same pages; the bridge opens every
+      // database with "cooperative", which starts no collector thread.
+      const db = freshDatabase('gc-policy');
+      const policy = (handle: number) => queryRows(handle,
+        "SELECT TRIM(RDB$CONFIG_VALUE), TRIM(RDB$CONFIG_SOURCE) FROM RDB$CONFIG WHERE RDB$CONFIG_NAME = 'GCPolicy'");
+      expect(policy(db)).toEqual([['cooperative', '<DPB>']]);
+      expect(mod._fb_detach_database(db)).toBe(0);
+
+      const pathPtr = allocString(mod, '/data/gc-policy.fdb');
+      try {
+        const again = mod._fb_attach_database(pathPtr);
+        expect({ handle: again > 0, error: errorText() }).toEqual({ handle: true, error: '' });
+        expect(policy(again)).toEqual([['cooperative', '<DPB>']]);
+        expect(mod._fb_detach_database(again)).toBe(0);
+      } finally {
+        mod._free(pathPtr);
+      }
+    });
+
     it('binds a double from its binary form, bit for bit', () => {
       const db = freshDatabase('typed-double');
       expect(execParams(db, 0, 'CREATE TABLE d (id INTEGER, v DOUBLE PRECISION)', [])).toBe(0);

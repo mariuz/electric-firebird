@@ -107,9 +107,9 @@ Three things learned on the way:
   300 rows a round, alternating processes, three runs each: `combined` 16.7–
   17.1 ms a round, `cooperative` 2.6, `background` 2.6–2.7, flat from the
   first round to the last. A CPU profile of `combined` spends 42 % of the
-  time in `_do_futex_wait` and 12 % in `emscripten_futex_wake`. Shipping
-  `cooperative` is worth doing for the threaded build on its own, and it is
-  the policy a build without threads needs anyway.
+  time in `_do_futex_wait` and 12 % in `emscripten_futex_wake`. The bridge
+  now opens every database with `cooperative` (see the roadmap), so the
+  configuration step below is already done in the threaded build.
 
 ## What it is not
 

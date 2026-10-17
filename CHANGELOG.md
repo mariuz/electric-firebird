@@ -39,6 +39,16 @@ API may still move between minor releases.
   number when parsed; 3000 doubles and 98 708 rows of dates, times and
   numbers across years 1 to 9999 parse identically before and after. Needs a
   rebuilt artifact.
+- **Garbage is collected by the statements, not by a thread.** Every database
+  is opened with `GCPolicy = cooperative` (in the DPB). Under the engine's
+  default, `combined`, a statement and the garbage collector thread fought
+  over the same pages, and every handoff between them was a futex wait and
+  wake between Web Workers: updating and reading back 300 rows took
+  16.0–16.3 ms a round, and now takes 2.1–2.3. Smaller updates, bulk
+  inserts, deletes and updates, and scans over a deleted table's garbage cost
+  the same as before, and each database starts one thread fewer.
+  `RDB$CONFIG` reports the setting with the source `<DPB>`. Needs a rebuilt
+  artifact.
 
 ## 0.6.1 — 2026-10-10
 
