@@ -996,12 +996,20 @@ gaps it ran into, with its numbers, in rough order of what they would buy.
       column. Writing a value costs about 0.5–0.65 µs in C and decoding it
       about 0.1 µs in JS. The JS around the call (parameters, heap copies)
       is 1–5 µs and `FirebirdBrowser`'s own layer a few more.
-- [ ] **Describe a kept statement's columns once.** Its columns cannot change
-      while it is kept, so the C bridge can write their JSON once, keep it
-      with the statement, and the JS can keep the decoded field list by that
-      text. From the numbers above, a one-row query of ten columns would drop
-      from 41–70 µs to roughly 20–30. After that, the cost per value in C
-      (`snprintf` for doubles and timestamps is the likely part) is next.
+- [x] **Describe a kept statement's columns once.** Its columns cannot change
+      while it is kept, so the C bridge works out their layout and their JSON
+      once and keeps both with the statement, and the JS keeps the decoded
+      field list by that text. `bench:calls`, `main` and this alternating,
+      two rounds each: one row of ten columns 48–59 µs a call before, 34–40
+      after (the C call 28–30 to 19–23); ten columns and no row 35–40 to
+      22–24; one value 24–34 to 19–26. Short of the 20–30 hoped for: the JS
+      still copies the column text out of the heap and hashes it to find the
+      cached list, 4.6–6.9 µs for ten columns.
+- [ ] **A shape id instead of the column text.** The C bridge could number a
+      kept statement's shape and send the number, the JS keeping the decoded
+      fields by it, so a small result would cross as its rows alone. Then
+      the cost per value in C (`snprintf` for doubles and timestamps is the
+      likely part).
 - [x] **`execBatch` on the Node backend.** It prepared once and looped, one
       execute and one round trip per row; the browser's runs as one `IBatch`
       request. The Node driver binds no `IBatch`: not node-firebird-native-api
@@ -1011,19 +1019,17 @@ gaps it ran into, with its numbers, in rough order of what they would buy.
       the driver binds them: three columns from 152–174 to 18–35 µs a row
       against a local Firebird 3 server. Still possible: `IBatch` bound
       upstream, which would also take a BLOB value's own round trips away.
-- [ ] **A build that survives a rebuild.** Three things stopped a clean local
+- [x] **A build that survives a rebuild.** Three things stopped a clean local
       build on a stock Ubuntu machine: the native bootstrap needs the host's
       ICU headers and failed deep inside a compile without saying so; CMake
       3.28's generate step refuses a generated `parse.cpp` that does not exist
       yet; and a rebuild after deleting `build-native-config` compiled the
       native `gpre_boot` against the source tree's 32-bit-edited
       `autoconfig.h` (git-ignored, so it survives a cleaned submodule). Fixed
-      in the `build-bootstrap` branch; CI only ever builds once, from a fresh
-      checkout, which is why none of these showed there. A CI job that builds
-      twice would keep it so.
-- [ ] **The linter runs.** `npm run lint` had a script and its dependencies
-      but no configuration, so it never ran. Fixed in the `lint-config`
-      branch, with a CI step.
+      in #17; CI only ever builds once, from a fresh checkout, which is why
+      none of these showed there. Still open: a CI job that builds twice.
+- [x] **The linter runs.** `npm run lint` had a script and its dependencies
+      but no configuration, so it never ran. Fixed in #15, with a CI step.
 - [ ] **No `SharedArrayBuffer` requirement.** Every static-hosted consumer
       carries a service worker that only adds COOP/COEP. See
       [plans/sab-free-build.md](./plans/sab-free-build.md); step 1, the list
