@@ -66,20 +66,31 @@ export interface DatabaseLockOptions {
   onUnavailable?: (message: string) => void;
 }
 
-/** Thrown when another tab holds the database and did not release in time. */
+/**
+ * Thrown when the database is already open: in another tab that did not
+ * release it in time, or by another instance in this very page.
+ */
 export class DatabaseLockedError extends Error {
   constructor(
     /** The logical database name that is held elsewhere. */
     readonly dbName: string,
-    /** How long we waited, in milliseconds. */
+    /** How long we waited, in milliseconds (0 when it is held in this page). */
     readonly waitedMs: number,
+    /** Where it is held: another tab or worker, or this page itself. */
+    readonly heldBy: 'other' | 'this-page' = 'other',
   ) {
     super(
-      `Database "${dbName}" is already open in another tab or worker ` +
-        `(waited ${waitedMs}ms).  Each tab keeps its own full copy of the ` +
-        `database, so allowing both would silently discard one tab's writes.  ` +
-        `Close the other tab, or pass multiTab: 'allow-unsafe' if you are ` +
-        `certain only one of them writes.`,
+      heldBy === 'this-page'
+        ? `Database "${dbName}" is already open in this page, by another ` +
+            `FirebirdBrowser that has not been closed.  Both would use the one ` +
+            `file and each persist its own view of it, so one would silently ` +
+            `discard the other's writes.  Share the open instance, or close() ` +
+            `it before opening the name again.`
+        : `Database "${dbName}" is already open in another tab or worker ` +
+            `(waited ${waitedMs}ms).  Each tab keeps its own full copy of the ` +
+            `database, so allowing both would silently discard one tab's writes.  ` +
+            `Close the other tab, or pass multiTab: 'allow-unsafe' if you are ` +
+            `certain only one of them writes.`,
     );
     this.name = 'DatabaseLockedError';
   }
@@ -90,6 +101,15 @@ export class DatabaseLockedError extends Error {
 // ---------------------------------------------------------------------------
 
 const DEFAULT_TIMEOUT_MS = 5_000;
+
+/**
+ * The databases this realm (a page, a worker, a Node process) holds.  Web
+ * Locks cannot tell a second instance in this page from another tab, so it
+ * would wait out the timeout and blame "another tab"; and where Web Locks are
+ * missing, as in Node, nothing would stop it at all.  This page knows what it
+ * holds, so it refuses at once and says so.
+ */
+const heldHere = new Set<string>();
 
 /** Lock names are namespaced so they cannot collide with an app's own locks. */
 export function databaseLockName(dbName: string): string {
@@ -125,6 +145,26 @@ export async function acquireDatabaseLock(
 ): Promise<DatabaseLock> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
+  if (heldHere.has(dbName)) {
+    throw new DatabaseLockedError(dbName, 0, 'this-page');
+  }
+  // Reserved now, not once granted: a second instance racing this one is in
+  // this page too, and must be told so rather than queue behind it.
+  heldHere.add(dbName);
+  try {
+    return await acquireCrossTab(dbName, timeoutMs, options);
+  } catch (err) {
+    heldHere.delete(dbName);
+    throw err;
+  }
+}
+
+/** The cross-tab half of {@link acquireDatabaseLock}: the Web Lock itself. */
+async function acquireCrossTab(
+  dbName: string,
+  timeoutMs: number,
+  options: DatabaseLockOptions,
+): Promise<DatabaseLock> {
   if (!locksAvailable()) {
     const warn = options.onUnavailable ?? ((m: string) => console.warn(m));
     warn(
@@ -132,7 +172,7 @@ export async function acquireDatabaseLock(
         'cannot be detected.  Opening the same database in two places will ' +
         'silently lose writes.',
     );
-    return { enforced: false, release: async () => {} };
+    return holdHere(dbName, { enforced: false, release: async () => {} });
   }
 
   const name = databaseLockName(dbName);
@@ -189,7 +229,7 @@ export async function acquireDatabaseLock(
   if (timer !== null) clearTimeout(timer);
 
   let released = false;
-  return {
+  return holdHere(dbName, {
     enforced: true,
     release: async () => {
       if (released) return;
@@ -198,6 +238,20 @@ export async function acquireDatabaseLock(
       // Await the request promise, so the lock is provably gone once this
       // resolves: a caller that reopens immediately must not race itself.
       await done.catch(() => {});
+    },
+  });
+}
+
+/** Keep `dbName` recorded as held in this realm until `lock` is released. */
+function holdHere(dbName: string, lock: DatabaseLock): DatabaseLock {
+  let released = false;
+  return {
+    enforced: lock.enforced,
+    release: async () => {
+      if (released) return;
+      released = true;
+      heldHere.delete(dbName);
+      await lock.release();
     },
   };
 }

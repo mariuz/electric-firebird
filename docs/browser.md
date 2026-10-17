@@ -229,10 +229,21 @@ try {
   await db.exec('SELECT 1 FROM RDB$DATABASE');
 } catch (err) {
   if (err instanceof DatabaseLockedError) {
-    showBanner(`Already open in another tab.`);
+    showBanner(err.heldBy === 'this-page'
+      ? 'Already open in this page.'
+      : 'Already open in another tab.');
   }
 }
 ```
+
+A second instance of the same name **in the same page** is refused too, and at
+once: both would use the one file and each persist its own view of it. The page
+knows what it holds, so it does not wait out `lockTimeoutMs` for a tab that
+does not exist, and the error says `heldBy: 'this-page'` and "already open in
+this page". Share the open instance, or `close()` it first. This holds in Node
+as well, where there are no Web Locks but instances in one process share an
+engine filesystem. An instance that fails to open releases the name, so a new
+one can try again without closing the broken one first.
 
 The exclusion uses the [Web Locks API][weblocks], for one property in
 particular: locks are released when the holding context dies.  A tab that
@@ -255,9 +266,9 @@ has since replaced.
 | `lockTimeoutMs` | How long to wait for the other tab, default `5000`. `Infinity` waits forever |
 
 Where the Web Locks API is unavailable — Node, jsdom, a page served over plain
-HTTP — there is nothing to enforce with, so the library warns and proceeds.
-Any browser able to run the engine at all supports it, since the engine
-already requires cross-origin isolation.
+HTTP — there is nothing to enforce between tabs with, so the library warns and
+proceeds (a second open in the same page or process is still refused). Every
+browser that runs the engine supports Web Locks in a secure context.
 
 ### Sharing one database between tabs
 

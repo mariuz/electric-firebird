@@ -6,6 +6,17 @@ API may still move between minor releases.
 
 ## Unreleased
 
+### Fixed
+
+- **A second open of the same database in one page is refused at once.** It
+  used to wait out `lockTimeoutMs` (5 s by default) for a tab that did not
+  exist and then report the database "already open in another tab"; in Node,
+  which has no Web Locks, it was not refused at all, and two instances shared
+  one file. The page now records the names it holds:
+  `DatabaseLockedError.heldBy` is `'this-page'` and the message says so. An
+  instance that fails to open now releases its name, so a new one can try
+  again without closing the broken one first.
+
 ### Added
 
 - **A build without threads.** `dist/wasm/firebird-embedded-st.{js,wasm}`
