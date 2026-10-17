@@ -416,7 +416,8 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
       // value in six, which is what the binary form exists to bypass.  A few
       // hundred deterministic doubles across the exponent range would catch
       // the text path with certainty; the binary path must return every one
-      // of them unchanged.  %.17g on the way out is exact for a double.
+      // of them unchanged.  The shortest round-trip text on the way out is
+      // exact for a double.
       const values: number[] = [];
       let seed = 0x2545f491;
       for (let i = 0; i < 300; i++) {
@@ -452,6 +453,51 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
       const [row] = queryRows(db,
         'SELECT CAST(i AS VARCHAR(30)), CAST(n AS VARCHAR(30)), s, CAST(f AS DOUBLE PRECISION) FROM m');
       expect(row).toEqual(['9007199254740993', '1.10', '1.5', Math.fround(0.1)]);
+      expect(mod._fb_detach_database(db)).toBe(0);
+    });
+
+    it('writes dates, times, integers and doubles as the engine would print them', () => {
+      const db = freshDatabase('value-text');
+      // The bridge decodes dates and times itself and writes numbers with
+      // to_chars; the calendar edges, leap days, fractions and the integer
+      // extremes are where hand-written formatting goes wrong.
+      const sqlPtr = allocString(mod, `SELECT
+          DATE '0001-01-01', DATE '9999-12-31', DATE '1858-11-17', DATE '1858-11-16',
+          DATE '2000-02-29', DATE '1900-02-28',
+          TIMESTAMP '0001-01-01 00:00:00.0001', TIMESTAMP '9999-12-31 23:59:59.9999',
+          TIME '00:00:00', TIME '23:59:59.9999', TIME '07:08:09.0100',
+          CAST(-32768 AS SMALLINT), CAST(-2147483648 AS INTEGER),
+          CAST(-9223372036854775808 AS BIGINT), CAST(9007199254740991 AS BIGINT),
+          CAST(9007199254740992 AS BIGINT), CAST(-12345.6789 AS NUMERIC(18,4)),
+          CAST(0.1 AS DOUBLE PRECISION), CAST(-0e0 AS DOUBLE PRECISION),
+          CAST(1e21 AS DOUBLE PRECISION), CAST(1e-7 AS DOUBLE PRECISION)
+        FROM RDB$DATABASE`);
+      try {
+        const resultPtr = mod._fb_query(db, 0, sqlPtr, 0);
+        expect({ pointer: resultPtr > 0, error: errorText() }).toEqual({ pointer: true, error: '' });
+        const text = mod.UTF8ToString(resultPtr);
+        mod._fb_free_result(resultPtr);
+        // Shortest round-trip doubles: 0.1, not 0.10000000000000001.
+        expect(text).toContain(',0.1,');
+        const [row] = (JSON.parse(text) as { rows: unknown[][] }).rows;
+        expect(row.slice(0, 11)).toEqual([
+          '0001-01-01', '9999-12-31', '1858-11-17', '1858-11-16', '2000-02-29', '1900-02-28',
+          '0001-01-01T00:00:00.0001', '9999-12-31T23:59:59.9999',
+          '00:00:00.0000', '23:59:59.9999', '07:08:09.0100',
+        ]);
+        expect(row.slice(11, 17)).toEqual([
+          -32768, -2147483648, '-9223372036854775808', 9007199254740991,
+          '9007199254740992', '-12345.6789',
+        ]);
+        const doubles = row.slice(17);
+        expect(doubles.length).toBe(4);
+        expect(Object.is(doubles[0], 0.1)).toBe(true);
+        expect(Object.is(doubles[1], -0)).toBe(true);
+        expect(Object.is(doubles[2], 1e21)).toBe(true);
+        expect(Object.is(doubles[3], 1e-7)).toBe(true);
+      } finally {
+        mod._free(sqlPtr);
+      }
       expect(mod._fb_detach_database(db)).toBe(0);
     });
 
