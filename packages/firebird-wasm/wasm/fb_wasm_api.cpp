@@ -1593,6 +1593,16 @@ IXpbBuilder* buildDpb(Status& status, bool forCreate)
 
 	dpb->insertInt(status.ptr(), isc_dpb_sql_dialect, SQL_DIALECT_V6);
 	dpb->insertString(status.ptr(), isc_dpb_lc_ctype, "UTF8");
+	// Garbage collection by the statements that meet old record versions,
+	// not by a thread of its own.  The engine's default in Super, "combined",
+	// has the statement and the collector thread work the same pages, and
+	// here every handoff between them is a futex wait and wake between Web
+	// Workers: updating and reading 300 rows cost 16.7 ms a round under
+	// "combined" and 2.6 under "cooperative" (docs/plans/sab-free-build.md).
+	// It is also one thread fewer per database.  GCPolicy is a per-database
+	// setting, applied by the attachment that opens the database; a second
+	// attachment to an open one gets a warning, not an error.
+	dpb->insertString(status.ptr(), isc_dpb_config, "GCPolicy = cooperative");
 
 	if (forCreate)
 	{

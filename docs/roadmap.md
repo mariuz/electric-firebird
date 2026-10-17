@@ -1033,13 +1033,17 @@ gaps it ran into, with its numbers, in rough order of what they would buy.
       and one on the first event (the event watcher). One is configuration,
       three are small inline patches, and the event watcher becomes a poll:
       about a week, as planned.
-- [ ] **Cooperative garbage collection.** Found while tracing the threads:
+- [x] **Cooperative garbage collection.** Found while tracing the threads:
       under the engine's default `GCPolicy = combined` the statement and the
       garbage collector thread fight over the same pages, and every handoff
-      is a futex wait and wake between Web Workers. Updating and reading 300
-      rows a round costs 16.7–17.1 ms under `combined`, 2.6 under
-      `cooperative`. The bridge should open every database with
-      `cooperative`, which is also what a build without threads needs.
+      is a futex wait and wake between Web Workers. The bridge now opens
+      every database with `GCPolicy = cooperative` (`isc_dpb_config`), which
+      is also what a build without threads needs, and starts one thread fewer
+      per database. Updating and reading 300 rows a round: 16.0–16.3 ms
+      before, 2.1–2.3 after. Nothing measured got slower: a 20-row update a
+      round, 50 000-row inserts, deletes and updates, and the scan that meets
+      a deleted table's garbage all cost the same within noise, and so does a
+      `firebird-quake2` tic (4.9–5.6 ms idle, 10.5–12 walking, either way).
 
 ### M5 — Ecosystem
 
