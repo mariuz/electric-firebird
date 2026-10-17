@@ -4,6 +4,89 @@ All notable changes to `firebird-wasm`. This project follows
 [semantic versioning](https://semver.org/); while the major version is 0 the
 API may still move between minor releases.
 
+## 0.7.0 — 2026-10-18
+
+### Fixed
+
+- **A second open of the same database in one page is refused at once.** It
+  used to wait out `lockTimeoutMs` (5 s by default) for a tab that did not
+  exist and then report the database "already open in another tab"; in Node,
+  which has no Web Locks, it was not refused at all, and two instances shared
+  one file. The page now records the names it holds:
+  `DatabaseLockedError.heldBy` is `'this-page'` and the message says so. An
+  instance that fails to open now releases its name, so a new one can try
+  again without closing the broken one first.
+
+### Added
+
+- **`cdnArtifacts()` and `VERSION`.** The engine's URLs on jsDelivr (or
+  unpkg, or any mirror) at this package's exact version: the glue to
+  `importScripts()` and the `locateFile` that sends its `.wasm` to the same
+  place, which a Worker needs because imported glue looks for the binary next
+  to the Worker. Both builds load this way; jsDelivr and unpkg send the
+  `Cross-Origin-Resource-Policy` an isolated page needs for the threaded one.
+- **A size budget.** `npm run size` prints each artifact raw, gzipped and
+  brotli-compressed (each `.wasm` is 8.7–8.8 MB, 2.9 MB and 2.05 MB) and fails
+  past 9.5 MB raw or 3.2 MB gzipped; CI runs it after every WASM build.
+
+- **A build without threads.** `dist/wasm/firebird-embedded-st.{js,wasm}`
+  needs no `SharedArrayBuffer`, so no cross-origin isolation and no
+  COOP/COEP service worker, and no Worker either: nothing in it blocks, so it
+  can run on a page's own thread. It gives up statement and idle timeouts,
+  which need the engine's timer thread. Pick it with
+  `loadFirebirdWasm({ threads: false })` (also on `DirectTransport` and
+  `FirebirdBrowser`) in Node, and in a browser by loading its glue:
+  `wasmGlueFile()` names the build a page can run. `hasSharedHeap(mod)` tells
+  them apart. The threaded build stays the default, and loading it in a page
+  that is not isolated now fails with a message instead of hanging. Against
+  the threaded build, alternating: start 0.33–0.43 s against 0.87–1.06 s,
+  one row of ten columns 34–49 µs against 54–76, a one-row update 28–41 µs
+  against 45–66.
+
+### Changed
+
+- **A kept statement's columns are described once.** Every query wrote every
+  column's description again (name, type, scale, length, nullable) and
+  decoded it again in JS, which was most of what a small query cost. A kept
+  statement's columns cannot change, so the C bridge now works out their
+  layout and their JSON once and keeps them with the statement, and the JS
+  keeps the decoded field list by that JSON; each call still gets field
+  objects of its own. `bench:calls`, alternating with 0.6.1, two rounds:
+  one row of ten columns 48–59 µs a call before, 34–40 now; ten columns and
+  no row 35–40 before, 22–24 now; one value 24–34 before, 19–26 now. Needs a
+  rebuilt artifact.
+- **…and then named by an id.** With the new `fb_query` flag
+  `FB_QUERY_SHAPE_IDS` (2), which `DirectTransport` sets, a kept statement's
+  result is `{"shape":N,"rows":[…]}`, the columns being sent no more; the
+  transport keeps what each id means and asks the new `_fb_shape_columns(N)`
+  once for an id it has not seen. Ids are never reused, so a remembered one is
+  never wrong. Without the flag, or for a statement that is not kept, results
+  describe their columns as before. Same machine, the flag off and on
+  alternating: the decode of ten columns and no row 5.7–7.0 µs before,
+  1.1–1.4 now (779 bytes of JSON to 21); the whole query 22–28 µs before,
+  16–21 now. Needs a rebuilt artifact.
+- **Values are written without `snprintf`.** The C bridge decodes DATE, TIME
+  and TIMESTAMP with the engine's own calendar arithmetic and writes them,
+  integers, NUMERICs and doubles straight into the result with
+  `std::to_chars`, instead of `IUtil` calls, `snprintf`, a temporary string
+  and an escaping pass. Per value written, alternating with the previous
+  artifact: TIMESTAMP 1.9 µs to 0.7, DATE 1.1 to 0.55, DOUBLE PRECISION 0.95
+  to 0.65, INTEGER, BIGINT and NUMERIC 0.75–0.85 to 0.55. A double is now
+  its shortest round-trip text (`0.1`, not `0.10000000000000001`), the same
+  number when parsed; 3000 doubles and 98 708 rows of dates, times and
+  numbers across years 1 to 9999 parse identically before and after. Needs a
+  rebuilt artifact.
+- **Garbage is collected by the statements, not by a thread.** Every database
+  is opened with `GCPolicy = cooperative` (in the DPB). Under the engine's
+  default, `combined`, a statement and the garbage collector thread fought
+  over the same pages, and every handoff between them was a futex wait and
+  wake between Web Workers: updating and reading back 300 rows took
+  16.0–16.3 ms a round, and now takes 2.1–2.3. Smaller updates, bulk
+  inserts, deletes and updates, and scans over a deleted table's garbage cost
+  the same as before, and each database starts one thread fewer.
+  `RDB$CONFIG` reports the setting with the source `<DPB>`. Needs a rebuilt
+  artifact.
+
 ## 0.6.1 — 2026-10-10
 
 ### Changed
