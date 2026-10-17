@@ -48,12 +48,14 @@
 
 #include <firebird/Interface.h>
 
+#include <charconv>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <list>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -93,12 +95,56 @@ IUtil*     g_util     = nullptr;
  */
 IPluginSet* g_pluginSet = nullptr;
 
+/**
+ * What a statement's results look like: where each column sits in the output
+ * message, and the JSON describing the columns.  A prepared statement's
+ * columns cannot change, so a kept statement works this out once
+ * (CachedStatement::shape) rather than on every call: describing them was
+ * most of what a small query cost (bench/call-cost.js, "no row, 10 columns").
+ */
+struct OutputShape;
+
+/**
+ * Kept statements' shapes by id, for fb_shape_columns.  An id is given once
+ * and never reused, so a caller that remembers what an id meant is never
+ * wrong about it: a statement whose columns change (after DDL) is prepared
+ * again and gets a new shape and a new id.
+ */
+std::map<unsigned, OutputShape*> g_shapes;
+unsigned g_nextShapeId = 1;
+
+struct OutputShape
+{
+	IMessageMetadata* metadata = nullptr;   // owned
+	unsigned id = 0;                        // nonzero once kept with a statement
+	unsigned columnCount = 0;
+	unsigned messageLength = 0;
+	bool hasCursor = true;                  // EXECUTE PROCEDURE has columns but no cursor
+	std::vector<unsigned> types, lengths, offsets, nullOffsets;
+	std::vector<int> subTypes, scales;
+	std::string header;                     // {"columns":[...],"rows":[
+	std::string idHeader;                   // {"shape":N,"rows":[  (kept shapes only)
+
+	OutputShape() = default;
+	OutputShape(const OutputShape&) = delete;
+	OutputShape& operator=(const OutputShape&) = delete;
+
+	~OutputShape()
+	{
+		if (id)
+			g_shapes.erase(id);
+		if (metadata)
+			metadata->release();
+	}
+};
+
 /** A statement kept prepared for its SQL text (see acquireStatement). */
 struct CachedStatement
 {
 	std::string sql;
 	IStatement* statement = nullptr;
 	unsigned type = 0;
+	std::shared_ptr<OutputShape> shape;     // filled by the first query that runs it
 };
 
 /** An attached database, and the statements kept prepared for it, most recently used first. */
@@ -167,6 +213,13 @@ ISC_INT64 g_lastAffectedRows = 0;
  */
 /** `flags` bit for fb_query/fb_query_params: binary BLOBs out of band. */
 #define FB_QUERY_BINARY_BLOBS 1
+
+/**
+ * `flags` bit for fb_query/fb_query_params: the caller understands
+ * `{"shape":N,"rows":[...]}` for a kept statement, in place of the columns,
+ * and asks fb_shape_columns(N) for an id it does not know yet.
+ */
+#define FB_QUERY_SHAPE_IDS 2
 
 struct BlobSink
 {
@@ -640,14 +693,86 @@ void base64Encode(const std::vector<unsigned char>& bytes, std::string& out)
  * double here would silently lose precision on the very types users pick
  * *because* they need precision, so the digits are shifted textually instead.
  */
+// ---------------------------------------------------------------------------
+// Writing values without snprintf
+// ---------------------------------------------------------------------------
+//
+// bench/call-cost.js put the cost of writing a value at 0.5-0.65 µs against
+// 0.1 µs to decode it in JS, the most for dates and timestamps: each went
+// through IUtil::decodeDate/decodeTime, snprintf, a temporary string and an
+// escaping pass.  These write digits straight into the result.
+
+/** `value` in decimal, as snprintf("%lld") would. */
+void appendInteger(long long value, std::string& out)
+{
+	char buf[24];
+	const auto r = std::to_chars(buf, buf + sizeof(buf), value);
+	out.append(buf, r.ptr);
+}
+
+/** `value` zero-padded to at least `width` digits, as snprintf("%0*u") would. */
+void appendPadded(unsigned value, int width, std::string& out)
+{
+	char buf[16];
+	const auto r = std::to_chars(buf, buf + sizeof(buf), value);
+	const int digits = static_cast<int>(r.ptr - buf);
+	if (digits < width)
+		out.append(static_cast<size_t>(width - digits), '0');
+	out.append(buf, r.ptr);
+}
+
+/**
+ * Firebird's day number (days since 1858-11-17) as a calendar date: the
+ * engine's own arithmetic (NoThrowTimeStamp::decode_date), done here rather
+ * than through an IUtil call per value.
+ */
+void decodeDay(ISC_DATE date, unsigned& year, unsigned& month, unsigned& day)
+{
+	int nday = date + 2400001 - 1721119;
+	const int century = (4 * nday - 1) / 146097;
+	nday = 4 * nday - 1 - 146097 * century;
+	int d = nday / 4;
+
+	nday = (4 * d + 3) / 1461;
+	d = 4 * d + 3 - 1461 * nday;
+	d = (d + 4) / 4;
+
+	int m = (5 * d - 3) / 153;
+	d = 5 * d - 3 - 153 * m;
+	d = (d + 5) / 5;
+
+	int y = 100 * century + nday;
+	if (m < 10)
+		m += 3;
+	else
+	{
+		m -= 9;
+		y += 1;
+	}
+
+	year = static_cast<unsigned>(y);
+	month = static_cast<unsigned>(m);
+	day = static_cast<unsigned>(d);
+}
+
+/** Firebird's time of day (1/10000 s since midnight), as NoThrowTimeStamp::decode_time. */
+void decodeTimeOfDay(ISC_TIME time, unsigned& hours, unsigned& minutes, unsigned& seconds,
+	unsigned& fractions)
+{
+	hours = time / (3600 * ISC_TIME_SECONDS_PRECISION);
+	time %= 3600 * ISC_TIME_SECONDS_PRECISION;
+	minutes = time / (60 * ISC_TIME_SECONDS_PRECISION);
+	time %= 60 * ISC_TIME_SECONDS_PRECISION;
+	seconds = time / ISC_TIME_SECONDS_PRECISION;
+	fractions = time % ISC_TIME_SECONDS_PRECISION;
+}
+
 void appendScaledDecimal(ISC_INT64 value, int scale, std::string& out)
 {
 	if (scale >= 0)
 	{
 		// Positive scale means the stored value must be multiplied by 10^scale.
-		char buf[32];
-		snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(value));
-		out += buf;
+		appendInteger(static_cast<long long>(value), out);
 		out.append(static_cast<size_t>(scale), '0');
 		return;
 	}
@@ -660,8 +785,8 @@ void appendScaledDecimal(ISC_INT64 value, int scale, std::string& out)
 		: static_cast<unsigned long long>(value);
 
 	char digits[32];
-	const int written = snprintf(digits, sizeof(digits), "%llu", magnitude);
-	std::string text(digits, written > 0 ? static_cast<size_t>(written) : 0);
+	const auto written = std::to_chars(digits, digits + sizeof(digits), magnitude);
+	std::string text(digits, written.ptr);
 
 	const size_t decimals = static_cast<size_t>(-scale);
 	if (text.size() <= decimals)
@@ -688,17 +813,22 @@ bool exactlyRepresentableAsDouble(ISC_INT64 value)
 void appendTimeText(unsigned hours, unsigned minutes, unsigned seconds,
 	unsigned fractions, std::string& out)
 {
-	char buf[32];
-	snprintf(buf, sizeof(buf), "%02u:%02u:%02u.%04u",
-		hours, minutes, seconds, fractions);
-	out += buf;
+	appendPadded(hours, 2, out);
+	out += ':';
+	appendPadded(minutes, 2, out);
+	out += ':';
+	appendPadded(seconds, 2, out);
+	out += '.';
+	appendPadded(fractions, 4, out);
 }
 
 void appendDateText(unsigned year, unsigned month, unsigned day, std::string& out)
 {
-	char buf[16];
-	snprintf(buf, sizeof(buf), "%04u-%02u-%02u", year, month, day);
-	out += buf;
+	appendPadded(year, 4, out);
+	out += '-';
+	appendPadded(month, 2, out);
+	out += '-';
+	appendPadded(day, 2, out);
 }
 
 /** Read a text or binary BLOB in full and append it as a JSON string. */
@@ -792,11 +922,7 @@ void appendValue(IAttachment* attachment, ITransaction* transaction,
 			if (scale)
 				{ out += '"'; appendScaledDecimal(value, scale, out); out += '"'; }
 			else
-			{
-				char buf[16];
-				snprintf(buf, sizeof(buf), "%d", static_cast<int>(value));
-				out += buf;
-			}
+				appendInteger(value, out);
 			break;
 		}
 
@@ -807,11 +933,7 @@ void appendValue(IAttachment* attachment, ITransaction* transaction,
 			if (scale)
 				{ out += '"'; appendScaledDecimal(value, scale, out); out += '"'; }
 			else
-			{
-				char buf[16];
-				snprintf(buf, sizeof(buf), "%d", static_cast<int>(value));
-				out += buf;
-			}
+				appendInteger(value, out);
 			break;
 		}
 
@@ -822,17 +944,13 @@ void appendValue(IAttachment* attachment, ITransaction* transaction,
 			if (scale)
 				{ out += '"'; appendScaledDecimal(value, scale, out); out += '"'; }
 			else if (exactlyRepresentableAsDouble(value))
-			{
-				char buf[32];
-				snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(value));
-				out += buf;
-			}
+				appendInteger(static_cast<long long>(value), out);
 			else
 			{
 				// Emitting a JSON number here would silently round the value.
-				char buf[32];
-				snprintf(buf, sizeof(buf), "\"%lld\"", static_cast<long long>(value));
-				out += buf;
+				out += '"';
+				appendInteger(static_cast<long long>(value), out);
+				out += '"';
 			}
 			break;
 		}
@@ -879,9 +997,11 @@ void appendValue(IAttachment* attachment, ITransaction* transaction,
 				out += "null";
 			else
 			{
+				// The shortest text that reads back as this very double: what
+				// %.17g guaranteed, in fewer digits (0.1, not 0.10000000000000001).
 				char buf[32];
-				snprintf(buf, sizeof(buf), "%.17g", value);
-				out += buf;
+				const auto r = std::to_chars(buf, buf + sizeof(buf), value);
+				out.append(buf, r.ptr);
 			}
 			break;
 		}
@@ -925,10 +1045,10 @@ void appendValue(IAttachment* attachment, ITransaction* transaction,
 			ISC_DATE value = 0;
 			memcpy(&value, data, sizeof(value));
 			unsigned year = 0, month = 0, day = 0;
-			g_util->decodeDate(value, &year, &month, &day);
-			std::string text;
-			appendDateText(year, month, day, text);
-			jsonEscape(text, out);
+			decodeDay(value, year, month, day);
+			out += '"';
+			appendDateText(year, month, day, out);
+			out += '"';
 			break;
 		}
 
@@ -937,10 +1057,10 @@ void appendValue(IAttachment* attachment, ITransaction* transaction,
 			ISC_TIME value = 0;
 			memcpy(&value, data, sizeof(value));
 			unsigned hours = 0, minutes = 0, seconds = 0, fractions = 0;
-			g_util->decodeTime(value, &hours, &minutes, &seconds, &fractions);
-			std::string text;
-			appendTimeText(hours, minutes, seconds, fractions, text);
-			jsonEscape(text, out);
+			decodeTimeOfDay(value, hours, minutes, seconds, fractions);
+			out += '"';
+			appendTimeText(hours, minutes, seconds, fractions, out);
+			out += '"';
 			break;
 		}
 
@@ -950,13 +1070,13 @@ void appendValue(IAttachment* attachment, ITransaction* transaction,
 			memcpy(&value, data, sizeof(value));
 			unsigned year = 0, month = 0, day = 0;
 			unsigned hours = 0, minutes = 0, seconds = 0, fractions = 0;
-			g_util->decodeDate(value.timestamp_date, &year, &month, &day);
-			g_util->decodeTime(value.timestamp_time, &hours, &minutes, &seconds, &fractions);
-			std::string text;
-			appendDateText(year, month, day, text);
-			text += 'T';
-			appendTimeText(hours, minutes, seconds, fractions, text);
-			jsonEscape(text, out);
+			decodeDay(value.timestamp_date, year, month, day);
+			decodeTimeOfDay(value.timestamp_time, hours, minutes, seconds, fractions);
+			out += '"';
+			appendDateText(year, month, day, out);
+			out += 'T';
+			appendTimeText(hours, minutes, seconds, fractions, out);
+			out += '"';
 			break;
 		}
 
@@ -1734,14 +1854,153 @@ bool describeMetadata(IMessageMetadata* meta, std::string& json)
 	return true;
 }
 
-bool serialiseCursor(IAttachment* attachment, ITransaction* transaction,
-	IStatement* statement, IMessageMetadata* metadata, unsigned columnCount,
-	IMessageMetadata* inMeta, void* inBuffer,
-	IResultSet*& cursor, std::string& json, BlobSink* sink)
+/**
+ * The shape of `statement`'s results, described from its output metadata.
+ * Null on failure, with the error set; `context` names the caller in it.
+ */
+std::shared_ptr<OutputShape> describeOutput(IStatement* statement, const char* context)
 {
 	Status status;
+	auto shape = std::make_shared<OutputShape>();
 
+	shape->metadata = statement->getOutputMetadata(status.ptr());
+	if (status.failed())
+	{
+		setErrorFromStatus((std::string(context) + ": could not read output metadata").c_str(),
+			status.ptr());
+		return nullptr;
+	}
+
+	IMessageMetadata* metadata = shape->metadata;
+	const unsigned columnCount = metadata ? metadata->getCount(status.ptr()) : 0;
+	if (status.failed())
+	{
+		setErrorFromStatus((std::string(context) + ": could not read column count").c_str(),
+			status.ptr());
+		return nullptr;
+	}
+
+	shape->columnCount = columnCount;
+	shape->types.resize(columnCount);
+	shape->subTypes.resize(columnCount);
+	shape->scales.resize(columnCount);
+	shape->lengths.resize(columnCount);
+	shape->offsets.resize(columnCount);
+	shape->nullOffsets.resize(columnCount);
+
+	std::string& json = shape->header;
 	json = "{\"columns\":[";
+
+	for (unsigned i = 0; i < columnCount; i++)
+	{
+		if (i)
+			json += ',';
+
+		// Prefer the alias so `SELECT COUNT(*) AS TOTAL` reports TOTAL.
+		const char* name = metadata->getAlias(status.ptr(), i);
+		if (status.failed() || !name || !*name)
+			name = metadata->getField(status.ptr(), i);
+
+		shape->types[i]       = metadata->getType(status.ptr(), i);
+		shape->subTypes[i]    = metadata->getSubType(status.ptr(), i);
+		shape->scales[i]      = metadata->getScale(status.ptr(), i);
+		shape->lengths[i]     = metadata->getLength(status.ptr(), i);
+		shape->offsets[i]     = metadata->getOffset(status.ptr(), i);
+		shape->nullOffsets[i] = metadata->getNullOffset(status.ptr(), i);
+
+		const FB_BOOLEAN nullable = metadata->isNullable(status.ptr(), i);
+
+		if (status.failed())
+		{
+			setErrorFromStatus("could not read column metadata", status.ptr());
+			return nullptr;
+		}
+
+		// Each column is described, not just named.  Without the type a
+		// caller cannot tell a NUMERIC rendered as "20.25" from a VARCHAR
+		// that happens to contain digits — the JSON encoding makes them
+		// identical, and only the declared type separates them.
+		json += "{\"name\":";
+		jsonEscape(name ? name : "", name ? strlen(name) : 0, json);
+
+		char described[128];
+		snprintf(described, sizeof(described),
+			",\"type\":%u,\"subType\":%d,\"scale\":%d,\"length\":%u,\"nullable\":%s}",
+			shape->types[i], shape->subTypes[i], shape->scales[i], shape->lengths[i],
+			nullable ? "true" : "false");
+		json += described;
+	}
+
+	json += "],\"rows\":[";
+
+	if (columnCount)
+	{
+		shape->messageLength = metadata->getMessageLength(status.ptr());
+		if (status.failed())
+		{
+			setErrorFromStatus("could not size the message buffer", status.ptr());
+			return nullptr;
+		}
+
+		// EXECUTE PROCEDURE has output columns but no cursor: opening one is
+		// refused ("Cannot open cursor for non-SELECT statement").
+		Status flagStatus;
+		const unsigned statementFlags = statement->getFlags(flagStatus.ptr());
+		shape->hasCursor = flagStatus.failed() || (statementFlags & IStatement::FLAG_HAS_CURSOR);
+	}
+
+	return shape;
+}
+
+/**
+ * The shape of `statement`'s results: the kept statement's own if it has one,
+ * else described now, and kept with the statement when the cache holds it.
+ */
+std::shared_ptr<OutputShape> outputShape(int db_handle, IStatement* statement, bool cached,
+	const char* context)
+{
+	CachedStatement* kept = nullptr;
+	if (cached)
+	{
+		if (DbEntry* entry = lookupEntry(db_handle))
+		{
+			// A statement just used is at the front: this is one comparison.
+			for (auto& c : entry->statements)
+			{
+				if (c.statement == statement)
+				{
+					kept = &c;
+					break;
+				}
+			}
+		}
+	}
+
+	if (kept && kept->shape)
+		return kept->shape;
+
+	std::shared_ptr<OutputShape> shape = describeOutput(statement, context);
+	if (shape && kept)
+	{
+		shape->id = g_nextShapeId++;
+		shape->idHeader = "{\"shape\":" + std::to_string(shape->id) + ",\"rows\":[";
+		g_shapes[shape->id] = shape.get();
+		kept->shape = shape;
+	}
+	return shape;
+}
+
+bool serialiseCursor(IAttachment* attachment, ITransaction* transaction,
+	IStatement* statement, const OutputShape& shape,
+	IMessageMetadata* inMeta, void* inBuffer,
+	IResultSet*& cursor, std::string& json, BlobSink* sink, bool shapeIds = false)
+{
+	Status status;
+	const unsigned columnCount = shape.columnCount;
+
+	// A kept shape goes by its id when the caller understands ids: the
+	// columns' description is then not copied, sent, or read again.
+	json = shapeIds && shape.id ? shape.idHeader : shape.header;
 
 	// A statement with no output columns (INSERT, DDL, …) still succeeds; it
 	// simply yields an empty result set rather than an error.
@@ -1769,66 +2028,9 @@ bool serialiseCursor(IAttachment* attachment, ITransaction* transaction,
 			? 0
 			: static_cast<ISC_INT64>(affected);
 	}
-
-	std::vector<unsigned> types(columnCount);
-	std::vector<int>      subTypes(columnCount);
-	std::vector<int>      scales(columnCount);
-	std::vector<unsigned> lengths(columnCount);
-	std::vector<unsigned> offsets(columnCount);
-	std::vector<unsigned> nullOffsets(columnCount);
-
-	for (unsigned i = 0; i < columnCount; i++)
+	else
 	{
-		if (i)
-			json += ',';
-
-		// Prefer the alias so `SELECT COUNT(*) AS TOTAL` reports TOTAL.
-		const char* name = metadata->getAlias(status.ptr(), i);
-		if (status.failed() || !name || !*name)
-			name = metadata->getField(status.ptr(), i);
-
-		types[i]       = metadata->getType(status.ptr(), i);
-		subTypes[i]    = metadata->getSubType(status.ptr(), i);
-		scales[i]      = metadata->getScale(status.ptr(), i);
-		lengths[i]     = metadata->getLength(status.ptr(), i);
-		offsets[i]     = metadata->getOffset(status.ptr(), i);
-		nullOffsets[i] = metadata->getNullOffset(status.ptr(), i);
-
-		const FB_BOOLEAN nullable = metadata->isNullable(status.ptr(), i);
-
-		if (status.failed())
-		{
-			setErrorFromStatus("could not read column metadata", status.ptr());
-			return false;
-		}
-
-		// Each column is described, not just named.  Without the type a
-		// caller cannot tell a NUMERIC rendered as "20.25" from a VARCHAR
-		// that happens to contain digits — the JSON encoding makes them
-		// identical, and only the declared type separates them.
-		json += "{\"name\":";
-		jsonEscape(name ? name : "", name ? strlen(name) : 0, json);
-
-		char described[128];
-		snprintf(described, sizeof(described),
-			",\"type\":%u,\"subType\":%d,\"scale\":%d,\"length\":%u,\"nullable\":%s}",
-			types[i], subTypes[i], scales[i], lengths[i],
-			nullable ? "true" : "false");
-		json += described;
-	}
-
-	json += "],\"rows\":[";
-
-	if (columnCount)
-	{
-		const unsigned messageLength = metadata->getMessageLength(status.ptr());
-		if (status.failed())
-		{
-			setErrorFromStatus("could not size the message buffer", status.ptr());
-			return false;
-		}
-
-		std::vector<unsigned char> buffer(messageLength);
+		std::vector<unsigned char> buffer(shape.messageLength);
 		bool firstRow = true;
 
 		const auto appendRow = [&]()
@@ -1844,28 +2046,25 @@ bool serialiseCursor(IAttachment* attachment, ITransaction* transaction,
 					json += ',';
 
 				short nullFlag = 0;
-				memcpy(&nullFlag, buffer.data() + nullOffsets[i], sizeof(nullFlag));
+				memcpy(&nullFlag, buffer.data() + shape.nullOffsets[i], sizeof(nullFlag));
 
 				if (nullFlag == -1)
 					json += "null";
 				else
 				{
-					appendValue(attachment, transaction, types[i], subTypes[i],
-						scales[i], lengths[i], buffer.data() + offsets[i], json, sink);
+					appendValue(attachment, transaction, shape.types[i], shape.subTypes[i],
+						shape.scales[i], shape.lengths[i], buffer.data() + shape.offsets[i],
+						json, sink);
 				}
 			}
 			json += ']';
 		};
 
-		// EXECUTE PROCEDURE has output columns but no cursor: opening one is
-		// refused ("Cannot open cursor for non-SELECT statement").  It runs
-		// once and fills one row, which is its result.
-		Status flagStatus;
-		const unsigned statementFlags = statement->getFlags(flagStatus.ptr());
-		if (!flagStatus.failed() && !(statementFlags & IStatement::FLAG_HAS_CURSOR))
+		if (!shape.hasCursor)
 		{
+			// EXECUTE PROCEDURE: it runs once and fills one row, which is its result.
 			statement->execute(status.ptr(), transaction, inMeta, inBuffer,
-				metadata, buffer.data());
+				shape.metadata, buffer.data());
 
 			if (status.failed())
 			{
@@ -1878,7 +2077,7 @@ bool serialiseCursor(IAttachment* attachment, ITransaction* transaction,
 		else
 		{
 			cursor = statement->openCursor(status.ptr(), transaction, inMeta, inBuffer,
-				metadata, 0);
+				shape.metadata, 0);
 
 			if (status.failed() || !cursor)
 			{
@@ -2152,6 +2351,29 @@ int fb_execute(int db_handle, int tx_handle, const char* sql)
  * every database's cache, so it is also the way to drop statements that DDL
  * run through EXECUTE STATEMENT, which the cache cannot see, made stale.
  */
+/**
+ * The columns of the kept shape `id`, as `{"columns":[...]}`, for a caller of
+ * fb_query with FB_QUERY_SHAPE_IDS that has not seen this id or has
+ * forgotten it.  Null if no kept statement has that shape any more; asked
+ * right after the query that named it, the shape is still there, since the
+ * statement that ran is the cache's most recently used.  Free the result with
+ * fb_free_result().
+ */
+FB_WASM_EXPORT
+const char* fb_shape_columns(unsigned id)
+{
+	clearError();
+	const auto it = g_shapes.find(id);
+	if (it == g_shapes.end())
+	{
+		setError("fb_shape_columns: unknown shape");
+		return nullptr;
+	}
+	const std::string& header = it->second->header;   // {"columns":[...],"rows":[
+	const std::string rowsKey = ",\"rows\":[";
+	return allocCString(header.substr(0, header.size() - rowsKey.size()) + "}");
+}
+
 FB_WASM_EXPORT
 int fb_statement_cache(int size)
 {
@@ -2392,7 +2614,6 @@ const char* fb_query(int db_handle, int tx_handle, const char* sql, int flags)
 	// released on every exit path, including the error ones.
 	IResultSet*       cursor    = nullptr;
 	IStatement*       statement = nullptr;
-	IMessageMetadata* metadata  = nullptr;
 	bool              cached    = false;
 
 	// `keep` leaves a kept statement kept although the call failed.
@@ -2404,8 +2625,6 @@ const char* fb_query(int db_handle, int tx_handle, const char* sql, int flags)
 			cursor->close(s.ptr());
 			cursor->release();
 		}
-		if (metadata)
-			metadata->release();
 		releaseStatement(db_handle, statement, cached, !commit && !keep);
 		if (ownTransaction && transaction)
 		{
@@ -2441,18 +2660,9 @@ const char* fb_query(int db_handle, int tx_handle, const char* sql, int flags)
 		}
 	}
 
-	metadata = statement->getOutputMetadata(status.ptr());
-	if (status.failed())
+	const std::shared_ptr<OutputShape> shape = outputShape(db_handle, statement, cached, "fb_query");
+	if (!shape)
 	{
-		setErrorFromStatus("fb_query: could not read output metadata", status.ptr());
-		cleanup(false);
-		return nullptr;
-	}
-
-	const unsigned columnCount = metadata ? metadata->getCount(status.ptr()) : 0;
-	if (status.failed())
-	{
-		setErrorFromStatus("fb_query: could not read column count", status.ptr());
 		cleanup(false);
 		return nullptr;
 	}
@@ -2461,8 +2671,8 @@ const char* fb_query(int db_handle, int tx_handle, const char* sql, int flags)
 	sink.enabled = (flags & FB_QUERY_BINARY_BLOBS) != 0;
 
 	std::string json;
-	if (!serialiseCursor(attachment, transaction, statement, metadata, columnCount,
-			nullptr, nullptr, cursor, json, &sink))
+	if (!serialiseCursor(attachment, transaction, statement, *shape,
+			nullptr, nullptr, cursor, json, &sink, (flags & FB_QUERY_SHAPE_IDS) != 0))
 	{
 		if (shared && g_lastErrorReadOnly)
 		{
@@ -3295,7 +3505,6 @@ const char* fb_query_params(int db_handle, int tx_handle, const char* sql,
 
 	IResultSet*       cursor    = nullptr;
 	IStatement*       statement = nullptr;
-	IMessageMetadata* metadata  = nullptr;
 	bool              cached    = false;
 
 	// `keep` leaves a kept statement kept although the call failed.
@@ -3307,8 +3516,6 @@ const char* fb_query_params(int db_handle, int tx_handle, const char* sql,
 			cursor->close(s.ptr());
 			cursor->release();
 		}
-		if (metadata)
-			metadata->release();
 		releaseStatement(db_handle, statement, cached, !commit && !keep);
 		if (ownTransaction && transaction)
 		{
@@ -3351,18 +3558,9 @@ const char* fb_query_params(int db_handle, int tx_handle, const char* sql,
 		return nullptr;
 	}
 
-	metadata = statement->getOutputMetadata(status.ptr());
-	if (status.failed())
+	const std::shared_ptr<OutputShape> shape = outputShape(db_handle, statement, cached, "fb_query_params");
+	if (!shape)
 	{
-		setErrorFromStatus("fb_query_params: could not read output metadata", status.ptr());
-		cleanup(false);
-		return nullptr;
-	}
-
-	const unsigned columnCount = metadata ? metadata->getCount(status.ptr()) : 0;
-	if (status.failed())
-	{
-		setErrorFromStatus("fb_query_params: could not read column count", status.ptr());
 		cleanup(false);
 		return nullptr;
 	}
@@ -3371,8 +3569,8 @@ const char* fb_query_params(int db_handle, int tx_handle, const char* sql,
 	sink.enabled = (flags & FB_QUERY_BINARY_BLOBS) != 0;
 
 	std::string json;
-	if (!serialiseCursor(attachment, transaction, statement, metadata, columnCount,
-			input.meta(), input.data(), cursor, json, &sink))
+	if (!serialiseCursor(attachment, transaction, statement, *shape,
+			input.meta(), input.data(), cursor, json, &sink, (flags & FB_QUERY_SHAPE_IDS) != 0))
 	{
 		if (shared && g_lastErrorReadOnly)
 		{

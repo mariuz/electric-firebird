@@ -8,6 +8,37 @@ API may still move between minor releases.
 
 ### Changed
 
+- **A kept statement's columns are described once.** Every query wrote every
+  column's description again (name, type, scale, length, nullable) and
+  decoded it again in JS, which was most of what a small query cost. A kept
+  statement's columns cannot change, so the C bridge now works out their
+  layout and their JSON once and keeps them with the statement, and the JS
+  keeps the decoded field list by that JSON; each call still gets field
+  objects of its own. `bench:calls`, alternating with 0.6.1, two rounds:
+  one row of ten columns 48–59 µs a call before, 34–40 now; ten columns and
+  no row 35–40 before, 22–24 now; one value 24–34 before, 19–26 now. Needs a
+  rebuilt artifact.
+- **…and then named by an id.** With the new `fb_query` flag
+  `FB_QUERY_SHAPE_IDS` (2), which `DirectTransport` sets, a kept statement's
+  result is `{"shape":N,"rows":[…]}`, the columns being sent no more; the
+  transport keeps what each id means and asks the new `_fb_shape_columns(N)`
+  once for an id it has not seen. Ids are never reused, so a remembered one is
+  never wrong. Without the flag, or for a statement that is not kept, results
+  describe their columns as before. Same machine, the flag off and on
+  alternating: the decode of ten columns and no row 5.7–7.0 µs before,
+  1.1–1.4 now (779 bytes of JSON to 21); the whole query 22–28 µs before,
+  16–21 now. Needs a rebuilt artifact.
+- **Values are written without `snprintf`.** The C bridge decodes DATE, TIME
+  and TIMESTAMP with the engine's own calendar arithmetic and writes them,
+  integers, NUMERICs and doubles straight into the result with
+  `std::to_chars`, instead of `IUtil` calls, `snprintf`, a temporary string
+  and an escaping pass. Per value written, alternating with the previous
+  artifact: TIMESTAMP 1.9 µs to 0.7, DATE 1.1 to 0.55, DOUBLE PRECISION 0.95
+  to 0.65, INTEGER, BIGINT and NUMERIC 0.75–0.85 to 0.55. A double is now
+  its shortest round-trip text (`0.1`, not `0.10000000000000001`), the same
+  number when parsed; 3000 doubles and 98 708 rows of dates, times and
+  numbers across years 1 to 9999 parse identically before and after. Needs a
+  rebuilt artifact.
 - **Garbage is collected by the statements, not by a thread.** Every database
   is opened with `GCPolicy = cooperative` (in the DPB). Under the engine's
   default, `combined`, a statement and the garbage collector thread fought

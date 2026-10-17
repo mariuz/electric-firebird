@@ -437,7 +437,8 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
       // value in six, which is what the binary form exists to bypass.  A few
       // hundred deterministic doubles across the exponent range would catch
       // the text path with certainty; the binary path must return every one
-      // of them unchanged.  %.17g on the way out is exact for a double.
+      // of them unchanged.  The shortest round-trip text on the way out is
+      // exact for a double.
       const values: number[] = [];
       let seed = 0x2545f491;
       for (let i = 0; i < 300; i++) {
@@ -473,6 +474,51 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
       const [row] = queryRows(db,
         'SELECT CAST(i AS VARCHAR(30)), CAST(n AS VARCHAR(30)), s, CAST(f AS DOUBLE PRECISION) FROM m');
       expect(row).toEqual(['9007199254740993', '1.10', '1.5', Math.fround(0.1)]);
+      expect(mod._fb_detach_database(db)).toBe(0);
+    });
+
+    it('writes dates, times, integers and doubles as the engine would print them', () => {
+      const db = freshDatabase('value-text');
+      // The bridge decodes dates and times itself and writes numbers with
+      // to_chars; the calendar edges, leap days, fractions and the integer
+      // extremes are where hand-written formatting goes wrong.
+      const sqlPtr = allocString(mod, `SELECT
+          DATE '0001-01-01', DATE '9999-12-31', DATE '1858-11-17', DATE '1858-11-16',
+          DATE '2000-02-29', DATE '1900-02-28',
+          TIMESTAMP '0001-01-01 00:00:00.0001', TIMESTAMP '9999-12-31 23:59:59.9999',
+          TIME '00:00:00', TIME '23:59:59.9999', TIME '07:08:09.0100',
+          CAST(-32768 AS SMALLINT), CAST(-2147483648 AS INTEGER),
+          CAST(-9223372036854775808 AS BIGINT), CAST(9007199254740991 AS BIGINT),
+          CAST(9007199254740992 AS BIGINT), CAST(-12345.6789 AS NUMERIC(18,4)),
+          CAST(0.1 AS DOUBLE PRECISION), CAST(-0e0 AS DOUBLE PRECISION),
+          CAST(1e21 AS DOUBLE PRECISION), CAST(1e-7 AS DOUBLE PRECISION)
+        FROM RDB$DATABASE`);
+      try {
+        const resultPtr = mod._fb_query(db, 0, sqlPtr, 0);
+        expect({ pointer: resultPtr > 0, error: errorText() }).toEqual({ pointer: true, error: '' });
+        const text = mod.UTF8ToString(resultPtr);
+        mod._fb_free_result(resultPtr);
+        // Shortest round-trip doubles: 0.1, not 0.10000000000000001.
+        expect(text).toContain(',0.1,');
+        const [row] = (JSON.parse(text) as { rows: unknown[][] }).rows;
+        expect(row.slice(0, 11)).toEqual([
+          '0001-01-01', '9999-12-31', '1858-11-17', '1858-11-16', '2000-02-29', '1900-02-28',
+          '0001-01-01T00:00:00.0001', '9999-12-31T23:59:59.9999',
+          '00:00:00.0000', '23:59:59.9999', '07:08:09.0100',
+        ]);
+        expect(row.slice(11, 17)).toEqual([
+          -32768, -2147483648, '-9223372036854775808', 9007199254740991,
+          '9007199254740992', '-12345.6789',
+        ]);
+        const doubles = row.slice(17);
+        expect(doubles.length).toBe(4);
+        expect(Object.is(doubles[0], 0.1)).toBe(true);
+        expect(Object.is(doubles[1], -0)).toBe(true);
+        expect(Object.is(doubles[2], 1e21)).toBe(true);
+        expect(Object.is(doubles[3], 1e-7)).toBe(true);
+      } finally {
+        mod._free(sqlPtr);
+      }
       expect(mod._fb_detach_database(db)).toBe(0);
     });
 
@@ -716,6 +762,70 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
       const bare = {} as EngineTransport;
       expect(() => new FirebirdBrowser('memory://shared-reads-bare', { transport: bare, sharedReads: true }))
         .toThrow('setSharedReads');
+    });
+
+    // ── Shape ids ───────────────────────────────────────────────────────
+    //
+    // With FB_QUERY_SHAPE_IDS (2), a kept statement's result names its
+    // columns by id instead of describing them; fb_shape_columns(id) says
+    // what the id means.
+
+    const rawQuery = (db: number, sql: string, flags: number): string => {
+      const sqlPtr = allocString(mod, sql);
+      try {
+        const ptr = mod._fb_query(db, 0, sqlPtr, flags);
+        expect({ pointer: ptr > 0, error: errorText() }).toEqual({ pointer: true, error: '' });
+        const json = mod.UTF8ToString(ptr);
+        mod._fb_free_result(ptr);
+        return json;
+      } finally {
+        mod._free(sqlPtr);
+      }
+    };
+    const shapeColumns = (id: number): string | null => {
+      const ptr = mod._fb_shape_columns(id);
+      if (!ptr) return null;
+      const json = mod.UTF8ToString(ptr);
+      mod._fb_free_result(ptr);
+      return json;
+    };
+    const idOf = (json: string): number => Number(/^\{"shape":(\d+),"rows":/.exec(json)![1]);
+
+    it('names a kept statement\'s columns by id, only when asked', () => {
+      const db = freshDatabase('shape-ids');
+      expect(exec(db, 0, 'CREATE TABLE s (id INTEGER, name VARCHAR(10))')).toBe(0);
+      expect(exec(db, 0, "INSERT INTO s VALUES (1, 'one')")).toBe(0);
+      const sql = 'SELECT id, name FROM s';
+
+      const plain = rawQuery(db, sql, 0);
+      expect(plain.startsWith('{"columns":[')).toBe(true);
+
+      const named = rawQuery(db, sql, 2);
+      const id = idOf(named);
+      expect(id).toBeGreaterThan(0);
+      expect(JSON.parse(named)).toEqual({ shape: id, rows: [[1, 'one']] });
+      expect(rawQuery(db, sql, 2)).toBe(named);   // the same id each time
+
+      // The id stands for exactly the columns the plain form describes.
+      expect(JSON.parse(shapeColumns(id)!)).toEqual({ columns: JSON.parse(plain).columns });
+
+      // DDL empties the cache: the id is gone, and the statement comes back with a new one.
+      expect(exec(db, 0, 'CREATE TABLE other (x INTEGER)')).toBe(0);
+      expect(shapeColumns(id)).toBeNull();
+      expect(idOf(rawQuery(db, sql, 2))).toBeGreaterThan(id);
+      expect(mod._fb_detach_database(db)).toBe(0);
+    });
+
+    it('describes the columns of a statement it does not keep', () => {
+      const db = freshDatabase('shape-uncached');
+      expect(exec(db, 0, 'CREATE TABLE u (id INTEGER)')).toBe(0);
+      mod._fb_statement_cache(0);
+      try {
+        expect(rawQuery(db, 'SELECT id FROM u', 2).startsWith('{"columns":[')).toBe(true);
+      } finally {
+        mod._fb_statement_cache(64);
+      }
+      expect(mod._fb_detach_database(db)).toBe(0);
     });
 
     it('returns the outputs of EXECUTE PROCEDURE as one row', () => {
