@@ -328,19 +328,6 @@ let db = null;
 let currentExample = null;
 
 async function boot() {
-  if (!globalThis.crossOriginIsolated) {
-    setStatus('error', 'Not cross-origin isolated');
-    showError(
-      'This page is not cross-origin isolated, so the browser withholds ' +
-        'SharedArrayBuffer and the engine cannot start.\n\n' +
-        'On GitHub Pages a service worker supplies the COOP/COEP headers, ' +
-        'which needs one reload on a first visit. If this message persists, ' +
-        'the page is probably being served over plain HTTP — service workers ' +
-        'require HTTPS or localhost.',
-    );
-    return;
-  }
-
   setStatus('booting', 'Loading the engine…');
 
   try {
@@ -636,8 +623,9 @@ els.reset.addEventListener('click', async () => {
 });
 
 els.isolation.textContent = globalThis.crossOriginIsolated
-  ? 'Cross-origin isolated, so SharedArrayBuffer and the engine’s threads are available.'
-  : 'Waiting for cross-origin isolation…';
+  ? 'Cross-origin isolated, so this runs the threaded build of the engine.'
+  : 'Not cross-origin isolated (GitHub Pages sends no COOP/COEP), so this runs ' +
+    'the build without threads, which needs no SharedArrayBuffer.';
 
 buildExampleList();
 selectExample(EXAMPLES[0]);

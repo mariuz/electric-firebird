@@ -23,31 +23,26 @@ npm run demo                                    # build, then serve on :4173
 `npm run demo` deliberately serves the site **without** COOP/COEP headers,
 because that is what GitHub Pages does. See below.
 
-## Cross-origin isolation, and why a service worker
+## No cross-origin isolation needed
 
-The engine is compiled with pthreads, so it needs `SharedArrayBuffer`, and a
-browser only grants that to a [cross-origin isolated][coi] page. Isolation
-requires two headers on the document:
+The default engine build uses pthreads, so it needs `SharedArrayBuffer`, which
+a browser only grants to a [cross-origin isolated][coi] page, served with
+`Cross-Origin-Opener-Policy: same-origin` and
+`Cross-Origin-Embedder-Policy: require-corp`. GitHub Pages cannot send those.
 
-```
-Cross-Origin-Opener-Policy:   same-origin
-Cross-Origin-Embedder-Policy: require-corp
-```
+So the demo ships both builds, and its engine Worker loads the threaded one
+only where the page is isolated; on Pages it loads `firebird-embedded-st`, the
+build without threads, which needs no `SharedArrayBuffer` at all. The one
+thing that build gives up, statement timeouts, the demo does not use.
 
-GitHub Pages serves a fixed header set and offers no way to add them. So
-`public/coi-serviceworker.js` registers a service worker that re-issues every
-response with the headers attached — the page becomes isolated even though the
-server never said so.
+It used to synthesise isolation with a service worker that re-issued every
+response with the headers attached, at the price of a reload on every first
+visit. `public/coi-serviceworker.js` is now a retired version of it: visitors
+who still have the old worker registered get this one on its next update
+check, and it unregisters itself. The page registers nothing.
 
-The cost is inherent to service workers rather than to this implementation: a
-worker cannot control the load that registered it. A first visit therefore
-arrives un-isolated and reloads itself once. Subsequent visits are served
-through the worker directly.
-
-Because the demo depends on that mechanism, the local server does not set the
-headers itself. A dev server that helpfully set them would make the demo work
-locally and fail once published, which is precisely the bug worth catching
-early.
+The local server still sends no headers, so a demo that only worked behind a
+helpful dev server would fail here rather than once published.
 
 ## Tests
 
@@ -55,10 +50,10 @@ early.
 npm run test:demo
 ```
 
-20 Playwright tests drive the built site against the real engine. The first
-one asserts that the server is *not* sending COOP/COEP before checking that
-the page is isolated anyway — otherwise every other test could pass without
-the service worker doing anything at all.
+21 Playwright tests drive the built site against the real engine. The first
+one asserts that the server is *not* sending COOP/COEP, and that the page runs
+un-isolated with no service worker; the second, that the retired service
+worker unregisters itself when an earlier visit had it registered.
 
 The rest run each example and check the data: exact `BIGINT` and `NUMERIC`
 values that a double could not represent, a recursive CTE, `EXECUTE BLOCK`,

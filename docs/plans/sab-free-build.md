@@ -144,9 +144,14 @@ start 0.33–0.43 s against 0.87–1.06 s (no pool of 32 workers to spawn); one
 row of ten columns 34–49 µs a call against 54–76; a one-row update 28–41 µs
 against 45–66; 100 rows level. Not slower anywhere measured.
 
-Step 6 is what is left: the demo and `firebird-quake2` can drop their service
-workers, and the threaded build stays the default until the other has run
-every suite for a release.
+Step 6, the consumers: the demo dropped its service worker. Its Worker loads
+the threaded build only where the page is isolated, so on GitHub Pages it runs
+the build without threads, and `coi-serviceworker.js` is now a retired
+version that unregisters itself for visitors who still have the old one. All
+21 demo tests pass served without COOP/COEP. `firebird-quake2` follows once a
+release carries both builds (it installs the package from npm), and the
+threaded build stays the default until the other has run every suite for a
+release.
 
 ## What it is not
 

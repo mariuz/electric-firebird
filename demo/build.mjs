@@ -67,8 +67,13 @@ async function main() {
   // `self.location` inside a Worker is the worker script's own URL, so
   // resolving against it keeps the site working under any path prefix —
   // including the `/<repo>/` one that Pages serves a project site from.
+  //
+  // Which engine: the threaded build where the page is cross-origin isolated,
+  // else the build without threads, which needs no SharedArrayBuffer.  GitHub
+  // Pages sends no COOP/COEP, so there it is always the latter; a host that
+  // does send them gets the threads.  The same rule as wasmGlueFile().
   const prelude = [
-    "importScripts(new URL('./firebird-embedded.js', self.location.href).href);",
+    "importScripts(new URL(self.crossOriginIsolated ? './firebird-embedded.js' : './firebird-embedded-st.js', self.location.href).href);",
     'self.FIREBIRD_WORKER_OPTIONS = {',
     "  locateFile: (file) => new URL(file, self.location.href).href,",
     '};',
@@ -81,7 +86,10 @@ async function main() {
   );
 
   // ── The compiled engine ─────────────────────────────────────────────────
-  const artifacts = ['firebird-embedded.js', 'firebird-embedded.wasm'];
+  const artifacts = [
+    'firebird-embedded.js', 'firebird-embedded.wasm',
+    'firebird-embedded-st.js', 'firebird-embedded-st.wasm',
+  ];
   const missing = artifacts.filter((f) => !fs.existsSync(path.join(WASM_DIR, f)));
   if (missing.length > 0) {
     // Fail loudly.  A site that builds fine and then 404s the engine at
