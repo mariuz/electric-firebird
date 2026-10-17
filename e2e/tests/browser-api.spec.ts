@@ -1048,8 +1048,11 @@ test.describe('Binary BLOB side channel', () => {
 
     // Bit 0 is the side channel. Off by default, so every existing caller
     // keeps getting base64 and nothing about their rows changes.
-    expect(flags.without).toBe(0);
-    expect(flags.with_).toBe(1);
+    expect(flags.without & 1).toBe(0);
+    expect(flags.with_ & 1).toBe(1);
+    // Bit 1 (shape ids) is the transport's own and set either way.
+    expect(flags.without & 2).toBe(2);
+    expect(flags.with_ & 2).toBe(2);
   });
 
   test('replaces placeholders with the bytes beside them', async ({ page }) => {
