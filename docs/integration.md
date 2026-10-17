@@ -499,8 +499,9 @@ To keep the threaded build, a service worker can supply the headers, because
 it sits in front of the network for its own scope and can re-issue every
 response with the headers attached.
 
-`demo/public/coi-serviceworker.js` in this repository is a working
-implementation, tested against the live GitHub Pages deployment. The essential
+This repository's demo did this until it moved to the build without threads
+(`demo/public/coi-serviceworker.js` is now the retired version, which
+unregisters itself for visitors who still have the old one). The essential
 part:
 
 ```js

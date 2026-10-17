@@ -1052,9 +1052,10 @@ gaps it ran into, with its numbers, in rough order of what they would buy.
       `firebird-embedded-st.{js,wasm}`, built beside the threaded artifact,
       runs with a plain `ArrayBuffer` heap in a page with no COOP/COEP, on
       the page thread or in a Worker, and starts in a third of the time. It
-      gives up statement and idle timeouts. Left: step 6, the demo and
-      `firebird-quake2` dropping their service workers, and a release with
-      both builds before the default changes.
+      gives up statement and idle timeouts. Step 6: the demo dropped its
+      service worker and runs that build on GitHub Pages. Left: a release
+      with both builds, then `firebird-quake2` dropping its service worker,
+      and only then a change of default.
 - [x] **Cooperative garbage collection.** Found while tracing the threads:
       under the engine's default `GCPolicy = combined` the statement and the
       garbage collector thread fight over the same pages, and every handoff

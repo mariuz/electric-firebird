@@ -2,11 +2,10 @@
  * demo.spec.ts – the published demo site, served the way GitHub Pages serves it.
  *
  * The server behind this config sends no COOP/COEP headers, so the page is not
- * cross-origin isolated when it first loads and `SharedArrayBuffer` is
- * withheld.  Everything here therefore depends on the demo's service worker
- * re-issuing responses with the headers attached and the page reloading once
- * into isolation.  If that mechanism breaks, these tests fail — which is the
- * whole reason for testing the site rather than the library it uses.
+ * cross-origin isolated and `SharedArrayBuffer` is withheld.  The demo runs the
+ * engine's build without threads there, which needs neither; it used to rely
+ * on a service worker to synthesise isolation, and these tests are what keep
+ * it working on a host that sends nothing.
  *
  * The engine is the real compiled artifact, so the suite skips without it.
  */
@@ -18,19 +17,14 @@ import * as path from 'path';
 
 const WASM_BIN = path.resolve(
   __dirname,
-  '../../packages/firebird-wasm/dist/wasm/firebird-embedded.wasm',
+  '../../packages/firebird-wasm/dist/wasm/firebird-embedded-st.wasm',
 );
 const wasmAvailable = fs.existsSync(WASM_BIN);
 
 /** Creating a database is slow: the engine writes the whole system catalogue. */
 const BOOT_TIMEOUT = 180_000;
 
-/**
- * Load the demo and wait for the engine to be ready.
- *
- * The first visit registers the service worker and reloads itself, so this
- * waits for the state the second load reaches rather than for navigation.
- */
+/** Load the demo and wait for the engine to be ready. */
 async function openDemo(page: Page): Promise<void> {
   // './' not '/'.  A leading slash resolves against the *origin*, which on a
   // GitHub project site (https://user.github.io/repo/) lands on the user's own
@@ -86,20 +80,40 @@ async function readTable(
 test.describe('Demo site', () => {
   test.skip(!wasmAvailable, 'WASM binary not built – run npm run build:wasm first');
 
-  test('becomes cross-origin isolated on a host that sends no COOP/COEP', async ({
+  test('runs on a host that sends no COOP/COEP, with nothing to supply them', async ({
     page,
   }) => {
-    // Prove the premise before relying on it: if the test server started
-    // sending the headers itself, every other test here would pass without
-    // the service worker doing anything.
+    // Prove the premise: if the test server started sending the headers
+    // itself, this would pass on the threaded build too.
     const response = await page.request.get('./');
     expect(response.headers()['cross-origin-opener-policy']).toBeUndefined();
     expect(response.headers()['cross-origin-embedder-policy']).toBeUndefined();
 
     await openDemo(page);
 
-    expect(await page.evaluate(() => globalThis.crossOriginIsolated)).toBe(true);
-    expect(await page.evaluate(() => typeof SharedArrayBuffer)).toBe('function');
+    expect(await page.evaluate(async () => ({
+      isolated: globalThis.crossOriginIsolated,
+      sab: typeof SharedArrayBuffer,
+      serviceWorkers: (await navigator.serviceWorker.getRegistrations()).length,
+    }))).toEqual({ isolated: false, sab: 'undefined', serviceWorkers: 0 });
+    await expect(page.locator('#isolation-note')).toContainText('build without threads');
+  });
+
+  test('retires the service worker that earlier visits registered', async ({ page }) => {
+    // A visitor from before still has coi-serviceworker.js registered; the
+    // browser fetches it again, gets the retired version, which unregisters
+    // itself instead of isolating the page.
+    await page.goto('./');
+    await page.evaluate(async () => {
+      await navigator.serviceWorker.register('./coi-serviceworker.js');
+    });
+    await expect.poll(
+      () => page.evaluate(() => navigator.serviceWorker.getRegistrations().then((r) => r.length)),
+      { timeout: 20_000 },
+    ).toBe(0);
+
+    await openDemo(page);
+    expect(await page.evaluate(() => globalThis.crossOriginIsolated)).toBe(false);
   });
 
   test('reports the engine version it is actually running', async ({ page }) => {
