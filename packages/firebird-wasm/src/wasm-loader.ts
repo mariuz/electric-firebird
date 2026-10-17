@@ -139,6 +139,12 @@ export interface FirebirdWasmModule {
    */
   _fb_read_transaction(dbHandle: number, on: number): number;
   /**
+   * The columns of a kept statement's shape, `{"columns":[...]}`, for a
+   * result that named them by id (`{"shape":N,...}`); 0 if no kept statement
+   * has that shape any more. Free with `_fb_free_result`.
+   */
+  _fb_shape_columns(id: number): number;
+  /**
    * Pointer to the binary BLOB side buffer for the most recent query, or 0.
    *
    * Owned by the engine and replaced by the next query, like the error text —

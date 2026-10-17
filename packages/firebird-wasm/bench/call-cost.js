@@ -34,7 +34,7 @@
 const path = require('path');
 const dist = path.resolve(__dirname, '../dist/browser');
 const { FirebirdBrowser } = require(path.join(dist, 'firebird-browser.js'));
-const { DirectTransport, decodeResultSet } = require(path.join(dist, 'engine-transport.js'));
+const { DirectTransport, decodeResultSet, SHAPE_IDS } = require(path.join(dist, 'engine-transport.js'));
 const { encodeParams } = require(path.join(dist, 'params.js'));
 const { allocString } = require(path.resolve(__dirname, '../dist/wasm-loader.js'));
 
@@ -156,16 +156,17 @@ async function main() {
       let lastJson = '';
       r['c-call'].push(
         await perCall(calls, () => {
-          const ptr = mod._fb_query_params(dbHandle, 0, sqlPtr, paramPtr, encoded.length, 0);
+          const ptr = mod._fb_query_params(dbHandle, 0, sqlPtr, paramPtr, encoded.length, SHAPE_IDS);
           if (!ptr) throw new Error(`query failed: ${shape.sql}`);
           mod._fb_free_result(ptr);
         }),
       );
-      const ptr = mod._fb_query_params(dbHandle, 0, sqlPtr, paramPtr, encoded.length, 0);
+      const ptr = mod._fb_query_params(dbHandle, 0, sqlPtr, paramPtr, encoded.length, SHAPE_IDS);
       r.decode.push(
         await perCall(calls, () => {
           lastJson = mod.UTF8ToString(ptr);
-          decodeResultSet(lastJson, 'array');
+          // As DirectTransport decodes: a kept statement's columns by shape id.
+          decodeResultSet(lastJson, 'array', transport.shapeColumns);
         }),
       );
       mod._fb_free_result(ptr);

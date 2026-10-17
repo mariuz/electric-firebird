@@ -1005,11 +1005,17 @@ gaps it ran into, with its numbers, in rough order of what they would buy.
       22–24; one value 24–34 to 19–26. Short of the 20–30 hoped for: the JS
       still copies the column text out of the heap and hashes it to find the
       cached list, 4.6–6.9 µs for ten columns.
-- [ ] **A shape id instead of the column text.** The C bridge could number a
-      kept statement's shape and send the number, the JS keeping the decoded
-      fields by it, so a small result would cross as its rows alone. Then
-      the cost per value in C (`snprintf` for doubles and timestamps is the
-      likely part).
+- [x] **A shape id instead of the column text.** With `fb_query`'s
+      `FB_QUERY_SHAPE_IDS` flag, which `DirectTransport` sets, a kept
+      statement's result is `{"shape":N,"rows":[…]}`; the transport keeps
+      what each id means, asking `fb_shape_columns(N)` once for an id it has
+      not seen. Ids are never reused, so a remembered one is never wrong. The
+      decode of ten columns and no row went from 5.7–7.0 to 1.1–1.4 µs (779
+      bytes of JSON to 21), one row of ten from 5.2–7.6 to 2.3–2.8, and the
+      whole query of ten columns and no row from 22–28 to 16–21.
+- [ ] **The cost per value in C.** What is left of a large result: about
+      0.5–0.65 µs a value written (`snprintf` for doubles and timestamps is
+      the likely part), against 0.1 µs to decode it in JS.
 - [x] **`execBatch` on the Node backend.** It prepared once and looped, one
       execute and one round trip per row; the browser's runs as one `IBatch`
       request. The Node driver binds no `IBatch`: not node-firebird-native-api

@@ -101,15 +101,28 @@ IPluginSet* g_pluginSet = nullptr;
  * (CachedStatement::shape) rather than on every call: describing them was
  * most of what a small query cost (bench/call-cost.js, "no row, 10 columns").
  */
+struct OutputShape;
+
+/**
+ * Kept statements' shapes by id, for fb_shape_columns.  An id is given once
+ * and never reused, so a caller that remembers what an id meant is never
+ * wrong about it: a statement whose columns change (after DDL) is prepared
+ * again and gets a new shape and a new id.
+ */
+std::map<unsigned, OutputShape*> g_shapes;
+unsigned g_nextShapeId = 1;
+
 struct OutputShape
 {
 	IMessageMetadata* metadata = nullptr;   // owned
+	unsigned id = 0;                        // nonzero once kept with a statement
 	unsigned columnCount = 0;
 	unsigned messageLength = 0;
 	bool hasCursor = true;                  // EXECUTE PROCEDURE has columns but no cursor
 	std::vector<unsigned> types, lengths, offsets, nullOffsets;
 	std::vector<int> subTypes, scales;
 	std::string header;                     // {"columns":[...],"rows":[
+	std::string idHeader;                   // {"shape":N,"rows":[  (kept shapes only)
 
 	OutputShape() = default;
 	OutputShape(const OutputShape&) = delete;
@@ -117,6 +130,8 @@ struct OutputShape
 
 	~OutputShape()
 	{
+		if (id)
+			g_shapes.erase(id);
 		if (metadata)
 			metadata->release();
 	}
@@ -197,6 +212,13 @@ ISC_INT64 g_lastAffectedRows = 0;
  */
 /** `flags` bit for fb_query/fb_query_params: binary BLOBs out of band. */
 #define FB_QUERY_BINARY_BLOBS 1
+
+/**
+ * `flags` bit for fb_query/fb_query_params: the caller understands
+ * `{"shape":N,"rows":[...]}` for a kept statement, in place of the columns,
+ * and asks fb_shape_columns(N) for an id it does not know yet.
+ */
+#define FB_QUERY_SHAPE_IDS 2
 
 struct BlobSink
 {
@@ -1881,19 +1903,26 @@ std::shared_ptr<OutputShape> outputShape(int db_handle, IStatement* statement, b
 
 	std::shared_ptr<OutputShape> shape = describeOutput(statement, context);
 	if (shape && kept)
+	{
+		shape->id = g_nextShapeId++;
+		shape->idHeader = "{\"shape\":" + std::to_string(shape->id) + ",\"rows\":[";
+		g_shapes[shape->id] = shape.get();
 		kept->shape = shape;
+	}
 	return shape;
 }
 
 bool serialiseCursor(IAttachment* attachment, ITransaction* transaction,
 	IStatement* statement, const OutputShape& shape,
 	IMessageMetadata* inMeta, void* inBuffer,
-	IResultSet*& cursor, std::string& json, BlobSink* sink)
+	IResultSet*& cursor, std::string& json, BlobSink* sink, bool shapeIds = false)
 {
 	Status status;
 	const unsigned columnCount = shape.columnCount;
 
-	json = shape.header;
+	// A kept shape goes by its id when the caller understands ids: the
+	// columns' description is then not copied, sent, or read again.
+	json = shapeIds && shape.id ? shape.idHeader : shape.header;
 
 	// A statement with no output columns (INSERT, DDL, …) still succeeds; it
 	// simply yields an empty result set rather than an error.
@@ -2244,6 +2273,29 @@ int fb_execute(int db_handle, int tx_handle, const char* sql)
  * every database's cache, so it is also the way to drop statements that DDL
  * run through EXECUTE STATEMENT, which the cache cannot see, made stale.
  */
+/**
+ * The columns of the kept shape `id`, as `{"columns":[...]}`, for a caller of
+ * fb_query with FB_QUERY_SHAPE_IDS that has not seen this id or has
+ * forgotten it.  Null if no kept statement has that shape any more; asked
+ * right after the query that named it, the shape is still there, since the
+ * statement that ran is the cache's most recently used.  Free the result with
+ * fb_free_result().
+ */
+FB_WASM_EXPORT
+const char* fb_shape_columns(unsigned id)
+{
+	clearError();
+	const auto it = g_shapes.find(id);
+	if (it == g_shapes.end())
+	{
+		setError("fb_shape_columns: unknown shape");
+		return nullptr;
+	}
+	const std::string& header = it->second->header;   // {"columns":[...],"rows":[
+	const std::string rowsKey = ",\"rows\":[";
+	return allocCString(header.substr(0, header.size() - rowsKey.size()) + "}");
+}
+
 FB_WASM_EXPORT
 int fb_statement_cache(int size)
 {
@@ -2542,7 +2594,7 @@ const char* fb_query(int db_handle, int tx_handle, const char* sql, int flags)
 
 	std::string json;
 	if (!serialiseCursor(attachment, transaction, statement, *shape,
-			nullptr, nullptr, cursor, json, &sink))
+			nullptr, nullptr, cursor, json, &sink, (flags & FB_QUERY_SHAPE_IDS) != 0))
 	{
 		if (shared && g_lastErrorReadOnly)
 		{
@@ -3440,7 +3492,7 @@ const char* fb_query_params(int db_handle, int tx_handle, const char* sql,
 
 	std::string json;
 	if (!serialiseCursor(attachment, transaction, statement, *shape,
-			input.meta(), input.data(), cursor, json, &sink))
+			input.meta(), input.data(), cursor, json, &sink, (flags & FB_QUERY_SHAPE_IDS) != 0))
 	{
 		if (shared && g_lastErrorReadOnly)
 		{

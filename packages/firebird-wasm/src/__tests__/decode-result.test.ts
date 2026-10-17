@@ -47,6 +47,20 @@ describe('decodeResultSet', () => {
     expect(result).toEqual({ fields: [], rows: [] });
   });
 
+  it('takes the columns of a result named by shape id from the resolver', () => {
+    const fields = decodeResultSet(encode(columns, [])).fields;
+    const asked: number[] = [];
+    const resolve = (id: number) => {
+      asked.push(id);
+      return fields;
+    };
+    const result = decodeResultSet('{"shape":42,"rows":[[1,"a"],[2,"b"]]}', 'object', resolve);
+    expect(asked).toEqual([42]);
+    expect(result.fields.map((f) => f.name)).toEqual(['ID', 'NAME']);
+    expect(result.fields[0]).not.toBe(fields[0]);
+    expect(result.rows).toEqual([{ ID: 1, NAME: 'a' }, { ID: 2, NAME: 'b' }]);
+  });
+
   it('parses any other shape whole', () => {
     // Keys in another order: not the bridge's layout, so no split is attempted.
     const json = JSON.stringify({ rows: [[7]], columns: [{ name: 'n', type: 496, subType: 0, scale: 0, length: 4, nullable: false }] });

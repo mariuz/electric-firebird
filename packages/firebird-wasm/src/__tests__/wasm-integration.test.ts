@@ -697,6 +697,70 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
         .toThrow('setSharedReads');
     });
 
+    // ── Shape ids ───────────────────────────────────────────────────────
+    //
+    // With FB_QUERY_SHAPE_IDS (2), a kept statement's result names its
+    // columns by id instead of describing them; fb_shape_columns(id) says
+    // what the id means.
+
+    const rawQuery = (db: number, sql: string, flags: number): string => {
+      const sqlPtr = allocString(mod, sql);
+      try {
+        const ptr = mod._fb_query(db, 0, sqlPtr, flags);
+        expect({ pointer: ptr > 0, error: errorText() }).toEqual({ pointer: true, error: '' });
+        const json = mod.UTF8ToString(ptr);
+        mod._fb_free_result(ptr);
+        return json;
+      } finally {
+        mod._free(sqlPtr);
+      }
+    };
+    const shapeColumns = (id: number): string | null => {
+      const ptr = mod._fb_shape_columns(id);
+      if (!ptr) return null;
+      const json = mod.UTF8ToString(ptr);
+      mod._fb_free_result(ptr);
+      return json;
+    };
+    const idOf = (json: string): number => Number(/^\{"shape":(\d+),"rows":/.exec(json)![1]);
+
+    it('names a kept statement\'s columns by id, only when asked', () => {
+      const db = freshDatabase('shape-ids');
+      expect(exec(db, 0, 'CREATE TABLE s (id INTEGER, name VARCHAR(10))')).toBe(0);
+      expect(exec(db, 0, "INSERT INTO s VALUES (1, 'one')")).toBe(0);
+      const sql = 'SELECT id, name FROM s';
+
+      const plain = rawQuery(db, sql, 0);
+      expect(plain.startsWith('{"columns":[')).toBe(true);
+
+      const named = rawQuery(db, sql, 2);
+      const id = idOf(named);
+      expect(id).toBeGreaterThan(0);
+      expect(JSON.parse(named)).toEqual({ shape: id, rows: [[1, 'one']] });
+      expect(rawQuery(db, sql, 2)).toBe(named);   // the same id each time
+
+      // The id stands for exactly the columns the plain form describes.
+      expect(JSON.parse(shapeColumns(id)!)).toEqual({ columns: JSON.parse(plain).columns });
+
+      // DDL empties the cache: the id is gone, and the statement comes back with a new one.
+      expect(exec(db, 0, 'CREATE TABLE other (x INTEGER)')).toBe(0);
+      expect(shapeColumns(id)).toBeNull();
+      expect(idOf(rawQuery(db, sql, 2))).toBeGreaterThan(id);
+      expect(mod._fb_detach_database(db)).toBe(0);
+    });
+
+    it('describes the columns of a statement it does not keep', () => {
+      const db = freshDatabase('shape-uncached');
+      expect(exec(db, 0, 'CREATE TABLE u (id INTEGER)')).toBe(0);
+      mod._fb_statement_cache(0);
+      try {
+        expect(rawQuery(db, 'SELECT id FROM u', 2).startsWith('{"columns":[')).toBe(true);
+      } finally {
+        mod._fb_statement_cache(64);
+      }
+      expect(mod._fb_detach_database(db)).toBe(0);
+    });
+
     it('returns the outputs of EXECUTE PROCEDURE as one row', () => {
       const db = freshDatabase('exec-proc-outputs');
       expect(exec(db, 0, `CREATE PROCEDURE add_two (a INTEGER, b INTEGER)
