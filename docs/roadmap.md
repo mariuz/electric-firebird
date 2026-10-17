@@ -1013,9 +1013,15 @@ gaps it ran into, with its numbers, in rough order of what they would buy.
       decode of ten columns and no row went from 5.7–7.0 to 1.1–1.4 µs (779
       bytes of JSON to 21), one row of ten from 5.2–7.6 to 2.3–2.8, and the
       whole query of ten columns and no row from 22–28 to 16–21.
-- [ ] **The cost per value in C.** What is left of a large result: about
-      0.5–0.65 µs a value written (`snprintf` for doubles and timestamps is
-      the likely part), against 0.1 µs to decode it in JS.
+- [x] **The cost per value in C.** A value written cost 0.75–1.9 µs above
+      the engine's own fetch, against 0.1 µs to decode it in JS; a timestamp
+      went through two `IUtil` calls, `snprintf`, a temporary string and an
+      escaping pass. The bridge now decodes dates and times with the engine's
+      own arithmetic and writes digits with `std::to_chars`: timestamps
+      1.9 → 0.7 µs, dates 1.1 → 0.55, doubles 0.95 → 0.65, integers and
+      NUMERICs 0.75–0.85 → 0.55, BOOLEAN (untouched) 0.5 either way. What is
+      left, ~0.5 µs a value of any type, is the per-value loop itself; FLOAT
+      and the time-zone types still use the old path.
 - [x] **`execBatch` on the Node backend.** It prepared once and looped, one
       execute and one round trip per row; the browser's runs as one `IBatch`
       request. The Node driver binds no `IBatch`: not node-firebird-native-api

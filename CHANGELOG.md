@@ -28,6 +28,17 @@ API may still move between minor releases.
   alternating: the decode of ten columns and no row 5.7–7.0 µs before,
   1.1–1.4 now (779 bytes of JSON to 21); the whole query 22–28 µs before,
   16–21 now. Needs a rebuilt artifact.
+- **Values are written without `snprintf`.** The C bridge decodes DATE, TIME
+  and TIMESTAMP with the engine's own calendar arithmetic and writes them,
+  integers, NUMERICs and doubles straight into the result with
+  `std::to_chars`, instead of `IUtil` calls, `snprintf`, a temporary string
+  and an escaping pass. Per value written, alternating with the previous
+  artifact: TIMESTAMP 1.9 µs to 0.7, DATE 1.1 to 0.55, DOUBLE PRECISION 0.95
+  to 0.65, INTEGER, BIGINT and NUMERIC 0.75–0.85 to 0.55. A double is now
+  its shortest round-trip text (`0.1`, not `0.10000000000000001`), the same
+  number when parsed; 3000 doubles and 98 708 rows of dates, times and
+  numbers across years 1 to 9999 parse identically before and after. Needs a
+  rebuilt artifact.
 
 ## 0.6.1 — 2026-10-10
 

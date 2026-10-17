@@ -48,6 +48,7 @@
 
 #include <firebird/Interface.h>
 
+#include <charconv>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -692,14 +693,86 @@ void base64Encode(const std::vector<unsigned char>& bytes, std::string& out)
  * double here would silently lose precision on the very types users pick
  * *because* they need precision, so the digits are shifted textually instead.
  */
+// ---------------------------------------------------------------------------
+// Writing values without snprintf
+// ---------------------------------------------------------------------------
+//
+// bench/call-cost.js put the cost of writing a value at 0.5-0.65 µs against
+// 0.1 µs to decode it in JS, the most for dates and timestamps: each went
+// through IUtil::decodeDate/decodeTime, snprintf, a temporary string and an
+// escaping pass.  These write digits straight into the result.
+
+/** `value` in decimal, as snprintf("%lld") would. */
+void appendInteger(long long value, std::string& out)
+{
+	char buf[24];
+	const auto r = std::to_chars(buf, buf + sizeof(buf), value);
+	out.append(buf, r.ptr);
+}
+
+/** `value` zero-padded to at least `width` digits, as snprintf("%0*u") would. */
+void appendPadded(unsigned value, int width, std::string& out)
+{
+	char buf[16];
+	const auto r = std::to_chars(buf, buf + sizeof(buf), value);
+	const int digits = static_cast<int>(r.ptr - buf);
+	if (digits < width)
+		out.append(static_cast<size_t>(width - digits), '0');
+	out.append(buf, r.ptr);
+}
+
+/**
+ * Firebird's day number (days since 1858-11-17) as a calendar date: the
+ * engine's own arithmetic (NoThrowTimeStamp::decode_date), done here rather
+ * than through an IUtil call per value.
+ */
+void decodeDay(ISC_DATE date, unsigned& year, unsigned& month, unsigned& day)
+{
+	int nday = date + 2400001 - 1721119;
+	const int century = (4 * nday - 1) / 146097;
+	nday = 4 * nday - 1 - 146097 * century;
+	int d = nday / 4;
+
+	nday = (4 * d + 3) / 1461;
+	d = 4 * d + 3 - 1461 * nday;
+	d = (d + 4) / 4;
+
+	int m = (5 * d - 3) / 153;
+	d = 5 * d - 3 - 153 * m;
+	d = (d + 5) / 5;
+
+	int y = 100 * century + nday;
+	if (m < 10)
+		m += 3;
+	else
+	{
+		m -= 9;
+		y += 1;
+	}
+
+	year = static_cast<unsigned>(y);
+	month = static_cast<unsigned>(m);
+	day = static_cast<unsigned>(d);
+}
+
+/** Firebird's time of day (1/10000 s since midnight), as NoThrowTimeStamp::decode_time. */
+void decodeTimeOfDay(ISC_TIME time, unsigned& hours, unsigned& minutes, unsigned& seconds,
+	unsigned& fractions)
+{
+	hours = time / (3600 * ISC_TIME_SECONDS_PRECISION);
+	time %= 3600 * ISC_TIME_SECONDS_PRECISION;
+	minutes = time / (60 * ISC_TIME_SECONDS_PRECISION);
+	time %= 60 * ISC_TIME_SECONDS_PRECISION;
+	seconds = time / ISC_TIME_SECONDS_PRECISION;
+	fractions = time % ISC_TIME_SECONDS_PRECISION;
+}
+
 void appendScaledDecimal(ISC_INT64 value, int scale, std::string& out)
 {
 	if (scale >= 0)
 	{
 		// Positive scale means the stored value must be multiplied by 10^scale.
-		char buf[32];
-		snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(value));
-		out += buf;
+		appendInteger(static_cast<long long>(value), out);
 		out.append(static_cast<size_t>(scale), '0');
 		return;
 	}
@@ -712,8 +785,8 @@ void appendScaledDecimal(ISC_INT64 value, int scale, std::string& out)
 		: static_cast<unsigned long long>(value);
 
 	char digits[32];
-	const int written = snprintf(digits, sizeof(digits), "%llu", magnitude);
-	std::string text(digits, written > 0 ? static_cast<size_t>(written) : 0);
+	const auto written = std::to_chars(digits, digits + sizeof(digits), magnitude);
+	std::string text(digits, written.ptr);
 
 	const size_t decimals = static_cast<size_t>(-scale);
 	if (text.size() <= decimals)
@@ -740,17 +813,22 @@ bool exactlyRepresentableAsDouble(ISC_INT64 value)
 void appendTimeText(unsigned hours, unsigned minutes, unsigned seconds,
 	unsigned fractions, std::string& out)
 {
-	char buf[32];
-	snprintf(buf, sizeof(buf), "%02u:%02u:%02u.%04u",
-		hours, minutes, seconds, fractions);
-	out += buf;
+	appendPadded(hours, 2, out);
+	out += ':';
+	appendPadded(minutes, 2, out);
+	out += ':';
+	appendPadded(seconds, 2, out);
+	out += '.';
+	appendPadded(fractions, 4, out);
 }
 
 void appendDateText(unsigned year, unsigned month, unsigned day, std::string& out)
 {
-	char buf[16];
-	snprintf(buf, sizeof(buf), "%04u-%02u-%02u", year, month, day);
-	out += buf;
+	appendPadded(year, 4, out);
+	out += '-';
+	appendPadded(month, 2, out);
+	out += '-';
+	appendPadded(day, 2, out);
 }
 
 /** Read a text or binary BLOB in full and append it as a JSON string. */
@@ -844,11 +922,7 @@ void appendValue(IAttachment* attachment, ITransaction* transaction,
 			if (scale)
 				{ out += '"'; appendScaledDecimal(value, scale, out); out += '"'; }
 			else
-			{
-				char buf[16];
-				snprintf(buf, sizeof(buf), "%d", static_cast<int>(value));
-				out += buf;
-			}
+				appendInteger(value, out);
 			break;
 		}
 
@@ -859,11 +933,7 @@ void appendValue(IAttachment* attachment, ITransaction* transaction,
 			if (scale)
 				{ out += '"'; appendScaledDecimal(value, scale, out); out += '"'; }
 			else
-			{
-				char buf[16];
-				snprintf(buf, sizeof(buf), "%d", static_cast<int>(value));
-				out += buf;
-			}
+				appendInteger(value, out);
 			break;
 		}
 
@@ -874,17 +944,13 @@ void appendValue(IAttachment* attachment, ITransaction* transaction,
 			if (scale)
 				{ out += '"'; appendScaledDecimal(value, scale, out); out += '"'; }
 			else if (exactlyRepresentableAsDouble(value))
-			{
-				char buf[32];
-				snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(value));
-				out += buf;
-			}
+				appendInteger(static_cast<long long>(value), out);
 			else
 			{
 				// Emitting a JSON number here would silently round the value.
-				char buf[32];
-				snprintf(buf, sizeof(buf), "\"%lld\"", static_cast<long long>(value));
-				out += buf;
+				out += '"';
+				appendInteger(static_cast<long long>(value), out);
+				out += '"';
 			}
 			break;
 		}
@@ -931,9 +997,11 @@ void appendValue(IAttachment* attachment, ITransaction* transaction,
 				out += "null";
 			else
 			{
+				// The shortest text that reads back as this very double: what
+				// %.17g guaranteed, in fewer digits (0.1, not 0.10000000000000001).
 				char buf[32];
-				snprintf(buf, sizeof(buf), "%.17g", value);
-				out += buf;
+				const auto r = std::to_chars(buf, buf + sizeof(buf), value);
+				out.append(buf, r.ptr);
 			}
 			break;
 		}
@@ -977,10 +1045,10 @@ void appendValue(IAttachment* attachment, ITransaction* transaction,
 			ISC_DATE value = 0;
 			memcpy(&value, data, sizeof(value));
 			unsigned year = 0, month = 0, day = 0;
-			g_util->decodeDate(value, &year, &month, &day);
-			std::string text;
-			appendDateText(year, month, day, text);
-			jsonEscape(text, out);
+			decodeDay(value, year, month, day);
+			out += '"';
+			appendDateText(year, month, day, out);
+			out += '"';
 			break;
 		}
 
@@ -989,10 +1057,10 @@ void appendValue(IAttachment* attachment, ITransaction* transaction,
 			ISC_TIME value = 0;
 			memcpy(&value, data, sizeof(value));
 			unsigned hours = 0, minutes = 0, seconds = 0, fractions = 0;
-			g_util->decodeTime(value, &hours, &minutes, &seconds, &fractions);
-			std::string text;
-			appendTimeText(hours, minutes, seconds, fractions, text);
-			jsonEscape(text, out);
+			decodeTimeOfDay(value, hours, minutes, seconds, fractions);
+			out += '"';
+			appendTimeText(hours, minutes, seconds, fractions, out);
+			out += '"';
 			break;
 		}
 
@@ -1002,13 +1070,13 @@ void appendValue(IAttachment* attachment, ITransaction* transaction,
 			memcpy(&value, data, sizeof(value));
 			unsigned year = 0, month = 0, day = 0;
 			unsigned hours = 0, minutes = 0, seconds = 0, fractions = 0;
-			g_util->decodeDate(value.timestamp_date, &year, &month, &day);
-			g_util->decodeTime(value.timestamp_time, &hours, &minutes, &seconds, &fractions);
-			std::string text;
-			appendDateText(year, month, day, text);
-			text += 'T';
-			appendTimeText(hours, minutes, seconds, fractions, text);
-			jsonEscape(text, out);
+			decodeDay(value.timestamp_date, year, month, day);
+			decodeTimeOfDay(value.timestamp_time, hours, minutes, seconds, fractions);
+			out += '"';
+			appendDateText(year, month, day, out);
+			out += 'T';
+			appendTimeText(hours, minutes, seconds, fractions, out);
+			out += '"';
 			break;
 		}
 
