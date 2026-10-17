@@ -25,6 +25,7 @@ export default defineConfig({
     '**/browser-multitab.spec.ts',
     '**/browser-shared.spec.ts',
     '**/browser-single-thread.spec.ts',
+    '**/browser-cdn.spec.ts',
   ],
   fullyParallel: false,
   forbidOnly: !!process.env['CI'],

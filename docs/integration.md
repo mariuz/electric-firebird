@@ -21,16 +21,41 @@ before you meet them.
 npm install firebird-wasm
 ```
 
-The package ships the compiled engine, so there is nothing to build:
+The package ships the compiled engine, in two builds (§2), so there is
+nothing to build:
 
 ```
-node_modules/firebird-wasm/dist/wasm/firebird-embedded.js     ~108 KB
-node_modules/firebird-wasm/dist/wasm/firebird-embedded.wasm   ~9.1 MB
+node_modules/firebird-wasm/dist/wasm/firebird-embedded.js        ~100 KB
+node_modules/firebird-wasm/dist/wasm/firebird-embedded.wasm      ~8.8 MB  (2.9 MB gzip, 2.1 MB brotli)
+node_modules/firebird-wasm/dist/wasm/firebird-embedded-st.js     ~90 KB
+node_modules/firebird-wasm/dist/wasm/firebird-embedded-st.wasm   ~8.7 MB  (2.9 MB gzip, 2.1 MB brotli)
 ```
 
-Copy those two next to your Worker script, or point `locateFile` at them —
-see §3. Serve the `.wasm` compressed; Brotli takes it to roughly a third, and
-expect it to dominate first load. It caches normally afterwards.
+Copy the build you load next to your Worker script, or point `locateFile` at
+it — see §3. Serve the `.wasm` compressed, and expect it to dominate first
+load; it caches normally afterwards. `npm run size -w packages/firebird-wasm`
+prints these sizes, and CI fails a build that grows past the budget in
+`scripts/size-budget.mjs`.
+
+### From a CDN
+
+Or copy nothing: jsDelivr and unpkg serve the published package, with the
+headers a cross-origin isolated page needs (`Cross-Origin-Resource-Policy:
+cross-origin`). `cdnArtifacts()` names the glue and gives the `locateFile` that
+sends its `.wasm` there too, at this package's exact version:
+
+```js
+// the engine Worker, served from your own origin
+import { cdnArtifacts } from 'firebird-wasm/browser';
+const { glueUrl, locateFile } = cdnArtifacts();   // { cdn: 'unpkg' }, or a mirror's URL
+importScripts(glueUrl);
+self.FIREBIRD_WORKER_OPTIONS = { locateFile };
+```
+
+The `locateFile` is what a Worker needs: glue pulled in with `importScripts()`
+looks for its `.wasm` next to the *Worker*. Glue loaded by `<script src>` from
+the CDN finds it on its own. The Worker script itself must be on your origin:
+the threaded build starts its own workers from it.
 
 The Node backend needs `node-firebird-driver-native`, which is an
 **optional** dependency because it wants Firebird's client library installed.

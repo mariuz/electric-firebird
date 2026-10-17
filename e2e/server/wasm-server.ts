@@ -27,9 +27,21 @@
  *   GET /firebird-engine-worker-st.js  → the engine Worker on that build
  *   GET /wasm/firebird-embedded-st.*   → that build's glue and binary
  *
+ *   GET /firebird-engine-worker-cdn.js?glue=<file>
+ *                                      → the engine Worker, loading the engine
+ *                                        from the CDN origin below
+ *   GET /browser-harness-cdn-st        → the harness, with the glue of the
+ *                                        build without threads loaded straight
+ *                                        from the CDN origin by <script src>
+ *
  * Every route is also served under /no-isolation/, without the COOP/COEP
  * headers: a page there is not cross-origin isolated and gets no
  * SharedArrayBuffer, as on a static host that cannot send them.
+ *
+ * A second listener on CDN_PORT (3002) stands in for a CDN: another origin
+ * serving GET /wasm/<artifact> with the headers jsDelivr and unpkg send
+ * (Access-Control-Allow-Origin: *, Cross-Origin-Resource-Policy:
+ * cross-origin), and GET /hits counting what it served.
  */
 
 import * as http from 'http';
@@ -38,6 +50,8 @@ import * as path from 'path';
 import { buildSync } from 'esbuild';
 
 const PORT = parseInt(process.env['PORT'] ?? '3001', 10);
+const CDN_PORT = parseInt(process.env['CDN_PORT'] ?? '3002', 10);
+const CDN_BASE = `http://localhost:${CDN_PORT}/wasm/`;
 
 // WASM artifacts produced by `npm run build:wasm` + `npm run build`
 const WASM_DIR = path.resolve(
@@ -379,9 +393,10 @@ function getBrowserBundle(): string {
  *      the site root;
  *   3. only then the entry point, which starts answering messages.
  */
-function getWorkerBundle(glueFile = 'firebird-embedded.js'): string {
+function getWorkerBundle(glueFile = 'firebird-embedded.js', base = '/wasm/'): string {
   const stamp = sourceStamp(BROWSER_SRC);
-  const cached = workerBundles.get(glueFile);
+  const key = base + glueFile;
+  const cached = workerBundles.get(key);
   if (cached && cached.stamp === stamp) {
     return cached.text;
   }
@@ -397,11 +412,13 @@ function getWorkerBundle(glueFile = 'firebird-embedded.js'): string {
     external: ['*firebird-embedded.js', '*firebird-embedded-st.js'],
   });
 
+  // The prelude cdnArtifacts() describes: the glue from `base`, and a
+  // locateFile pointing there too.
   const text =
-    `importScripts('/wasm/${glueFile}');\n` +
-    "self.FIREBIRD_WORKER_OPTIONS = { locateFile: (f) => '/wasm/' + f };\n" +
+    `importScripts('${base}${glueFile}');\n` +
+    `self.FIREBIRD_WORKER_OPTIONS = { locateFile: (f) => '${base}' + f };\n` +
     result.outputFiles[0]!.text;
-  workerBundles.set(glueFile, { stamp, text });
+  workerBundles.set(key, { stamp, text });
   return text;
 }
 
@@ -497,6 +514,26 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (req.method === 'GET' && url.startsWith('/firebird-engine-worker-cdn.js?glue=')) {
+    const glueFile = url.slice('/firebird-engine-worker-cdn.js?glue='.length);
+    if (!WASM_FILES.has(glueFile) || !glueFile.endsWith('.js')) {
+      sendJson(res, 400, { error: `unknown glue ${glueFile}` });
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8' });
+    res.end(getWorkerBundle(glueFile, CDN_BASE));
+    return;
+  }
+
+  if (req.method === 'GET' && url === '/browser-harness-cdn-st') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(browserHarnessHtml(true, 'firebird-embedded-st.js').replace(
+      '<script src="/wasm/firebird-embedded-st.js">',
+      `<script src="${CDN_BASE}firebird-embedded-st.js">`,
+    ));
+    return;
+  }
+
   if (req.method === 'GET' && url === '/browser-harness-wasm-st') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(browserHarnessHtml(true, 'firebird-embedded-st.js'));
@@ -538,6 +575,31 @@ const server = http.createServer((req, res) => {
   sendJson(res, 404, { error: 'Not found' });
 });
 
+/** What the stand-in CDN served, by file, since the server started. */
+const cdnHits: Record<string, number> = {};
+
+const cdn = http.createServer((req, res) => {
+  const url = req.url ?? '/';
+  // The headers jsDelivr and unpkg send, and nothing else: no COOP/COEP.
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  if (req.method === 'GET' && url === '/hits') {
+    sendJson(res, 200, cdnHits);
+    return;
+  }
+  const file = url.startsWith('/wasm/') ? url.slice('/wasm/'.length) : '';
+  if (req.method === 'GET' && WASM_FILES.has(file) && fs.existsSync(path.join(WASM_DIR, file))) {
+    cdnHits[file] = (cdnHits[file] ?? 0) + 1;
+    res.writeHead(200, {
+      'Content-Type': file.endsWith('.wasm') ? 'application/wasm' : 'text/javascript; charset=utf-8',
+    });
+    res.end(fs.readFileSync(path.join(WASM_DIR, file)));
+    return;
+  }
+  sendJson(res, 404, { error: 'Not found' });
+});
+cdn.listen(CDN_PORT);
+
 server.listen(PORT, () => {
   console.log(`WASM test server listening on http://localhost:${PORT}`);
   console.log(`WASM JS  : ${WASM_JS}`);
@@ -545,6 +607,7 @@ server.listen(PORT, () => {
 });
 
 process.on('SIGTERM', () => {
+  cdn.close();
   server.close();
   process.exit(0);
 });

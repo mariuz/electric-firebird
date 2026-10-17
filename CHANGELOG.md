@@ -19,6 +19,16 @@ API may still move between minor releases.
 
 ### Added
 
+- **`cdnArtifacts()` and `VERSION`.** The engine's URLs on jsDelivr (or
+  unpkg, or any mirror) at this package's exact version: the glue to
+  `importScripts()` and the `locateFile` that sends its `.wasm` to the same
+  place, which a Worker needs because imported glue looks for the binary next
+  to the Worker. Both builds load this way; jsDelivr and unpkg send the
+  `Cross-Origin-Resource-Policy` an isolated page needs for the threaded one.
+- **A size budget.** `npm run size` prints each artifact raw, gzipped and
+  brotli-compressed (each `.wasm` is 8.7–8.8 MB, 2.9 MB and 2.05 MB) and fails
+  past 9.5 MB raw or 3.2 MB gzipped; CI runs it after every WASM build.
+
 - **A build without threads.** `dist/wasm/firebird-embedded-st.{js,wasm}`
   needs no `SharedArrayBuffer`, so no cross-origin isolation and no
   COOP/COEP service worker, and no Worker either: nothing in it blocks, so it

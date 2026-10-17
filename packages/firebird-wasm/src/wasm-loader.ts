@@ -10,6 +10,8 @@
  *      library.
  */
 
+import { VERSION } from './version';
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -348,6 +350,65 @@ export async function loadFirebirdWasm(
   const mod: FirebirdWasmModule = await factory(moduleOptions);
   cachedModules.set(glueFile, mod);
   return mod;
+}
+
+/** Options for {@link cdnArtifacts}. */
+export interface CdnOptions {
+  /** Which build; as {@link wasmGlueFile}.  Default `'auto'`. */
+  threads?: boolean | 'auto';
+  /**
+   * `'jsdelivr'` (the default), `'unpkg'`, or the base URL of a directory
+   * holding the four artifacts, such as a mirror of `dist/wasm/`.
+   */
+  cdn?: 'jsdelivr' | 'unpkg' | string;
+  /** The package version to load.  Default: this package's own. */
+  version?: string;
+}
+
+/** Where to load the engine from: the glue script, and a `locateFile` for its `.wasm`. */
+export interface CdnArtifacts {
+  /** URL of the glue script, for `importScripts()` or a `<script src>`. */
+  glueUrl: string;
+  /** Pass to `FirebirdBrowser`, `DirectTransport` or `FIREBIRD_WORKER_OPTIONS`. */
+  locateFile: (file: string) => string;
+}
+
+/**
+ * The engine's URLs on a CDN, so nothing has to be copied next to the app.
+ *
+ * Emscripten finds the `.wasm` next to the script that loaded the glue.  Glue
+ * pulled into a Worker with `importScripts()` sees the *Worker's* URL instead,
+ * so without a `locateFile` it fetches the binary from the app's own origin;
+ * this pairs the glue's URL with one that points at the CDN.  The URLs name
+ * this package's exact version by default, so the glue and the TypeScript
+ * calling it always match.
+ *
+ * Both builds load this way.  jsDelivr and unpkg send
+ * `Cross-Origin-Resource-Policy: cross-origin`, which a cross-origin isolated
+ * page needs for the threaded build; the threaded build's own workers start
+ * from the Worker's script, which must be on the app's origin.
+ *
+ * @example
+ * ```js
+ * // the engine Worker, on the app's own origin
+ * const { glueUrl, locateFile } = cdnArtifacts();
+ * importScripts(glueUrl);
+ * self.FIREBIRD_WORKER_OPTIONS = { locateFile };
+ * ```
+ */
+export function cdnArtifacts(options: CdnOptions = {}): CdnArtifacts {
+  const version = options.version ?? VERSION;
+  const cdn = options.cdn ?? 'jsdelivr';
+  const base =
+    cdn === 'jsdelivr'
+      ? `https://cdn.jsdelivr.net/npm/firebird-wasm@${version}/dist/wasm/`
+      : cdn === 'unpkg'
+        ? `https://unpkg.com/firebird-wasm@${version}/dist/wasm/`
+        : cdn.endsWith('/') ? cdn : `${cdn}/`;
+  return {
+    glueUrl: base + wasmGlueFile(options.threads),
+    locateFile: (file: string) => base + file,
+  };
 }
 
 /**
