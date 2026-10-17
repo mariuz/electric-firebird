@@ -59,10 +59,11 @@ await db.close();
 ```ts
 import { FirebirdBrowser } from 'firebird-wasm/browser';
 
-// The engine runs in a Worker: the build uses pthreads and a browser main
-// thread cannot block.  Build the worker script from
-// `firebird-wasm/browser/worker-entry`.  The page must be cross-origin
-// isolated (COOP/COEP) for SharedArrayBuffer.
+// The engine runs in a Worker: the default build uses pthreads and a browser
+// main thread cannot block.  Build the worker script from
+// `firebird-wasm/browser/worker-entry`.  That build needs a cross-origin
+// isolated page (COOP/COEP); firebird-embedded-st.js, the build without
+// threads, needs neither isolation nor a Worker (docs/integration.md §2).
 const db = new FirebirdBrowser('mydb', {
   worker: new Worker('/firebird-engine-worker.js'),
 });

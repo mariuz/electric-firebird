@@ -1048,9 +1048,13 @@ gaps it ran into, with its numbers, in rough order of what they would buy.
       (`wasm/trace-threads.sh`): the engine starts five threads, none on a
       statement's path. Two are per process (a timer, the auth mapping
       listener), two per database (the cache writer, the garbage collector),
-      and one on the first event (the event watcher). One is configuration,
-      three are small inline patches, and the event watcher becomes a poll:
-      about a week, as planned.
+      and one on the first event (the event watcher). Steps 2 to 5 are done:
+      `firebird-embedded-st.{js,wasm}`, built beside the threaded artifact,
+      runs with a plain `ArrayBuffer` heap in a page with no COOP/COEP, on
+      the page thread or in a Worker, and starts in a third of the time. It
+      gives up statement and idle timeouts. Left: step 6, the demo and
+      `firebird-quake2` dropping their service workers, and a release with
+      both builds before the default changes.
 - [x] **Cooperative garbage collection.** Found while tracing the threads:
       under the engine's default `GCPolicy = combined` the statement and the
       garbage collector thread fight over the same pages, and every handoff

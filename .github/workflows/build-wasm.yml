@@ -84,7 +84,8 @@ jobs:
       - name: Install root dependencies
         run: npm install
 
-      - name: Build WASM module (compile Firebird with Emscripten)
+      # Both builds: the threaded one and firebird-embedded-st, without threads.
+      - name: Build WASM modules (compile Firebird with Emscripten)
         run: npm run build:wasm -w packages/firebird-wasm
 
       - name: Build TypeScript package
@@ -97,6 +98,8 @@ jobs:
           path: |
             packages/firebird-wasm/dist/wasm/firebird-embedded.js
             packages/firebird-wasm/dist/wasm/firebird-embedded.wasm
+            packages/firebird-wasm/dist/wasm/firebird-embedded-st.js
+            packages/firebird-wasm/dist/wasm/firebird-embedded-st.wasm
           if-no-files-found: error
           retention-days: 90
 
@@ -104,7 +107,9 @@ jobs:
 
       - name: Run WASM console (Node.js) integration tests
         working-directory: packages/firebird-wasm
-        run: npx jest --testPathPattern=wasm-integration --forceExit
+        # wasm-integration runs once per build; wasm-single-thread checks what
+        # is particular to the build without threads.
+        run: npx jest --testPathPattern='wasm-(integration|single-thread)' --forceExit
 
       - name: Install Playwright browsers for WASM browser tests
         working-directory: e2e

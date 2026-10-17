@@ -145,15 +145,23 @@ export interface FirebirdBrowserOptions {
    */
   locateFile?: (filename: string) => string;
   /**
+   * Which build the engine loads in Node; see
+   * {@link import('../wasm-loader').WasmLoadOptions.threads}.  In a browser
+   * the page chooses by the glue script it loads ({@link wasmGlueFile}).
+   */
+  threads?: boolean | 'auto';
+  /**
    * Worker running the engine.
    *
-   * **Browsers need this.**  The WASM build uses pthreads, so Firebird blocks
-   * on mutexes while opening a database, and a browser main thread is not
-   * allowed to block — without a Worker the page deadlocks.  Build the Worker
-   * script from `firebird-wasm/browser/worker-entry`.
+   * **Browsers need this with the threaded build.**  It uses pthreads, so
+   * Firebird blocks on mutexes while opening a database, and a browser main
+   * thread is not allowed to block — without a Worker the page deadlocks.
+   * Build the Worker script from `firebird-wasm/browser/worker-entry`.
    *
-   * Omit it only where blocking the calling thread is acceptable, such as
-   * Node or a test harness driving a stub engine.
+   * Omit it where blocking the calling thread is acceptable, such as Node or
+   * a test harness driving a stub engine, or with `firebird-embedded-st.js`,
+   * the build without threads, which never blocks and can run on the page
+   * thread (though a Worker still keeps long statements off it).
    *
    * With `multiTab: 'shared'` this must be a **factory**.  It is called only
    * if this tab wins the election, so a follower never downloads and
@@ -402,6 +410,7 @@ export class FirebirdBrowser {
     return new DirectTransport({
       wasmBinary: this.options.wasmBinary,
       locateFile: this.options.locateFile,
+      threads: this.options.threads,
     });
   }
 

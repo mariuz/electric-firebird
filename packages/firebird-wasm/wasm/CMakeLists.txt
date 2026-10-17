@@ -392,16 +392,33 @@ target_compile_options(firebird-embedded PRIVATE
   # Native WASM exceptions rather than the JS-based emulation: smaller and
   # much faster, supported by every browser since ~2022.
   "-fwasm-exceptions"
-  # Firebird starts worker threads (timer, garbage collector, cache writer) and
-  # treats a pthread_create failure as fatal.  Emscripten implements pthreads
-  # over Web Workers + SharedArrayBuffer.
-  #
-  # Browser caveat: SharedArrayBuffer needs cross-origin isolation (COOP/COEP),
-  # and a browser main thread cannot block on a mutex — so in a browser the
-  # engine has to run inside a Worker.  Node has neither restriction, which is
-  # why the Node harness is the fast iteration loop.
-  "-pthread"
 )
+
+# ---------------------------------------------------------------------------
+# Threads:  cmake -DFB_WASM_THREADS=OFF for the build without them
+# ---------------------------------------------------------------------------
+# Firebird starts worker threads (timer, garbage collector, cache writer) and
+# treats a pthread_create failure as fatal.  Emscripten implements pthreads
+# over Web Workers + SharedArrayBuffer.
+#
+# Browser caveat: SharedArrayBuffer needs cross-origin isolation (COOP/COEP),
+# and a browser main thread cannot block on a mutex — so in a browser the
+# engine has to run inside a Worker.  Node has neither restriction, which is
+# why the Node harness is the fast iteration loop.
+#
+# OFF builds firebird-embedded-st.{js,wasm}: no -pthread, so a plain
+# ArrayBuffer heap and no cross-origin isolation, with patch 0006 keeping the
+# engine from starting the four threads it would otherwise start
+# (docs/plans/sab-free-build.md).  What it gives up: statement and idle
+# timeouts, which need the timer thread.
+option(FB_WASM_THREADS "Build with pthreads (needs SharedArrayBuffer)" ON)
+if(FB_WASM_THREADS)
+  target_compile_options(firebird-embedded PRIVATE "-pthread")
+else()
+  message(STATUS "FB_WASM_THREADS=OFF: building firebird-embedded-st without threads")
+  target_compile_definitions(firebird-embedded PRIVATE FB_WASM_NO_THREADS=1)
+  set_target_properties(firebird-embedded PROPERTIES OUTPUT_NAME "firebird-embedded-st")
+endif()
 
 # ---------------------------------------------------------------------------
 # Emscripten link flags
@@ -456,21 +473,31 @@ set(EMSCRIPTEN_LINK_FLAGS
   "-s ENVIRONMENT='web,worker,node'"
   "-s SINGLE_FILE=0"
   "-s USE_ICU=1"
-  # Must match the compile side; see -fwasm-exceptions and -pthread above.
+  # Must match the compile side; see -fwasm-exceptions above.
   "-fwasm-exceptions"
-  "-pthread"
-  # Pre-spawn workers.  Creating one on demand while the requesting thread
-  # blocks waiting for it to start is a deadlock; a pool avoids that.  The
-  # pool must cover every thread the engine starts at once — if it runs dry,
-  # a thread that another is waiting on never starts, which surfaces as
-  # sem_wait() timing out rather than as an obvious pthread failure.
-  "-s PTHREAD_POOL_SIZE=32"
   # Emscripten's default stack is 64 KB.  Firebird's engine recurses deeply
   # through DSQL and metadata initialisation and overflows it while creating a
-  # database, so give the main thread and each worker a realistic stack.
+  # database, so give the main thread (and each worker) a realistic stack.
   "-s STACK_SIZE=8388608"
-  "-s DEFAULT_PTHREAD_STACK_SIZE=4194304"
 )
+if(FB_WASM_THREADS)
+  list(APPEND EMSCRIPTEN_LINK_FLAGS
+    # Marks the factory as this build, so the loader can refuse it, with a
+    # message, where SharedArrayBuffer is not available instead of hanging.
+    "--extern-post-js ${CMAKE_CURRENT_SOURCE_DIR}/glue-threads.js"
+    # Must match the compile side; see FB_WASM_THREADS above.
+    "-pthread"
+    # Pre-spawn workers.  Creating one on demand while the requesting thread
+    # blocks waiting for it to start is a deadlock; a pool avoids that.  The
+    # pool must cover every thread the engine starts at once — if it runs dry,
+    # a thread that another is waiting on never starts, which surfaces as
+    # sem_wait() timing out rather than as an obvious pthread failure.
+    "-s PTHREAD_POOL_SIZE=32"
+    "-s DEFAULT_PTHREAD_STACK_SIZE=4194304"
+  )
+else()
+  list(APPEND EMSCRIPTEN_LINK_FLAGS "--extern-post-js ${CMAKE_CURRENT_SOURCE_DIR}/glue-st.js")
+endif()
 
 # ---------------------------------------------------------------------------
 # Optional debug profile:  cmake -DFB_WASM_DEBUG=ON

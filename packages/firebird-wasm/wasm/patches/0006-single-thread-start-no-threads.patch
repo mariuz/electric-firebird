@@ -1,0 +1,128 @@
+From: electric-firebird
+Subject: [PATCH] Under FB_WASM_NO_THREADS, start none of the engine's threads
+
+A build without -pthread (FB_WASM_THREADS=OFF) has no threads to start:
+Emscripten's pthread_create fails there, and Firebird treats that as
+fatal.  wasm/trace-threads.sh found five threads an embedded attachment
+starts (docs/plans/sab-free-build.md); one is configuration (the garbage
+collector, gone under GCPolicy = cooperative, which the bridge sets), and
+this patch keeps the other four from starting:
+
+- the yvalve timer thread (MasterImplementation.cpp): timers are queued
+  but never fire, so statement and idle timeouts are lost;
+- the auth mapping cache listener (Mapping.cpp): it only serves resets
+  from other processes, and clearCache() resets this process inline;
+- the cache writer (cch.cpp): Super already runs without one for
+  read-only and security databases;
+- the event watcher (event.cpp): post_process() delivers inline when the
+  process to wake is this one, holding the shared memory as the watcher
+  would.
+
+Every change is under #ifdef FB_WASM_NO_THREADS; the threaded build is
+unchanged.
+
+diff --git a/src/jrd/Mapping.cpp b/src/jrd/Mapping.cpp
+index 10090d0..9830353 100644
+--- a/src/jrd/Mapping.cpp
++++ b/src/jrd/Mapping.cpp
+@@ -853,6 +853,7 @@ public:
+ 			(Arg::Gds(isc_map_event) << "INIT").raise();
+ 		}
+ 
++#ifndef FB_WASM_NO_THREADS
+ 		try
+ 		{
+ 			cleanupSync.run(this);
+@@ -863,6 +864,10 @@ public:
+ 			throw;
+ 		}
+ 		startupSemaphore.enter();
++#endif
++		// FB_WASM_NO_THREADS: no listener.  It only serves resets sent by
++		// other processes, and there are none; clearCache() resets this
++		// process's own cache inline.
+ 	}
+ 
+ 	void exceptionHandler(const Exception& ex, ThreadFinishSync<MappingIpc*>::ThreadRoutine*)
+diff --git a/src/jrd/cch.cpp b/src/jrd/cch.cpp
+index b38f17f..75dad91 100644
+--- a/src/jrd/cch.cpp
++++ b/src/jrd/cch.cpp
+@@ -1664,6 +1664,13 @@ void CCH_init2(thread_db* tdbb)
+ 	}
+ #endif
+ 
++#ifdef FB_WASM_NO_THREADS
++	// No cache writer: the state Super is already in for a read-only or a
++	// security database.  Dirty pages are written as they are released and
++	// at commit, by the thread that dirtied them.
++	return;
++#endif
++
+ 	const Attachment* att = tdbb->getAttachment();
+ 	if (!(dbb->dbb_flags & DBB_read_only) && !(att->att_flags & ATT_security_db))
+ 	{
+diff --git a/src/jrd/event.cpp b/src/jrd/event.cpp
+index e1844c4..cbc34eb 100644
+--- a/src/jrd/event.cpp
++++ b/src/jrd/event.cpp
+@@ -99,9 +99,11 @@ EventManager::~EventManager()
+ 	if (m_process)
+ 	{
+ 		// Terminate the event watcher thread
++#ifndef FB_WASM_NO_THREADS
+ 		m_startupSemaphore.tryEnter(5);
+ 		(void) m_sharedMemory->eventPost(&m_process->prb_event);
+ 		m_cleanupSync.waitForCompletion();
++#endif
+ 
+ #if defined(HAVE_OBJECT_MAP) && !defined(__EMSCRIPTEN__)
+ 		m_sharedMemory->unmapObject(&localStatus, &m_process);
+@@ -642,7 +644,11 @@ void EventManager::create_process()
+ 
+ 	release_shmem();
+ 
++#ifndef FB_WASM_NO_THREADS
+ 	m_cleanupSync.run(this);
++#endif
++	// FB_WASM_NO_THREADS: no watcher thread; post_process() delivers to this
++	// process inline.
+ }
+ 
+ 
+@@ -1137,6 +1143,17 @@ bool EventManager::post_process(prb* process)
+  **************************************/
+ 	process->prb_flags &= ~PRB_wakeup;
+ 	process->prb_flags |= PRB_pending;
++#ifdef FB_WASM_NO_THREADS
++	// No watcher thread to wake: when the process to wake is this one, do
++	// what its watcher would, here.  The caller holds the shared memory, as
++	// the watcher does when it calls deliver(); deliver() releases it around
++	// each callback.
++	if (SRQ_REL_PTR(process) == m_processOffset)
++	{
++		deliver();
++		return true;
++	}
++#endif
+ 	return m_sharedMemory->eventPost(&process->prb_event) == FB_SUCCESS;
+ }
+ 
+diff --git a/src/yvalve/MasterImplementation.cpp b/src/yvalve/MasterImplementation.cpp
+index f23066b..637e07d 100644
+--- a/src/yvalve/MasterImplementation.cpp
++++ b/src/yvalve/MasterImplementation.cpp
+@@ -358,7 +358,13 @@ public:
+ 				return;
+ 			}
+ 
++#ifndef FB_WASM_NO_THREADS
+ 			timerHolder.init();
++#endif
++			// FB_WASM_NO_THREADS: no thread fires timers.  They are kept, so
++			// stop() still finds them, but never fire: statement and idle
++			// timeouts, the trace storage touch and the linger timer are what
++			// a build without threads gives up.
+ 
+ 			TimerEntry* curTimer = getTimer(timer);
+ 			if (curTimer)

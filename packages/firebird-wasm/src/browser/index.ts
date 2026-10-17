@@ -26,6 +26,7 @@ export { encodeParams, encodeParamValue } from './params';
 
 export { firebirdTypeName } from './field-types';
 export { statementKind } from '../statement-types';
+export { wasmGlueFile, hasSharedHeap } from '../wasm-loader';
 export { decodeDescription, attachBlobs, BLOB_SIDE_CHANNEL } from './engine-transport';
 
 export { isolationCode, hasTransactionOptions } from './isolation';

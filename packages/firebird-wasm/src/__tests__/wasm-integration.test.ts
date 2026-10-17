@@ -23,18 +23,23 @@ import { FirebirdBrowser } from '../browser/firebird-browser';
 import { DirectTransport } from '../browser/engine-transport';
 import type { EngineTransport } from '../browser/engine-transport';
 
-// The WASM artifact lives at dist/wasm/ after `npm run build:wasm` +
-// `npm run build`.  Skip the whole suite if the binary is absent.
-const WASM_JS_PATH = path.resolve(__dirname, '../../dist/wasm/firebird-embedded.js');
-const hasWasm = fs.existsSync(WASM_JS_PATH);
+// The WASM artifacts live at dist/wasm/ after `npm run build:wasm` +
+// `npm run build`.  The suite runs once per build: with threads
+// (firebird-embedded) and without (firebird-embedded-st), skipping a build
+// that is absent.  Each is a module of its own, with its own filesystem.
+const VARIANTS = [
+  { name: 'with threads', threads: true, glue: 'firebird-embedded.js' },
+  { name: 'without threads', threads: false, glue: 'firebird-embedded-st.js' },
+].map((v) => ({ ...v, present: fs.existsSync(path.resolve(__dirname, '../../dist/wasm', v.glue)) }));
 
-(hasWasm ? describe : describe.skip)(
-  'Firebird WASM module – console (Node.js) integration',
+for (const variant of VARIANTS) {
+(variant.present ? describe : describe.skip)(
+  `Firebird WASM module – console (Node.js) integration, ${variant.name}`,
   () => {
     let mod: FirebirdWasmModule;
 
     beforeAll(async () => {
-      mod = await loadFirebirdWasm();
+      mod = await loadFirebirdWasm({ threads: variant.threads });
     });
 
     // ── Module surface ──────────────────────────────────────────────────
@@ -740,7 +745,7 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
 
     it('takes sharedReads as a FirebirdBrowser option', async () => {
       const db = new FirebirdBrowser('memory://shared-reads-option', {
-        transport: new DirectTransport(),
+        transport: new DirectTransport({ threads: variant.threads }),
         sharedReads: true,
       });
       try {
@@ -881,3 +886,4 @@ const hasWasm = fs.existsSync(WASM_JS_PATH);
     });
   },
 );
+}

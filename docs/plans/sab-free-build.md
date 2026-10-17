@@ -111,6 +111,43 @@ Three things learned on the way:
   now opens every database with `cooperative` (see the roadmap), so the
   configuration step below is already done in the threaded build.
 
+## Steps 2 to 5, done
+
+The build without threads exists: `wasm/build.sh` builds
+`firebird-embedded-st.{js,wasm}` beside the threaded artifact
+(`--variant all`, the default; `threads` or `single` builds one).
+
+- **The patch** (`wasm/patches/0006`): under `FB_WASM_NO_THREADS` the timer,
+  the auth mapping listener and the cache writer do not start, and the event
+  manager delivers to its own process inline from `post_process()` instead of
+  waking a watcher. The garbage collector was already gone: the bridge opens
+  every database with `GCPolicy = cooperative`. Nothing else in the engine
+  needed to change; the first build ran the whole Node integration suite.
+- **Events** are delivered at commit, before the statement returns, so a
+  `fb_events_poll()` right after sees them. The subscription semantics (a
+  delivery disarms until the next poll re-arms) are the threaded build's.
+- **Loading.** `loadFirebirdWasm({ threads })` (and `DirectTransport`,
+  `FirebirdBrowser`) picks the Node artifact; `wasmGlueFile()` names the one a
+  browser page can run (`'auto'`: `crossOriginIsolated`). Each glue marks its
+  factory (`createFirebirdModule.threads`, from `--extern-post-js`), so the
+  loader refuses the threaded build in a page that is not isolated, with a
+  message; it used to hang there, its runtime failing to hand shared memory
+  to its own workers.
+- **Tests.** `wasm-integration.test.ts` runs once per build;
+  `wasm-single-thread.test.ts` checks the plain heap, the database's life and
+  inline events; `browser-single-thread.spec.ts` runs pages served without
+  COOP/COEP, where the build runs on the page thread (no Worker), in a Worker,
+  and the threaded build is refused.
+
+Measured against the threaded build, alternating processes, three rounds:
+start 0.33–0.43 s against 0.87–1.06 s (no pool of 32 workers to spawn); one
+row of ten columns 34–49 µs a call against 54–76; a one-row update 28–41 µs
+against 45–66; 100 rows level. Not slower anywhere measured.
+
+Step 6 is what is left: the demo and `firebird-quake2` can drop their service
+workers, and the threaded build stays the default until the other has run
+every suite for a release.
+
 ## What it is not
 
 - **Not Asyncify or JSPI.** Those make a synchronous C call yield to the

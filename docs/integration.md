@@ -68,12 +68,31 @@ runtime, so the check has to happen at build time.
 
 ---
 
-## 2. The two hard requirements
+## 2. The two hard requirements, and the build without them
 
-Both of these are structural. Neither can be worked around in application
-code, so it is worth confirming them before writing any.
+The package ships two builds of the engine:
 
-### Your page must be cross-origin isolated
+| | `firebird-embedded.js` (threads) | `firebird-embedded-st.js` (no threads) |
+|---|---|---|
+| Needs a cross-origin isolated page | yes | no |
+| Needs a Worker | yes | no: it can run on the page thread |
+| Statement and idle timeouts | yes | no (they need the timer thread) |
+
+The threaded build is the default. Both requirements below are structural for
+it; the build without threads has neither, and is what a page should load when
+it cannot be isolated. `wasmGlueFile()` names the build a page can run:
+
+```ts
+import { wasmGlueFile } from 'firebird-wasm/browser';
+// in the engine's Worker, or in the page: 'firebird-embedded.js' when
+// crossOriginIsolated, else 'firebird-embedded-st.js'
+importScripts(`/wasm/${wasmGlueFile()}`);
+```
+
+Loading the threaded build in a page that is not isolated fails at once, with
+a message naming the other build, rather than hanging.
+
+### Your page must be cross-origin isolated (threaded build)
 
 The engine uses pthreads, which need `SharedArrayBuffer`, which browsers
 withhold unless the document is served with:
@@ -98,11 +117,13 @@ fonts, analytics or iframes, verify them before committing to this.
 
 If you cannot set headers — GitHub Pages, most static CDNs — see §7.
 
-### The engine must run in a Worker
+### The engine must run in a Worker (threaded build)
 
 Firebird blocks on mutexes while opening a database, and a browser main thread
 is not allowed to block. Running the engine on the main thread deadlocks
-reliably, not intermittently.
+reliably, not intermittently. The build without threads never blocks, so it
+can run on the page thread, though a Worker still keeps long statements off
+it.
 
 ```ts
 const db = new FirebirdBrowser('mydb', {
@@ -470,9 +491,13 @@ Two tabs *sharing* one database is not supported yet — see
 
 ## 7. Hosting without control of headers
 
-Static hosts — GitHub Pages, most CDNs — will not send COOP/COEP. A service
-worker can supply them, because it sits in front of the network for its own
-scope and can re-issue every response with the headers attached.
+Static hosts — GitHub Pages, most CDNs — will not send COOP/COEP. The simplest
+answer is the build without threads (§2): it needs no isolation, so there is
+nothing to supply. What it gives up is statement and idle timeouts.
+
+To keep the threaded build, a service worker can supply the headers, because
+it sits in front of the network for its own scope and can re-issue every
+response with the headers attached.
 
 `demo/public/coi-serviceworker.js` in this repository is a working
 implementation, tested against the live GitHub Pages deployment. The essential

@@ -1043,7 +1043,7 @@ test.describe('Binary BLOB side channel', () => {
       const with_ = window.__stub.firstCall('_fb_query')?.args[3];
       await on.close();
 
-      return { without, with_ };
+      return { without: without as number, with_: with_ as number };
     });
 
     // Bit 0 is the side channel. Off by default, so every existing caller

@@ -154,6 +154,8 @@ export interface EngineTransport {
 export interface DirectTransportOptions {
   wasmBinary?: ArrayBuffer | string;
   locateFile?: (filename: string) => string;
+  /** Which build to load; see {@link import('../wasm-loader').WasmLoadOptions.threads}. */
+  threads?: boolean | 'auto';
 }
 
 // ---------------------------------------------------------------------------
@@ -575,6 +577,7 @@ export class DirectTransport implements EngineTransport {
     this.mod = await loadFirebirdWasm({
       wasmBinary: this.options.wasmBinary,
       locateFile: this.options.locateFile,
+      threads: this.options.threads,
     });
 
     const rc = this.mod._fb_init();

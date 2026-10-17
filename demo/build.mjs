@@ -35,7 +35,7 @@ const WORKER_ENTRY = path.join(PKG, 'src/browser/worker-entry.ts');
  * but esbuild resolves string-literal requires eagerly, which would drag the
  * glue's node:fs / node:crypto imports into the bundle and fail the build.
  */
-const EXTERNAL = ['*firebird-embedded.js'];
+const EXTERNAL = ['*firebird-embedded.js', '*firebird-embedded-st.js'];
 
 async function main() {
   fs.rmSync(OUT, { recursive: true, force: true });
