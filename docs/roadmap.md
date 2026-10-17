@@ -590,7 +590,7 @@ Legend: ✅ shipped · 🟡 partial · ❌ missing · n/a not applicable
 | Capability | PGlite | electric-firebird | Notes |
 |---|---|---|---|
 | Prebuilt WASM on npm | ✅ | ✅ | `npm install firebird-wasm` ships the engine |
-| CDN distribution | ✅ | 🟡 | Reachable via unpkg/jsDelivr by virtue of being on npm, but untested and there is no `locateFile` default for it |
+| CDN distribution | ✅ | ✅ | `cdnArtifacts()` gives the jsDelivr/unpkg URLs and their `locateFile`; both builds tested from another origin |
 | Bundler guides (Vite/webpack) | ✅ | 🟡 | Vite, webpack, esbuild and Next.js in [integration.md](./integration.md); still not built by a real example app in CI |
 | Framework hooks (React/Vue) | ✅ | ❌ | |
 | ORM / query-builder support | ✅ | ❌ | |
@@ -930,8 +930,15 @@ be built:
       exist" has to mean *has bytes* or the engine's `O_CREAT | O_EXCL` fails
       with EEXIST on a database that was never written.
 - [x] Publish the prebuilt artifact to npm. Shipped in `firebird-wasm@0.1.0`.
-- [ ] A size budget and a default `locateFile` for CDN use; the 9 MB artifact
-      is currently unbudgeted and every consumer wires `locateFile` by hand.
+- [x] A size budget and a default `locateFile` for CDN use. Each `.wasm` is
+      8.7–8.8 MB raw, 2.9 MB gzipped and 2.05 MB with brotli;
+      `scripts/size-budget.mjs` prints that and fails CI past 9.5 MB raw or
+      3.2 MB gzipped. `cdnArtifacts()` returns the glue URL and a
+      `locateFile` on jsDelivr (or unpkg, or a mirror) at the package's exact
+      version, and both builds are tested loading from another origin with
+      the headers those CDNs send: the threaded one in a Worker of an
+      isolated page, the other in a Worker or by `<script src>` on the page
+      thread.
 - [x] Live queries built on `POST_EVENT`; a `listen()` / `notify()` API.
       Shipped in 0.3.0 (`db.listen`, `db.notify`, `db.live`), once event
       delivery under Emscripten was fixed: the engine had delivered exactly one

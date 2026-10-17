@@ -21,6 +21,7 @@
     "test": "jest --forceExit",
     "bench": "node bench/decode-bench.js",
     "bench:calls": "node bench/call-cost.js",
+    "size": "node scripts/size-budget.mjs",
     "lint": "eslint src --ext .ts",
     "clean": "rm -rf dist",
     "prepublishOnly": "node scripts/check-publish.mjs"
