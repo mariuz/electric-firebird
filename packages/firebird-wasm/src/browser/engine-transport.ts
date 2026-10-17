@@ -188,6 +188,61 @@ interface EncodedColumn {
 }
 
 // ---------------------------------------------------------------------------
+// Column descriptions
+// ---------------------------------------------------------------------------
+
+/**
+ * Decoded field lists by the text of their columns' JSON.
+ *
+ * A kept statement describes the same columns on every call, in the same
+ * bytes, so the description is parsed and turned into `FieldInfo`s once
+ * (bench/call-cost.js measured the decode of ten columns' description at
+ * about 7 µs a call). Bounded like `rowBuilders`, and for the same reason.
+ */
+const fieldLists = new Map<string, readonly FieldInfo[]>();
+const MAX_FIELD_LISTS = 256;
+
+const COLUMNS_PREFIX = '{"columns":';
+const ROWS_INFIX = '],"rows":';
+
+/**
+ * Split the engine's `{"columns":[…],"rows":[…]}` into its two parts,
+ * parsing the rows and taking the columns from the cache when it has them.
+ *
+ * The first `],"rows":` is the boundary: it cannot occur inside a column
+ * name, where every `"` is escaped. Anything else is parsed whole.
+ */
+function splitResultSet(json: string): { columns: readonly FieldInfo[]; rows: unknown[][] } {
+  const split = json.startsWith(COLUMNS_PREFIX) && json.endsWith('}') ? json.indexOf(ROWS_INFIX) : -1;
+  if (split < 0) {
+    const parsed = JSON.parse(json) as { columns: EncodedColumn[]; rows: unknown[][] };
+    return { columns: toFields(parsed.columns), rows: parsed.rows };
+  }
+
+  const columnsText = json.slice(COLUMNS_PREFIX.length, split + 1);
+  let columns = fieldLists.get(columnsText);
+  if (!columns) {
+    columns = toFields(JSON.parse(columnsText) as EncodedColumn[]);
+    if (fieldLists.size >= MAX_FIELD_LISTS) fieldLists.clear();
+    fieldLists.set(columnsText, columns);
+  }
+  const rows = JSON.parse(json.slice(split + ROWS_INFIX.length, -1)) as unknown[][];
+  return { columns, rows };
+}
+
+function toFields(columns: EncodedColumn[]): FieldInfo[] {
+  return columns.map((c) => ({
+    name: c.name.toUpperCase(),
+    type: c.type,
+    typeName: firebirdTypeName(c.type, c.scale),
+    subType: c.subType,
+    scale: c.scale,
+    length: c.length,
+    nullable: c.nullable,
+  }));
+}
+
+// ---------------------------------------------------------------------------
 // Row construction
 // ---------------------------------------------------------------------------
 
@@ -289,25 +344,15 @@ export function decodeResultSet<T = Row>(
   json: string,
   rowMode: RowMode = 'object',
 ): QueryResult<T> {
-  const parsed = JSON.parse(json) as {
-    columns: EncodedColumn[];
-    rows: unknown[][];
-  };
-
-  const fields: FieldInfo[] = parsed.columns.map((c) => ({
-    name: c.name.toUpperCase(),
-    type: c.type,
-    typeName: firebirdTypeName(c.type, c.scale),
-    subType: c.subType,
-    scale: c.scale,
-    length: c.length,
-    nullable: c.nullable,
-  }));
+  const { columns, rows: encodedRows } = splitResultSet(json);
+  // Copies: the cached list is shared by every call with these columns, and a
+  // caller is free to change the fields it was given.
+  const fields: FieldInfo[] = columns.map((f) => ({ ...f }));
 
   if (rowMode === 'array') {
     // Handed straight through: no builder, no per-row object, and nothing to
     // collide when two columns share a name.
-    return { rows: parsed.rows as T[], fields };
+    return { rows: encodedRows as T[], fields };
   }
 
   const names = fields.map((f) => f.name);
@@ -315,8 +360,8 @@ export function decodeResultSet<T = Row>(
 
   const rows = (
     build
-      ? parsed.rows.map(build)
-      : parsed.rows.map((cols) =>
+      ? encodedRows.map(build)
+      : encodedRows.map((cols) =>
           Object.fromEntries(names.map((name, i) => [name, cols[i]])),
         )
   ) as T[];

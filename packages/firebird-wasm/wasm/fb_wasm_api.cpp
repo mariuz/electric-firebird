@@ -54,6 +54,7 @@
 #include <cstring>
 #include <list>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -93,12 +94,41 @@ IUtil*     g_util     = nullptr;
  */
 IPluginSet* g_pluginSet = nullptr;
 
+/**
+ * What a statement's results look like: where each column sits in the output
+ * message, and the JSON describing the columns.  A prepared statement's
+ * columns cannot change, so a kept statement works this out once
+ * (CachedStatement::shape) rather than on every call: describing them was
+ * most of what a small query cost (bench/call-cost.js, "no row, 10 columns").
+ */
+struct OutputShape
+{
+	IMessageMetadata* metadata = nullptr;   // owned
+	unsigned columnCount = 0;
+	unsigned messageLength = 0;
+	bool hasCursor = true;                  // EXECUTE PROCEDURE has columns but no cursor
+	std::vector<unsigned> types, lengths, offsets, nullOffsets;
+	std::vector<int> subTypes, scales;
+	std::string header;                     // {"columns":[...],"rows":[
+
+	OutputShape() = default;
+	OutputShape(const OutputShape&) = delete;
+	OutputShape& operator=(const OutputShape&) = delete;
+
+	~OutputShape()
+	{
+		if (metadata)
+			metadata->release();
+	}
+};
+
 /** A statement kept prepared for its SQL text (see acquireStatement). */
 struct CachedStatement
 {
 	std::string sql;
 	IStatement* statement = nullptr;
 	unsigned type = 0;
+	std::shared_ptr<OutputShape> shape;     // filled by the first query that runs it
 };
 
 /** An attached database, and the statements kept prepared for it, most recently used first. */
@@ -1724,14 +1754,146 @@ bool describeMetadata(IMessageMetadata* meta, std::string& json)
 	return true;
 }
 
+/**
+ * The shape of `statement`'s results, described from its output metadata.
+ * Null on failure, with the error set; `context` names the caller in it.
+ */
+std::shared_ptr<OutputShape> describeOutput(IStatement* statement, const char* context)
+{
+	Status status;
+	auto shape = std::make_shared<OutputShape>();
+
+	shape->metadata = statement->getOutputMetadata(status.ptr());
+	if (status.failed())
+	{
+		setErrorFromStatus((std::string(context) + ": could not read output metadata").c_str(),
+			status.ptr());
+		return nullptr;
+	}
+
+	IMessageMetadata* metadata = shape->metadata;
+	const unsigned columnCount = metadata ? metadata->getCount(status.ptr()) : 0;
+	if (status.failed())
+	{
+		setErrorFromStatus((std::string(context) + ": could not read column count").c_str(),
+			status.ptr());
+		return nullptr;
+	}
+
+	shape->columnCount = columnCount;
+	shape->types.resize(columnCount);
+	shape->subTypes.resize(columnCount);
+	shape->scales.resize(columnCount);
+	shape->lengths.resize(columnCount);
+	shape->offsets.resize(columnCount);
+	shape->nullOffsets.resize(columnCount);
+
+	std::string& json = shape->header;
+	json = "{\"columns\":[";
+
+	for (unsigned i = 0; i < columnCount; i++)
+	{
+		if (i)
+			json += ',';
+
+		// Prefer the alias so `SELECT COUNT(*) AS TOTAL` reports TOTAL.
+		const char* name = metadata->getAlias(status.ptr(), i);
+		if (status.failed() || !name || !*name)
+			name = metadata->getField(status.ptr(), i);
+
+		shape->types[i]       = metadata->getType(status.ptr(), i);
+		shape->subTypes[i]    = metadata->getSubType(status.ptr(), i);
+		shape->scales[i]      = metadata->getScale(status.ptr(), i);
+		shape->lengths[i]     = metadata->getLength(status.ptr(), i);
+		shape->offsets[i]     = metadata->getOffset(status.ptr(), i);
+		shape->nullOffsets[i] = metadata->getNullOffset(status.ptr(), i);
+
+		const FB_BOOLEAN nullable = metadata->isNullable(status.ptr(), i);
+
+		if (status.failed())
+		{
+			setErrorFromStatus("could not read column metadata", status.ptr());
+			return nullptr;
+		}
+
+		// Each column is described, not just named.  Without the type a
+		// caller cannot tell a NUMERIC rendered as "20.25" from a VARCHAR
+		// that happens to contain digits — the JSON encoding makes them
+		// identical, and only the declared type separates them.
+		json += "{\"name\":";
+		jsonEscape(name ? name : "", name ? strlen(name) : 0, json);
+
+		char described[128];
+		snprintf(described, sizeof(described),
+			",\"type\":%u,\"subType\":%d,\"scale\":%d,\"length\":%u,\"nullable\":%s}",
+			shape->types[i], shape->subTypes[i], shape->scales[i], shape->lengths[i],
+			nullable ? "true" : "false");
+		json += described;
+	}
+
+	json += "],\"rows\":[";
+
+	if (columnCount)
+	{
+		shape->messageLength = metadata->getMessageLength(status.ptr());
+		if (status.failed())
+		{
+			setErrorFromStatus("could not size the message buffer", status.ptr());
+			return nullptr;
+		}
+
+		// EXECUTE PROCEDURE has output columns but no cursor: opening one is
+		// refused ("Cannot open cursor for non-SELECT statement").
+		Status flagStatus;
+		const unsigned statementFlags = statement->getFlags(flagStatus.ptr());
+		shape->hasCursor = flagStatus.failed() || (statementFlags & IStatement::FLAG_HAS_CURSOR);
+	}
+
+	return shape;
+}
+
+/**
+ * The shape of `statement`'s results: the kept statement's own if it has one,
+ * else described now, and kept with the statement when the cache holds it.
+ */
+std::shared_ptr<OutputShape> outputShape(int db_handle, IStatement* statement, bool cached,
+	const char* context)
+{
+	CachedStatement* kept = nullptr;
+	if (cached)
+	{
+		if (DbEntry* entry = lookupEntry(db_handle))
+		{
+			// A statement just used is at the front: this is one comparison.
+			for (auto& c : entry->statements)
+			{
+				if (c.statement == statement)
+				{
+					kept = &c;
+					break;
+				}
+			}
+		}
+	}
+
+	if (kept && kept->shape)
+		return kept->shape;
+
+	std::shared_ptr<OutputShape> shape = describeOutput(statement, context);
+	if (shape && kept)
+		kept->shape = shape;
+	return shape;
+}
+
 bool serialiseCursor(IAttachment* attachment, ITransaction* transaction,
-	IStatement* statement, IMessageMetadata* metadata, unsigned columnCount,
+	IStatement* statement, const OutputShape& shape,
 	IMessageMetadata* inMeta, void* inBuffer,
 	IResultSet*& cursor, std::string& json, BlobSink* sink)
 {
 	Status status;
+	const unsigned columnCount = shape.columnCount;
 
-	json = "{\"columns\":[";
+	json = shape.header;
 
 	// A statement with no output columns (INSERT, DDL, …) still succeeds; it
 	// simply yields an empty result set rather than an error.
@@ -1759,66 +1921,9 @@ bool serialiseCursor(IAttachment* attachment, ITransaction* transaction,
 			? 0
 			: static_cast<ISC_INT64>(affected);
 	}
-
-	std::vector<unsigned> types(columnCount);
-	std::vector<int>      subTypes(columnCount);
-	std::vector<int>      scales(columnCount);
-	std::vector<unsigned> lengths(columnCount);
-	std::vector<unsigned> offsets(columnCount);
-	std::vector<unsigned> nullOffsets(columnCount);
-
-	for (unsigned i = 0; i < columnCount; i++)
+	else
 	{
-		if (i)
-			json += ',';
-
-		// Prefer the alias so `SELECT COUNT(*) AS TOTAL` reports TOTAL.
-		const char* name = metadata->getAlias(status.ptr(), i);
-		if (status.failed() || !name || !*name)
-			name = metadata->getField(status.ptr(), i);
-
-		types[i]       = metadata->getType(status.ptr(), i);
-		subTypes[i]    = metadata->getSubType(status.ptr(), i);
-		scales[i]      = metadata->getScale(status.ptr(), i);
-		lengths[i]     = metadata->getLength(status.ptr(), i);
-		offsets[i]     = metadata->getOffset(status.ptr(), i);
-		nullOffsets[i] = metadata->getNullOffset(status.ptr(), i);
-
-		const FB_BOOLEAN nullable = metadata->isNullable(status.ptr(), i);
-
-		if (status.failed())
-		{
-			setErrorFromStatus("could not read column metadata", status.ptr());
-			return false;
-		}
-
-		// Each column is described, not just named.  Without the type a
-		// caller cannot tell a NUMERIC rendered as "20.25" from a VARCHAR
-		// that happens to contain digits — the JSON encoding makes them
-		// identical, and only the declared type separates them.
-		json += "{\"name\":";
-		jsonEscape(name ? name : "", name ? strlen(name) : 0, json);
-
-		char described[128];
-		snprintf(described, sizeof(described),
-			",\"type\":%u,\"subType\":%d,\"scale\":%d,\"length\":%u,\"nullable\":%s}",
-			types[i], subTypes[i], scales[i], lengths[i],
-			nullable ? "true" : "false");
-		json += described;
-	}
-
-	json += "],\"rows\":[";
-
-	if (columnCount)
-	{
-		const unsigned messageLength = metadata->getMessageLength(status.ptr());
-		if (status.failed())
-		{
-			setErrorFromStatus("could not size the message buffer", status.ptr());
-			return false;
-		}
-
-		std::vector<unsigned char> buffer(messageLength);
+		std::vector<unsigned char> buffer(shape.messageLength);
 		bool firstRow = true;
 
 		const auto appendRow = [&]()
@@ -1834,28 +1939,25 @@ bool serialiseCursor(IAttachment* attachment, ITransaction* transaction,
 					json += ',';
 
 				short nullFlag = 0;
-				memcpy(&nullFlag, buffer.data() + nullOffsets[i], sizeof(nullFlag));
+				memcpy(&nullFlag, buffer.data() + shape.nullOffsets[i], sizeof(nullFlag));
 
 				if (nullFlag == -1)
 					json += "null";
 				else
 				{
-					appendValue(attachment, transaction, types[i], subTypes[i],
-						scales[i], lengths[i], buffer.data() + offsets[i], json, sink);
+					appendValue(attachment, transaction, shape.types[i], shape.subTypes[i],
+						shape.scales[i], shape.lengths[i], buffer.data() + shape.offsets[i],
+						json, sink);
 				}
 			}
 			json += ']';
 		};
 
-		// EXECUTE PROCEDURE has output columns but no cursor: opening one is
-		// refused ("Cannot open cursor for non-SELECT statement").  It runs
-		// once and fills one row, which is its result.
-		Status flagStatus;
-		const unsigned statementFlags = statement->getFlags(flagStatus.ptr());
-		if (!flagStatus.failed() && !(statementFlags & IStatement::FLAG_HAS_CURSOR))
+		if (!shape.hasCursor)
 		{
+			// EXECUTE PROCEDURE: it runs once and fills one row, which is its result.
 			statement->execute(status.ptr(), transaction, inMeta, inBuffer,
-				metadata, buffer.data());
+				shape.metadata, buffer.data());
 
 			if (status.failed())
 			{
@@ -1868,7 +1970,7 @@ bool serialiseCursor(IAttachment* attachment, ITransaction* transaction,
 		else
 		{
 			cursor = statement->openCursor(status.ptr(), transaction, inMeta, inBuffer,
-				metadata, 0);
+				shape.metadata, 0);
 
 			if (status.failed() || !cursor)
 			{
@@ -2382,7 +2484,6 @@ const char* fb_query(int db_handle, int tx_handle, const char* sql, int flags)
 	// released on every exit path, including the error ones.
 	IResultSet*       cursor    = nullptr;
 	IStatement*       statement = nullptr;
-	IMessageMetadata* metadata  = nullptr;
 	bool              cached    = false;
 
 	// `keep` leaves a kept statement kept although the call failed.
@@ -2394,8 +2495,6 @@ const char* fb_query(int db_handle, int tx_handle, const char* sql, int flags)
 			cursor->close(s.ptr());
 			cursor->release();
 		}
-		if (metadata)
-			metadata->release();
 		releaseStatement(db_handle, statement, cached, !commit && !keep);
 		if (ownTransaction && transaction)
 		{
@@ -2431,18 +2530,9 @@ const char* fb_query(int db_handle, int tx_handle, const char* sql, int flags)
 		}
 	}
 
-	metadata = statement->getOutputMetadata(status.ptr());
-	if (status.failed())
+	const std::shared_ptr<OutputShape> shape = outputShape(db_handle, statement, cached, "fb_query");
+	if (!shape)
 	{
-		setErrorFromStatus("fb_query: could not read output metadata", status.ptr());
-		cleanup(false);
-		return nullptr;
-	}
-
-	const unsigned columnCount = metadata ? metadata->getCount(status.ptr()) : 0;
-	if (status.failed())
-	{
-		setErrorFromStatus("fb_query: could not read column count", status.ptr());
 		cleanup(false);
 		return nullptr;
 	}
@@ -2451,7 +2541,7 @@ const char* fb_query(int db_handle, int tx_handle, const char* sql, int flags)
 	sink.enabled = (flags & FB_QUERY_BINARY_BLOBS) != 0;
 
 	std::string json;
-	if (!serialiseCursor(attachment, transaction, statement, metadata, columnCount,
+	if (!serialiseCursor(attachment, transaction, statement, *shape,
 			nullptr, nullptr, cursor, json, &sink))
 	{
 		if (shared && g_lastErrorReadOnly)
@@ -3285,7 +3375,6 @@ const char* fb_query_params(int db_handle, int tx_handle, const char* sql,
 
 	IResultSet*       cursor    = nullptr;
 	IStatement*       statement = nullptr;
-	IMessageMetadata* metadata  = nullptr;
 	bool              cached    = false;
 
 	// `keep` leaves a kept statement kept although the call failed.
@@ -3297,8 +3386,6 @@ const char* fb_query_params(int db_handle, int tx_handle, const char* sql,
 			cursor->close(s.ptr());
 			cursor->release();
 		}
-		if (metadata)
-			metadata->release();
 		releaseStatement(db_handle, statement, cached, !commit && !keep);
 		if (ownTransaction && transaction)
 		{
@@ -3341,18 +3428,9 @@ const char* fb_query_params(int db_handle, int tx_handle, const char* sql,
 		return nullptr;
 	}
 
-	metadata = statement->getOutputMetadata(status.ptr());
-	if (status.failed())
+	const std::shared_ptr<OutputShape> shape = outputShape(db_handle, statement, cached, "fb_query_params");
+	if (!shape)
 	{
-		setErrorFromStatus("fb_query_params: could not read output metadata", status.ptr());
-		cleanup(false);
-		return nullptr;
-	}
-
-	const unsigned columnCount = metadata ? metadata->getCount(status.ptr()) : 0;
-	if (status.failed())
-	{
-		setErrorFromStatus("fb_query_params: could not read column count", status.ptr());
 		cleanup(false);
 		return nullptr;
 	}
@@ -3361,7 +3439,7 @@ const char* fb_query_params(int db_handle, int tx_handle, const char* sql,
 	sink.enabled = (flags & FB_QUERY_BINARY_BLOBS) != 0;
 
 	std::string json;
-	if (!serialiseCursor(attachment, transaction, statement, metadata, columnCount,
+	if (!serialiseCursor(attachment, transaction, statement, *shape,
 			input.meta(), input.data(), cursor, json, &sink))
 	{
 		if (shared && g_lastErrorReadOnly)

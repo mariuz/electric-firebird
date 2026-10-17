@@ -4,6 +4,21 @@ All notable changes to `firebird-wasm`. This project follows
 [semantic versioning](https://semver.org/); while the major version is 0 the
 API may still move between minor releases.
 
+## Unreleased
+
+### Changed
+
+- **A kept statement's columns are described once.** Every query wrote every
+  column's description again (name, type, scale, length, nullable) and
+  decoded it again in JS, which was most of what a small query cost. A kept
+  statement's columns cannot change, so the C bridge now works out their
+  layout and their JSON once and keeps them with the statement, and the JS
+  keeps the decoded field list by that JSON; each call still gets field
+  objects of its own. `bench:calls`, alternating with 0.6.1, two rounds:
+  one row of ten columns 48–59 µs a call before, 34–40 now; ten columns and
+  no row 35–40 before, 22–24 now; one value 24–34 before, 19–26 now. Needs a
+  rebuilt artifact.
+
 ## 0.6.1 — 2026-10-10
 
 ### Changed
