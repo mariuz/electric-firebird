@@ -18,6 +18,16 @@ API may still move between minor releases.
   one row of ten columns 48–59 µs a call before, 34–40 now; ten columns and
   no row 35–40 before, 22–24 now; one value 24–34 before, 19–26 now. Needs a
   rebuilt artifact.
+- **…and then named by an id.** With the new `fb_query` flag
+  `FB_QUERY_SHAPE_IDS` (2), which `DirectTransport` sets, a kept statement's
+  result is `{"shape":N,"rows":[…]}`, the columns being sent no more; the
+  transport keeps what each id means and asks the new `_fb_shape_columns(N)`
+  once for an id it has not seen. Ids are never reused, so a remembered one is
+  never wrong. Without the flag, or for a statement that is not kept, results
+  describe their columns as before. Same machine, the flag off and on
+  alternating: the decode of ten columns and no row 5.7–7.0 µs before,
+  1.1–1.4 now (779 bytes of JSON to 21); the whole query 22–28 µs before,
+  16–21 now. Needs a rebuilt artifact.
 
 ## 0.6.1 — 2026-10-10
 

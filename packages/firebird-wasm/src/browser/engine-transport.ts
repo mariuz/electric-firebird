@@ -203,6 +203,8 @@ const fieldLists = new Map<string, readonly FieldInfo[]>();
 const MAX_FIELD_LISTS = 256;
 
 const COLUMNS_PREFIX = '{"columns":';
+const SHAPE_PREFIX = '{"shape":';
+const ROWS_KEY = ',"rows":';
 const ROWS_INFIX = '],"rows":';
 
 /**
@@ -212,7 +214,17 @@ const ROWS_INFIX = '],"rows":';
  * The first `],"rows":` is the boundary: it cannot occur inside a column
  * name, where every `"` is escaped. Anything else is parsed whole.
  */
-function splitResultSet(json: string): { columns: readonly FieldInfo[]; rows: unknown[][] } {
+function splitResultSet(
+  json: string,
+  shapes?: (id: number) => readonly FieldInfo[],
+): { columns: readonly FieldInfo[]; rows: unknown[][] } {
+  if (shapes && json.startsWith(SHAPE_PREFIX)) {
+    const comma = json.indexOf(',', SHAPE_PREFIX.length);
+    const id = Number(json.slice(SHAPE_PREFIX.length, comma));
+    const rows = JSON.parse(json.slice(comma + ROWS_KEY.length, -1)) as unknown[][];
+    return { columns: shapes(id), rows };
+  }
+
   const split = json.startsWith(COLUMNS_PREFIX) && json.endsWith('}') ? json.indexOf(ROWS_INFIX) : -1;
   if (split < 0) {
     const parsed = JSON.parse(json) as { columns: EncodedColumn[]; rows: unknown[][] };
@@ -343,8 +355,9 @@ function rowBuilder(names: string[]): ((cols: unknown[]) => Row) | null {
 export function decodeResultSet<T = Row>(
   json: string,
   rowMode: RowMode = 'object',
+  shapes?: (id: number) => readonly FieldInfo[],
 ): QueryResult<T> {
-  const { columns, rows: encodedRows } = splitResultSet(json);
+  const { columns, rows: encodedRows } = splitResultSet(json, shapes);
   // Copies: the cached list is shared by every call with these columns, and a
   // caller is free to change the fields it was given.
   const fields: FieldInfo[] = columns.map((f) => ({ ...f }));
@@ -411,6 +424,14 @@ export function decodeDescription(json: string): QueryDescription {
 
 /** `flags` bit asking the engine to send binary BLOBs beside the JSON. */
 export const BLOB_SIDE_CHANNEL = 1;
+
+/**
+ * `fb_query` flag bit: a kept statement's result may name its columns by id,
+ * `{"shape":N,"rows":[...]}`, rather than describe them again. The ids are
+ * the engine module's own and never reused, so the transport that loaded the
+ * module keeps what each one means.
+ */
+export const SHAPE_IDS = 2;
 
 /** The placeholder a side-channelled BLOB leaves in the JSON. */
 interface BlobRef {
@@ -510,6 +531,35 @@ export function attachBlobs<T>(
 export class DirectTransport implements EngineTransport {
   private mod: FirebirdWasmModule | null = null;
   private initPromise: Promise<void> | null = null;
+  /** What each shape id of this module's engine means (see SHAPE_IDS). */
+  private readonly shapes = new Map<number, readonly FieldInfo[]>();
+
+  /**
+   * The fields of shape `id`: remembered, or asked of the engine once. Called
+   * while decoding, right after the query that named the id and before any
+   * other engine call, when the statement holding that shape is the cache's
+   * most recently used and still kept.
+   */
+  private readonly shapeColumns = (id: number): readonly FieldInfo[] => {
+    const known = this.shapes.get(id);
+    if (known) return known;
+
+    const mod = this.module;
+    const ptr = mod._fb_shape_columns(id);
+    if (ptr === 0) {
+      throw engineError(mod, `Firebird returned rows of a shape it no longer has (${id})`);
+    }
+    let parsed: { columns: EncodedColumn[] };
+    try {
+      parsed = JSON.parse(mod.UTF8ToString(ptr)) as { columns: EncodedColumn[] };
+    } finally {
+      mod._fb_free_result(ptr);
+    }
+    const fields = toFields(parsed.columns);
+    if (this.shapes.size >= MAX_FIELD_LISTS) this.shapes.clear();
+    this.shapes.set(id, fields);
+    return fields;
+  };
 
   constructor(private readonly options: DirectTransportOptions = {}) {}
 
@@ -653,7 +703,7 @@ export class DirectTransport implements EngineTransport {
     binaryBlobs = false,
   ): Promise<QueryResult<T>> {
     const mod = this.module;
-    const flags = binaryBlobs ? BLOB_SIDE_CHANNEL : 0;
+    const flags = (binaryBlobs ? BLOB_SIDE_CHANNEL : 0) | SHAPE_IDS;
     return this.withString(sql, (sqlPtr) =>
       this.withParams(params, (paramPtr, paramLen) => {
       const resultPtr =
@@ -679,7 +729,7 @@ export class DirectTransport implements EngineTransport {
       // engine and the next query replaces it.
       const blobs = binaryBlobs ? readBlobs(mod) : null;
 
-      const result = decodeResultSet<T>(json, rowMode);
+      const result = decodeResultSet<T>(json, rowMode, this.shapeColumns);
       return blobs ? attachBlobs(result, blobs, rowMode) : result;
       }),
     );
