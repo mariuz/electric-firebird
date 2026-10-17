@@ -6,6 +6,22 @@ API may still move between minor releases.
 
 ## Unreleased
 
+### Added
+
+- **A build without threads.** `dist/wasm/firebird-embedded-st.{js,wasm}`
+  needs no `SharedArrayBuffer`, so no cross-origin isolation and no
+  COOP/COEP service worker, and no Worker either: nothing in it blocks, so it
+  can run on a page's own thread. It gives up statement and idle timeouts,
+  which need the engine's timer thread. Pick it with
+  `loadFirebirdWasm({ threads: false })` (also on `DirectTransport` and
+  `FirebirdBrowser`) in Node, and in a browser by loading its glue:
+  `wasmGlueFile()` names the build a page can run. `hasSharedHeap(mod)` tells
+  them apart. The threaded build stays the default, and loading it in a page
+  that is not isolated now fails with a message instead of hanging. Against
+  the threaded build, alternating: start 0.33–0.43 s against 0.87–1.06 s,
+  one row of ten columns 34–49 µs against 54–76, a one-row update 28–41 µs
+  against 45–66.
+
 ### Changed
 
 - **A kept statement's columns are described once.** Every query wrote every

@@ -32,6 +32,14 @@ const REQUIRED = [
     'dist/wasm/firebird-embedded.wasm',
     'the engine itself — run `npm run build:wasm`',
   ],
+  [
+    'dist/wasm/firebird-embedded-st.js',
+    'Emscripten glue of the build without threads — run `npm run build:wasm`',
+  ],
+  [
+    'dist/wasm/firebird-embedded-st.wasm',
+    'the engine without threads — run `npm run build:wasm`',
+  ],
   ['LICENSE', 'required by the declared licence'],
   ['README.md', 'shown on the npm package page'],
 ];
@@ -44,12 +52,13 @@ for (const [file, why] of REQUIRED) {
 
 // A zero-length or truncated artifact would satisfy an existence check and
 // fail at instantiation. The real binary is around 9 MB.
-const wasm = path.join(pkgDir, 'dist/wasm/firebird-embedded.wasm');
-if (fs.existsSync(wasm)) {
+for (const name of ['firebird-embedded.wasm', 'firebird-embedded-st.wasm']) {
+  const wasm = path.join(pkgDir, 'dist/wasm', name);
+  if (!fs.existsSync(wasm)) continue;
   const mb = fs.statSync(wasm).size / 1024 / 1024;
   if (mb < 1) {
     problems.push(
-      `dist/wasm/firebird-embedded.wasm is only ${mb.toFixed(2)} MB; ` +
+      `dist/wasm/${name} is only ${mb.toFixed(2)} MB; ` +
         'expected roughly 9 MB — the build looks truncated',
     );
   }

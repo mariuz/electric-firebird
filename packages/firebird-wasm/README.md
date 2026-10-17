@@ -51,10 +51,11 @@ const { rows } = await db.query('SELECT * FROM notes');
 // [{ ID: 1, TITLE: 'Hello' }]
 ```
 
-Two constraints are structural rather than incidental: the page must be
-[cross-origin isolated](../../docs/integration.md#2-the-two-hard-requirements),
+Two constraints are structural for the default, threaded build: the page must
+be [cross-origin isolated](../../docs/integration.md#2-the-two-hard-requirements-and-the-build-without-them),
 and the engine must run in a Worker — it blocks on mutexes, and a browser main
-thread may not block.
+thread may not block. `firebird-embedded-st.js`, the build without threads,
+has neither constraint and gives up statement and idle timeouts.
 
 ## Quick start
 

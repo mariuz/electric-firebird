@@ -237,13 +237,55 @@ export interface WasmLoadOptions {
    * automatically (e.g. bundled browser apps).
    */
   locateFile?: (filename: string) => string;
+  /**
+   * Which build to load.  `true` is `firebird-embedded.js`: pthreads over Web
+   * Workers, whose heap is a `SharedArrayBuffer` and which a browser gives
+   * only to a cross-origin isolated page.  `false` is
+   * `firebird-embedded-st.js`: no threads and a plain `ArrayBuffer` heap, at
+   * the cost of statement and idle timeouts.  `'auto'` (the default) is `true`
+   * in Node.
+   *
+   * In Node this picks the file the loader requires.  In a browser the page
+   * loads the glue itself, so the choice is made there:
+   * {@link wasmGlueFile} names the file to load.
+   */
+  threads?: boolean | 'auto';
 }
 
 // ---------------------------------------------------------------------------
 // Module state
 // ---------------------------------------------------------------------------
 
-let cachedModule: FirebirdWasmModule | null = null;
+/** One module per build: the two can live side by side in one process. */
+const cachedModules = new Map<string, FirebirdWasmModule>();
+
+/**
+ * The glue script of the build `threads` selects.
+ *
+ * `'auto'` (the default) picks the threaded build where it can run: in Node,
+ * and in a browser page or worker that is cross-origin isolated.  Elsewhere,
+ * GitHub Pages and other static hosts that cannot send COOP/COEP among them,
+ * it picks the build without threads, which needs neither.
+ *
+ * @example
+ * ```js
+ * // in the engine's Worker, before the transport loads the module
+ * importScripts(`/wasm/${wasmGlueFile()}`);
+ * ```
+ */
+export function wasmGlueFile(threads: boolean | 'auto' = 'auto'): string {
+  return useThreads(threads) ? 'firebird-embedded.js' : 'firebird-embedded-st.js';
+}
+
+function useThreads(threads: boolean | 'auto' | undefined): boolean {
+  if (threads === true || threads === false) return threads;
+  const g = globalThis as Record<string, unknown>;
+  if (typeof g['process'] !== 'undefined' && typeof g['window'] === 'undefined'
+    && typeof g['WorkerGlobalScope'] === 'undefined') {
+    return true;
+  }
+  return g['crossOriginIsolated'] === true;
+}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -267,13 +309,27 @@ let cachedModule: FirebirdWasmModule | null = null;
 export async function loadFirebirdWasm(
   options: WasmLoadOptions = {},
 ): Promise<FirebirdWasmModule> {
-  if (cachedModule) return cachedModule;
+  const glueFile = wasmGlueFile(options.threads);
+  const cached = cachedModules.get(glueFile);
+  if (cached) return cached;
 
   // The Emscripten glue script exports a factory function named
   // `createFirebirdModule` (configured via `-s EXPORT_NAME` in CMake).
   // In Node it can be `require()`-d; in browsers it is expected to be
   // available on `globalThis` or loaded via a <script> tag / importmap.
-  const factory = await resolveFactory(options);
+  const factory = await resolveFactory(glueFile);
+
+  // Each build marks its factory (wasm/glue-threads.js, wasm/glue-st.js).
+  // The threaded one cannot run without SharedArrayBuffer: its runtime fails
+  // to hand its memory to its own workers, the error is not reported to the
+  // caller, and every call waits forever.  Say so instead.
+  if (factory.threads === true && (globalThis as Record<string, unknown>)['crossOriginIsolated'] === false) {
+    throw new Error(
+      'firebird-embedded.js is the threaded build, which needs SharedArrayBuffer, and this page is ' +
+        'not cross-origin isolated (it needs COOP/COEP headers).  Load firebird-embedded-st.js, the ' +
+        'build without threads, instead: wasmGlueFile() names the build a page can run.',
+    );
+  }
 
   const moduleOptions: Record<string, unknown> = {};
 
@@ -290,8 +346,16 @@ export async function loadFirebirdWasm(
   }
 
   const mod: FirebirdWasmModule = await factory(moduleOptions);
-  cachedModule = mod;
+  cachedModules.set(glueFile, mod);
   return mod;
+}
+
+/**
+ * True when the module's heap is a `SharedArrayBuffer`, which is the case for
+ * the threaded build only.
+ */
+export function hasSharedHeap(mod: FirebirdWasmModule): boolean {
+  return typeof SharedArrayBuffer !== 'undefined' && mod.HEAPU8.buffer instanceof SharedArrayBuffer;
 }
 
 /**
@@ -320,18 +384,27 @@ export function lastError(mod: FirebirdWasmModule): string {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-type ModuleFactory = (opts?: Record<string, unknown>) => Promise<FirebirdWasmModule>;
+type ModuleFactory = ((opts?: Record<string, unknown>) => Promise<FirebirdWasmModule>) & {
+  /** Which build this is, set by the glue (wasm/glue-*.js); absent from older artifacts. */
+  threads?: boolean;
+};
 
-async function resolveFactory(_options: WasmLoadOptions): Promise<ModuleFactory> {
+async function resolveFactory(glueFile: string): Promise<ModuleFactory> {
   // Node.js environment
   if (typeof globalThis !== 'undefined' && typeof (globalThis as Record<string, unknown>)['process'] !== 'undefined') {
     try {
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const glue = require('../dist/wasm/firebird-embedded.js');
+      // Two literal requires, not one with the name in a template: a bundler
+      // resolves string literals (and marks these external), but turns a
+      // template into a glob over dist/wasm, .wasm files included.
+      const glue = glueFile === 'firebird-embedded-st.js'
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        ? require('../dist/wasm/firebird-embedded-st.js')
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        : require('../dist/wasm/firebird-embedded.js');
       return glue as ModuleFactory;
     } catch {
       throw new Error(
-        'firebird-embedded.js not found.  Run the WASM build first: packages/firebird-wasm/wasm/build.sh',
+        `${glueFile} not found.  Run the WASM build first: packages/firebird-wasm/wasm/build.sh`,
       );
     }
   }

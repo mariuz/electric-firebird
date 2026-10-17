@@ -2,7 +2,13 @@
 # build.sh – Build Firebird Embedded as a WASM module via Emscripten
 #
 # Usage:
-#   ./build.sh [--firebird-src <path>] [--output <dir>]
+#   ./build.sh [--firebird-src <path>] [--output <dir>] [--variant all|threads|single]
+#
+#   --variant threads  firebird-embedded.{js,wasm}: pthreads over Web Workers,
+#                      needs SharedArrayBuffer (cross-origin isolation)
+#   --variant single   firebird-embedded-st.{js,wasm}: no threads, a plain
+#                      ArrayBuffer heap (FB_WASM_THREADS=OFF)
+#   --variant all      both (the default)
 #
 # Requirements:
 #   - Emscripten SDK (emsdk) must be activated  (source emsdk_env.sh)
@@ -24,19 +30,25 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 FIREBIRD_SRC="${SCRIPT_DIR}/firebird-src"
 OUTPUT_DIR="${SCRIPT_DIR}/../dist/wasm"
 PATCHES_DIR="${SCRIPT_DIR}/patches"
+VARIANT="all"
 
 # ── Parse arguments ──────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --firebird-src) FIREBIRD_SRC="$2"; shift 2 ;;
     --output)       OUTPUT_DIR="$2";   shift 2 ;;
+    --variant)      VARIANT="$2";      shift 2 ;;
     -h|--help)
-      echo "Usage: $0 [--firebird-src <path>] [--output <dir>]"
+      echo "Usage: $0 [--firebird-src <path>] [--output <dir>] [--variant all|threads|single]"
       exit 0
       ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
   esac
 done
+case "${VARIANT}" in
+  all|threads|single) ;;
+  *) echo "Unknown variant: ${VARIANT} (all, threads or single)" >&2; exit 1 ;;
+esac
 
 # ── Verify Emscripten ────────────────────────────────────────────────────────
 if ! command -v emcc &>/dev/null; then
@@ -446,25 +458,35 @@ sed -i '/^#define SUPPORT_RAW_DEVICES/d' "${AUTOCONFIG_SRC}"
 # at runtime, this is the likely cause.  Add to EMSCRIPTEN_LINK_FLAGS in
 # CMakeLists.txt:
 #   "--preload-file /path/to/icudt<ver>l.dat@/usr/share/icu/<ver>/icudt<ver>l.dat"
-BUILD_DIR="${SCRIPT_DIR}/build"
-mkdir -p "${BUILD_DIR}"
+# One build tree per variant: -pthread changes how every object is compiled,
+# so the two cannot share objects.
+build_variant() {
+  local threads="$1" build_dir="$2" name="$3"
 
-echo "Configuring with Emscripten CMake toolchain…"
-emcmake cmake \
-  -B "${BUILD_DIR}" \
-  -S "${SCRIPT_DIR}" \
-  -DFIREBIRD_SRC="${FIREBIRD_SRC}" \
-  -DFB_EPP_GENERATED_DIR="${EPP_OUT_DIR}" \
-  -DCMAKE_BUILD_TYPE=Release
+  echo "Configuring ${name} with Emscripten CMake toolchain…"
+  emcmake cmake \
+    -B "${build_dir}" \
+    -S "${SCRIPT_DIR}" \
+    -DFIREBIRD_SRC="${FIREBIRD_SRC}" \
+    -DFB_EPP_GENERATED_DIR="${EPP_OUT_DIR}" \
+    -DFB_WASM_THREADS="${threads}" \
+    -DCMAKE_BUILD_TYPE=Release
 
-echo "Building WASM module…"
-cmake --build "${BUILD_DIR}" -j"$(nproc)"
+  echo "Building ${name}…"
+  cmake --build "${build_dir}" -j"$(nproc)"
 
-# ── Copy artefacts ───────────────────────────────────────────────────────────
-mkdir -p "${OUTPUT_DIR}"
-cp "${BUILD_DIR}/firebird-embedded.js"   "${OUTPUT_DIR}/"
-cp "${BUILD_DIR}/firebird-embedded.wasm" "${OUTPUT_DIR}/"
+  mkdir -p "${OUTPUT_DIR}"
+  cp "${build_dir}/${name}.js"   "${OUTPUT_DIR}/"
+  cp "${build_dir}/${name}.wasm" "${OUTPUT_DIR}/"
+}
+
+if [[ "${VARIANT}" == "all" || "${VARIANT}" == "threads" ]]; then
+  build_variant ON "${SCRIPT_DIR}/build" firebird-embedded
+fi
+if [[ "${VARIANT}" == "all" || "${VARIANT}" == "single" ]]; then
+  build_variant OFF "${SCRIPT_DIR}/build-st" firebird-embedded-st
+fi
 
 echo ""
 echo "Build complete:"
-ls -lh "${OUTPUT_DIR}/firebird-embedded".*
+ls -lh "${OUTPUT_DIR}/firebird-embedded"*.js "${OUTPUT_DIR}/firebird-embedded"*.wasm

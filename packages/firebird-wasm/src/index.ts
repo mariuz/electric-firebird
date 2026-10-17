@@ -38,7 +38,7 @@ export type {
 } from './types';
 
 // WASM loader (available on all platforms)
-export { loadFirebirdWasm, allocString } from './wasm-loader';
+export { loadFirebirdWasm, allocString, wasmGlueFile, hasSharedHeap } from './wasm-loader';
 export type {
   FirebirdWasmModule,
   WasmLoadOptions,

@@ -22,6 +22,14 @@
  *                                        `globalThis.createFirebirdModule`
  *   GET /browser-harness-wasm          → same, but also loads the real
  *                                        Emscripten glue via <script>
+ *   GET /browser-harness-wasm-st       → same, with the glue of the build
+ *                                        without threads
+ *   GET /firebird-engine-worker-st.js  → the engine Worker on that build
+ *   GET /wasm/firebird-embedded-st.*   → that build's glue and binary
+ *
+ * Every route is also served under /no-isolation/, without the COOP/COEP
+ * headers: a page there is not cross-origin isolated and gets no
+ * SharedArrayBuffer, as on a static host that cannot send them.
  */
 
 import * as http from 'http';
@@ -38,6 +46,11 @@ const WASM_DIR = path.resolve(
 );
 const WASM_JS   = path.join(WASM_DIR, 'firebird-embedded.js');
 const WASM_BIN  = path.join(WASM_DIR, 'firebird-embedded.wasm');
+/** The artifacts served under /wasm/: both builds' glue and binary. */
+const WASM_FILES = new Set([
+  'firebird-embedded.js', 'firebird-embedded.wasm',
+  'firebird-embedded-st.js', 'firebird-embedded-st.wasm',
+]);
 
 // TypeScript entry point of the browser build, bundled on demand.
 const BROWSER_ENTRY = path.resolve(
@@ -263,9 +276,9 @@ const WASM_WORKER_TEST_HTML = `<!DOCTYPE html>
  *                       library talks to the actual engine instead of to a
  *                       stub installed by `page.addInitScript()`.
  */
-function browserHarnessHtml(withWasmGlue: boolean): string {
+function browserHarnessHtml(withWasmGlue: boolean, glueFile = 'firebird-embedded.js'): string {
   const glue = withWasmGlue
-    ? '<script src="/wasm/firebird-embedded.js"></script>'
+    ? `<script src="/wasm/${glueFile}"></script>`
     : '';
 
   return `<!DOCTYPE html>
@@ -297,8 +310,7 @@ const BROWSER_SRC = path.resolve(
 let browserBundle: string | null = null;
 let browserBundleStamp = -1;
 
-let workerBundle: string | null = null;
-let workerBundleStamp = -1;
+const workerBundles = new Map<string, { stamp: number; text: string }>();
 
 // The library's Worker entry point, bundled the way an application would.
 const WORKER_ENTRY = path.resolve(
@@ -348,7 +360,7 @@ function getBrowserBundle(): string {
     // globalThis instead), but esbuild resolves string-literal requires
     // eagerly — and once the artifact is actually built, that drags the glue's
     // node:fs / node:crypto / ws imports into a browser bundle and fails.
-    external: ['*firebird-embedded.js'],
+    external: ['*firebird-embedded.js', '*firebird-embedded-st.js'],
   });
 
   browserBundle = result.outputFiles[0]!.text;
@@ -367,10 +379,11 @@ function getBrowserBundle(): string {
  *      the site root;
  *   3. only then the entry point, which starts answering messages.
  */
-function getWorkerBundle(): string {
+function getWorkerBundle(glueFile = 'firebird-embedded.js'): string {
   const stamp = sourceStamp(BROWSER_SRC);
-  if (workerBundle !== null && stamp === workerBundleStamp) {
-    return workerBundle;
+  const cached = workerBundles.get(glueFile);
+  if (cached && cached.stamp === stamp) {
+    return cached.text;
   }
 
   const result = buildSync({
@@ -381,15 +394,15 @@ function getWorkerBundle(): string {
     target: 'es2020',
     write: false,
     sourcemap: 'inline',
-    external: ['*firebird-embedded.js'],
+    external: ['*firebird-embedded.js', '*firebird-embedded-st.js'],
   });
 
-  workerBundle =
-    "importScripts('/wasm/firebird-embedded.js');\n" +
+  const text =
+    `importScripts('/wasm/${glueFile}');\n` +
     "self.FIREBIRD_WORKER_OPTIONS = { locateFile: (f) => '/wasm/' + f };\n" +
     result.outputFiles[0]!.text;
-  workerBundleStamp = stamp;
-  return workerBundle;
+  workerBundles.set(glueFile, { stamp, text });
+  return text;
 }
 
 // ---------------------------------------------------------------------------
@@ -428,9 +441,15 @@ function setCrossOriginIsolation(res: http.ServerResponse): void {
   res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
 }
 
+const NO_ISOLATION = '/no-isolation';
+
 const server = http.createServer((req, res) => {
-  const url = req.url ?? '/';
-  setCrossOriginIsolation(res);
+  let url = req.url ?? '/';
+  if (url.startsWith(`${NO_ISOLATION}/`)) {
+    url = url.slice(NO_ISOLATION.length);
+  } else {
+    setCrossOriginIsolation(res);
+  }
 
   if (req.method === 'GET' && url === '/health') {
     sendJson(res, 200, { status: 'ok' });
@@ -451,10 +470,12 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  if (req.method === 'GET' && url === '/firebird-engine-worker.js') {
+  if (req.method === 'GET'
+    && (url === '/firebird-engine-worker.js' || url === '/firebird-engine-worker-st.js')) {
     try {
+      const glueFile = url.endsWith('-st.js') ? 'firebird-embedded-st.js' : 'firebird-embedded.js';
       res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8' });
-      res.end(getWorkerBundle());
+      res.end(getWorkerBundle(glueFile));
     } catch (err) {
       sendJson(res, 500, {
         error: 'Failed to bundle the engine worker',
@@ -476,6 +497,12 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (req.method === 'GET' && url === '/browser-harness-wasm-st') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(browserHarnessHtml(true, 'firebird-embedded-st.js'));
+    return;
+  }
+
   if (req.method === 'GET' && url === '/wasm-engine-worker.js') {
     res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8' });
     res.end(ENGINE_WORKER_JS);
@@ -494,23 +521,17 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  if (req.method === 'GET' && url === '/wasm/firebird-embedded.js') {
-    if (!fs.existsSync(WASM_JS)) {
-      sendJson(res, 404, { error: 'WASM JS glue not found – run npm run build:wasm' });
+  const wasmFile = url.startsWith('/wasm/') ? url.slice('/wasm/'.length) : '';
+  if (req.method === 'GET' && WASM_FILES.has(wasmFile)) {
+    const file = path.join(WASM_DIR, wasmFile);
+    if (!fs.existsSync(file)) {
+      sendJson(res, 404, { error: `${wasmFile} not found – run npm run build:wasm` });
       return;
     }
-    res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8' });
-    res.end(fs.readFileSync(WASM_JS));
-    return;
-  }
-
-  if (req.method === 'GET' && url === '/wasm/firebird-embedded.wasm') {
-    if (!fs.existsSync(WASM_BIN)) {
-      sendJson(res, 404, { error: 'WASM binary not found – run npm run build:wasm' });
-      return;
-    }
-    res.writeHead(200, { 'Content-Type': 'application/wasm' });
-    res.end(fs.readFileSync(WASM_BIN));
+    res.writeHead(200, {
+      'Content-Type': wasmFile.endsWith('.wasm') ? 'application/wasm' : 'text/javascript; charset=utf-8',
+    });
+    res.end(fs.readFileSync(file));
     return;
   }
 
