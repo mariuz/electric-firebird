@@ -839,6 +839,43 @@ test.describe('FirebirdBrowser against the real engine', () => {
     expect(result.nullBlob).toBeNull();
   });
 
+  test('binds text into BLOB parameters, by every route that takes parameters', async ({ page }) => {
+    // A BLOB parameter takes a blob's id, not a value: the bridge used to
+    // fail every string bound to one ("BLOB and array data types are not
+    // supported for move operation").  Larger than a segment (64 KB) and
+    // than the old 64 KB text limit, and not ASCII.
+    const result = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('memory://blob-params', {
+        worker: new Worker('/firebird-engine-worker.js'),
+      });
+      await db.exec('CREATE TABLE notes (id INTEGER, body BLOB SUB_TYPE TEXT)');
+      const big = 'ž€😀 '.repeat(40_000);
+
+      await db.exec('INSERT INTO notes VALUES (?, ?)', [1, 'exec']);
+      await db.query('INSERT INTO notes VALUES (?, ?) RETURNING id', [2, big]);
+      await db.transaction(async (tx) => {
+        await tx.exec('INSERT INTO notes VALUES (?, ?)', [3, 'in a transaction']);
+        await tx.execBatch('INSERT INTO notes VALUES (?, ?)', [[4, 'batch a'], [5, null]]);
+      });
+      await db.execBatch('INSERT INTO notes VALUES (?, ?)', [[6, 'batch b'], [7, 'batch c']]);
+      await db.exec('UPDATE notes SET body = ? WHERE id = ?', ['updated', 1]);
+
+      const rows = (await db.query('SELECT id, body FROM notes ORDER BY id')).rows as Array<{ ID: number; BODY: string | null }>;
+      const matched = (await db.query('SELECT id FROM notes WHERE body = ?', ['batch c'])).rows;
+      await db.close();
+      return {
+        bodies: rows.map((r) => (r.ID === 2 ? `${r.BODY === big} ${r.BODY?.length}` : r.BODY)),
+        matched,
+        bigLength: big.length,
+      };
+    });
+
+    expect(result.bodies).toEqual([
+      'updated', `true ${result.bigLength}`, 'in a transaction', 'batch a', null, 'batch b', 'batch c',
+    ]);
+    expect(result.matched).toEqual([{ ID: 7 }]);
+  });
+
   test('still base64s binary BLOBs when bytes were not asked for', async ({ page }) => {
     const value = await page.evaluate(async () => {
       const db = new window.FB.FirebirdBrowser('blob-default', {
