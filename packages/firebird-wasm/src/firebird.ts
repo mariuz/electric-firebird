@@ -494,7 +494,7 @@ export class FirebirdTransaction {
       const lease = await this.statements.acquire(this.transaction, statement.sql);
       let failed = true;
       try {
-        await lease.stmt.execute(this.transaction, statement.params);
+        await lease.stmt.execute(this.transaction, await blobsAsBuffers(lease.stmt, statement.params));
         failed = false;
       } finally {
         await lease.release(failed);
@@ -523,7 +523,7 @@ export class FirebirdTransaction {
         await this.executeInBlocks(lease.stmt, plan, rows);
       } else {
         for (const row of rows) {
-          await lease.stmt.execute(this.transaction, row);
+          await lease.stmt.execute(this.transaction, await blobsAsBuffers(lease.stmt, row));
         }
       }
       failed = false;
@@ -577,7 +577,7 @@ export class FirebirdTransaction {
       for (let at = 0; at < rows.length; ) {
         const chunk = rows.slice(at, at + size);
         if (chunk.length === 1) {
-          await single.execute(this.transaction, chunk[0]);
+          await single.execute(this.transaction, await blobsAsBuffers(single, chunk[0]!));
           at += 1;
           continue;
         }
@@ -595,10 +595,10 @@ export class FirebirdTransaction {
           }
         }
         try {
-          await current.lease.stmt.execute(this.transaction, chunk.flat());
+          await current.lease.stmt.execute(this.transaction, await blobsAsBuffers(current.lease.stmt, chunk.flat()));
         } catch {
           for (const row of chunk) {
-            await single.execute(this.transaction, row);
+            await single.execute(this.transaction, await blobsAsBuffers(single, row));
           }
         }
         at += chunk.length;
@@ -702,6 +702,25 @@ async function inputParams(stmt: Statement): Promise<ParamDescriptor[] | undefin
   } catch {
     return undefined;
   }
+}
+
+/** `SQL_BLOB`, without the nullable bit. */
+const SQL_BLOB = 520;
+
+/**
+ * A string bound to a BLOB parameter, as its UTF-8 bytes: the driver takes
+ * a Buffer or a Blob there and refused a string ("Unrecognized type used as
+ * BLOB"), so `INSERT INTO notes (body) VALUES (?)` failed for any text.  The
+ * browser engine had the same gap; both now write the text as the blob.
+ */
+async function blobsAsBuffers(stmt: Statement, params: QueryParams): Promise<QueryParams> {
+  if (!params.some((p) => typeof p === 'string')) return params;
+  const described = await inputParams(stmt);
+  if (!described) return params;
+  return params.map((p, i) =>
+    typeof p === 'string' && described[i] !== undefined && (described[i]!.type & ~1) === SQL_BLOB
+      ? Buffer.from(p, 'utf8')
+      : p);
 }
 
 /** Character sets by id, read once per connection. */
@@ -860,6 +879,7 @@ async function fetchRows(
   params: QueryParams,
   columnCount: number,
 ): Promise<unknown[][]> {
+  params = await blobsAsBuffers(stmt, params);
   if (stmt.hasResultSet) {
     const resultSet = await stmt.executeQuery(transaction, params);
     // A failing fetch must still close.

@@ -33,7 +33,14 @@ const asText: Convert = (text) => text;
 
 const asInteger: Convert = (text) => Number(text);
 
-const asBigInt: Convert = (text) => BigInt(text);
+// As text, which Firebird converts to BIGINT exactly; the Node driver cannot
+// bind a JavaScript bigint at all.
+const asBigInt: Convert = (text, column) => {
+  if (!/^-?\d+$/.test(text)) {
+    throw new RangeError(`Column ${column} holds ${text}, which is not a whole number`);
+  }
+  return text;
+};
 
 const asFloat: Convert = (text, column) => {
   const value = Number(text);
