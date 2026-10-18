@@ -4,6 +4,18 @@ All notable changes to `firebird-wasm`. This project follows
 [semantic versioning](https://semver.org/); while the major version is 0 the
 API may still move between minor releases.
 
+## Unreleased
+
+### Fixed
+
+- **Closing a shape server while a live request waits no longer crashes the
+  process.** `close()` disconnected at once, and a waiting live request's next
+  poll started a transaction on the closed connection, where the native
+  client segfaults rather than throwing. `close()` now waits for whatever is
+  running on the connection, and the requests still waiting end with a 503.
+  Found as an intermittent crash of `browser-firebird-shapes.spec.ts`, which
+  closes its server while the browser is still following it.
+
 ## 0.8.0 — 2026-10-18
 
 ### Security

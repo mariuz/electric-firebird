@@ -267,6 +267,7 @@ export async function createShapeServer(options: ShapeServerOptions): Promise<Sh
     let result = await changesAfter(table, columns, after);
     while (live && result.messages.length === 0 && Date.now() < deadline && !closed && !req.destroyed) {
       await new Promise((r) => setTimeout(r, pollIntervalMs));
+      if (closed) throw new HttpError(503, 'The shape server is closing');
       result = await changesAfter(table, columns, after);
     }
     const headers: Record<string, string> = {
@@ -293,8 +294,16 @@ export async function createShapeServer(options: ShapeServerOptions): Promise<Sh
       });
     },
     close: async () => {
+      if (closed) return;
       closed = true;
-      await attachment.disconnect().catch(() => undefined);
+      // In the connection's queue, after whatever is running on it: a live
+      // request polls the log, and a native call on a disconnected
+      // attachment crashes the process rather than throwing. Whatever is
+      // queued after this is refused instead of run.
+      await serialized(attachment, async () => {
+        disconnected.add(attachment);
+        await attachment.disconnect().catch(() => undefined);
+      });
       await client.dispose().catch(() => undefined);
     },
   };
@@ -307,10 +316,17 @@ export async function createShapeServer(options: ShapeServerOptions): Promise<Sh
  */
 const queues = new WeakMap<Attachment, Promise<unknown>>();
 
-/** Run `fn` after whatever else this connection is running. */
+/** Connections `close()` has disconnected: nothing more may run on them. */
+const disconnected = new WeakSet<Attachment>();
+
+/** Run `fn` after whatever else this connection is running; refuse once it is closed. */
 function serialized<T>(attachment: Attachment, fn: () => Promise<T>): Promise<T> {
   const previous = queues.get(attachment) ?? Promise.resolve();
-  const result = previous.then(fn, fn);
+  const run = () => {
+    if (disconnected.has(attachment)) throw new HttpError(503, 'The shape server is closing');
+    return fn();
+  };
+  const result = previous.then(run, run);
   queues.set(attachment, result.catch(() => undefined));
   return result;
 }
