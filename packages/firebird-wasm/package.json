@@ -26,6 +26,10 @@
       "types": "./dist/vue/index.d.ts",
       "default": "./dist/vue/index.js"
     },
+    "./repl": {
+      "types": "./dist/repl/index.d.ts",
+      "default": "./dist/repl/index.js"
+    },
     "./package.json": "./package.json"
   },
   "scripts": {

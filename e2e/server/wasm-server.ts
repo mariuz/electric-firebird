@@ -25,8 +25,8 @@
  *   GET /browser-harness-wasm-st       → same, with the glue of the build
  *                                        without threads
  *   GET /firebird-engine-worker-st.js  → the engine Worker on that build
- *   GET /dist/firebird-frameworks.mjs  → React, Vue and firebird-wasm/react
- *                                        and /vue, as `window.Frameworks`
+ *   GET /dist/firebird-frameworks.mjs  → React, Vue, firebird-wasm/react,
+ *                                        /vue and /repl, as `window.Frameworks`
  *   GET /browser-harness-frameworks-st → the -st harness, with that bundle
  *   GET /wasm/firebird-embedded-st.*   → that build's glue and binary
  *

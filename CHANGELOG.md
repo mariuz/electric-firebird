@@ -24,6 +24,13 @@ API may still move between minor releases.
 
 ### Added
 
+- **`firebird-wasm/repl`: a SQL console as a custom element.**
+  `defineFirebirdRepl()` registers `<firebird-repl>`; give it a database
+  through its `db` property. Ctrl+Enter runs a script statement by statement
+  (`SET TERM` included) and stops at the first error; rows show as a table,
+  other statements with the rows they changed; ArrowUp and ArrowDown walk the
+  history. Values are drawn as text, never as HTML. A `db` set before the
+  element was defined, as frameworks do, is kept.
 - **`firebird-wasm/react` and `firebird-wasm/vue`.** `useQuery` runs a
   statement and re-runs it when its SQL or parameters change by value;
   `useLiveQuery` re-runs it each time one of its events fires (`live()`

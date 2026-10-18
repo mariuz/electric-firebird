@@ -105,7 +105,9 @@ function Items() {
 }
 ```
 
-See [docs/integration.md](./docs/integration.md) §3 for both.
+See [docs/integration.md](./docs/integration.md) §3 for both, and for
+`<firebird-repl>` (`firebird-wasm/repl`), an interactive SQL console as a
+custom element.
 
 ## Setup
 
@@ -259,6 +261,7 @@ The library provides two execution backends:
 - [x] Pre-built WASM binary published to npm — `npm install firebird-wasm`
 - [x] Live queries / `POST_EVENT`-based notifications (`live()`, `listen()`, `notify()`)
 - [x] React and Vue hooks (`firebird-wasm/react`, `firebird-wasm/vue`)
+- [x] A REPL component: `<firebird-repl>` (`firebird-wasm/repl`)
 
 See [docs/roadmap.md](./docs/roadmap.md) for the full status audit, a
 feature-by-feature comparison with PGlite, and the staged plan.
