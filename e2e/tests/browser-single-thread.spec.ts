@@ -94,6 +94,30 @@ test.describe('the build without threads, without cross-origin isolation', () =>
     });
   });
 
+  test('does not answer engine requests posted to the page by another window', async ({ page }) => {
+    // The engine on the page thread shares the page's window, which every
+    // window that can reach it (a frame, an opener) can postMessage to.  The
+    // library used to start an engine server there on import, so a posted
+    // init and execute ran SQL against the page's database.
+    await openHarness(page, '/browser-harness-wasm-st');
+
+    const rows = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('memory://posted-to');
+      await db.exec('CREATE TABLE secrets (v VARCHAR(20))');
+      await db.exec("INSERT INTO secrets VALUES ('kept')");
+      for (const handle of [1, 2, 3]) {
+        window.postMessage({ id: 1, op: 'init', args: [] }, '*');
+        window.postMessage({ id: 2, op: 'execute', args: [handle, 0, 'DELETE FROM secrets'] }, '*');
+      }
+      await new Promise((r) => setTimeout(r, 1_000));
+      const result = await db.query('SELECT v FROM secrets');
+      await db.close();
+      return result.rows;
+    });
+
+    expect(rows).toEqual([{ V: 'kept' }]);
+  });
+
   test('runs in a Worker', async ({ page }) => {
     await openHarness(page, '/browser-harness');
 
