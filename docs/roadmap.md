@@ -1094,7 +1094,10 @@ gaps it ran into, with its numbers, in rough order of what they would buy.
       `useQuery` and `useLiveQuery` on one framework-free store
       (`src/frameworks/query-store.ts`, unit-tested against forced orderings)
       and run in Chromium against the real engine, React under StrictMode.
-- [ ] A REPL component.
+- [x] A REPL component: `<firebird-repl>` in `firebird-wasm/repl`, a custom
+      element so that plain pages, React and Vue share one. Scripts with
+      `SET TERM`, results as tables, history, values drawn as text; six
+      browser tests drive it by keyboard against the real engine.
 - [ ] ElectricSQL sync integration (the project's namesake).
 - [ ] A Firebird version build matrix. The submodule tracks `master` and the
       shipped engine reports `ENGINE_VERSION 6.0.0`, so the recurring "Firebird

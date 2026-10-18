@@ -282,6 +282,34 @@ CREATE TRIGGER notes_changed FOR notes AFTER INSERT OR UPDATE OR DELETE
 AS BEGIN POST_EVENT 'notes'; END
 ```
 
+
+### A SQL console
+
+`firebird-wasm/repl` is an interactive console as a custom element, so it
+works the same in a plain page, React or Vue:
+
+```js
+import { defineFirebirdRepl } from 'firebird-wasm/repl';
+
+defineFirebirdRepl();                    // registers <firebird-repl>; pass a name for another tag
+const repl = document.createElement('firebird-repl');
+repl.db = db;                            // in React: <firebird-repl ref={(el) => el && (el.db = db)} />
+document.body.append(repl);
+```
+
+Ctrl+Enter (⌘+Enter) or the Run button runs what is typed. A script runs
+statement by statement, `SET TERM` and PSQL included, and stops at the first
+error. Rows come back as a table (the first 500 of a result), other
+statements with what they changed, each with its time; ArrowUp on the first
+line and ArrowDown on the last walk the history. `repl.run(sql)` runs SQL from
+code and resolves with what each statement did, the same list the
+`firebird-repl-run` event carries.
+
+Values are written as text, never as HTML: a row cannot put markup in the
+page. Colours follow the page's `color-scheme` and can be set through
+`--firebird-repl-bg`, `-fg`, `-muted`, `-border`, `-error`, `-accent` and
+`-font`. Nothing is defined on import, so the module is safe to import where
+there is no DOM.
 ---
 
 ## 4. Bundlers
