@@ -24,6 +24,16 @@ API may still move between minor releases.
 
 ### Added
 
+- **`firebird-wasm/react` and `firebird-wasm/vue`.** `useQuery` runs a
+  statement and re-runs it when its SQL or parameters change by value;
+  `useLiveQuery` re-runs it each time one of its events fires (`live()`
+  under a hook). Both give `rows`, `error`, `loading` and `refresh()`, keep
+  the previous rows while the next ones load, drop results that arrive after
+  the component moved on, and unsubscribe on unmount, StrictMode's double
+  mount included. React through `FirebirdProvider`, Vue through
+  `provideFirebird(db)` or `app.provide(FIREBIRD, db)`; the statement and
+  parameters may be refs or getters in Vue. React 18+ and Vue 3.3+ are
+  optional peer dependencies.
 - **`examples/vite` and `examples/webpack`.** Minimal apps built by their own
   bundlers from the package, run by CI in Chromium with and without
   cross-origin isolation.

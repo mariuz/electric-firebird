@@ -25,6 +25,9 @@
  *   GET /browser-harness-wasm-st       → same, with the glue of the build
  *                                        without threads
  *   GET /firebird-engine-worker-st.js  → the engine Worker on that build
+ *   GET /dist/firebird-frameworks.mjs  → React, Vue and firebird-wasm/react
+ *                                        and /vue, as `window.Frameworks`
+ *   GET /browser-harness-frameworks-st → the -st harness, with that bundle
  *   GET /wasm/firebird-embedded-st.*   → that build's glue and binary
  *
  *   GET /firebird-engine-worker-cdn.js?glue=<file>
@@ -290,7 +293,11 @@ const WASM_WORKER_TEST_HTML = `<!DOCTYPE html>
  *                       library talks to the actual engine instead of to a
  *                       stub installed by `page.addInitScript()`.
  */
-function browserHarnessHtml(withWasmGlue: boolean, glueFile = 'firebird-embedded.js'): string {
+function browserHarnessHtml(
+  withWasmGlue: boolean,
+  glueFile = 'firebird-embedded.js',
+  withFrameworks = false,
+): string {
   const glue = withWasmGlue
     ? `<script src="/wasm/${glueFile}"></script>`
     : '';
@@ -308,6 +315,7 @@ function browserHarnessHtml(withWasmGlue: boolean, glueFile = 'firebird-embedded
     import * as FB from '/dist/firebird-browser.mjs';
     window.FB = FB;
   </script>
+  ${withFrameworks ? '<script type="module" src="/dist/firebird-frameworks.mjs"></script>' : ''}
 </body>
 </html>`;
 }
@@ -380,6 +388,38 @@ function getBrowserBundle(): string {
   browserBundle = result.outputFiles[0]!.text;
   browserBundleStamp = stamp;
   return browserBundle;
+}
+
+const FRAMEWORKS_ENTRY = path.resolve(__dirname, 'frameworks-entry.ts');
+let frameworksBundle: { stamp: number; text: string } | null = null;
+
+/**
+ * React, Vue and the bindings (`firebird-wasm/react`, `/vue`) in one module,
+ * for browser-frameworks.spec.ts.  Development builds of both, so React's
+ * StrictMode runs every effect twice, as it does in an app being developed.
+ */
+function getFrameworksBundle(): string {
+  const stamp = sourceStamp(BROWSER_SRC);
+  if (frameworksBundle && frameworksBundle.stamp === stamp) return frameworksBundle.text;
+
+  const result = buildSync({
+    entryPoints: [FRAMEWORKS_ENTRY],
+    bundle: true,
+    format: 'esm',
+    platform: 'browser',
+    target: 'es2020',
+    write: false,
+    sourcemap: 'inline',
+    define: {
+      'process.env.NODE_ENV': '"development"',
+      __VUE_OPTIONS_API__: 'true',
+      __VUE_PROD_DEVTOOLS__: 'false',
+      __VUE_PROD_HYDRATION_MISMATCH_DETAILS__: 'false',
+    },
+    external: ['*firebird-embedded.js', '*firebird-embedded-st.js'],
+  });
+  frameworksBundle = { stamp, text: result.outputFiles[0]!.text };
+  return frameworksBundle.text;
 }
 
 /**
@@ -531,6 +571,25 @@ const server = http.createServer((req, res) => {
       '<script src="/wasm/firebird-embedded-st.js">',
       `<script src="${CDN_BASE}firebird-embedded-st.js">`,
     ));
+    return;
+  }
+
+  if (req.method === 'GET' && url === '/dist/firebird-frameworks.mjs') {
+    try {
+      res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8' });
+      res.end(getFrameworksBundle());
+    } catch (err) {
+      sendJson(res, 500, {
+        error: 'Failed to bundle React, Vue and the bindings',
+        detail: err instanceof Error ? err.message : String(err),
+      });
+    }
+    return;
+  }
+
+  if (req.method === 'GET' && url === '/browser-harness-frameworks-st') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(browserHarnessHtml(true, 'firebird-embedded-st.js', true));
     return;
   }
 
