@@ -959,6 +959,55 @@ test.describe('FirebirdBrowser against the real engine', () => {
     expect(result.matched).toEqual([{ ID: 7 }]);
   });
 
+  test('binds bytes into a binary BLOB and an OCTETS column, and refuses a text column', async ({ page }) => {
+    // A Uint8Array goes as its own bytes, marked as bytes: written as they
+    // are where bytes are kept, refused where they would be read as text.
+    const result = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('memory://byte-params', {
+        worker: new Worker('/firebird-engine-worker.js'),
+        types: { binary: true },
+      });
+      await db.exec('CREATE TABLE raws (id INTEGER, raw BLOB SUB_TYPE BINARY, code VARBINARY(4), title VARCHAR(10))');
+      const bytes = new Uint8Array([0, 0xff, 0x80, 0x0a]);
+      const big = new Uint8Array(100_000).map((_, i) => (i * 7) & 0xff);
+
+      await db.exec('INSERT INTO raws (id, raw, code) VALUES (?, ?, ?)', [1, bytes, bytes]);
+      await db.query('INSERT INTO raws (id, raw, code) VALUES (?, ?, ?) RETURNING id', [2, big, bytes.buffer.slice(1, 3)]);
+      await db.transaction(async (tx) => {
+        await tx.execBatch('INSERT INTO raws (id, raw) VALUES (?, ?)', [[3, bytes], [4, new Uint8Array(0)]]);
+      });
+      await db.execBatch('INSERT INTO raws (id, code) VALUES (?, ?)', [[5, bytes], [6, null]]);
+
+      const rows = (await db.query('SELECT id, raw, code FROM raws ORDER BY id')).rows as Array<{
+        ID: number; RAW: Uint8Array | null; CODE: Uint8Array | null;
+      }>;
+      let refused = '';
+      try {
+        await db.exec('INSERT INTO raws (id, title) VALUES (?, ?)', [7, bytes]);
+      } catch (e) {
+        refused = (e as Error).message;
+      }
+      await db.close();
+      const list = (b: Uint8Array | null) => (b === null ? null : b.length > 8 ? `${b.length} bytes` : [...b]);
+      return {
+        rows: rows.map((r) => [r.ID, list(r.RAW), list(r.CODE)]),
+        bigSame: rows[1]!.RAW!.every((v, i) => v === big[i]),
+        refused,
+      };
+    });
+
+    expect(result.rows).toEqual([
+      [1, [0, 255, 128, 10], [0, 255, 128, 10]],
+      [2, '100000 bytes', [255, 128]],
+      [3, [0, 255, 128, 10], null],
+      [4, [], null],
+      [5, null, [0, 255, 128, 10]],
+      [6, null, null],
+    ]);
+    expect(result.bigSame).toBe(true);
+    expect(result.refused).toMatch(/parameter 1 is binary; bind it to a BLOB or a BINARY\/VARBINARY \(OCTETS\) column/);
+  });
+
   test('still base64s binary BLOBs when bytes were not asked for', async ({ page }) => {
     const value = await page.evaluate(async () => {
       const db = new window.FB.FirebirdBrowser('blob-default', {

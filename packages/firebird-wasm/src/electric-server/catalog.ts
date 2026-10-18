@@ -17,6 +17,8 @@ export interface FirebirdColumn {
   precision: number;
   charLength: number;
   notNull: boolean;
+  /** RDB$CHARACTER_SET_ID: 1 is OCTETS, the set of BINARY and VARBINARY. */
+  charSet?: number;
 }
 
 /** How one column is read and described. */
@@ -28,7 +30,7 @@ export interface ColumnPlan {
   /** The SELECT expression that yields the value. */
   select: string;
   /** How the fetched value becomes text. */
-  render: 'text' | 'number' | 'boolean' | 'blob' | 'utc';
+  render: 'text' | 'number' | 'boolean' | 'blob' | 'bytes' | 'utc';
   /** The column in `electric-schema`. */
   schema: ElectricColumn;
 }
@@ -45,6 +47,9 @@ export function quote(name: string): string {
 export function shapeName(firebirdName: string): string {
   return /^[A-Z][A-Z0-9_$]*$/.test(firebirdName) ? firebirdName.toLowerCase() : firebirdName;
 }
+
+/** RDB$CHARACTER_SET_ID of OCTETS. */
+const OCTETS = 1;
 
 /** The plan for one column, from its system-table description. */
 export function planColumn(column: FirebirdColumn): ColumnPlan {
@@ -75,12 +80,20 @@ export function planColumn(column: FirebirdColumn): ColumnPlan {
     case 10: return { ...base, select: q, render: 'number', schema: schema('float4') };
     case 27: return { ...base, select: q, render: 'number', schema: schema('float8') };
     case 23: return { ...base, select: q, render: 'boolean', schema: schema('bool') };
-    case 14: return { ...base, select: q, render: 'text', schema: schema('bpchar', { length: column.charLength }) };
-    case 37: return { ...base, select: q, render: 'text', schema: schema('varchar', { max_length: column.charLength }) };
+    // BINARY(n) and VARBINARY(n) are CHAR and VARCHAR in OCTETS: bytes. Read
+    // as a binary BLOB: the native driver decodes an OCTETS column as text.
+    case 14:
+      return column.charSet === OCTETS
+        ? { ...base, select: `CAST(${q} AS BLOB SUB_TYPE BINARY)`, render: 'bytes', schema: schema('bytea') }
+        : { ...base, select: q, render: 'text', schema: schema('bpchar', { length: column.charLength }) };
+    case 37:
+      return column.charSet === OCTETS
+        ? { ...base, select: `CAST(${q} AS BLOB SUB_TYPE BINARY)`, render: 'bytes', schema: schema('bytea') }
+        : { ...base, select: q, render: 'text', schema: schema('varchar', { max_length: column.charLength }) };
     case 261:
       return column.subType === 1
         ? { ...base, select: q, render: 'blob', schema: schema('text') }
-        : { ...base, select: 'NULL', render: 'text', schema: schema('bytea') };
+        : { ...base, select: q, render: 'bytes', schema: schema('bytea') };
     case 12: return { ...base, select: `CAST(${q} AS VARCHAR(10))`, render: 'text', schema: schema('date') };
     case 13: return { ...base, select: `CAST(${q} AS VARCHAR(13))`, render: 'text', schema: schema('time') };
     case 35: return { ...base, select: `CAST(${q} AS VARCHAR(24))`, render: 'text', schema: schema('timestamp') };
@@ -132,6 +145,11 @@ export function renderValue(plan: ColumnPlan, value: unknown): string | null {
       return String(value);
     case 'boolean':
       return value ? 'true' : 'false';
+    case 'bytes': {
+      // Postgres's hex form, of the bytes of a BLOB read whole.
+      const bytes = Buffer.from(value as Uint8Array);
+      return `\\x${bytes.toString('hex')}`;
+    }
     case 'utc':
       // '2024-05-01 10:00:00.0000 UTC' → '2024-05-01 10:00:00.0000+00'
       return String(value).replace(/ (UTC|GMT|\+00:00)$/, '+00');

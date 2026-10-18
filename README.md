@@ -265,7 +265,8 @@ The library provides two execution backends:
 - [x] React and Vue hooks (`firebird-wasm/react`, `firebird-wasm/vue`)
 - [x] A REPL component: `<firebird-repl>` (`firebird-wasm/repl`)
 - [x] Sync a Postgres table through ElectricSQL (`firebird-wasm/electric`, read-only)
-- [x] Sync a Firebird server's table the same way (`firebird-wasm/electric-server`)
+- [x] Sync a Firebird server's table the same way (`firebird-wasm/electric-server`), with `where`, paged snapshots and a pruned log
+- [x] `bytea`, several tables in one transaction (`syncShapesToTables`), and a write path (`createWriteQueue`)
 
 See [docs/roadmap.md](./docs/roadmap.md) for the full status audit, a
 feature-by-feature comparison with PGlite, and the staged plan.

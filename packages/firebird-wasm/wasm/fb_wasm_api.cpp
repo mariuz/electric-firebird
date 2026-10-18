@@ -31,7 +31,8 @@
  * chosen to be lossless-or-explicit rather than silently approximate:
  *
  *     CHAR/VARCHAR/text BLOB      → string
- *     binary BLOB                 → base64 string
+ *     binary BLOB, BINARY,        → base64 string (or bytes beside the JSON,
+ *     VARBINARY (OCTETS)            with the side-buffer flag)
  *     SMALLINT/INTEGER            → number
  *     BIGINT/INT128               → number when exactly representable as an
  *                                   IEEE-754 double, otherwise string
@@ -834,6 +835,35 @@ void appendDateText(unsigned year, unsigned month, unsigned day, std::string& ou
 	appendPadded(day, 2, out);
 }
 
+/** RDB$CHARACTER_SETS id of OCTETS, the set of BINARY and VARBINARY. */
+constexpr unsigned CHARSET_OCTETS = 1;
+
+/**
+ * Append bytes as a binary value: a placeholder for the side buffer when the
+ * caller asked for bytes, otherwise a base64 string.
+ */
+void appendBytes(const std::vector<unsigned char>& bytes, std::string& out, BlobSink* sink)
+{
+	if (sink && sink->enabled)
+	{
+		// Out of band: the JSON keeps a reference and the bytes go beside it.
+		// The index is the value's position in the side buffer, which is
+		// simply how many have been collected so far.
+		char placeholder[32];
+		snprintf(placeholder, sizeof(placeholder), "{\"$blob\":%u}",
+			static_cast<unsigned>(sink->lengths.size()));
+		out += placeholder;
+
+		sink->lengths.push_back(static_cast<unsigned>(bytes.size()));
+		sink->data.insert(sink->data.end(), bytes.begin(), bytes.end());
+		return;
+	}
+
+	out += '"';
+	base64Encode(bytes, out);
+	out += '"';
+}
+
 /** Read a text or binary BLOB in full and append it as a JSON string. */
 void appendBlob(IAttachment* attachment, ITransaction* transaction,
 	ISC_QUAD* blobId, int subType, std::string& out, BlobSink* sink)
@@ -875,24 +905,7 @@ void appendBlob(IAttachment* attachment, ITransaction* transaction,
 		return;
 	}
 
-	if (sink && sink->enabled)
-	{
-		// Out of band: the JSON keeps a reference and the bytes go beside it.
-		// The index is the blob's position in the side buffer, which is simply
-		// how many have been collected so far.
-		char placeholder[32];
-		snprintf(placeholder, sizeof(placeholder), "{\"$blob\":%u}",
-			static_cast<unsigned>(sink->lengths.size()));
-		out += placeholder;
-
-		sink->lengths.push_back(static_cast<unsigned>(bytes.size()));
-		sink->data.insert(sink->data.end(), bytes.begin(), bytes.end());
-		return;
-	}
-
-	out += '"';
-	base64Encode(bytes, out);
-	out += '"';
+	appendBytes(bytes, out, sink);
 }
 
 /**
@@ -942,16 +955,24 @@ void appendValue(IAttachment* attachment, ITransaction* transaction,
 	switch (type)
 	{
 		case SQL_TEXT:
-			jsonEscape(reinterpret_cast<const char*>(data),
-				charTextLength(data, length, charSet), out);
+			// OCTETS (BINARY(n), GEN_UUID()) is bytes, not text: as a binary BLOB.
+			if ((charSet & 0xff) == CHARSET_OCTETS)
+				appendBytes(std::vector<unsigned char>(data, data + length), out, sink);
+			else
+				jsonEscape(reinterpret_cast<const char*>(data),
+					charTextLength(data, length, charSet), out);
 			break;
 
 		case SQL_VARYING:
 		{
 			unsigned short varLength = 0;
 			memcpy(&varLength, data, sizeof(varLength));
-			jsonEscape(reinterpret_cast<const char*>(data + sizeof(varLength)),
-				varLength, out);
+			if ((charSet & 0xff) == CHARSET_OCTETS)
+				appendBytes(std::vector<unsigned char>(data + sizeof(varLength), data + sizeof(varLength) + varLength),
+					out, sink);
+			else
+				jsonEscape(reinterpret_cast<const char*>(data + sizeof(varLength)),
+					varLength, out);
 			break;
 		}
 
@@ -1211,6 +1232,8 @@ struct ParamValue
 	std::string   text;
 	/** 0: text only; 1: the value is in `i64`; 2: in `dbl`. */
 	unsigned char binaryKind = 0;
+	/** `text` holds bytes, not text: bound only where bytes go (a BLOB, OCTETS). */
+	bool          bytes = false;
 	ISC_INT64     i64 = 0;
 	double        dbl = 0;
 };
@@ -1252,6 +1275,7 @@ bool parseParamsAt(const unsigned char* data, unsigned length, unsigned& pos,
 		ParamValue value;
 		const unsigned char flags = data[pos++];
 		value.isNull = (flags & 1) != 0;
+		value.bytes = (flags & 4) != 0;
 
 		if (!value.isNull)
 		{
@@ -1404,6 +1428,7 @@ public:
 			fields[i].length     = metadata->getLength(status.ptr(), i);
 			fields[i].offset     = metadata->getOffset(status.ptr(), i);
 			fields[i].nullOffset = metadata->getNullOffset(status.ptr(), i);
+			fields[i].charSet    = metadata->getCharSet(status.ptr(), i);
 
 			if (status.failed())
 			{
@@ -1462,6 +1487,50 @@ public:
 				if (!writeBlob(values[i].text, blobId, i))
 					return false;
 				memcpy(buffer.data() + f.offset, &blobId, sizeof(blobId));
+				continue;
+			}
+
+			if (values[i].bytes)
+			{
+				// Bytes go where bytes are kept: a BLOB (above) or a CHAR or
+				// VARCHAR in OCTETS (BINARY, VARBINARY).  Anywhere else they
+				// would be read as text in the connection's character set.
+				const bool octets = (f.type == SQL_TEXT || f.type == SQL_VARYING) && (f.charSet & 0xff) == CHARSET_OCTETS;
+				if (!octets)
+				{
+					char message[160];
+					snprintf(message, sizeof(message),
+						"parameter %u is binary; bind it to a BLOB or a BINARY/VARBINARY (OCTETS) column", i);
+					setError(message);
+					return false;
+				}
+
+				// No conversion: IUtil::convert reads its source as text in a
+				// character set and refused bytes that are not.  The message
+				// holds an OCTETS value as the bytes themselves.
+				const std::string& bytes = values[i].text;
+				if (bytes.size() > f.length)
+				{
+					char message[160];
+					snprintf(message, sizeof(message),
+						"parameter %u is %u bytes, longer than its column's %u", i,
+						static_cast<unsigned>(bytes.size()), f.length);
+					setError(message);
+					return false;
+				}
+				unsigned char* at = buffer.data() + f.offset;
+				if (f.type == SQL_VARYING)
+				{
+					const unsigned short n = static_cast<unsigned short>(bytes.size());
+					memcpy(at, &n, sizeof(n));
+					memcpy(at + sizeof(n), bytes.data(), bytes.size());
+				}
+				else
+				{
+					// BINARY(n) is padded with zero bytes, as Firebird pads it.
+					memset(at, 0, f.length);
+					memcpy(at, bytes.data(), bytes.size());
+				}
 				continue;
 			}
 
@@ -1528,6 +1597,7 @@ private:
 		unsigned length = 0;
 		unsigned offset = 0;
 		unsigned nullOffset = 0;
+		unsigned charSet = 0;
 	};
 
 	/** Write `text` as a new blob in the bound transaction; its id into `id`. */

@@ -9,7 +9,7 @@ would not, and the smallest piece that proves the rest.
 first step's read path is built (`firebird-wasm/electric`; see
 [integration.md](../integration.md) §3). Building it found that the
 engine could not bind a string into a BLOB parameter, now fixed, and that
-`bytea` waits for binary parameters.
+`bytea` waited for binary parameters, which the engine now binds.
 
 ---
 
@@ -182,8 +182,16 @@ shape. Two patterns are known to work on top, both left to the app at first:
    examples do this with a view and triggers; Firebird has updatable views and
    triggers to do the same.
 
-A built-in write path (a queue of local changes sent to an endpoint, with
-conflict rules) is the second step, once the read path is in use.
+A built-in write path (a queue of local changes sent to an endpoint) was the
+second step, and is built: `createWriteQueue` does the optimistic pattern
+above without a view. A write goes to the synced table and to
+`ELECTRIC_WRITES` in one transaction; the sync applies the pending writes
+again after each batch; a sent write is dropped when the change carrying the
+transaction id `send` returned comes back (Electric's `txids`), or the row
+changes, or a timeout passes; a rejected write is rolled back by fetching
+the table's shape again, since the source's row as it was is not kept
+locally. Conflicts are the API's to decide: the last write the source
+accepts is what comes back.
 
 ## The first step
 
@@ -204,8 +212,8 @@ A prototype that proves the read path end to end:
 4. A demo page: a Postgres table synced into the browser, queried with
    Firebird SQL in `<firebird-repl>` (#39).
 
-Out of the first step: several shapes in one transaction
-(`syncShapesToTables` in PGlite's terms), writes, `replica=full`, subset
+Out of the first step, and since built: several shapes in one transaction
+(`syncShapesToTables`, as PGlite names it). Still out: writes, `replica=full`, subset
 snapshots, and the Node side beyond what the tests need.
 
 ## Questions to decide first

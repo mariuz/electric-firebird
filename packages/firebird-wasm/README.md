@@ -180,12 +180,14 @@ Shipped since:
 - [x] ElectricSQL sync, read path: a shape from Postgres through Electric
       (`firebird-wasm/electric`), or from a Firebird server
       (`firebird-wasm/electric-server`), with an example app syncing from
-      both ([`examples/electric`](../../examples/electric))
+      both ([`examples/electric`](../../examples/electric)), `bytea`
+      included, and several tables in one transaction
+      (`syncShapesToTables`)
+- [x] ElectricSQL writes: `createWriteQueue` applies a write at once, sends
+      it to the app's API, and keeps it over the sync until it comes back
 
 Next:
 
-- [ ] ElectricSQL sync: several shapes in one transaction, writes back to
-      the server
 - [ ] A typed binary result ABI, so exact numerics need not travel as strings
 - [ ] Module disposal — `close()` does not currently release the WASM heap
 - [ ] UNICODE collations (case- and accent-insensitive comparison), which

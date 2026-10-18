@@ -20,7 +20,8 @@ import { Shape, ShapeStream } from '@electric-sql/client';
 import type { Message, Row } from '@electric-sql/client';
 import { FirebirdLite } from '../firebird';
 import { createShapeServer } from '../electric-server';
-import { syncShapeToTable } from '../electric';
+import { createWriteQueue, syncShapeToTable, syncShapesToTables, WriteRejected } from '../electric';
+import type { LocalWrite } from '../electric';
 import type { ElectricDatabase } from '../electric';
 import type { ShapeServer } from '../electric-server';
 
@@ -85,12 +86,17 @@ describeIfFirebird('createShapeServer against a Firebird server', () => {
   const aborts: AbortController[] = [];
 
   /** A live Shape of `table`, the way a client follows it. */
-  function follow(table: string, from?: { offset: string; handle: string }) {
+  function follow(
+    table: string,
+    from?: { offset: string; handle: string },
+    at: string = url,
+    extra: Record<string, unknown> = {},
+  ) {
     const abort = new AbortController();
     aborts.push(abort);
     const stream = new ShapeStream({
-      url,
-      params: { table },
+      url: at,
+      params: { table, ...extra } as never,
       parser: TEXT,
       signal: abort.signal,
       ...(from ? { offset: from.offset as never, handle: from.handle } : {}),
@@ -108,12 +114,12 @@ describeIfFirebird('createShapeServer against a Firebird server', () => {
     await source.exec(
       'CREATE TABLE items (id INTEGER NOT NULL PRIMARY KEY, small SMALLINT, big BIGINT, price NUMERIC(10,2), ' +
         'ratio DOUBLE PRECISION, title VARCHAR(40), code CHAR(3), done BOOLEAN, note BLOB SUB_TYPE TEXT, ' +
-        `day_ DATE, at_ TIME, ts TIMESTAMP${zoned})`);
+        `day_ DATE, at_ TIME, ts TIMESTAMP, raw BLOB SUB_TYPE BINARY, bin VARCHAR(4) CHARACTER SET OCTETS${zoned})`);
     await source.exec('CREATE TABLE pairs (a INTEGER NOT NULL, b VARCHAR(10) NOT NULL, v VARCHAR(20), PRIMARY KEY (a, b))');
     await source.exec(
-      'INSERT INTO items (id, small, big, price, ratio, title, code, done, note, day_, at_, ts) VALUES ' +
+      'INSERT INTO items (id, small, big, price, ratio, title, code, done, note, day_, at_, ts, raw, bin) VALUES ' +
         "(1, -2, 9007199254740993, 12.5, 0.1, 'it''s', 'ab', TRUE, 'a note longer than nothing', '2024-02-29', " +
-        "'13:45:01.5', '2024-05-01 12:00:00.1234')");
+        "'13:45:01.5', '2024-05-01 12:00:00.1234', x'00ff800a', x'ff0080')");
     if (major >= 4) {
       await source.exec(
         "UPDATE items SET tstz = TIMESTAMP '2024-05-01 12:00:00 +02:00', huge = 170141183460469231731687303715884105727 WHERE id = 1");
@@ -160,6 +166,8 @@ describeIfFirebird('createShapeServer against a Firebird server', () => {
       day_: { type: 'date' },
       at_: { type: 'time' },
       ts: { type: 'timestamp' },
+      raw: { type: 'bytea' },
+      bin: { type: 'bytea' },
     });
     if (major >= 4) expect(schema).toMatchObject({ tstz: { type: 'timestamptz' }, huge: { type: 'numeric' } });
   });
@@ -172,6 +180,8 @@ describeIfFirebird('createShapeServer against a Firebird server', () => {
       id: '1', small: '-2', big: '9007199254740993', price: '12.50', ratio: '0.1', title: "it's",
       code: 'ab ', done: 'true', note: 'a note longer than nothing', day_: '2024-02-29',
       at_: '13:45:01.5000', ts: '2024-05-01 12:00:00.1234',
+      // Postgres's hex form, byte for byte: a binary BLOB and a VARBINARY.
+      raw: '\\x00ff800a', bin: '\\xff0080',
     });
     if (major >= 4) {
       expect(rows[0]).toMatchObject({
@@ -253,9 +263,153 @@ describeIfFirebird('createShapeServer against a Firebird server', () => {
     expect(response.headers.get('electric-handle')).toBeTruthy();
   });
 
-  it('serves only the tables it was given, and refuses where', async () => {
+  it('serves only the tables it was given, and refuses a where it does not take', async () => {
     expect((await fetch(`${url}?table=rdb$database&offset=-1`)).status).toBe(404);
-    expect((await fetch(`${url}?table=items&offset=-1&where=id%3D1`)).status).toBe(400);
+    const refused = await fetch(`${url}?table=items&offset=-1&where=${encodeURIComponent('lower(title) = 1')}`);
+    expect(refused.status).toBe(400);
+    expect((await refused.json()).message).toMatch(/functions \(lower\) are not supported/);
+  });
+
+  /** Another server on the same database, with its own options. */
+  async function another(extra: Partial<Parameters<typeof createShapeServer>[0]> = {}) {
+    const other = await createShapeServer({ database, ...credentials, tables: ['items', 'pairs'], pollIntervalMs: 50, liveTimeoutMs: 2_000, ...extra });
+    const otherHttp = http.createServer(other.handler);
+    await new Promise<void>((r) => otherHttp.listen(0, '127.0.0.1', r));
+    const at = `http://127.0.0.1:${(otherHttp.address() as AddressInfo).port}/v1/shape`;
+    return {
+      server: other,
+      url: at,
+      close: async () => {
+        otherHttp.closeAllConnections();
+        await new Promise((r) => otherHttp.close(r));
+        await other.close();
+      },
+    };
+  }
+
+  it('serves a where: only matching rows, and rows moving in and out of it', async () => {
+    await source.exec("INSERT INTO items (id, title) VALUES (50, 'w-in')");
+    await source.exec("INSERT INTO items (id, title) VALUES (51, 'w-out')");
+    const { shape, stream } = follow('items', undefined, url, { where: "id >= $1 AND title LIKE 'w-%' AND title <> $2", params: { 1: '50', 2: 'w-out' } });
+    const ids = async () => byId(await shape.rows).map((r) => r['id']);
+    expect(await ids()).toEqual(['50']);
+    // A shape of its own: not the whole table's handle.
+    const whole = await fetch(`${url}?table=items&offset=-1`);
+    await whole.arrayBuffer();
+    expect(stream.shapeHandle).not.toBe(whole.headers.get('electric-handle'));
+
+    await source.exec("UPDATE items SET title = 'w-in-now' WHERE id = 51");   // moves in
+    await source.exec("UPDATE items SET title = 'w-out' WHERE id = 50");      // moves out
+    await source.exec("INSERT INTO items (id, title) VALUES (52, 'x-never')"); // never in
+    const rows = await until(() => byId(shape.currentRows).map((r) => r['id']), (r) => r.length === 1 && r[0] === '51', 'the moves');
+    expect(rows).toEqual(['51']);
+  });
+
+  it('serves a large snapshot in pages, keyed, and the client reads them all', async () => {
+    for (let id = 100; id < 107; id++) await source.exec('INSERT INTO items (id, title) VALUES (?, ?)', [id, `p${id}`]);
+    const paged = await another({ snapshotPageRows: 3 });
+    try {
+      const first = await fetch(`${paged.url}?table=items&offset=-1&where=${encodeURIComponent('id >= 100 AND id < 107')}`);
+      const body = await first.json() as Array<{ headers: Record<string, string> }>;
+      // A page: three rows, no up-to-date, an offset naming where the next starts.
+      expect(body).toHaveLength(3);
+      expect(body.some((m) => m.headers['control'] === 'up-to-date')).toBe(false);
+      expect(first.headers.get('electric-offset')).toMatch(/^\d+_[1-9]\d*$/);
+
+      const { shape } = follow('items', undefined, paged.url, { where: 'id >= 100 AND id < 107' });
+      expect(byId(await shape.rows).map((r) => r['id'])).toEqual(['100', '101', '102', '103', '104', '105', '106']);
+      // A page cursor the server does not know sends the client back to the start.
+      const lost = await fetch(`${paged.url}?table=items&offset=1_999&handle=${first.headers.get('electric-handle')}&where=${encodeURIComponent('id >= 100 AND id < 107')}`);
+      expect(lost.status).toBe(409);
+    } finally {
+      await paged.close();
+    }
+  });
+
+  it('prunes the log, and sends a client older than it back to a snapshot', async () => {
+    const pruned = await another({ retainLogMs: null });
+    try {
+      const first = follow('items', undefined, pruned.url);
+      await first.shape.rows;
+      const old = { offset: String(first.stream.lastOffset), handle: first.stream.shapeHandle! };
+      await source.exec("INSERT INTO items (id, title) VALUES (60, 'before pruning')");
+      await until(() => first.shape.currentRows.some((r) => r['id'] === '60'), Boolean, 'the change');
+
+      expect(await pruned.server.prune(new Date(Date.now() + 1_000))).toBeGreaterThan(0);
+      const { rows } = await source.query<{ N: number }>('SELECT COUNT(*) AS n FROM electric_changes WHERE commit_seq IS NOT NULL');
+      expect(Number(rows[0]!.N)).toBe(0);
+
+      // Behind the pruning: 409, then a snapshot, which has the row.
+      const behind = await fetch(`${pruned.url}?table=items&offset=${old.offset}&handle=${old.handle}`);
+      expect(behind.status).toBe(409);
+      const resumed = follow('items', old, pruned.url);
+      await until(() => resumed.shape.currentRows.some((r) => r['id'] === '60'), Boolean, 'the snapshot after pruning');
+      // And a client at the head goes on as before.
+      await source.exec("INSERT INTO items (id, title) VALUES (61, 'after pruning')");
+      await until(() => first.shape.currentRows.some((r) => r['id'] === '61'), Boolean, 'a change after pruning');
+    } finally {
+      await pruned.close();
+    }
+  });
+
+  it('wakes a live request on the commit, not the next poll', async () => {
+    // Polling every minute: only the event can bring the change in time.
+    const eventful = await another({ pollIntervalMs: 60_000, liveTimeoutMs: 30_000 });
+    try {
+      // A Firebird in a container needs its RemoteAuxPort pinned and
+      // published for events to reach this process (CI does both).
+      expect(eventful.server.events).toBe(true);
+      const { shape } = follow('items', undefined, eventful.url);
+      await shape.rows;
+      await new Promise((r) => setTimeout(r, 300)); // the client is waiting in a live request
+      const wrote = Date.now();
+      await source.exec("INSERT INTO items (id, title) VALUES (70, 'by event')");
+      await until(() => shape.currentRows.some((r) => r['id'] === '70'), Boolean, 'the change');
+      expect(Date.now() - wrote).toBeLessThan(5_000);
+    } finally {
+      await eventful.close();
+    }
+  });
+
+  it('numbers only under the lock every server takes, so numbers commit in order', async () => {
+    // Another server mid-numbering holds the ELECTRIC_META row.  Numbering
+    // past it could commit a higher number before its lower one, and a
+    // client that saw the higher would never be sent the lower.
+    const { shape } = follow('items');
+    await shape.rows;
+    const holder = new FirebirdLite(database, credentials);
+    try {
+      await holder.transaction(async (tx) => {
+        await tx.exec('UPDATE electric_meta SET epoch = epoch');
+        await source.exec("INSERT INTO items (id, title) VALUES (80, 'held')");
+        await new Promise((r) => setTimeout(r, 800));
+        expect(shape.currentRows.some((r) => r['id'] === '80')).toBe(false);
+      });
+      await until(() => shape.currentRows.some((r) => r['id'] === '80'), Boolean, 'the change once the lock is free');
+    } finally {
+      await holder.close();
+    }
+  });
+
+  it('runs two servers on one database: each serves every commit, in order', async () => {
+    const second = await another();
+    try {
+      const a = follow('items');
+      const b = follow('items', undefined, second.url);
+      await Promise.all([a.shape.rows, b.shape.rows]);
+      // Writers committing while both servers number the log.
+      await Promise.all(Array.from({ length: 12 }, (_, i) =>
+        source.exec('INSERT INTO items (id, title) VALUES (?, ?)', [200 + i, `two-${i}`])));
+      const want = Array.from({ length: 12 }, (_, i) => String(200 + i));
+      for (const { shape } of [a, b]) {
+        await until(() => want.every((id) => shape.currentRows.some((r) => r['id'] === id)), Boolean, 'every row on both');
+      }
+      // Numbers given once each: no change numbered twice or skipped.
+      const { rows } = await source.query<{ N: number }>('SELECT COUNT(*) AS n FROM electric_changes WHERE commit_seq IS NULL');
+      expect(Number(rows[0]!.N)).toBe(0);
+    } finally {
+      await second.close();
+    }
   });
 
   it('closes while live requests are waiting, without touching the closed connection', async () => {
@@ -285,6 +439,90 @@ describeIfFirebird('createShapeServer against a Firebird server', () => {
       for (const status of await Promise.all(waiting)) expect([200, 500, 503, 0]).toContain(status);
       otherHttp.closeAllConnections();
       await new Promise((r) => otherHttp.close(r));
+    }
+  });
+
+  it('writes locally at once, sends to the source, and drops each write once its transaction comes back', async () => {
+    await source.exec('CREATE TABLE todos (id INTEGER NOT NULL PRIMARY KEY, title VARCHAR(40), done BOOLEAN)');
+    await source.exec("INSERT INTO todos VALUES (1, 'from the server', FALSE)");
+    const served = await another({ tables: ['todos'] });
+    const target = new FirebirdLite(`${host}:${path.join(os.tmpdir(), `writes-target-${Date.now()}.fdb`)}`, credentials);
+    let online = true;
+    const sent: LocalWrite[] = [];
+    const errors: string[] = [];
+    try {
+      await target.exec('CREATE TABLE todos (id INTEGER NOT NULL PRIMARY KEY, title VARCHAR(40), done BOOLEAN)');
+      const db = target as unknown as ElectricDatabase;
+      // The app's API: writes to the source, says which transaction did it.
+      const writes = await createWriteQueue(db, {
+        retryMs: 100,
+        onError: (e) => errors.push(e.message),
+        send: async (w) => {
+          if (!online) throw new Error('offline');
+          if (w.value['title'] === 'refused') throw new WriteRejected('the server says no');
+          sent.push(w);
+          return source.transaction(async (tx) => {
+            if (w.operation === 'insert') {
+              await tx.exec('UPDATE OR INSERT INTO todos (id, title, done) VALUES (?, ?, ?) MATCHING (id)',
+                [w.key['id'], w.value['title'] ?? null, w.value['done'] ?? null]);
+            } else if (w.operation === 'update') {
+              await tx.exec('UPDATE todos SET title = COALESCE(?, title), done = COALESCE(?, done) WHERE id = ?',
+                [w.value['title'] ?? null, w.value['done'] ?? null, w.key['id']]);
+            } else {
+              await tx.exec('DELETE FROM todos WHERE id = ?', [w.key['id']]);
+            }
+            const { rows } = await tx.query<{ T: number }>('SELECT CURRENT_TRANSACTION AS t FROM rdb$database');
+            return { txid: rows[0]!.T };
+          });
+        },
+      });
+      const sync = await syncShapeToTable(db, {
+        shape: { url: served.url, params: { table: 'todos' } },
+        table: 'todos',
+        shapeKey: 'todos',
+        writes,
+        onError: (e) => errors.push(`sync: ${e.message}`),
+      });
+      const local = async () => (await target.query<{ ID: number; TITLE: string; DONE: boolean }>(
+        'SELECT id, title, done FROM todos ORDER BY id')).rows.map((r) => `${r.ID}:${r.TITLE}:${r.DONE}`);
+      try {
+        await sync.upToDate;
+        expect(await local()).toEqual(['1:from the server:false']);
+
+        // Seen here before the source has it; gone from the queue once its
+        // transaction has come back down the shape.
+        await writes.insert('todos', { id: 2, title: 'mine', done: false });
+        expect(await local()).toEqual(['1:from the server:false', '2:mine:false']);
+        await until(() => writes.pending(), (p) => p.length === 0, 'the write confirmed');
+        expect((await source.query('SELECT title FROM todos WHERE id = 2')).rows).toEqual([{ TITLE: 'mine' }]);
+
+        // Offline: kept, and kept over the server's own change to the row.
+        online = false;
+        await writes.update('todos', { id: 1 }, { title: 'edited offline' });
+        await source.exec('UPDATE todos SET done = TRUE WHERE id = 1');
+        await until(local, (r) => r[0] === '1:edited offline:true', 'the server change under the local one');
+        expect((await writes.pending()).map((w) => w.operation)).toEqual(['update']);
+
+        // Online again: sent, confirmed, and the source agrees.
+        online = true;
+        await writes.flush();
+        await until(() => writes.pending(), (p) => p.length === 0, 'the offline write confirmed');
+        expect((await source.query('SELECT title, done FROM todos WHERE id = 1')).rows)
+          .toEqual([{ TITLE: 'edited offline', DONE: true }]);
+
+        // Refused: rolled back to what the source has.
+        await writes.insert('todos', { id: 3, title: 'refused', done: false });
+        await until(local, (r) => !r.some((x) => x.startsWith('3:')), 'the rejected write rolled back');
+        expect(errors).toContain('the server says no');
+        expect(await writes.pending()).toEqual([]);
+        expect(sent.map((w) => w.value['title'])).toEqual(['mine', 'edited offline']);
+      } finally {
+        await sync.unsubscribe();
+        await writes.close();
+      }
+    } finally {
+      await target.close();
+      await served.close();
     }
   });
 
@@ -329,6 +567,54 @@ describeIfFirebird('createShapeServer against a Firebird server', () => {
         await sync.unsubscribe();
       }
     } finally {
+      await target.close();
+    }
+  });
+
+  it('syncs two shapes into a FirebirdLite database together: a transaction lands in both or neither', async () => {
+    const targetPath = `${host}:${path.join(os.tmpdir(), `shapes-target-${Date.now()}.fdb`)}`;
+    const target = new FirebirdLite(targetPath, credentials);
+    let reader: FirebirdLite | undefined;
+    try {
+      await target.exec('CREATE TABLE items (id INTEGER NOT NULL PRIMARY KEY, title VARCHAR(40))');
+      await target.exec('CREATE TABLE pairs (a INTEGER NOT NULL, b VARCHAR(10) NOT NULL, v VARCHAR(20), PRIMARY KEY (a, b))');
+      const sync = await syncShapesToTables(target as unknown as ElectricDatabase, {
+        shapes: {
+          items: { shape: { url, params: { table: 'items', columns: ['id', 'title'] } }, table: 'items' },
+          pairs: { shape: { url, params: { table: 'pairs' } }, table: 'pairs' },
+        },
+        key: 'both',
+        onError: () => undefined,
+      });
+      try {
+        await sync.upToDate;
+        // Each commit of the target holds the whole of each source transaction:
+        // a reader (on a connection of its own) never sees item 40 without its
+        // pair, or the other way round.
+        reader = new FirebirdLite(targetPath, credentials);
+        const seen: string[] = [];
+        let watching = true;
+        const watch = (async () => {
+          while (watching) {
+            const { rows } = await reader!.query<{ I: number; P: number }>(
+              "SELECT (SELECT COUNT(*) FROM items WHERE id = 40) AS i, (SELECT COUNT(*) FROM pairs WHERE a = 40) AS p FROM rdb$database");
+            seen.push(`${rows[0]!.I}${rows[0]!.P}`);
+            await new Promise((r) => setTimeout(r, 5));
+          }
+        })();
+        await source.transaction(async (tx) => {
+          await tx.exec("INSERT INTO items (id, title) VALUES (40, 'with a pair')");
+          await tx.exec("INSERT INTO pairs VALUES (40, 'z', 'pair of 40')");
+        });
+        await until(() => seen[seen.length - 1], (v) => v === '11', 'both rows');
+        watching = false;
+        await watch;
+        expect(seen.filter((v) => v === '10' || v === '01')).toEqual([]);
+      } finally {
+        await sync.unsubscribe();
+      }
+    } finally {
+      await reader?.close();
       await target.close();
     }
   });

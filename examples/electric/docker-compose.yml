@@ -21,4 +21,6 @@ services:
     image: firebirdsql/firebird:5
     environment:
       FIREBIRD_ROOT_PASSWORD: masterkey
-    ports: ["3050:3050"]
+      # Events reach the shape server on a second connection, to this port.
+      FIREBIRD_CONF_RemoteAuxPort: "3051"
+    ports: ["3050:3050", "3051:3051"]

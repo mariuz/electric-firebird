@@ -349,14 +349,73 @@ await sync.unsubscribe();
   `time`) must be quoted in your queries: `SELECT "DAY" FROM items`.
 - **Types.** Integers, `numeric` (exact), floats, `boolean`, text, `uuid`,
   `date`, `time`, `timestamp`, `timestamptz` and `timetz`, `json` and `jsonb`
-  (as text), and arrays (as JSON text). A shape with any other type (`bytea`,
-  `interval`, ranges, `money`) is refused before any row is stored, naming
-  the columns: leave them out with the shape's `columns` parameter.
+  (as text), arrays (as JSON text), and `bytea` (as the bytes, in a
+  `BLOB SUB_TYPE BINARY`). A shape with any other type (`interval`, ranges,
+  `money`) is refused before any row is stored, naming the columns: leave
+  them out with the shape's `columns` parameter.
 - **Following it.** The sync posts the event `electric_<shapeKey>` with each
   batch, so `useLiveQuery(sql, { events: ['electric_items'] })` and
   `db.live()` follow it; triggers on the table fire as for any write.
 - **One shape per table**, and one tab syncing a database: with
   `multiTab: 'shared'`, start the sync in the leading tab only.
+- **Several tables together.** `syncShapesToTables` keeps several tables in
+  step in one sync, and applies each batch to all of them in one Firebird
+  transaction, so a Postgres transaction that wrote to two of them never
+  shows in one and not the other:
+
+  ```js
+  import { syncShapesToTables } from 'firebird-wasm/electric';
+
+  const sync = await syncShapesToTables(db, {
+    shapes: {
+      orders: { shape: { url, params: { table: 'orders' } }, table: 'orders' },
+      lines:  { shape: { url, params: { table: 'order_lines' } }, table: 'order_lines' },
+    },
+    key: 'shop',        // positions kept as shop:orders and shop:lines; null starts over
+  });
+  ```
+
+  A batch is applied once every shape has reached up-to-date after the last
+  change it received, and, where the server marks up-to-date with its
+  position in the Postgres log (Electric and the shape server below do), once
+  they are all at the same one: a shape left behind is asked to refresh. It
+  posts one event per batch, `electric_<key>`.
+- **Writing back.** Electric takes no writes; your API does. A write queue
+  shows a write at once and sends it to your API in the background:
+
+  ```js
+  import { createWriteQueue, WriteRejected } from 'firebird-wasm/electric';
+
+  const writes = await createWriteQueue(db, {
+    // One write at a time, in order. Return the transaction id that applied
+    // it (Postgres: pg_current_xact_id()::xid::text; Firebird:
+    // CURRENT_TRANSACTION) so the queue knows when it has come back.
+    send: async (w) => {
+      const r = await fetch('/api/write', { method: 'POST', body: JSON.stringify(w) });
+      if (r.status === 422) throw new WriteRejected(await r.text());  // rolled back
+      if (!r.ok) throw new Error(r.statusText);                       // retried
+      return r.json();                                                // { txid }
+    },
+  });
+  const sync = await syncShapeToTable(db, { shape, table: 'items', shapeKey: 'items', writes });
+
+  await writes.insert('items', { id: 7, title: 'new' });     // in the table now
+  await writes.update('items', { id: 7 }, { done: true });
+  await writes.delete('items', { id: 7 });
+  ```
+
+  A write is applied to the table and recorded (`ELECTRIC_WRITES`) in one
+  transaction, so it survives a reload and an offline spell; the queue sends
+  it when it can. Each batch the sync applies is followed by the writes still
+  pending, so the source's older state never shows over them. A sent write
+  is dropped when its change comes back: by the transaction id `send`
+  returned (in Electric's `txids`; the shape server below sends them too),
+  otherwise when the row changes in the shape, or after
+  `confirmTimeoutMs`. A `WriteRejected` from `send` rolls the write back by
+  fetching the table's shape again. Values are keyed by the shape's column
+  names and may be strings, numbers, booleans, `null`, `Date` and
+  `Uint8Array`; the key needs the table's primary key columns. The sync and
+  the queue run their transactions one at a time on the database.
 
 See [plans/electric-sync.md](./plans/electric-sync.md) for the design.
 [`examples/electric`](../examples/electric) is a working app: two tables, one
@@ -396,10 +455,34 @@ per served table that logs each changed row's key. Before every read it
 numbers the changes committed since, so the stream follows commit order: a
 transaction that wrote first and committed last is not skipped. Values are
 read from the table when served and sent as Firebird renders them (exact
-for `BIGINT`, `NUMERIC`, `INT128` and timestamps). Run one server per
-database, and put your own authentication in front of it, as Electric's
-documentation advises for Electric itself. Not yet: `where`, paging of a
-large snapshot, and pruning of the log. See
+for `BIGINT`, `NUMERIC`, `INT128` and timestamps). A binary `BLOB` and a
+`BINARY` or `VARBINARY` column are served as `bytea`. Put your own
+authentication in front of it, as Electric's documentation advises for
+Electric itself. What else it does:
+
+- **`where`**, as Electric takes it (`params: { table: 'items', where: 'done = $1', params: { 1: 'false' } }`):
+  comparisons, `AND` / `OR` / `NOT`, `IS [NOT] NULL`, `IN`, `LIKE` / `ILIKE`,
+  `BETWEEN`, literals and `$n` parameters over the table's columns, with every
+  value bound. Anything else (functions, casts, subqueries) is refused with a
+  400 naming it. A row that stops matching leaves the shape as a delete. Each
+  `where` and `columns` is a shape of its own, with its own handle.
+- **Pages.** A snapshot is served `snapshotPageRows` rows a response (default
+  10 000), in key order; the client reads on until up-to-date.
+- **Pruning.** The log keeps a change `retainLogMs` after numbering it
+  (default 7 days; `null` keeps all, and `shapes.prune(before)` prunes by
+  hand). A client further behind is sent back to a snapshot.
+- **Events.** A commit that logged a change posts `ELECTRIC_CHANGES`, which
+  wakes waiting live requests at once, through a connection of its own;
+  polling (`pollIntervalMs`, default 1 s) is the fallback. Firebird delivers
+  events on a second connection to the server's `RemoteAuxPort`, random by
+  default: for a Firebird in a container, pin it (`RemoteAuxPort = 3051`, or
+  `FIREBIRD_CONF_RemoteAuxPort=3051` in the official image) and publish it.
+  `shapes.events` says whether events are on; without them the server warns
+  once and polls.
+- **Several servers** can serve one database: numbering takes a lock, so the
+  log is numbered in commit order whichever server numbers it.
+
+See
 [plans/firebird-shape-server.md](./plans/firebird-shape-server.md).
 
 ---
@@ -508,12 +591,13 @@ await db.query('SELECT * FROM notes WHERE title = ?', [userInput]);
 | `boolean` | `TRUE` / `FALSE` |
 | `Date` | ISO-8601 |
 | `null`, `undefined` | SQL `NULL` |
-| `Uint8Array` | **throws** — binary parameters are not supported |
+| `Uint8Array`, `ArrayBuffer` | the bytes themselves, into a `BLOB` or a `BINARY` / `VARBINARY` (`OCTETS`) column; any other column refuses them |
 | `NaN`, `Infinity`, plain objects | **throws** |
 
 Values cross as text and are converted using the statement's declared
-parameter metadata, so the engine's own coercion rules apply. Binary throws
-rather than being silently mangled.
+parameter metadata, so the engine's own coercion rules apply. Bytes are the
+exception: they are never text, so they go only where bytes are kept, and a
+`Uint8Array` bound to a `VARCHAR` throws rather than being read as text.
 
 ### Reading values back
 
@@ -526,7 +610,7 @@ Anything a `double` cannot hold arrives as an **exact decimal string**:
 | `NUMERIC`, `DECIMAL`, `DECFLOAT`, `INT128` | `string` |
 | `DATE`, `TIME`, `TIMESTAMP` | ISO-8601 `string` |
 | `BLOB SUB_TYPE TEXT` | `string` |
-| `BLOB SUB_TYPE BINARY` | base64 `string` |
+| `BLOB SUB_TYPE BINARY`, `BINARY`, `VARBINARY` (`OCTETS`) | base64 `string` |
 
 Which means a money column is a string, and `+` will concatenate it:
 

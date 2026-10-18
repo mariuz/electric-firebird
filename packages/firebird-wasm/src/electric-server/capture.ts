@@ -14,6 +14,10 @@ import { quote } from './catalog';
 
 export const CHANGES = 'ELECTRIC_CHANGES';
 export const META = 'ELECTRIC_META';
+/** When each commit number was given: what pruning goes by. */
+export const STAMPS = 'ELECTRIC_STAMPS';
+/** The event each logged change posts, delivered when its transaction commits. */
+export const CHANGE_EVENT = 'ELECTRIC_CHANGES';
 const CHANGE_SEQ = 'ELECTRIC_CHANGE_SEQ';
 const COMMIT_SEQ = 'ELECTRIC_COMMIT_SEQ';
 
@@ -81,11 +85,19 @@ export async function installCapture(attachment: Attachment, tables: TablePlan[]
     await ddl(`CREATE INDEX ${CHANGES}_SEQ ON ${CHANGES} (COMMIT_SEQ)`);
   }
   if (!(await has(relation, META))) {
-    await ddl(`CREATE TABLE ${META} (EPOCH VARCHAR(40) NOT NULL)`);
+    await ddl(`CREATE TABLE ${META} (EPOCH VARCHAR(40) NOT NULL, PRUNED_THROUGH BIGINT DEFAULT 0 NOT NULL)`);
     const tx = await attachment.startTransaction();
     const epoch = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
     await attachment.execute(tx, `INSERT INTO ${META} (EPOCH) VALUES (?)`, [epoch]);
     await tx.commit();
+  }
+  // Installed by an earlier version: without pruning.
+  const column = 'SELECT 1 FROM RDB$RELATION_FIELDS WHERE RDB$RELATION_NAME = \'' + META + '\' AND RDB$FIELD_NAME = ?';
+  if (!(await has(column, 'PRUNED_THROUGH'))) {
+    await ddl(`ALTER TABLE ${META} ADD PRUNED_THROUGH BIGINT DEFAULT 0 NOT NULL`);
+  }
+  if (!(await has(relation, STAMPS))) {
+    await ddl(`CREATE TABLE ${STAMPS} (COMMIT_SEQ BIGINT NOT NULL PRIMARY KEY, STAMPED_AT TIMESTAMP NOT NULL)`);
   }
 
   for (const table of tables) {
@@ -110,6 +122,9 @@ export function tableTrigger(table: TablePlan): string {
     `  IF (DELETING OR (UPDATING AND (${keyChanged}))) THEN ${log('D', 'OLD')}\n` +
     `  IF (INSERTING) THEN ${log('I', 'NEW')}\n` +
     `  IF (UPDATING) THEN ${log('U', 'NEW')}\n` +
+    // Wakes the servers' live requests when the transaction commits; Firebird
+    // delivers one per transaction however many rows posted it.
+    `  POST_EVENT '${CHANGE_EVENT}';\n` +
     'END'
   );
 }
@@ -122,32 +137,89 @@ export function tableTrigger(table: TablePlan): string {
  * is loaded when a connection attaches, so an application connected before
  * the capture was installed would never run it.  A change still being
  * written is invisible to this READ COMMITTED update and is numbered by a
- * later call, after its commit; so numbers follow commits, and one stamper
- * at a time (the server's queue) leaves no number to arrive late.
+ * later call, after its commit; so numbers follow commits.
+ *
+ * One numbering at a time, across every server on the database: each takes
+ * the ELECTRIC_META row first, and a number is taken only under it.  So
+ * numbers commit in order, and a snapshot that sees a number sees every
+ * number below it.  Two servers numbering at once used to fail on each
+ * other's rows, or commit a higher number before a lower one.
  */
 export async function stampCommitted(attachment: Attachment): Promise<number> {
-  const tx = await attachment.startTransaction({
-    isolation: TransactionIsolation.READ_COMMITTED,
-    readCommittedMode: 'RECORD_VERSION',
-    waitMode: 'NO_WAIT',
-  });
-  try {
-    const pending = await attachment.executeQuery(
-      tx, `SELECT FIRST 1 1 FROM ${CHANGES} WHERE COMMIT_SEQ IS NULL`);
-    const any = (await pending.fetch({ fetchSize: 1 })).length > 0;
-    await pending.close();
-    if (!any) {
+  for (let attempt = 1; ; attempt++) {
+    const tx = await attachment.startTransaction({
+      isolation: TransactionIsolation.READ_COMMITTED,
+      readCommittedMode: 'RECORD_VERSION',
+      waitMode: 'NO_WAIT',
+    });
+    try {
+      const pending = await attachment.executeQuery(
+        tx, `SELECT FIRST 1 1 FROM ${CHANGES} WHERE COMMIT_SEQ IS NULL`);
+      const any = (await pending.fetch({ fetchSize: 1 })).length > 0;
+      await pending.close();
+      if (!any) {
+        await tx.commit();
+        return 0;
+      }
+      try {
+        await attachment.execute(tx, `UPDATE ${META} SET EPOCH = EPOCH`);
+      } catch (err) {
+        // Another server is numbering: try again once it has.
+        await tx.rollback().catch(() => undefined);
+        if (attempt >= 100) throw err;
+        await new Promise((r) => setTimeout(r, Math.min(5 * attempt, 50)));
+        continue;
+      }
+      const seq = await attachment.executeQuery(tx, `SELECT GEN_ID(${COMMIT_SEQ}, 1) FROM RDB$DATABASE`);
+      const n = Number((await seq.fetch())[0]![0]);
+      await seq.close();
+      await attachment.execute(tx, `UPDATE ${CHANGES} SET COMMIT_SEQ = ? WHERE COMMIT_SEQ IS NULL`, [n]);
+      await attachment.execute(tx, `INSERT INTO ${STAMPS} (COMMIT_SEQ, STAMPED_AT) VALUES (?, CURRENT_TIMESTAMP)`, [n]);
       await tx.commit();
-      return 0;
+      return n;
+    } catch (err) {
+      await tx.rollback().catch(() => undefined);
+      throw err;
     }
-    const seq = await attachment.executeQuery(tx, `SELECT GEN_ID(${COMMIT_SEQ}, 1) FROM RDB$DATABASE`);
-    const n = Number((await seq.fetch())[0]![0]);
-    await seq.close();
-    await attachment.execute(tx, `UPDATE ${CHANGES} SET COMMIT_SEQ = ? WHERE COMMIT_SEQ IS NULL`, [n]);
-    await tx.commit();
-    return n;
-  } catch (err) {
-    await tx.rollback().catch(() => undefined);
-    throw err;
+  }
+}
+
+/**
+ * Drop what was numbered before `before` from the log, and return the
+ * highest number dropped (0 when nothing was).  A client whose position is
+ * below it is sent back to a snapshot: what it would need is gone.
+ */
+export async function pruneLog(attachment: Attachment, before: Date): Promise<number> {
+  for (let attempt = 1; ; attempt++) {
+    const tx = await attachment.startTransaction({
+      isolation: TransactionIsolation.READ_COMMITTED,
+      readCommittedMode: 'RECORD_VERSION',
+      waitMode: 'NO_WAIT',
+    });
+    try {
+      try {
+        // Not while a number is being given: the same lock as stampCommitted.
+        await attachment.execute(tx, `UPDATE ${META} SET EPOCH = EPOCH`);
+      } catch (err) {
+        await tx.rollback().catch(() => undefined);
+        if (attempt >= 100) throw err;
+        await new Promise((r) => setTimeout(r, Math.min(5 * attempt, 50)));
+        continue;
+      }
+      const rs = await attachment.executeQuery(
+        tx, `SELECT MAX(COMMIT_SEQ) FROM ${STAMPS} WHERE STAMPED_AT < ?`, [before]);
+      const through = Number((await rs.fetch())[0]?.[0] ?? 0);
+      await rs.close();
+      if (through > 0) {
+        await attachment.execute(tx, `DELETE FROM ${CHANGES} WHERE COMMIT_SEQ <= ?`, [through]);
+        await attachment.execute(tx, `DELETE FROM ${STAMPS} WHERE COMMIT_SEQ <= ?`, [through]);
+        await attachment.execute(tx, `UPDATE ${META} SET PRUNED_THROUGH = ? WHERE PRUNED_THROUGH < ?`, [through, through]);
+      }
+      await tx.commit();
+      return through;
+    } catch (err) {
+      await tx.rollback().catch(() => undefined);
+      throw err;
+    }
   }
 }

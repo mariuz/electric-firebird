@@ -803,6 +803,8 @@ const TEXT_LENGTH = 128;
  * The parameters as the driver will take them, the statement made ready to
  * take them.
  *
+ * A `Uint8Array` or `ArrayBuffer` goes on as a Buffer, the driver's bytes.
+ *
  * A string or Buffer bound to a BLOB parameter is written to a new blob here,
  * and the blob passed on. The driver takes a Buffer or a Blob there and
  * refused a string ("Unrecognized type used as BLOB"); and given a Buffer,
@@ -829,7 +831,14 @@ const TEXT_LENGTH = 128;
  * PRECISION or FLOAT parameter is still converted by JS, which rounds
  * correctly.
  */
-async function bindParams(stmt: Statement, transaction: Transaction, params: QueryParams): Promise<QueryParams> {
+async function bindParams(stmt: Statement, transaction: Transaction, given: QueryParams): Promise<QueryParams> {
+  // Bytes as the driver takes them: a Buffer (the browser engine takes a
+  // Uint8Array or an ArrayBuffer, so the same call works on both).
+  const params = given.some((p) => p instanceof Uint8Array || p instanceof ArrayBuffer)
+    ? given.map((p) => p instanceof ArrayBuffer
+      ? Buffer.from(p)
+      : p instanceof Uint8Array && !Buffer.isBuffer(p) ? Buffer.from(p.buffer, p.byteOffset, p.byteLength) : p)
+    : given;
   const binding = bindings.get(stmt);
   if (!params.some((p) => typeof p === 'string' || Buffer.isBuffer(p)) && (!binding || binding.current === '')) {
     return params;

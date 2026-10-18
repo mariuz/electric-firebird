@@ -277,8 +277,9 @@ Consequences worth knowing:
 
 - `null` and `undefined` both bind SQL NULL — JavaScript uses them
   interchangeably for "absent", and accepting only one would be a trap.
-- Binary parameters (`Uint8Array`) throw a clear error naming the limitation
-  rather than corrupting data: the encoding is text-based.
+- Binary parameters (`Uint8Array`, `ArrayBuffer`) go as their own bytes,
+  marked as bytes, into a `BLOB` or an `OCTETS` column; any other column
+  refuses them rather than reading bytes as text.
 - A parameter-count mismatch is reported against the prepared statement
   ("expects 1 parameter but 2 were supplied") instead of surfacing as an
   obscure engine failure.
@@ -1104,16 +1105,21 @@ gaps it ran into, with its numbers, in rough order of what they would buy.
       element so that plain pages, React and Vue share one. Scripts with
       `SET TERM`, results as tables, history, values drawn as text; six
       browser tests drive it by keyboard against the real engine.
-- [ ] ElectricSQL sync integration (the project's namesake). Planned in
+- [x] ElectricSQL sync integration (the project's namesake). Planned in
       [plans/electric-sync.md](./plans/electric-sync.md). **The read path
       is in:** `firebird-wasm/electric`'s `syncShapeToTable`, tested in
       Chromium against a real Postgres and Electric in CI (types, live
       changes, resume after a reload, must-refetch). A demo:
       [`examples/electric`](../examples/electric) syncs from both kinds of
-      source into one page, tested against real containers in CI. Left:
-      several shapes in one transaction, a write path, and `bytea`.
+      source into one page, tested against real containers in CI. `bytea`
+      maps to a binary BLOB, which the engine now binds bytes into;
+      `syncShapesToTables` applies several shapes in one transaction; and
+      `createWriteQueue` is the write path: local writes at once, sent to
+      the app's API, kept over the sync until their transaction comes back.
       **A Firebird server as the source** works the same way through
-      `firebird-wasm/electric-server` (Electric reads only Postgres): see
+      `firebird-wasm/electric-server` (Electric reads only Postgres), with
+      `where`, paged snapshots, a pruned log, event wake-ups and several
+      servers per database: see
       [plans/firebird-shape-server.md](./plans/firebird-shape-server.md).
 - [ ] A Firebird version build matrix. The submodule tracks `master` and the
       shipped engine reports `ENGINE_VERSION 6.0.0`, so the recurring "Firebird
