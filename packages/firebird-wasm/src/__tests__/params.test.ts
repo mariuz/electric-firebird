@@ -88,8 +88,17 @@ describe('encodeParams', () => {
 
   it('refuses what has no SQL text form', () => {
     expect(() => encodeParams([NaN])).toThrow(RangeError);
-    expect(() => encodeParams([new Uint8Array(2)])).toThrow(TypeError);
     expect(() => encodeParams([{}])).toThrow(TypeError);
+  });
+
+  it('sends bytes as themselves, marked as bytes', () => {
+    const bytes = new Uint8Array([0, 0xff, 0x80, 0x0a]);
+    for (const value of [bytes, bytes.buffer]) {
+      const out = encodeParams([value]);
+      expect(out[4]).toBe(4); // not null, bytes, no binary number form
+      expect(view(out).getUint32(5, true)).toBe(4);
+      expect([...out.subarray(9)]).toEqual([0, 0xff, 0x80, 0x0a]);
+    }
   });
 });
 

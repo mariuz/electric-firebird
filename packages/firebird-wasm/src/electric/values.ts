@@ -103,6 +103,20 @@ const asZoned: Convert = (text, column) => {
   return fourDigitFraction(match[1]!) + offset(match[2]!, match[3]!, match[4]);
 };
 
+// Postgres's hex output (`\x` and two digits a byte), the default since 9.0,
+// into the bytes, which bind as themselves into a BLOB SUB_TYPE BINARY.
+const asBytes: Convert = (text, column) => {
+  if (!/^\\x([0-9a-fA-F]{2})*$/.test(text)) {
+    throw new RangeError(
+      `Column ${column} holds bytea that is not in hex form (\\x…); ` +
+        "Postgres's bytea_output must be 'hex', its default",
+    );
+  }
+  const bytes = new Uint8Array((text.length - 2) / 2);
+  for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(text.slice(2 + i * 2, 4 + i * 2), 16);
+  return bytes;
+};
+
 /** Postgres type name to its conversion, for every type this maps. */
 const CONVERSIONS: Record<string, Convert> = {
   int2: asInteger,
@@ -125,12 +139,11 @@ const CONVERSIONS: Record<string, Convert> = {
   timestamp: asTimestamp,
   timetz: asZoned,
   timestamptz: asZoned,
+  bytea: asBytes,
 };
 
 /** Why a type is not mapped, where there is more to say than "not yet". */
-const REFUSED: Record<string, string> = {
-  bytea: 'bytea is not mapped yet: the WASM build binds parameters as text, and bytes are not text',
-};
+const REFUSED: Record<string, string> = {};
 
 /**
  * Check that every column of `schema` can be stored, before any row is.
@@ -218,6 +231,7 @@ function firebirdType(info: ElectricColumn): string {
     case 'timetz': return 'TIME WITH TIME ZONE';
     case 'timestamp': return 'TIMESTAMP';
     case 'timestamptz': return 'TIMESTAMP WITH TIME ZONE';
+    case 'bytea': return 'BLOB SUB_TYPE BINARY';
     case 'text':
     case 'name':
     case 'citext':
@@ -248,6 +262,7 @@ export function tableFromSchema(table: string, schema: ElectricSchema): string {
   const lines = columns.map(([name, info]) => {
     let type = firebirdType(info);
     if (key.includes(name) && type === 'BLOB SUB_TYPE TEXT') type = 'VARCHAR(255)';
+    if (key.includes(name) && type === 'BLOB SUB_TYPE BINARY') type = 'VARCHAR(255) CHARACTER SET OCTETS';
     const notNull = info.not_null || key.includes(name) ? ' NOT NULL' : '';
     return `  ${firebirdColumn(name)} ${type}${notNull}`;
   });

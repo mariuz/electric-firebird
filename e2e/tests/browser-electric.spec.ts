@@ -88,23 +88,25 @@ test.describe('firebird-wasm/electric with Postgres and Electric', () => {
     await sql(`CREATE TABLE ${table} (
       id integer PRIMARY KEY, small smallint, big bigint, price numeric(10,2), ratio double precision,
       title text, code varchar(8), done boolean, uid uuid, day date, at_time time, ts timestamp,
-      tstz timestamptz, doc jsonb, tags text[], "camelCase" text, nothing text)`);
+      tstz timestamptz, doc jsonb, tags text[], "camelCase" text, nothing text, raw bytea)`);
     await sql(`INSERT INTO ${table} VALUES (1, -2, 9007199254740993, 12.50, 0.1, 'it''s "x"', 'abc', true,
       'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2024-02-29', '13:45:01.5', '2024-05-01 12:00:00.123456',
-      '2024-05-01 12:00:00+02', '{"a":[1,2]}', ARRAY['a','b,c'], 'cc', NULL)`);
+      '2024-05-01 12:00:00+02', '{"a":[1,2]}', ARRAY['a','b,c'], 'cc', NULL, '\\x00ff800a')`);
 
     await openPage(page);
     await startSync(page, 'memory://electric-types', table, true);
 
     const rows = await rowsWhen(page,
       `SELECT id, small, big, price, ratio, title, code, done, uid, "DAY", at_time, ts,
-         CAST(tstz AT TIME ZONE 'UTC' AS VARCHAR(40)) AS tstz, doc, tags, "camelCase", nothing FROM ${table}`,
+         CAST(tstz AT TIME ZONE 'UTC' AS VARCHAR(40)) AS tstz, doc, tags, "camelCase", nothing, raw FROM ${table}`,
       (r) => r.length === 1);
     expect(rows[0]).toMatchObject({
       ID: 1, SMALL: -2, PRICE: '12.50', RATIO: 0.1, TITLE: `it's "x"`, CODE: 'abc', DONE: true,
       UID: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', DOC: '{"a": [1, 2]}', TAGS: '["a","b,c"]',
       // Stored under its quoted name, and read back under it.
       camelCase: 'cc', NOTHING: null,
+      // bytea, as bytes in a binary BLOB (read back in base64 by default).
+      RAW: 'AP+ACg==',
     });
     expect(String(rows[0].BIG)).toBe('9007199254740993');
     expect(String(rows[0].DAY)).toContain('2024-02-29');

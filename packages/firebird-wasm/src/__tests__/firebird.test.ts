@@ -120,6 +120,24 @@ describeIfFirebird('FirebirdLite', () => {
     expect(match.rows).toEqual([{ ID: 6 }]);
   });
 
+  it('binds bytes into a binary BLOB and an OCTETS column, by every route', async () => {
+    // A Uint8Array or ArrayBuffer, as the browser engine takes them.
+    await db.exec('CREATE TABLE raws (id INTEGER, raw BLOB SUB_TYPE BINARY, code VARCHAR(4) CHARACTER SET OCTETS)');
+    const bytes = new Uint8Array([0, 0xff, 0x80, 0x0a]);
+    await db.exec('INSERT INTO raws VALUES (?, ?, ?)', [1, bytes, bytes]);
+    await db.query('INSERT INTO raws VALUES (?, ?, ?)', [2, bytes.buffer, bytes.subarray(1, 3)]);
+    await db.transaction(async (tx) => {
+      await tx.execBatch('INSERT INTO raws VALUES (?, ?, ?)', [[3, bytes, null], [4, new Uint8Array(0), bytes]]);
+    });
+    // Compared in SQL: the driver reads an OCTETS column back as text.
+    const { rows } = await db.query<{ ID: number; L: number; SAME: boolean; CODE: string | null }>(
+      "SELECT id, OCTET_LENGTH(raw) AS l, CAST(raw AS VARCHAR(8) CHARACTER SET OCTETS) = x'00ff800a' AS same, " +
+        "TRIM(CASE WHEN code = x'00ff800a' THEN 'all' WHEN code = x'ff80' THEN 'part' END) AS code FROM raws ORDER BY id");
+    expect(rows.map((r) => [r.ID, r.L, r.SAME, r.CODE])).toEqual([
+      [1, 4, true, 'all'], [2, 4, true, 'part'], [3, 4, true, null], [4, 0, false, 'all'],
+    ]);
+  });
+
   describe('dates and times given as text', () => {
     // As firebird-wasm/electric's syncShapeToTable sends them, and as the
     // browser engine takes them: Firebird converts the text, to 1/10000 s.

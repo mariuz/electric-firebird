@@ -6,9 +6,10 @@
  *
  *     u32  count
  *     per parameter:
- *       u8   flags         bit 0: SQL NULL; bit 1: a binary form follows the text
+ *       u8   flags         bit 0: SQL NULL; bit 1: a binary form follows the text;
+ *                          bit 2: the bytes are bytes, not text
  *       u32  byteLength    (absent when NULL)
- *       ...  UTF-8 bytes   (absent when NULL)
+ *       ...  UTF-8 bytes   (absent when NULL), or the value's own bytes (bit 2)
  *       u8   kind          (only with bit 1) 1: INT64, 2: DOUBLE
  *       8    the value     (only with bit 1) little-endian
  *
@@ -25,6 +26,11 @@
  * Every other column — NUMERIC and DECIMAL with their exact decimal
  * conversion, VARCHAR, dates — gets the text, so `1.1` into a NUMERIC(18,2)
  * is still 1.10 and into a VARCHAR still '1.1'.
+ *
+ * A `Uint8Array` (or `ArrayBuffer`) is sent as its own bytes, marked as
+ * bytes: the engine writes them into a BLOB or a BINARY / VARBINARY (OCTETS)
+ * column as they are, and refuses any other column rather than read them as
+ * text.
  */
 
 import type { QueryParams } from '../types';
@@ -69,8 +75,7 @@ export function encodeParamValue(value: unknown, index: number): string {
 
   if (value instanceof Uint8Array || value instanceof ArrayBuffer) {
     throw new TypeError(
-      `Parameter ${index} is binary, which the WASM build cannot bind yet — ` +
-        'the parameter encoding is text-based (see docs/roadmap.md, M2)',
+      `Parameter ${index} is binary, which has no text form; it is bound as bytes instead`,
     );
   }
 
@@ -109,10 +114,14 @@ export function binaryParamForm(value: unknown): { kind: number; value: bigint |
 interface EncodedParam {
   text: Uint8Array | null;
   binary: { kind: number; value: bigint | number } | null;
+  /** `text` holds the value's own bytes. */
+  bytes?: boolean;
 }
 
 function encodeOne(value: unknown, index: number, encoder: TextEncoder): EncodedParam {
   if (value === null || value === undefined) return { text: null, binary: null };
+  if (value instanceof Uint8Array) return { text: value, binary: null, bytes: true };
+  if (value instanceof ArrayBuffer) return { text: new Uint8Array(value), binary: null, bytes: true };
   return { text: encoder.encode(encodeParamValue(value, index)), binary: binaryParamForm(value) };
 }
 
@@ -125,7 +134,7 @@ function writeParams(out: Uint8Array, view: DataView, pos: number, encoded: Enco
   pos += 4;
 
   for (const p of encoded) {
-    out[pos++] = (p.text ? 0 : 1) | (p.binary ? 2 : 0);
+    out[pos++] = (p.text ? 0 : 1) | (p.binary ? 2 : 0) | (p.bytes ? 4 : 0);
     if (p.text) {
       view.setUint32(pos, p.text.length, true);
       pos += 4;

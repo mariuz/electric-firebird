@@ -52,9 +52,9 @@ test.describe('Firebird server → firebird-wasm/electric-server → Firebird in
     source = new FirebirdLite(database, credentials);
     await source.exec(
       'CREATE TABLE notes (id INTEGER NOT NULL PRIMARY KEY, title VARCHAR(60), body BLOB SUB_TYPE TEXT, ' +
-        'price NUMERIC(10,2), done BOOLEAN, at_ TIMESTAMP)');
+        'price NUMERIC(10,2), done BOOLEAN, at_ TIMESTAMP, raw BLOB SUB_TYPE BINARY)');
     await source.exec(
-      "INSERT INTO notes VALUES (1, 'first', 'a body', 12.5, TRUE, '2024-05-01 12:00:00.1234')");
+      "INSERT INTO notes VALUES (1, 'first', 'a body', 12.5, TRUE, '2024-05-01 12:00:00.1234', x'00ff800a')");
     shapes = await createShapeServer({ database, ...credentials, tables: ['notes'], pollIntervalMs: 50 });
     httpServer = http.createServer(shapes.handler);
     await new Promise<void>((r) => httpServer.listen(0, '127.0.0.1', r));
@@ -87,10 +87,11 @@ test.describe('Firebird server → firebird-wasm/electric-server → Firebird in
     }, { url, schema });
 
     const first = await rowsWhen(page,
-      'SELECT id, title, body, CAST(price AS VARCHAR(20)) AS price, done, CAST(at_ AS VARCHAR(24)) AS at_ FROM notes',
+      'SELECT id, title, body, CAST(price AS VARCHAR(20)) AS price, done, CAST(at_ AS VARCHAR(24)) AS at_, raw FROM notes',
       (r) => r.length === 1);
     expect(first).toEqual([{
       ID: 1, TITLE: 'first', BODY: 'a body', PRICE: '12.50', DONE: true, AT_: '2024-05-01 12:00:00.1234',
+      RAW: 'AP+ACg==',
     }]);
 
     await source.transaction(async (tx) => {

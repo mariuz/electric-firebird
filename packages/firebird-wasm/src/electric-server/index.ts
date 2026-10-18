@@ -131,14 +131,14 @@ export async function createShapeServer(options: ShapeServerOptions): Promise<Sh
         messages.push(await change('insert', table, columns, row, tx));
       }
       await rs.close();
-      return { messages, offset: top };
+      return { messages, offset: top, seen: top };
     });
   };
 
   /** The changes to `table` after `after`, up to the watermark, one per key. */
   const changesAfter = async (table: TablePlan, columns: TablePlan['columns'], after: number) => {
     return stampedSnapshot(async (tx, top) => {
-      if (top <= after) return { messages: [] as Message[], offset: after };
+      if (top <= after) return { messages: [] as Message[], offset: after, seen: top };
       const keys = Array.from({ length: KEY_COLUMNS }, (_, i) => `K${i + 1}`).join(', ');
       const rs = await attachment.executeQuery(
         tx,
@@ -168,7 +168,7 @@ export async function createShapeServer(options: ShapeServerOptions): Promise<Sh
           ? await change('insert', table, columns, current, tx)
           : deletion(table, key));
       }
-      return { messages, offset: top };
+      return { messages, offset: top, seen: top };
     });
   };
 
@@ -183,7 +183,10 @@ export async function createShapeServer(options: ShapeServerOptions): Promise<Sh
     for (let i = 0; i < columns.length; i++) {
       const plan = columns[i]!;
       let raw = row[i];
-      if (plan.render === 'blob' && raw) raw = await readBlob(attachment, tx, raw as FbBlob);
+      if ((plan.render === 'blob' || plan.render === 'bytes') && raw) {
+        const bytes = await readBlob(attachment, tx, raw as FbBlob);
+        raw = plan.render === 'blob' ? bytes.toString('utf8') : bytes;
+      }
       value[plan.shapeName] = renderValue(plan, raw);
     }
     return { key: keyOf(table, table.key.map((k) => value[shapeOf(table, k)])), value, headers: { operation } };
@@ -239,12 +242,15 @@ export async function createShapeServer(options: ShapeServerOptions): Promise<Sh
     const columns = selectColumns(table, params.get('columns'));
     const schema = Object.fromEntries(columns.map((c) => [c.shapeName, table.schema[c.shapeName]]));
     const handle = handleOf(table);
-    const upToDate = { headers: { control: 'up-to-date' } };
+    // As Electric's: the last position of the whole log this response has
+    // seen, so a client of several shapes can tell when they are all at the
+    // same one (syncShapesToTables).
+    const upToDate = (seen: number) => ({ headers: { control: 'up-to-date', global_last_seen_lsn: String(seen) } });
     const offsetParam = params.get('offset') ?? '-1';
 
     if (offsetParam === '-1') {
-      const { messages, offset } = await snapshot(table, columns);
-      respond(res, 200, [...messages, upToDate], {
+      const { messages, offset, seen } = await snapshot(table, columns);
+      respond(res, 200, [...messages, upToDate(seen)], {
         'electric-handle': handle,
         'electric-offset': `${offset}_0`,
         'electric-schema': JSON.stringify(schema),
@@ -277,7 +283,7 @@ export async function createShapeServer(options: ShapeServerOptions): Promise<Sh
     };
     if (live) headers['electric-cursor'] = String(Math.floor(Date.now() / 1000));
     else headers['electric-schema'] = JSON.stringify(schema);
-    respond(res, 200, [...result.messages, upToDate], headers);
+    respond(res, 200, [...result.messages, upToDate(result.seen)], headers);
   };
 
   return {
@@ -344,7 +350,7 @@ async function readOnly<T>(attachment: Attachment, fn: (tx: Transaction) => Prom
   });
 }
 
-async function readBlob(attachment: Attachment, tx: Transaction, blob: FbBlob): Promise<string> {
+async function readBlob(attachment: Attachment, tx: Transaction, blob: FbBlob): Promise<Buffer> {
   const stream = await attachment.openBlob(tx, blob);
   try {
     const chunks: Buffer[] = [];
@@ -354,7 +360,7 @@ async function readBlob(attachment: Attachment, tx: Transaction, blob: FbBlob): 
       if (n < 0) break;
       chunks.push(buffer.subarray(0, n));
     }
-    return Buffer.concat(chunks).toString('utf8');
+    return Buffer.concat(chunks);
   } finally {
     await stream.close();
   }
@@ -368,7 +374,7 @@ async function describeTable(attachment: Attachment, name: string): Promise<Tabl
       'SELECT TRIM(rf.RDB$FIELD_NAME), f.RDB$FIELD_TYPE, COALESCE(f.RDB$FIELD_SUB_TYPE, 0), ' +
         'COALESCE(f.RDB$FIELD_SCALE, 0), COALESCE(f.RDB$FIELD_PRECISION, 0), ' +
         'COALESCE(f.RDB$CHARACTER_LENGTH, f.RDB$FIELD_LENGTH, 0), ' +
-        'COALESCE(rf.RDB$NULL_FLAG, f.RDB$NULL_FLAG, 0) ' +
+        'COALESCE(rf.RDB$NULL_FLAG, f.RDB$NULL_FLAG, 0), COALESCE(f.RDB$CHARACTER_SET_ID, 0) ' +
         'FROM RDB$RELATION_FIELDS rf JOIN RDB$FIELDS f ON f.RDB$FIELD_NAME = rf.RDB$FIELD_SOURCE ' +
         'WHERE rf.RDB$RELATION_NAME = ? AND f.RDB$COMPUTED_BLR IS NULL ORDER BY rf.RDB$FIELD_POSITION',
       [name],
@@ -381,6 +387,7 @@ async function describeTable(attachment: Attachment, name: string): Promise<Tabl
       precision: Number(r[4]),
       charLength: Number(r[5]),
       notNull: Number(r[6]) === 1,
+      charSet: Number(r[7]),
     }));
     await rs.close();
     const keyRs = await attachment.executeQuery(

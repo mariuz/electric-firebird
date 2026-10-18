@@ -8,6 +8,25 @@ API may still move between minor releases.
 
 ### Added
 
+- **Bytes as parameters.** A `Uint8Array` or `ArrayBuffer` binds as its own
+  bytes into a `BLOB` or a `BINARY` / `VARBINARY` (`OCTETS`) column, on both
+  backends and by every route (`exec`, `query`, transactions, `execBatch`).
+  The browser engine marks the bytes as bytes, so any other column refuses
+  them instead of reading them as text; `FirebirdLite` hands them to the
+  driver as a `Buffer`. They used to throw.
+- **`bytea` syncs.** `firebird-wasm/electric` decodes Electric's `\x…` hex
+  into bytes, and `tableFromSchema` maps `bytea` to `BLOB SUB_TYPE BINARY`
+  (`VARCHAR(255) CHARACTER SET OCTETS` in a key). The shape server serves a
+  binary `BLOB`, `BINARY` and `VARBINARY` as `bytea`, byte for byte.
+- **`syncShapesToTables`: several tables, one transaction per batch.** The
+  shapes are followed together and each batch is applied to every table in
+  one Firebird transaction with every shape's position, so a Postgres
+  transaction that wrote to two tables never shows in one of them alone. A
+  batch waits until every shape has reached up-to-date after its last change,
+  and until all are at the same `global_last_seen_lsn` where the server sends
+  it; a shape behind is refreshed. The shape server now sends
+  `global_last_seen_lsn` (its log position) as Electric does.
+  `syncShapeToTable` is the one-shape case of the same code.
 - **An example app that syncs from two servers:
   [`examples/electric`](./examples/electric).** Two lists of notes, each a
   table in the page's Firebird: one follows Postgres through Electric, the

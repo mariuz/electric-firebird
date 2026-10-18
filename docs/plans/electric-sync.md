@@ -9,7 +9,7 @@ would not, and the smallest piece that proves the rest.
 first step's read path is built (`firebird-wasm/electric`; see
 [integration.md](../integration.md) §3). Building it found that the
 engine could not bind a string into a BLOB parameter, now fixed, and that
-`bytea` waits for binary parameters.
+`bytea` waited for binary parameters, which the engine now binds.
 
 ---
 
@@ -204,8 +204,8 @@ A prototype that proves the read path end to end:
 4. A demo page: a Postgres table synced into the browser, queried with
    Firebird SQL in `<firebird-repl>` (#39).
 
-Out of the first step: several shapes in one transaction
-(`syncShapesToTables` in PGlite's terms), writes, `replica=full`, subset
+Out of the first step, and since built: several shapes in one transaction
+(`syncShapesToTables`, as PGlite names it). Still out: writes, `replica=full`, subset
 snapshots, and the Node side beyond what the tests need.
 
 ## Questions to decide first

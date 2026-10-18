@@ -1205,12 +1205,17 @@ void appendValue(IAttachment* attachment, ITransaction* transaction,
  * whole-number column gets, so a NUMERIC(18,2) still sees "1.1" and a VARCHAR
  * "1.5"; those two kinds of column take the binary form, exactly.
  */
+/** RDB$CHARACTER_SETS id of OCTETS, the set of BINARY and VARBINARY. */
+constexpr unsigned CHARSET_OCTETS = 1;
+
 struct ParamValue
 {
 	bool          isNull = true;
 	std::string   text;
 	/** 0: text only; 1: the value is in `i64`; 2: in `dbl`. */
 	unsigned char binaryKind = 0;
+	/** `text` holds bytes, not text: bound only where bytes go (a BLOB, OCTETS). */
+	bool          bytes = false;
 	ISC_INT64     i64 = 0;
 	double        dbl = 0;
 };
@@ -1252,6 +1257,7 @@ bool parseParamsAt(const unsigned char* data, unsigned length, unsigned& pos,
 		ParamValue value;
 		const unsigned char flags = data[pos++];
 		value.isNull = (flags & 1) != 0;
+		value.bytes = (flags & 4) != 0;
 
 		if (!value.isNull)
 		{
@@ -1404,6 +1410,7 @@ public:
 			fields[i].length     = metadata->getLength(status.ptr(), i);
 			fields[i].offset     = metadata->getOffset(status.ptr(), i);
 			fields[i].nullOffset = metadata->getNullOffset(status.ptr(), i);
+			fields[i].charSet    = metadata->getCharSet(status.ptr(), i);
 
 			if (status.failed())
 			{
@@ -1462,6 +1469,50 @@ public:
 				if (!writeBlob(values[i].text, blobId, i))
 					return false;
 				memcpy(buffer.data() + f.offset, &blobId, sizeof(blobId));
+				continue;
+			}
+
+			if (values[i].bytes)
+			{
+				// Bytes go where bytes are kept: a BLOB (above) or a CHAR or
+				// VARCHAR in OCTETS (BINARY, VARBINARY).  Anywhere else they
+				// would be read as text in the connection's character set.
+				const bool octets = (f.type == SQL_TEXT || f.type == SQL_VARYING) && f.charSet == CHARSET_OCTETS;
+				if (!octets)
+				{
+					char message[160];
+					snprintf(message, sizeof(message),
+						"parameter %u is binary; bind it to a BLOB or a BINARY/VARBINARY (OCTETS) column", i);
+					setError(message);
+					return false;
+				}
+
+				// No conversion: IUtil::convert reads its source as text in a
+				// character set and refused bytes that are not.  The message
+				// holds an OCTETS value as the bytes themselves.
+				const std::string& bytes = values[i].text;
+				if (bytes.size() > f.length)
+				{
+					char message[160];
+					snprintf(message, sizeof(message),
+						"parameter %u is %u bytes, longer than its column's %u", i,
+						static_cast<unsigned>(bytes.size()), f.length);
+					setError(message);
+					return false;
+				}
+				unsigned char* at = buffer.data() + f.offset;
+				if (f.type == SQL_VARYING)
+				{
+					const unsigned short n = static_cast<unsigned short>(bytes.size());
+					memcpy(at, &n, sizeof(n));
+					memcpy(at + sizeof(n), bytes.data(), bytes.size());
+				}
+				else
+				{
+					// BINARY(n) is padded with zero bytes, as Firebird pads it.
+					memset(at, 0, f.length);
+					memcpy(at, bytes.data(), bytes.size());
+				}
 				continue;
 			}
 
@@ -1528,6 +1579,7 @@ private:
 		unsigned length = 0;
 		unsigned offset = 0;
 		unsigned nullOffset = 0;
+		unsigned charSet = 0;
 	};
 
 	/** Write `text` as a new blob in the bound transaction; its id into `id`. */

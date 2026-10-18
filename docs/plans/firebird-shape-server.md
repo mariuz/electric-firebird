@@ -91,8 +91,9 @@ Postgres: `SMALLINT` int2, `INTEGER` int4, `BIGINT` int8, `NUMERIC`/`DECIMAL`
 and `INT128` numeric (rendered by Firebird, exact), `FLOAT` float4, `DOUBLE
 PRECISION` float8 (the shortest text that reads back as the same double),
 `BOOLEAN` bool, `CHAR` bpchar, `VARCHAR` varchar, text `BLOB` text, `DATE`,
-`TIME` and `TIMESTAMP` (Firebird's text), the `WITH TIME ZONE` types in UTC.
-`DECFLOAT` and binary BLOBs are reported as types the client refuses by name.
+`TIME` and `TIMESTAMP` (Firebird's text), the `WITH TIME ZONE` types in UTC,
+a binary `BLOB`, `BINARY` and `VARBINARY` bytea (Postgres's `\x` hex).
+`DECFLOAT` is reported as a type the client refuses by name.
 
 ## Out of the prototype
 

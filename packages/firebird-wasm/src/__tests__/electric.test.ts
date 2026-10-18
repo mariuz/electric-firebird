@@ -8,7 +8,7 @@
  * the real engine, in e2e/tests/browser-electric.spec.ts.
  */
 
-import { syncShapeToTable, tableFromSchema, toFirebird, firebirdColumn, firebirdName, checkSchema } from '../electric';
+import { syncShapeToTable, syncShapesToTables, tableFromSchema, toFirebird, firebirdColumn, firebirdName, checkSchema } from '../electric';
 import type { ElectricDatabase, ElectricSchema, ElectricTransaction } from '../electric';
 import type { FirebirdBrowser } from '../browser/firebird-browser';
 
@@ -93,6 +93,10 @@ function scriptedStream() {
     }
     unsubscribeAll() {
       this.callback = null;
+    }
+    refreshes = 0;
+    async forceDisconnectAndRefresh() {
+      this.refreshes++;
     }
     /** Simulate a response: its schema header, then its messages. */
     async deliver(messages: unknown[], offset: string, schema?: ElectricSchema) {
@@ -224,9 +228,9 @@ describe('syncShapeToTable', () => {
     const { sync, stream, errors } = await start(db);
     await stream.deliver(
       [insert({ id: '1', blob: '\\x00' }), upToDate], '1_0',
-      { id: { type: 'int4', pk_index: 0 }, blob: { type: 'bytea' }, at: { type: 'interval' } },
+      { id: { type: 'int4', pk_index: 0 }, span: { type: 'tsrange' }, at: { type: 'interval' } },
     );
-    await expect(sync.upToDate).rejects.toThrow(/blob \(bytea\)[\s\S]*at \(interval\)/);
+    await expect(sync.upToDate).rejects.toThrow(/span \(tsrange\)[\s\S]*at \(interval\)/);
     expect(errors).toHaveLength(1);
     expect(db.committed.filter((t) => t.some((s) => s.sql.includes('"ITEMS"')))).toHaveLength(0);
   });
@@ -249,6 +253,95 @@ describe('syncShapeToTable', () => {
   });
 });
 
+describe('syncShapesToTables', () => {
+  const TAGS: ElectricSchema = { id: { type: 'int4', pk_index: 0, not_null: true }, item: { type: 'int4' } };
+  const at = (lsn: string) => ({ headers: { control: 'up-to-date', global_last_seen_lsn: lsn } });
+  /** Data statements of every commit, per commit, without the bookkeeping. */
+  const commits = (db: FakeDb) => db.committed
+    .map((t) => t.filter((s) => /"(ITEMS|TAGS)"/.test(s.sql)).map((s) => s.sql.split(' (')[0]!.replace('UPDATE OR INSERT INTO', 'upsert')))
+    .filter((t) => t.length > 0);
+
+  async function startTwo(db: FakeDb, key: string | null = 'app') {
+    const { FakeStream, created } = scriptedStream();
+    const errors: Error[] = [];
+    const sync = await syncShapesToTables(db, {
+      shapes: {
+        items: { shape: { url: 'http://electric.test/v1/shape', params: { table: 'items' } }, table: 'items' },
+        tags: { shape: { url: 'http://electric.test/v1/shape', params: { table: 'tags' } }, table: 'tags' },
+      },
+      key,
+      onError: (e) => errors.push(e),
+      ShapeStream: FakeStream as never,
+    });
+    return { sync, items: created[0]!.instance, tags: created[1]!.instance, created, errors };
+  }
+
+  it('commits nothing until every shape is up to date, then all of it in one transaction', async () => {
+    const db = new FakeDb();
+    const { sync, items, tags } = await startTwo(db);
+    await items.deliver([insert({ id: '1', title: 'a', done: 'f' }), upToDate], '1_0', SCHEMA);
+    expect(commits(db)).toEqual([]);
+    await tags.deliver([insert({ id: '7', item: '1' }), upToDate], '1_0', TAGS);
+    await sync.upToDate;
+    expect(commits(db)).toEqual([['DELETE FROM "ITEMS"', 'upsert "ITEMS"', 'DELETE FROM "TAGS"', 'upsert "TAGS"']]);
+    expect([...db.metadata.keys()].sort()).toEqual(['app:items', 'app:tags']);
+    // One event per commit, named after the key.
+    expect(db.committed[db.committed.length - 1]!.filter((s) => s.sql.startsWith('EXECUTE BLOCK')).map((s) => s.params))
+      .toEqual([['electric_app']]);
+  });
+
+  it('waits while a shape is mid-transaction', async () => {
+    const db = new FakeDb();
+    const { items, tags } = await startTwo(db);
+    await items.deliver([upToDate], '1_0', SCHEMA);
+    await tags.deliver([upToDate], '1_0', TAGS);
+    const before = commits(db).length;
+    // tags has a change and no up-to-date yet: items' next batch waits for it.
+    await tags.deliver([insert({ id: '8', item: '2' })], '2_0');
+    await items.deliver([insert({ id: '2', title: 'b', done: 't' }), upToDate], '2_0');
+    expect(commits(db).length).toBe(before);
+    await tags.deliver([upToDate], '2_0');
+    expect(commits(db).slice(before)).toEqual([['upsert "ITEMS"', 'upsert "TAGS"']]);
+  });
+
+  it('holds a batch until every shape has seen the same Postgres position, refreshing one behind', async () => {
+    const db = new FakeDb();
+    const { items, tags } = await startTwo(db);
+    await items.deliver([at('100')], '1_0', SCHEMA);
+    await tags.deliver([at('100')], '1_0', TAGS);
+    const before = commits(db).length;
+    // A transaction wrote to both: items has its part, tags is idle at 100.
+    await items.deliver([insert({ id: '3', title: 'c', done: 'f' }), at('120')], '2_0');
+    expect(commits(db).length).toBe(before);
+    expect(tags.refreshes).toBe(1);
+    // Refreshed, tags brings its part of the same transaction.
+    await tags.deliver([insert({ id: '9', item: '3' }), at('120')], '2_0');
+    expect(commits(db).slice(before)).toEqual([['upsert "ITEMS"', 'upsert "TAGS"']]);
+  });
+
+  it('resumes every shape from its own stored position', async () => {
+    const db = new FakeDb();
+    const first = await startTwo(db);
+    await first.items.deliver([upToDate], '5_1', SCHEMA);
+    first.tags.shapeHandle = 'h2';
+    await first.tags.deliver([upToDate], '6_2', TAGS);
+    await first.sync.unsubscribe();
+
+    const second = await startTwo(db);
+    expect(second.created.map((c) => [c.options['handle'], c.options['offset']])).toEqual([['h1', '5_1'], ['h2', '6_2']]);
+  });
+
+  it('refuses two shapes into one table', async () => {
+    await expect(syncShapesToTables(new FakeDb(), {
+      shapes: {
+        a: { shape: { url: 'http://electric.test/v1/shape' }, table: 'items' },
+        b: { shape: { url: 'http://electric.test/v1/shape' }, table: 'ITEMS' },
+      },
+      key: null,
+    })).rejects.toThrow(/table of its own/);
+  });
+});
+
 describe('values', () => {
   const col = (type: string, extra = {}) => ({ type, ...extra });
 
@@ -267,6 +360,8 @@ describe('values', () => {
     expect(toFirebird('{"a": [1, 2]}', 'c', col('jsonb'))).toBe('{"a": [1, 2]}');
     expect(toFirebird(['a', 'b,c', null], 'c', col('text', { dims: 1 }))).toBe('["a","b,c",null]');
     expect(toFirebird(null, 'c', col('int4'))).toBeNull();
+    expect(toFirebird('\\x00ff800a', 'c', col('bytea'))).toEqual(new Uint8Array([0, 0xff, 0x80, 0x0a]));
+    expect(toFirebird('\\x', 'c', col('bytea'))).toEqual(new Uint8Array(0));
   });
 
   it('refuses values Firebird cannot hold, naming the column', () => {
@@ -274,6 +369,8 @@ describe('values', () => {
     expect(() => toFirebird('NaN', 'price', col('numeric'))).toThrow(/price holds NaN/);
     expect(() => toFirebird('infinity', 'day', col('date'))).toThrow(/day holds infinity/);
     expect(() => toFirebird('maybe', 'ok', col('bool'))).toThrow(/ok holds maybe/);
+    // bytea_output = 'escape' instead of the default hex.
+    expect(() => toFirebird('\\000abc', 'raw', col('bytea'))).toThrow(/raw holds bytea that is not in hex form/);
   });
 
   it('maps names the way the same unquoted word finds them', () => {
@@ -296,6 +393,7 @@ describe('values', () => {
       price: { type: 'numeric', precision: 10, scale: 2 },
       doc: { type: 'jsonb' },
       at: { type: 'timestamptz' },
+      raw: { type: 'bytea' },
     })).toBe(
       'CREATE TABLE "ITEMS" (\n' +
         '  "ID" VARCHAR(36) NOT NULL,\n' +
@@ -303,6 +401,7 @@ describe('values', () => {
         '  "PRICE" NUMERIC(10, 2),\n' +
         '  "DOC" BLOB SUB_TYPE TEXT,\n' +
         '  "AT" TIMESTAMP WITH TIME ZONE,\n' +
+        '  "RAW" BLOB SUB_TYPE BINARY,\n' +
         '  PRIMARY KEY ("ID")\n' +
         ')',
     );

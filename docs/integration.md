@@ -349,14 +349,37 @@ await sync.unsubscribe();
   `time`) must be quoted in your queries: `SELECT "DAY" FROM items`.
 - **Types.** Integers, `numeric` (exact), floats, `boolean`, text, `uuid`,
   `date`, `time`, `timestamp`, `timestamptz` and `timetz`, `json` and `jsonb`
-  (as text), and arrays (as JSON text). A shape with any other type (`bytea`,
-  `interval`, ranges, `money`) is refused before any row is stored, naming
-  the columns: leave them out with the shape's `columns` parameter.
+  (as text), arrays (as JSON text), and `bytea` (as the bytes, in a
+  `BLOB SUB_TYPE BINARY`). A shape with any other type (`interval`, ranges,
+  `money`) is refused before any row is stored, naming the columns: leave
+  them out with the shape's `columns` parameter.
 - **Following it.** The sync posts the event `electric_<shapeKey>` with each
   batch, so `useLiveQuery(sql, { events: ['electric_items'] })` and
   `db.live()` follow it; triggers on the table fire as for any write.
 - **One shape per table**, and one tab syncing a database: with
   `multiTab: 'shared'`, start the sync in the leading tab only.
+- **Several tables together.** `syncShapesToTables` keeps several tables in
+  step in one sync, and applies each batch to all of them in one Firebird
+  transaction, so a Postgres transaction that wrote to two of them never
+  shows in one and not the other:
+
+  ```js
+  import { syncShapesToTables } from 'firebird-wasm/electric';
+
+  const sync = await syncShapesToTables(db, {
+    shapes: {
+      orders: { shape: { url, params: { table: 'orders' } }, table: 'orders' },
+      lines:  { shape: { url, params: { table: 'order_lines' } }, table: 'order_lines' },
+    },
+    key: 'shop',        // positions kept as shop:orders and shop:lines; null starts over
+  });
+  ```
+
+  A batch is applied once every shape has reached up-to-date after the last
+  change it received, and, where the server marks up-to-date with its
+  position in the Postgres log (Electric and the shape server below do), once
+  they are all at the same one: a shape left behind is asked to refresh. It
+  posts one event per batch, `electric_<key>`.
 
 See [plans/electric-sync.md](./plans/electric-sync.md) for the design.
 [`examples/electric`](../examples/electric) is a working app: two tables, one
@@ -399,7 +422,8 @@ read from the table when served and sent as Firebird renders them (exact
 for `BIGINT`, `NUMERIC`, `INT128` and timestamps). Run one server per
 database, and put your own authentication in front of it, as Electric's
 documentation advises for Electric itself. Not yet: `where`, paging of a
-large snapshot, and pruning of the log. See
+large snapshot, and pruning of the log. A binary `BLOB` and a `BINARY` or
+`VARBINARY` column are served as `bytea`. See
 [plans/firebird-shape-server.md](./plans/firebird-shape-server.md).
 
 ---
@@ -508,12 +532,13 @@ await db.query('SELECT * FROM notes WHERE title = ?', [userInput]);
 | `boolean` | `TRUE` / `FALSE` |
 | `Date` | ISO-8601 |
 | `null`, `undefined` | SQL `NULL` |
-| `Uint8Array` | **throws** — binary parameters are not supported |
+| `Uint8Array`, `ArrayBuffer` | the bytes themselves, into a `BLOB` or a `BINARY` / `VARBINARY` (`OCTETS`) column; any other column refuses them |
 | `NaN`, `Infinity`, plain objects | **throws** |
 
 Values cross as text and are converted using the statement's declared
-parameter metadata, so the engine's own coercion rules apply. Binary throws
-rather than being silently mangled.
+parameter metadata, so the engine's own coercion rules apply. Bytes are the
+exception: they are never text, so they go only where bytes are kept, and a
+`Uint8Array` bound to a `VARCHAR` throws rather than being read as text.
 
 ### Reading values back
 

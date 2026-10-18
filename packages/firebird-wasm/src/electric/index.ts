@@ -47,7 +47,7 @@ export interface SyncShapeToTableOptions {
    * The shape, as `ShapeStream` takes it: `url` of Electric's `/v1/shape`
    * (or a proxy in front of it), and `params` with at least `table`.
    */
-  shape: Omit<ShapeStreamOptions, 'parser' | 'transformer' | 'columnMapper' | 'offset' | 'handle'>;
+  shape: ShapeOptions;
   /** The Firebird table the rows go to, as written in Firebird SQL. */
   table: string;
   /**
@@ -72,7 +72,39 @@ export interface SyncShapeToTableOptions {
   ShapeStream?: typeof ShapeStream;
 }
 
-/** A running sync.  Returned by {@link syncShapeToTable}. */
+/** The shape options a sync passes on to `ShapeStream`. */
+export type ShapeOptions = Omit<ShapeStreamOptions, 'parser' | 'transformer' | 'columnMapper' | 'offset' | 'handle'>;
+
+/** One shape of {@link syncShapesToTables}. */
+export interface ShapeTableOptions {
+  /** The shape, as {@link SyncShapeToTableOptions.shape}. */
+  shape: ShapeOptions;
+  /** The Firebird table its rows go to. */
+  table: string;
+  /** The primary key, as Postgres column names.  Default: the shape's own. */
+  primaryKey?: string[];
+  /** Firebird column names for Postgres columns. */
+  columns?: Record<string, string>;
+}
+
+/** Options of {@link syncShapesToTables}. */
+export interface SyncShapesToTablesOptions {
+  /** The shapes, by a name of your choosing; one table each. */
+  shapes: Record<string, ShapeTableOptions>;
+  /**
+   * Where the positions are kept (one per shape, under `<key>:<name>`), so
+   * the next sync resumes; `null` starts over every time.
+   */
+  key: string | null;
+  /** The event posted once per committed batch.  Default `electric_<key>`, or none without a key. */
+  event?: string | null;
+  /** Called when the sync stops on an error.  Default: console.error. */
+  onError?: (error: Error) => void;
+  /** For tests: the ShapeStream class to use. */
+  ShapeStream?: typeof ShapeStream;
+}
+
+/** A running sync.  Returned by {@link syncShapeToTable} and {@link syncShapesToTables}. */
 export interface ShapeSync {
   /** Resolves when the first complete copy of the shape is in; rejects if the sync stops before. */
   readonly upToDate: Promise<void>;
@@ -100,44 +132,120 @@ export async function syncShapeToTable(
   db: ElectricDatabase,
   options: SyncShapeToTableOptions,
 ): Promise<ShapeSync> {
-  const table = firebirdName(options.table);
-  const column = (name: string) =>
-    options.columns?.[name] !== undefined ? firebirdName(options.columns[name]) : defaultColumn(name);
-  const eventName = options.event === undefined
-    ? `electric_${options.shapeKey ?? options.table}`
-    : options.event;
-  const report = options.onError ?? ((e: Error) => console.error('[firebird-wasm/electric] sync stopped', e));
+  return syncShapes(db, {
+    shapes: [{
+      shape: options.shape,
+      table: options.table,
+      primaryKey: options.primaryKey,
+      columns: options.columns,
+      positionKey: options.shapeKey,
+    }],
+    event: options.event === undefined ? `electric_${options.shapeKey ?? options.table}` : options.event,
+    onError: options.onError,
+    ShapeStream: options.ShapeStream,
+  });
+}
 
-  // Where a previous sync stopped.
-  let position: { handle: string; offset: string; schema: ElectricSchema } | undefined;
-  // Its own transaction: Firebird applies DDL at commit, so a table made in
-  // a transaction cannot be read in that same transaction.
+/**
+ * Keep several tables in step with several shapes, together: every batch is
+ * applied in one Firebird transaction with all the shapes' positions, so a
+ * Postgres transaction that wrote to two of them never shows in one table
+ * and not the other.
+ *
+ * A batch is applied once every shape has reached up-to-date after the last
+ * change it received.  Electric marks each up-to-date with the last
+ * Postgres position it has seen (`global_last_seen_lsn`); where it does, the
+ * shapes must also be at the same one, and a shape behind is asked to
+ * refresh, so the batch holds the whole of each transaction it holds any of.
+ * The tables must exist.
+ */
+export async function syncShapesToTables(
+  db: ElectricDatabase,
+  options: SyncShapesToTablesOptions,
+): Promise<ShapeSync> {
+  const names = Object.keys(options.shapes);
+  if (names.length === 0) throw new RangeError('syncShapesToTables needs at least one shape');
+  const tables = names.map((n) => firebirdName(options.shapes[n]!.table));
+  if (new Set(tables).size !== tables.length) throw new RangeError('Each shape needs a table of its own');
+  return syncShapes(db, {
+    shapes: names.map((name) => ({
+      ...options.shapes[name]!,
+      positionKey: options.key === null ? null : `${options.key}:${name}`,
+    })),
+    event: options.event === undefined ? (options.key === null ? null : `electric_${options.key}`) : options.event,
+    onError: options.onError,
+    ShapeStream: options.ShapeStream,
+  });
+}
+
+interface ShapeSpec extends ShapeTableOptions {
+  /** The ELECTRIC_SHAPES key of its position, or null to start over. */
+  positionKey: string | null;
+}
+
+/** One shape's part of a running sync. */
+interface ShapeState {
+  spec: ShapeSpec;
+  table: string;
+  column: (name: string) => string;
+  stream: ShapeStream;
+  abort: AbortController;
+  schema: ElectricSchema | undefined;
+  checked: boolean;
+  /** Operations received since the last commit. */
+  pending: LogEntry[];
+  /** A change came after the last up-to-date: the shape is mid-transaction. */
+  dirty: boolean;
+  /** Has reached up-to-date at least once. */
+  seen: boolean;
+  /** `global_last_seen_lsn` of the last up-to-date, where the server sends it. */
+  lsn: bigint | undefined;
+  /** Position at the last up-to-date: what a commit stores. */
+  handle: string | undefined;
+  offset: string | undefined;
+  /** Asked to refresh to catch up with another shape; not again until it answers. */
+  refreshing: boolean;
+}
+
+async function syncShapes(
+  db: ElectricDatabase,
+  options: {
+    shapes: ShapeSpec[];
+    event: string | null;
+    onError?: (error: Error) => void;
+    ShapeStream?: typeof ShapeStream;
+  },
+): Promise<ShapeSync> {
+  const report = options.onError ?? ((e: Error) => console.error('[firebird-wasm/electric] sync stopped', e));
+  const eventName = options.event;
+
+  // Where a previous sync stopped.  Its own transaction first: Firebird
+  // applies DDL at commit, so a table made in a transaction cannot be read
+  // in that same transaction.
   await ensureMetadata(db);
+  const positions = new Map<string, { handle: string; offset: string; schema: ElectricSchema }>();
   await db.transaction(async (tx) => {
-    if (options.shapeKey !== null) {
+    for (const spec of options.shapes) {
+      if (spec.positionKey === null) continue;
       const { rows } = await tx.query(
         `SELECT SHAPE_HANDLE, SHAPE_OFFSET, SHAPE_SCHEMA FROM ${METADATA} WHERE SHAPE_KEY = ?`,
-        [options.shapeKey],
+        [spec.positionKey],
       );
       const row = rows[0];
       if (row && row['SHAPE_HANDLE'] && row['SHAPE_OFFSET']) {
-        position = {
+        positions.set(spec.positionKey, {
           handle: String(row['SHAPE_HANDLE']),
           offset: String(row['SHAPE_OFFSET']),
           schema: JSON.parse(String(row['SHAPE_SCHEMA'] ?? '{}')) as ElectricSchema,
-        };
+        });
       }
     }
   });
 
-  let schema: ElectricSchema | undefined = position?.schema;
-  let checked = false;
-  // Operations received since the last up-to-date; applied together at the next.
-  let pending: LogEntry[] = options.shapeKey === null || !position ? [{ kind: 'reset' }] : [];
   let upToDate = false;
   let failure: Error | undefined;
   let stopped = false;
-  let applying: Promise<void> = Promise.resolve();
+  let committing: Promise<void> = Promise.resolve();
 
   let resolveReady!: () => void;
   let rejectReady!: (e: Error) => void;
@@ -147,40 +255,16 @@ export async function syncShapeToTable(
   });
   ready.catch(() => undefined);
 
-  const abort = new AbortController();
-  const userSignal = options.shape.signal;
-  if (userSignal) userSignal.addEventListener('abort', () => abort.abort(), { once: true });
-
-  // The schema arrives as a header, which the client does not hand on.
-  const baseFetch: typeof fetch = options.shape.fetchClient ?? ((...args) => fetch(...args));
-  const fetchClient: typeof fetch = async (input, init) => {
-    const response = await baseFetch(input, init);
-    const header = response.headers.get('electric-schema');
-    if (header) {
-      schema = JSON.parse(header) as ElectricSchema;
-      checked = false;
-    }
-    return response;
-  };
-
   const Stream = options.ShapeStream ?? ShapeStream;
-  const stream = new Stream({
-    ...options.shape,
-    signal: abort.signal,
-    fetchClient,
-    parser: KEEP_TEXT,
-    ...(position ? { handle: position.handle, offset: position.offset as ShapeStreamOptions['offset'] } : {}),
-    onError: (error: Error) => {
-      // The client has already retried what it retries; this is final.
-      void stop(error);
-    },
-  });
+  const states: ShapeState[] = [];
 
   const stop = async (error?: Error) => {
     if (stopped) return;
     stopped = true;
-    abort.abort();
-    stream.unsubscribeAll();
+    for (const s of states) {
+      s.abort.abort();
+      s.stream.unsubscribeAll();
+    }
     if (error) {
       failure = error;
       rejectReady(error);
@@ -188,32 +272,34 @@ export async function syncShapeToTable(
     }
   };
 
-  const apply = async (entries: LogEntry[]) => {
-    if (!schema) throw new Error('Electric sent rows before a schema; the sync cannot map them');
-    if (!checked) {
-      checkSchema(schema);
-      checked = true;
-    }
-    const target = {
-      table,
-      column,
-      schema,
-      primaryKey: options.primaryKey ?? primaryKeyOf(schema),
-    };
-    if (target.primaryKey.length === 0) {
-      throw new Error(`The shape of ${options.table} has no primary key; pass primaryKey`);
-    }
-    const handle = stream.shapeHandle;
-    const offset = String(stream.lastOffset);
-    const schemaText = JSON.stringify(schema);
+  /** Apply every shape's pending operations, and every position, in one transaction. */
+  const commit = async () => {
+    const batch = states.map((s) => ({ s, entries: s.pending, handle: s.handle, offset: s.offset }));
+    for (const s of states) s.pending = [];
+    const targets = batch.map(({ s }) => {
+      const schema = s.schema;
+      if (!schema) throw new Error('Electric sent rows before a schema; the sync cannot map them');
+      if (!s.checked) {
+        checkSchema(schema);
+        s.checked = true;
+      }
+      const primaryKey = s.spec.primaryKey ?? primaryKeyOf(schema);
+      if (primaryKey.length === 0) {
+        throw new Error(`The shape of ${s.spec.table} has no primary key; pass primaryKey`);
+      }
+      return { table: s.table, column: s.column, schema, primaryKey };
+    });
     await db.transaction(async (tx) => {
-      await applyEntries(tx, target, entries);
-      if (options.shapeKey !== null && handle) {
-        await tx.exec(
-          `UPDATE OR INSERT INTO ${METADATA} (SHAPE_KEY, SHAPE_HANDLE, SHAPE_OFFSET, SHAPE_SCHEMA) ` +
-            'VALUES (?, ?, ?, ?) MATCHING (SHAPE_KEY)',
-          [options.shapeKey, handle, offset, schemaText],
-        );
+      for (let i = 0; i < batch.length; i++) {
+        const { s, entries, handle, offset } = batch[i]!;
+        await applyEntries(tx, targets[i]!, entries);
+        if (s.spec.positionKey !== null && handle && offset) {
+          await tx.exec(
+            `UPDATE OR INSERT INTO ${METADATA} (SHAPE_KEY, SHAPE_HANDLE, SHAPE_OFFSET, SHAPE_SCHEMA) ` +
+              'VALUES (?, ?, ?, ?) MATCHING (SHAPE_KEY)',
+            [s.spec.positionKey, handle, offset, JSON.stringify(targets[i]!.schema)],
+          );
+        }
       }
       if (eventName) {
         await tx.exec(
@@ -222,33 +308,112 @@ export async function syncShapeToTable(
         );
       }
     });
+    if (!upToDate) {
+      upToDate = true;
+      resolveReady();
+    }
   };
 
-  stream.subscribe(async (messages: Message<ElectricRow>[]) => {
-    if (stopped) return;
-    for (const message of messages) {
-      if (isChangeMessage(message)) {
-        pending.push({ kind: message.headers.operation, value: message.value as Record<string, unknown> });
-      } else if (isControlMessage(message) && message.headers.control === 'must-refetch') {
-        // What came before belongs to a shape that no longer exists.
-        pending = [{ kind: 'reset' }];
-      } else if (isControlMessage(message) && message.headers.control === 'up-to-date') {
-        const entries = pending;
-        pending = [];
-        applying = applying.then(() => apply(entries));
-        try {
-          await applying;
-        } catch (err) {
-          await stop(err instanceof Error ? err : new Error(String(err)));
-          return;
+  /** Commit if every shape is at a transaction boundary, and the same one where that is known. */
+  const settle = async () => {
+    if (stopped || states.some((s) => !s.seen || s.dirty)) return;
+    const lsns = states.map((s) => s.lsn);
+    if (lsns.every((l) => l !== undefined)) {
+      const top = lsns.reduce((a, b) => (b! > a! ? b : a))!;
+      const behind = states.filter((s) => s.lsn! < top);
+      if (behind.length > 0) {
+        // Idle in a long poll since an earlier position: ask for the current one.
+        for (const s of behind) {
+          if (s.refreshing) continue;
+          s.refreshing = true;
+          void s.stream.forceDisconnectAndRefresh?.().catch(() => undefined);
         }
-        if (!upToDate) {
-          upToDate = true;
-          resolveReady();
-        }
+        return;
       }
     }
-  });
+    committing = committing.then(commit);
+    await committing;
+  };
+
+  for (const spec of options.shapes) {
+    const position = spec.positionKey === null ? undefined : positions.get(spec.positionKey);
+    const abort = new AbortController();
+    const userSignal = spec.shape.signal;
+    if (userSignal) userSignal.addEventListener('abort', () => abort.abort(), { once: true });
+
+    const state: ShapeState = {
+      spec,
+      table: firebirdName(spec.table),
+      column: (name: string) =>
+        spec.columns?.[name] !== undefined ? firebirdName(spec.columns[name]) : defaultColumn(name),
+      stream: undefined as unknown as ShapeStream,
+      abort,
+      schema: position?.schema,
+      checked: false,
+      pending: position ? [] : [{ kind: 'reset' }],
+      dirty: false,
+      seen: false,
+      lsn: undefined,
+      handle: position?.handle,
+      offset: position?.offset,
+      refreshing: false,
+    };
+
+    // The schema arrives as a header, which the client does not hand on.
+    const baseFetch: typeof fetch = spec.shape.fetchClient ?? ((...args) => fetch(...args));
+    const fetchClient: typeof fetch = async (input, init) => {
+      const response = await baseFetch(input, init);
+      const header = response.headers.get('electric-schema');
+      if (header) {
+        state.schema = JSON.parse(header) as ElectricSchema;
+        state.checked = false;
+      }
+      return response;
+    };
+
+    state.stream = new Stream({
+      ...spec.shape,
+      signal: abort.signal,
+      fetchClient,
+      parser: KEEP_TEXT,
+      ...(position ? { handle: position.handle, offset: position.offset as ShapeStreamOptions['offset'] } : {}),
+      onError: (error: Error) => {
+        // The client has already retried what it retries; this is final.
+        void stop(error);
+      },
+    });
+    states.push(state);
+  }
+
+  for (const state of states) {
+    state.stream.subscribe(async (messages: Message<ElectricRow>[]) => {
+      if (stopped) return;
+      for (const message of messages) {
+        if (isChangeMessage(message)) {
+          state.pending.push({ kind: message.headers.operation, value: message.value as Record<string, unknown> });
+          state.dirty = true;
+        } else if (isControlMessage(message) && message.headers.control === 'must-refetch') {
+          // What came before belongs to a shape that no longer exists.
+          state.pending = [{ kind: 'reset' }];
+          state.dirty = true;
+        } else if (isControlMessage(message) && message.headers.control === 'up-to-date') {
+          state.dirty = false;
+          state.seen = true;
+          state.refreshing = false;
+          const lsn = (message.headers as { global_last_seen_lsn?: string }).global_last_seen_lsn;
+          state.lsn = lsn !== undefined && /^\d+$/.test(lsn) ? BigInt(lsn) : undefined;
+          state.handle = state.stream.shapeHandle ?? state.handle;
+          state.offset = String(state.stream.lastOffset);
+          try {
+            await settle();
+          } catch (err) {
+            await stop(err instanceof Error ? err : new Error(String(err)));
+            return;
+          }
+        }
+      }
+    });
+  }
 
   return {
     upToDate: ready,
@@ -260,7 +425,7 @@ export async function syncShapeToTable(
     },
     unsubscribe: async () => {
       await stop();
-      await applying.catch(() => undefined);
+      await committing.catch(() => undefined);
       rejectReady(new Error('The sync was stopped before it was up to date'));
     },
   };

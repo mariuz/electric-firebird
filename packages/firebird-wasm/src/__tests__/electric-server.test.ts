@@ -20,7 +20,7 @@ import { Shape, ShapeStream } from '@electric-sql/client';
 import type { Message, Row } from '@electric-sql/client';
 import { FirebirdLite } from '../firebird';
 import { createShapeServer } from '../electric-server';
-import { syncShapeToTable } from '../electric';
+import { syncShapeToTable, syncShapesToTables } from '../electric';
 import type { ElectricDatabase } from '../electric';
 import type { ShapeServer } from '../electric-server';
 
@@ -108,12 +108,12 @@ describeIfFirebird('createShapeServer against a Firebird server', () => {
     await source.exec(
       'CREATE TABLE items (id INTEGER NOT NULL PRIMARY KEY, small SMALLINT, big BIGINT, price NUMERIC(10,2), ' +
         'ratio DOUBLE PRECISION, title VARCHAR(40), code CHAR(3), done BOOLEAN, note BLOB SUB_TYPE TEXT, ' +
-        `day_ DATE, at_ TIME, ts TIMESTAMP${zoned})`);
+        `day_ DATE, at_ TIME, ts TIMESTAMP, raw BLOB SUB_TYPE BINARY, bin VARCHAR(4) CHARACTER SET OCTETS${zoned})`);
     await source.exec('CREATE TABLE pairs (a INTEGER NOT NULL, b VARCHAR(10) NOT NULL, v VARCHAR(20), PRIMARY KEY (a, b))');
     await source.exec(
-      'INSERT INTO items (id, small, big, price, ratio, title, code, done, note, day_, at_, ts) VALUES ' +
+      'INSERT INTO items (id, small, big, price, ratio, title, code, done, note, day_, at_, ts, raw, bin) VALUES ' +
         "(1, -2, 9007199254740993, 12.5, 0.1, 'it''s', 'ab', TRUE, 'a note longer than nothing', '2024-02-29', " +
-        "'13:45:01.5', '2024-05-01 12:00:00.1234')");
+        "'13:45:01.5', '2024-05-01 12:00:00.1234', x'00ff800a', x'ff0080')");
     if (major >= 4) {
       await source.exec(
         "UPDATE items SET tstz = TIMESTAMP '2024-05-01 12:00:00 +02:00', huge = 170141183460469231731687303715884105727 WHERE id = 1");
@@ -160,6 +160,8 @@ describeIfFirebird('createShapeServer against a Firebird server', () => {
       day_: { type: 'date' },
       at_: { type: 'time' },
       ts: { type: 'timestamp' },
+      raw: { type: 'bytea' },
+      bin: { type: 'bytea' },
     });
     if (major >= 4) expect(schema).toMatchObject({ tstz: { type: 'timestamptz' }, huge: { type: 'numeric' } });
   });
@@ -172,6 +174,8 @@ describeIfFirebird('createShapeServer against a Firebird server', () => {
       id: '1', small: '-2', big: '9007199254740993', price: '12.50', ratio: '0.1', title: "it's",
       code: 'ab ', done: 'true', note: 'a note longer than nothing', day_: '2024-02-29',
       at_: '13:45:01.5000', ts: '2024-05-01 12:00:00.1234',
+      // Postgres's hex form, byte for byte: a binary BLOB and a VARBINARY.
+      raw: '\\x00ff800a', bin: '\\xff0080',
     });
     if (major >= 4) {
       expect(rows[0]).toMatchObject({
@@ -329,6 +333,54 @@ describeIfFirebird('createShapeServer against a Firebird server', () => {
         await sync.unsubscribe();
       }
     } finally {
+      await target.close();
+    }
+  });
+
+  it('syncs two shapes into a FirebirdLite database together: a transaction lands in both or neither', async () => {
+    const targetPath = `${host}:${path.join(os.tmpdir(), `shapes-target-${Date.now()}.fdb`)}`;
+    const target = new FirebirdLite(targetPath, credentials);
+    let reader: FirebirdLite | undefined;
+    try {
+      await target.exec('CREATE TABLE items (id INTEGER NOT NULL PRIMARY KEY, title VARCHAR(40))');
+      await target.exec('CREATE TABLE pairs (a INTEGER NOT NULL, b VARCHAR(10) NOT NULL, v VARCHAR(20), PRIMARY KEY (a, b))');
+      const sync = await syncShapesToTables(target as unknown as ElectricDatabase, {
+        shapes: {
+          items: { shape: { url, params: { table: 'items', columns: ['id', 'title'] } }, table: 'items' },
+          pairs: { shape: { url, params: { table: 'pairs' } }, table: 'pairs' },
+        },
+        key: 'both',
+        onError: () => undefined,
+      });
+      try {
+        await sync.upToDate;
+        // Each commit of the target holds the whole of each source transaction:
+        // a reader (on a connection of its own) never sees item 40 without its
+        // pair, or the other way round.
+        reader = new FirebirdLite(targetPath, credentials);
+        const seen: string[] = [];
+        let watching = true;
+        const watch = (async () => {
+          while (watching) {
+            const { rows } = await reader!.query<{ I: number; P: number }>(
+              "SELECT (SELECT COUNT(*) FROM items WHERE id = 40) AS i, (SELECT COUNT(*) FROM pairs WHERE a = 40) AS p FROM rdb$database");
+            seen.push(`${rows[0]!.I}${rows[0]!.P}`);
+            await new Promise((r) => setTimeout(r, 5));
+          }
+        })();
+        await source.transaction(async (tx) => {
+          await tx.exec("INSERT INTO items (id, title) VALUES (40, 'with a pair')");
+          await tx.exec("INSERT INTO pairs VALUES (40, 'z', 'pair of 40')");
+        });
+        await until(() => seen[seen.length - 1], (v) => v === '11', 'both rows');
+        watching = false;
+        await watch;
+        expect(seen.filter((v) => v === '10' || v === '01')).toEqual([]);
+      } finally {
+        await sync.unsubscribe();
+      }
+    } finally {
+      await reader?.close();
       await target.close();
     }
   });
