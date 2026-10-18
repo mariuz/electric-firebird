@@ -496,7 +496,7 @@ export class FirebirdTransaction {
       const lease = await this.statements.acquire(this.transaction, statement.sql);
       let failed = true;
       try {
-        await lease.stmt.execute(this.transaction, await blobsAsBuffers(lease.stmt, statement.params));
+        await lease.stmt.execute(this.transaction, await bindParams(lease.stmt, this.transaction, statement.params));
         failed = false;
       } finally {
         await lease.release(failed);
@@ -525,7 +525,7 @@ export class FirebirdTransaction {
         await this.executeInBlocks(lease.stmt, plan, rows);
       } else {
         for (const row of rows) {
-          await lease.stmt.execute(this.transaction, await blobsAsBuffers(lease.stmt, row));
+          await lease.stmt.execute(this.transaction, await bindParams(lease.stmt, this.transaction, row));
         }
       }
       failed = false;
@@ -579,7 +579,7 @@ export class FirebirdTransaction {
       for (let at = 0; at < rows.length; ) {
         const chunk = rows.slice(at, at + size);
         if (chunk.length === 1) {
-          await single.execute(this.transaction, await blobsAsBuffers(single, chunk[0]!));
+          await single.execute(this.transaction, await bindParams(single, this.transaction, chunk[0]!));
           at += 1;
           continue;
         }
@@ -597,10 +597,10 @@ export class FirebirdTransaction {
           }
         }
         try {
-          await current.lease.stmt.execute(this.transaction, await blobsAsBuffers(current.lease.stmt, chunk.flat()));
+          await current.lease.stmt.execute(this.transaction, await bindParams(current.lease.stmt, this.transaction, chunk.flat()));
         } catch {
           for (const row of chunk) {
-            await single.execute(this.transaction, await blobsAsBuffers(single, row));
+            await single.execute(this.transaction, await bindParams(single, this.transaction, row));
           }
         }
         at += chunk.length;
@@ -662,26 +662,87 @@ export class FirebirdTransaction {
  * one of the engine's 256 contexts per row, so 200 leaves room. */
 const BLOCK_ROWS = 200;
 
+// The driver's statement internals this file reads and, for text, rewrites.
+// Not public API: each use checks they are there and falls back to the
+// driver's own behaviour when they are not.
+
+interface NativeMetadata {
+  getCountSync(status: unknown): number;
+  getTypeSync(status: unknown, i: number): number;
+  getSubTypeSync(status: unknown, i: number): number;
+  getLengthSync(status: unknown, i: number): number;
+  getScaleSync(status: unknown, i: number): number;
+  getCharSetSync(status: unknown, i: number): number;
+  getMessageLengthSync(status: unknown): number;
+  getBuilderSync(status: unknown): NativeMetadataBuilder;
+  releaseSync(): number;
+}
+
+interface NativeMetadataBuilder {
+  setTypeSync(status: unknown, i: number, type: number): void;
+  setSubTypeSync(status: unknown, i: number, subType: number): void;
+  setLengthSync(status: unknown, i: number, length: number): void;
+  setCharSetSync(status: unknown, i: number, charSet: number): void;
+  setScaleSync(status: unknown, i: number, scale: number): void;
+  getMetadataSync(status: unknown): NativeMetadata;
+  releaseSync(): number;
+}
+
+/** What the driver encodes a statement's parameters with: the message and its writer. */
+interface InputMessage {
+  inMetadata: NativeMetadata;
+  inBuffer: Uint8Array;
+  dataWriter: unknown;
+}
+
+type NativeStatement = Partial<InputMessage> & {
+  attachment?: Attachment & {
+    client?: { statusAction?: <T>(fn: (status: unknown) => Promise<T>) => Promise<T> };
+  };
+  internalDispose?: () => Promise<void>;
+  statementHandle?: { getInputMetadataAsync?: (status: unknown) => Promise<NativeMetadata | undefined> };
+};
+
+/** A statement's parameters as prepared, and the input messages made for text. */
+interface Binding {
+  params: ParamDescriptor[] | undefined;
+  /** The driver's own message, kept while another is in place. */
+  original?: InputMessage;
+  /** Messages by the positions they take as text: `"1,3"`. */
+  variants: Map<string, InputMessage>;
+  /** The positions of the message in place; `''` is the driver's own. */
+  current: string;
+}
+
+const bindings = new WeakMap<Statement, Binding>();
+
+async function bindingOf(stmt: Statement): Promise<Binding> {
+  let binding = bindings.get(stmt);
+  if (!binding) {
+    // Read before anything here rewrites the message; a statement is used
+    // by one call at a time, so nothing else reads it meanwhile.
+    binding = { params: await readInputParams(stmt), variants: new Map(), current: '' };
+    bindings.set(stmt, binding);
+  }
+  return binding;
+}
+
 /**
- * The driver's description of a statement's `?` parameters: its input
- * metadata, after the driver's own rewrites (integers bound as doubles,
- * CHAR as VARCHAR). Not public API: read from the native statement's
- * fields, and `undefined` whenever they are not there, so a driver that
- * changes shape makes `execBatch` fall back to one execute per row.
+ * A statement's `?` parameters: its input metadata as the driver rewrote it
+ * (CHAR as VARCHAR, the zoned types in their `_EX` forms), except that an
+ * integer or NUMERIC parameter, which the driver binds as a double, is
+ * described as prepared: SMALLINT, INTEGER or BIGINT, with its scale. That is
+ * what `execBatch` declares a block's parameters as, and what tells a string
+ * to send as text. `undefined` whenever the internals are not there, so a
+ * driver that changes shape makes `execBatch` fall back to one execute per
+ * row and strings go to the driver as they are.
  */
 async function inputParams(stmt: Statement): Promise<ParamDescriptor[] | undefined> {
-  interface Metadata {
-    getCountSync(status: unknown): number;
-    getTypeSync(status: unknown, i: number): number;
-    getSubTypeSync(status: unknown, i: number): number;
-    getLengthSync(status: unknown, i: number): number;
-    getScaleSync(status: unknown, i: number): number;
-    getCharSetSync(status: unknown, i: number): number;
-  }
-  const internal = stmt as unknown as {
-    inMetadata?: Metadata;
-    attachment?: { client?: { statusAction?: <T>(fn: (status: unknown) => Promise<T>) => Promise<T> } };
-  };
+  return (await bindingOf(stmt)).params;
+}
+
+async function readInputParams(stmt: Statement): Promise<ParamDescriptor[] | undefined> {
+  const internal = stmt as unknown as NativeStatement;
   const meta = internal.inMetadata;
   const client = internal.attachment?.client;
   if (!meta || typeof meta.getCountSync !== 'function' || typeof client?.statusAction !== 'function') {
@@ -689,17 +750,29 @@ async function inputParams(stmt: Statement): Promise<ParamDescriptor[] | undefin
   }
   try {
     return await client.statusAction(async (status) => {
+      const read = (m: NativeMetadata, i: number): ParamDescriptor => ({
+        type: m.getTypeSync(status, i),
+        subType: m.getSubTypeSync(status, i),
+        length: m.getLengthSync(status, i),
+        scale: m.getScaleSync(status, i),
+        charSet: m.getCharSetSync(status, i),
+      });
       const params: ParamDescriptor[] = [];
-      for (let i = 0, n = meta.getCountSync(status); i < n; i++) {
-        params.push({
-          type: meta.getTypeSync(status, i),
-          subType: meta.getSubTypeSync(status, i),
-          length: meta.getLengthSync(status, i),
-          scale: meta.getScaleSync(status, i),
-          charSet: meta.getCharSetSync(status, i),
+      for (let i = 0, n = meta.getCountSync(status); i < n; i++) params.push(read(meta, i));
+
+      if (!params.some((p) => (p.type & ~1) === SQL_DOUBLE)) return params;
+      // The metadata as prepared, before the driver's rewrite.
+      const prepared = await internal.statementHandle?.getInputMetadataAsync?.(status);
+      if (!prepared) return params;
+      try {
+        return params.map((p, i) => {
+          if ((p.type & ~1) !== SQL_DOUBLE) return p;
+          const as = read(prepared, i);
+          return INTEGER_TYPES.has(as.type & ~1) ? as : p;
         });
+      } finally {
+        prepared.releaseSync();
       }
-      return params;
     });
   } catch {
     return undefined;
@@ -708,21 +781,198 @@ async function inputParams(stmt: Statement): Promise<ParamDescriptor[] | undefin
 
 /** `SQL_BLOB`, without the nullable bit. */
 const SQL_BLOB = 520;
+/** `SQL_DOUBLE`: what the driver binds every integer and NUMERIC as. */
+const SQL_DOUBLE = 480;
+/** SMALLINT, INTEGER, BIGINT, and NUMERIC / DECIMAL kept in them. */
+const INTEGER_TYPES: ReadonlySet<number> = new Set([500, 496, 580]);
+/** `SQL_VARYING`. */
+const SQL_VARYING = 448;
+/** Character set id of UTF8. */
+const CS_UTF8 = 4;
+/**
+ * DATE, TIME, TIMESTAMP, and TIME / TIMESTAMP WITH TIME ZONE in both forms
+ * (the driver rewrites the zoned ones to their `_EX` forms).
+ */
+const DATE_TIME_TYPES: ReadonlySet<number> = new Set([570, 560, 510, 32756, 32754, 32750, 32748]);
+/** The types a string is sent to as text, for Firebird to convert. */
+const TEXT_TYPES: ReadonlySet<number> = new Set([...DATE_TIME_TYPES, ...INTEGER_TYPES]);
+/** Bytes a value takes as text: a timestamp with the longest zone name fits twice. */
+const TEXT_LENGTH = 128;
 
 /**
- * A string bound to a BLOB parameter, as its UTF-8 bytes: the driver takes
- * a Buffer or a Blob there and refused a string ("Unrecognized type used as
- * BLOB"), so `INSERT INTO notes (body) VALUES (?)` failed for any text.  The
- * browser engine had the same gap; both now write the text as the blob.
+ * The parameters as the driver will take them, the statement made ready to
+ * take them.
+ *
+ * A string or Buffer bound to a BLOB parameter is written to a new blob here,
+ * and the blob passed on. The driver takes a Buffer or a Blob there and
+ * refused a string ("Unrecognized type used as BLOB"); and given a Buffer,
+ * it writes the blob while encoding the other parameters, under a
+ * `Promise.all` that rejects as soon as one of them fails, with the blob's
+ * native calls still running. The transaction is then rolled back under
+ * them, and the process died with a segmentation fault: a date given as a
+ * string beside a BLOB did it, so did a string too long for its VARCHAR.
+ * Written first, the blob is done before the driver encodes anything, and
+ * nothing is in flight when a parameter fails.
+ *
+ * A string bound to a DATE, TIME or TIMESTAMP parameter (with or without a
+ * time zone) is sent as text, and Firebird converts it: the driver takes a
+ * JS `Date` there (`date.getFullYear is not a function` for a string),
+ * which holds milliseconds where Firebird keeps 1/10000 s, and is read in
+ * the process's time zone. The browser engine binds every parameter as text,
+ * so the same call now means the same there and here, to the last digit.
+ * A `Date` still goes the driver's way.
+ *
+ * So does a string bound to a SMALLINT, INTEGER, BIGINT or NUMERIC parameter:
+ * the driver binds those as doubles, and `'9007199254740993'` arrived as
+ * 9007199254740992, `'0.1'` in a NUMERIC(18,17) as 0.10000000000000001.
+ * A JS number still goes as a double (it is one); a string to a DOUBLE
+ * PRECISION or FLOAT parameter is still converted by JS, which rounds
+ * correctly.
  */
-async function blobsAsBuffers(stmt: Statement, params: QueryParams): Promise<QueryParams> {
-  if (!params.some((p) => typeof p === 'string')) return params;
-  const described = await inputParams(stmt);
+async function bindParams(stmt: Statement, transaction: Transaction, params: QueryParams): Promise<QueryParams> {
+  const binding = bindings.get(stmt);
+  if (!params.some((p) => typeof p === 'string' || Buffer.isBuffer(p)) && (!binding || binding.current === '')) {
+    return params;
+  }
+  const described = (binding ?? (await bindingOf(stmt))).params;
   if (!described) return params;
-  return params.map((p, i) =>
-    typeof p === 'string' && described[i] !== undefined && (described[i]!.type & ~1) === SQL_BLOB
-      ? Buffer.from(p, 'utf8')
-      : p);
+
+  const text: number[] = [];
+  const bound: unknown[] = [...params];
+  for (let i = 0; i < bound.length; i++) {
+    const p = bound[i];
+    const type = (described[i]?.type ?? 0) & ~1;
+    if (type === SQL_BLOB && (typeof p === 'string' || Buffer.isBuffer(p))) {
+      bound[i] = await writeBlob(stmt, transaction, typeof p === 'string' ? Buffer.from(p, 'utf8') : p);
+    } else if (typeof p === 'string' && TEXT_TYPES.has(type)) {
+      text.push(i);
+    }
+  }
+  if (!(await useMessage(stmt, text))) return params;
+  return bound as QueryParams;
+}
+
+/** A new blob holding `bytes`, in `transaction`; `bytes` itself where the driver's internals are not there. */
+async function writeBlob(stmt: Statement, transaction: Transaction, bytes: Buffer): Promise<unknown> {
+  const attachment = (stmt as unknown as NativeStatement).attachment;
+  if (typeof attachment?.createBlob !== 'function') return bytes;
+  const stream = await attachment.createBlob(transaction);
+  try {
+    await stream.write(bytes);
+  } catch (err) {
+    await stream.cancel().catch(() => undefined);
+    throw err;
+  }
+  await stream.close();
+  return stream.blob;
+}
+
+/**
+ * Put in place the input message that takes the parameters at `positions`
+ * as VARCHAR text and every other as the driver prepared it, making it the
+ * first time. False when that cannot be done: the driver's internals are not
+ * what this expects.
+ *
+ * The message is what the driver encodes into and what Firebird reads from;
+ * Firebird converts each value from the message's type to the parameter's,
+ * which is how the driver itself binds every integer as a double. A
+ * statement is used by one call at a time (the cache leases it), so the
+ * message in place is the one this call chose.
+ */
+async function useMessage(stmt: Statement, positions: number[]): Promise<boolean> {
+  const binding = await bindingOf(stmt);
+  const key = positions.join(',');
+  if (binding.current === key) return true;
+  const internal = stmt as unknown as NativeStatement;
+
+  let message = key === '' ? binding.original : binding.variants.get(key);
+  if (!message) {
+    const made = await makeTextMessage(internal, binding, positions);
+    if (!made) return positions.length === 0;
+    if (!binding.original) {
+      binding.original = {
+        inMetadata: internal.inMetadata!,
+        inBuffer: internal.inBuffer!,
+        dataWriter: internal.dataWriter,
+      };
+      releaseMessagesOnDispose(internal, binding);
+    }
+    binding.variants.set(key, made);
+    message = made;
+  }
+  internal.inMetadata = message.inMetadata;
+  internal.inBuffer = message.inBuffer;
+  internal.dataWriter = message.dataWriter;
+  binding.current = key;
+  return true;
+}
+
+let driverUtil: { createDataWriter(d: unknown): unknown; createDescriptors(s: unknown, m: unknown): unknown } | null | undefined;
+
+async function makeTextMessage(
+  internal: NativeStatement,
+  binding: Binding,
+  positions: number[],
+): Promise<InputMessage | undefined> {
+  if (driverUtil === undefined) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      driverUtil = require('node-firebird-driver-native/dist/lib/fb-util');
+      if (typeof driverUtil?.createDataWriter !== 'function' || typeof driverUtil.createDescriptors !== 'function') {
+        driverUtil = null;
+      }
+    } catch {
+      driverUtil = null;
+    }
+  }
+  const util = driverUtil;
+  // Made from the driver's own message, whichever is in place.
+  const base = binding.original?.inMetadata ?? internal.inMetadata;
+  const client = internal.attachment?.client;
+  if (!util || !base || typeof base.getBuilderSync !== 'function' || typeof client?.statusAction !== 'function') {
+    return undefined;
+  }
+  return client.statusAction(async (status) => {
+    const builder = base.getBuilderSync(status);
+    let inMetadata: NativeMetadata;
+    try {
+      for (const i of positions) {
+        builder.setTypeSync(status, i, SQL_VARYING);
+        builder.setSubTypeSync(status, i, 0);
+        builder.setLengthSync(status, i, TEXT_LENGTH);
+        builder.setCharSetSync(status, i, CS_UTF8);
+        builder.setScaleSync(status, i, 0);
+      }
+      inMetadata = builder.getMetadataSync(status);
+    } finally {
+      builder.releaseSync();
+    }
+    return {
+      inMetadata,
+      inBuffer: new Uint8Array(inMetadata.getMessageLengthSync(status)),
+      dataWriter: util.createDataWriter(util.createDescriptors(status, inMetadata)),
+    };
+  });
+}
+
+/**
+ * Hand the driver back its own message when the statement is disposed, for
+ * it to release as it always does, and release the ones made here.
+ */
+function releaseMessagesOnDispose(internal: NativeStatement, binding: Binding): void {
+  const dispose = internal.internalDispose;
+  if (typeof dispose !== 'function') return;
+  internal.internalDispose = async function (this: NativeStatement) {
+    if (binding.original) {
+      internal.inMetadata = binding.original.inMetadata;
+      internal.inBuffer = binding.original.inBuffer;
+      internal.dataWriter = binding.original.dataWriter;
+    }
+    for (const message of binding.variants.values()) message.inMetadata.releaseSync();
+    binding.variants.clear();
+    binding.current = '';
+    return dispose.call(this);
+  };
 }
 
 /** Character sets by id, read once per connection. */
@@ -881,7 +1131,7 @@ async function fetchRows(
   params: QueryParams,
   columnCount: number,
 ): Promise<unknown[][]> {
-  params = await blobsAsBuffers(stmt, params);
+  params = await bindParams(stmt, transaction, params);
   if (stmt.hasResultSet) {
     const resultSet = await stmt.executeQuery(transaction, params);
     // A failing fetch must still close.

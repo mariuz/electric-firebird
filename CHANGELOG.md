@@ -67,6 +67,28 @@ API may still move between minor releases.
 
 ### Fixed
 
+- **`FirebirdLite` binds a string into a DATE, TIME or TIMESTAMP parameter,
+  exactly.** The native driver takes a JS `Date` there and failed on a string
+  (`date.getFullYear is not a function`), so `firebird-wasm/electric`'s
+  `syncShapeToTable`, which sends dates and times as text, could not write to
+  a `FirebirdLite` database. Such a string is now sent as text and Firebird
+  converts it, as the browser engine does: to 1/10000 s, with no detour
+  through milliseconds or the process's time zone, and `WITH TIME ZONE` too
+  (with a Firebird 4 or later client library). A `Date` binds as before.
+- **`FirebirdLite` binds a string into an integer or NUMERIC parameter digit
+  for digit.** The driver binds those as doubles: `'9007199254740993'` into
+  a BIGINT arrived as 9007199254740992, and `syncShapeToTable` sends `int8`
+  and `numeric` as text. Such a string is now sent as text too; a JS number
+  is unchanged, and `execBatch` declares a block's parameter as the column's
+  own type rather than DOUBLE PRECISION.
+- **A bad parameter beside a BLOB no longer kills the process.** The driver
+  wrote a BLOB parameter while encoding the others, under a `Promise.all`
+  that rejected as soon as one failed, and the transaction was rolled back
+  under the blob's native calls: a date as a string, or a string too long for
+  its VARCHAR, beside a BLOB ended Node with a segmentation fault (seen in
+  Jest syncing a shape into a `FirebirdLite` database). `FirebirdLite` now
+  writes the blob before the driver encodes anything, so the failure is the
+  error it should be.
 - **An event posted right after subscribing is no longer lost.** A
   subscription's first delivery from the engine is a baseline, not news, and
   the bridge absorbed whatever it said. With threads that delivery comes from
