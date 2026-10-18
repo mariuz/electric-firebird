@@ -24,6 +24,16 @@ API may still move between minor releases.
 
 ### Added
 
+- **`firebird-wasm/electric`: sync a Postgres table through Electric.**
+  `syncShapeToTable(db, { shape, table, shapeKey })` keeps a Firebird table in
+  step with an Electric shape: each batch Electric marks up-to-date applied in
+  one transaction with the sync position, a resume from that position after a
+  reload, a full reload in one transaction on must-refetch, Postgres text
+  converted exactly per column type (and unmapped types refused by name), and
+  an event per batch for `live()` and the hooks. `tableFromSchema()` writes a
+  `CREATE TABLE` from a shape's schema to review. Read-only, as Electric is.
+  `@electric-sql/client` is an optional peer dependency. Tested against a real
+  Postgres and Electric in CI.
 - **`firebird-wasm/repl`: a SQL console as a custom element.**
   `defineFirebirdRepl()` registers `<firebird-repl>`; give it a database
   through its `db` property. Ctrl+Enter runs a script statement by statement

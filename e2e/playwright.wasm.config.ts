@@ -28,6 +28,7 @@ export default defineConfig({
     '**/browser-cdn.spec.ts',
     '**/browser-frameworks.spec.ts',
     '**/browser-repl.spec.ts',
+    '**/browser-electric.spec.ts',
   ],
   fullyParallel: false,
   forbidOnly: !!process.env['CI'],

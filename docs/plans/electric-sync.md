@@ -5,8 +5,11 @@ comparison still marked ❌ ([roadmap.md](../roadmap.md) §M5). This plan says
 what Electric is today, what syncing it into Firebird would mean, what it
 would not, and the smallest piece that proves the rest.
 
-Nothing here is built yet. The open questions at the end are the decisions
-to make before it is.
+**Status:** the four questions at the end were decided as proposed, and the
+first step's read path is built (`firebird-wasm/electric`; see
+[integration.md](../integration.md) §3). Building it found that the
+engine could not bind a string into a BLOB parameter, now fixed, and that
+`bytea` waits for binary parameters.
 
 ---
 
@@ -128,7 +131,7 @@ booleans and JSON; the rest is a mapping this package owns:
 | `float4`, `float8` | `FLOAT`, `DOUBLE PRECISION` | number |
 | `bool` | `BOOLEAN` | boolean |
 | `text`, `varchar(n)`, `bpchar(n)` | `VARCHAR(n)`, or `BLOB SUB_TYPE TEXT` for unbounded text | string |
-| `uuid` | `CHAR(36)` (`BINARY(16)` an option) | string |
+| `uuid` | `VARCHAR(36)` (`BINARY(16)` an option) | string |
 | `date`, `time`, `timestamp` | `DATE`, `TIME`, `TIMESTAMP` | parsed, no zone |
 | `timestamptz`, `timetz` | `TIMESTAMP WITH TIME ZONE`, `TIME WITH TIME ZONE` | parsed with its offset |
 | `json`, `jsonb` | `BLOB SUB_TYPE TEXT` | the JSON text |
