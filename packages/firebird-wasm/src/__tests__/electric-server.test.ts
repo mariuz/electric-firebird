@@ -81,6 +81,7 @@ describeIfFirebird('createShapeServer against a Firebird server', () => {
   let httpServer: http.Server;
   let url: string;
   let major = 3;
+  let database: string;
   const aborts: AbortController[] = [];
 
   /** A live Shape of `table`, the way a client follows it. */
@@ -98,7 +99,7 @@ describeIfFirebird('createShapeServer against a Firebird server', () => {
   }
 
   beforeAll(async () => {
-    const database = `${host}:${path.join(os.tmpdir(), `shape-source-${Date.now()}.fdb`)}`;
+    database = `${host}:${path.join(os.tmpdir(), `shape-source-${Date.now()}.fdb`)}`;
     source = new FirebirdLite(database, credentials);
     const version = await source.query<{ V: string }>(
       "SELECT rdb$get_context('SYSTEM', 'ENGINE_VERSION') AS v FROM rdb$database");
@@ -255,6 +256,36 @@ describeIfFirebird('createShapeServer against a Firebird server', () => {
   it('serves only the tables it was given, and refuses where', async () => {
     expect((await fetch(`${url}?table=rdb$database&offset=-1`)).status).toBe(404);
     expect((await fetch(`${url}?table=items&offset=-1&where=id%3D1`)).status).toBe(400);
+  });
+
+  it('closes while live requests are waiting, without touching the closed connection', async () => {
+    // A live request polls the log every pollIntervalMs. Closing used to
+    // disconnect at once, and the next poll started a transaction on the
+    // closed connection: the native client crashed the process.
+    for (let round = 0; round < 10; round++) {
+      const other = await createShapeServer({
+        database,
+        ...credentials,
+        tables: ['items'],
+        pollIntervalMs: 5,
+        liveTimeoutMs: 5_000,
+      });
+      const otherHttp = http.createServer(other.handler);
+      await new Promise<void>((r) => otherHttp.listen(0, '127.0.0.1', r));
+      const base = `http://127.0.0.1:${(otherHttp.address() as AddressInfo).port}/v1/shape`;
+      const first = await fetch(`${base}?table=items&offset=-1`);
+      await first.arrayBuffer();
+      const at = `table=items&offset=${first.headers.get('electric-offset')}&handle=${first.headers.get('electric-handle')}`;
+      const waiting = [1, 2, 3].map(() => fetch(`${base}?${at}&live=true`).then((r) => r.status, () => 0));
+
+      await new Promise((r) => setTimeout(r, 20 + round * 3));
+      await other.close();
+      // Each ends, with the 503 a closing server gives or a 500, instead of
+      // polling on; and the process is still here to see it.
+      for (const status of await Promise.all(waiting)) expect([200, 500, 503, 0]).toContain(status);
+      otherHttp.closeAllConnections();
+      await new Promise((r) => otherHttp.close(r));
+    }
   });
 
   it('picks up changes from a connection opened before the capture was installed', async () => {
