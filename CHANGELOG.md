@@ -4,6 +4,31 @@ All notable changes to `firebird-wasm`. This project follows
 [semantic versioning](https://semver.org/); while the major version is 0 the
 API may still move between minor releases.
 
+## Unreleased
+
+### Security
+
+- **Importing the library no longer starts an engine server, and a page's
+  window is never served.** `firebird-wasm/browser` re-exported
+  `serveEngine` from the Worker entry, which started serving as soon as it
+  was loaded wherever `self.postMessage` existed, and a page's `window` has
+  one. So every page that imported the library listened for engine requests
+  on its window. With the engine on the page thread (the build without
+  threads, new in 0.7.0) that listener shared the page's engine, and any
+  window able to `postMessage` to the page, a frame or an opener of another
+  origin, could run SQL against its databases. With the engine in a Worker it
+  had no engine to reach. Now `serveEngine` lives in a module without side
+  effects, the Worker entry starts only in a dedicated Worker, and
+  `serveEngine` refuses a scope that has a `document`. Upgrade from 0.7.0 if
+  you run the engine on the page thread.
+
+### Fixed
+
+- **`firebird-wasm/browser/worker-entry` imported with a bundler.** In a
+  Worker that imported the library before setting
+  `FIREBIRD_WORKER_OPTIONS`, the side effect above started the engine without
+  them, so its `.wasm` was looked for next to the Worker script.
+
 ## 0.7.0 — 2026-10-18
 
 ### Fixed

@@ -62,8 +62,10 @@ export type { LeaderElection, LeaderElectionOptions } from './leader-election';
 export { WorkerTransport } from './worker-transport';
 export type { WorkerTransportOptions } from './worker-transport';
 
-export { serveEngine } from './worker-entry';
-export type { EngineWorkerScope } from './worker-entry';
+// From serve-engine, not worker-entry: importing the library must not start an
+// engine server (worker-entry starts one when it is loaded).
+export { serveEngine } from './serve-engine';
+export type { EngineWorkerScope } from './serve-engine';
 export type {
   EngineOp,
   EngineRequest,
