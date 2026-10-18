@@ -26,9 +26,14 @@ webpack). See [docs/integration.md](../docs/integration.md) §3 and §4.
 
 ```sh
 npm run build -w packages/firebird-wasm          # the package, from the repository root
-(cd examples/vite && npm install && npm run build)
-(cd examples/webpack && npm install && npm run build)
+(cd examples/vite && npm install --install-links && npm run build)
+(cd examples/webpack && npm install --install-links && npm run build)
 cd e2e && npx playwright test --config playwright.examples.config.ts
 ```
+
+`--install-links` installs the package as a packed copy, the files npm would
+publish, rather than a link into this repository: what an app gets from npm.
+A link also made npm 10 in CI fail with `Cannot read properties of null
+(reading 'edgesOut')`.  Run it again after rebuilding the package.
 
 `node examples/serve.mjs <dist> <port> [--isolated]` serves a build by hand.
