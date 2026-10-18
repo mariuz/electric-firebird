@@ -134,14 +134,11 @@ list(FILTER FB_JRD_SRCS EXCLUDE REGEX ".*/jrd/tests/.*")
 # Exclude Win32 platform-specific sources – they require <windows.h> which is
 # unavailable under Emscripten.
 list(FILTER FB_JRD_SRCS EXCLUDE REGEX ".*/jrd/os/win32/.*")
-# Exclude the External Data Sources (extds/) subsystem – it connects to remote
-# Firebird servers via the legacy isc_* client API (isc_attach_database,
-# isc_array_*, isc_blob_*, isc_commit_transaction, etc.) and requires
-# UserId::populateDpb (implemented in scl.epp, not compiled for WASM).
-# Without this exclusion the linker reports 20+ undefined isc_* symbols.
-# The External Data Sources feature is irrelevant in a single-process
-# in-memory WASM embedded engine.
-list(FILTER FB_JRD_SRCS EXCLUDE REGEX ".*/jrd/extds/.*")
+# jrd/extds/ (External Data Sources) is compiled: EXECUTE STATEMENT runs
+# through it even without ON EXTERNAL, on its internal provider.  It used to be
+# excluded, on the grounds that it needs the isc_* API and scl.epp; both are
+# compiled now (yvalve/why.cpp, the gpre boot pass), and the stubs that stood
+# in for it made EXECUTE STATEMENT silently do nothing.
 # jrd/os/posix/unix.cpp provides the physical page I/O (PIO_read, PIO_write,
 # PIO_open, PIO_create, PIO_close, etc.) that the page cache (cch.cpp) and
 # other JRD modules require.  It compiles cleanly under Emscripten because:
@@ -304,9 +301,9 @@ set(FB_INCLUDE_DIRS
 # ---------------------------------------------------------------------------
 # fb_wasm_api.cpp  – extern "C" API surface exported to JavaScript via
 #                    -s EXPORTED_FUNCTIONS (fb_init, fb_create_database, …).
-# fb_wasm_stubs.cpp – minimal implementations of Firebird internal functions
-#                     whose canonical homes (yvalve/gds.cpp, …) are not yet
-#                     compiled into the WASM build.
+# fb_wasm_stubs.cpp – the few symbols a browser engine provides itself: Linux
+#                     and POSIX calls Emscripten lacks, and the entry points
+#                     of the utilities and the network provider it leaves out.
 set(FB_WASM_GLUE_SRCS
   "${CMAKE_CURRENT_SOURCE_DIR}/fb_wasm_api.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/fb_wasm_stubs.cpp"

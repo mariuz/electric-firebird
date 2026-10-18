@@ -77,6 +77,15 @@ API may still move between minor releases.
 
 ### Fixed
 
+- **`EXECUTE STATEMENT` runs in the browser engine.** It did nothing, without
+  an error: an `INSERT` through it inserted no row, `INTO` gave `NULL`, and
+  `FOR EXECUTE STATEMENT … DO` gave no rows. It runs through Firebird's
+  External Data Sources (`jrd/extds`) even without `ON EXTERNAL`, and the
+  build replaced that directory with no-op stubs. It is compiled now, so
+  parameters, `WITH AUTONOMOUS TRANSACTION` and the caller's transaction work
+  as in Firebird, and its errors are reported. DDL run through it is not seen
+  by the statement cache: call `_fb_statement_cache()` after it (docs/api.md).
+  Needs a rebuilt artifact: 170–200 KB larger, 54–55 KB gzipped (+2 %).
 - **The browser engine reads `BINARY` and `VARBINARY` (`OCTETS`) values as
   bytes**, as it reads a binary `BLOB`: base64 by default, a `Uint8Array`
   with `types: { binary: true }`. They were read as text, which turned bytes

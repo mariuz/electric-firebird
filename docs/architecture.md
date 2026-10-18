@@ -145,7 +145,7 @@ electric-firebird/
 │           ├── build.sh         ← Emscripten build script
 │           ├── CMakeLists.txt   ← CMake build configuration
 │           ├── fb_wasm_api.cpp  ← Exported C API
-│           └── fb_wasm_stubs.cpp ← Stubs for .epp-generated code
+│           └── fb_wasm_stubs.cpp ← The few symbols the engine provides itself
 ├── package.json                 ← Workspace root
 └── tsconfig.json
 ```

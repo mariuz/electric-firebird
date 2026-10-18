@@ -23,7 +23,7 @@ const ST_JS_PATH = path.resolve(__dirname, '../../dist/wasm/firebird-embedded-st
 const hasSingleThread = fs.existsSync(ST_JS_PATH);
 
 describe('wasmGlueFile', () => {
-  it('names each build, and picks the threaded one in Node', () => {
+  it('names each build, and picks the one without threads by default', () => {
     expect(wasmGlueFile(true)).toBe('firebird-embedded.js');
     expect(wasmGlueFile(false)).toBe('firebird-embedded-st.js');
     // The default since 0.9.0, in Node too: the build without threads.

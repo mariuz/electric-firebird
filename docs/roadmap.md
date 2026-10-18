@@ -844,8 +844,23 @@ be built:
       stubbing it out.
 - [x] **Fix the `_fb_create_database()` trap.**  Fixed; see "The
       create-database trap" above.
-- [ ] Re-check the remaining stubs in `fb_wasm_stubs.cpp` once the engine
-      executes a statement.
+- [x] Re-check the remaining stubs in `fb_wasm_stubs.cpp` once the engine
+      executes a statement.  Done in 0.9.0, and one of them was a bug: the
+      no-op `EDS::*` stubs made every `EXECUTE STATEMENT` silently do nothing
+      (no row inserted, `NULL` for `INTO`, no rows for `FOR … DO`), because it
+      runs through `jrd/extds` even without `ON EXTERNAL`.  `jrd/extds/` is
+      compiled now; both reasons it was left out (the `isc_*` API, `scl.epp`)
+      had expired.  The `fallocate` stub went too: its callers are compiled
+      out, and it claimed space it never allocated.  What is left (172 lines)
+      is `sem_timedwait`, the process-shared attributes, the RCU singleton,
+      and the entry points of the utilities and the network provider a
+      browser build leaves out, each with why it is accurate.
+      One consequence, now reachable: DDL run inside `EXECUTE STATEMENT` is
+      not seen by the statement cache, and a kept `SELECT` of a table it
+      dropped still reads the old rows (Firebird 6 rebinds a prepared
+      statement to the newest metadata but keeps the dropped relation).
+      `_fb_statement_cache()` empties the caches; seeing that DDL from the
+      bridge needs the engine's metadata version (`MetadataCache::mdc_front`).
 - **Acceptance:** in Chromium, `CREATE TABLE` → `INSERT` → `SELECT` returns the
   inserted rows — i.e. `wasm.spec.ts` runs instead of skipping.
 

@@ -125,14 +125,15 @@ electric-firebird/
    interface in `src/wasm-loader.ts`.
 4. Update [docs/api.md](./api.md).
 
-### Adding stubs for new Firebird internals
+### When the link needs a symbol
 
-When the WASM build requires symbols from `.epp`-generated files (e.g.
-`met.epp`, `scl.epp`) that are not compiled, add stub implementations to
-`wasm/fb_wasm_stubs.cpp`.  Make sure all signatures match the headers of the
-Firebird revision the submodule is on — currently **`master`, 6.0.0**, not the
-5.0.3 this once said. Signature drift between Firebird versions is the main
-source of stub breakage, so check against the tree you are building.
+Prefer compiling the Firebird source that defines it to stubbing it in
+`wasm/fb_wasm_stubs.cpp`: a stub that is wrong does not fail, it makes a
+feature quietly do nothing (`EXECUTE STATEMENT` did, until 0.9.0).  A stub
+belongs there only when it is accurate in a browser engine, and its comment
+says why; when that reason changes, the stub is a bug.  Match signatures to
+the headers of the Firebird revision the submodule is on — currently
+**`master`, 6.0.0**.
 
 ---
 
