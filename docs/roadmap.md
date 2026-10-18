@@ -298,8 +298,8 @@ written; what remains:
   strings at all. (Parameters already go the other way in binary where it is
   exact; see M2.)
 - ~~A build without `SharedArrayBuffer`.~~ Built: `firebird-embedded-st`
-  runs with no COOP/COEP headers and the demo uses it (M6). Left: a release
-  with both builds, then a change of default.
+  runs with no COOP/COEP headers, the demo uses it, and 0.8.0 ships it beside
+  the threaded build (M6). Left: a change of default.
 - `loadFirebirdWasm()` caches one module process-wide with no way to dispose
   it; `close()` does not release the WASM heap.
 - Only the built-in character sets are compiled in, and the UNICODE collations
@@ -1079,9 +1079,9 @@ gaps it ran into, with its numbers, in rough order of what they would buy.
       runs with a plain `ArrayBuffer` heap in a page with no COOP/COEP, on
       the page thread or in a Worker, and starts in a third of the time. It
       gives up statement and idle timeouts. Step 6: the demo dropped its
-      service worker and runs that build on GitHub Pages. Left: a release
-      with both builds, then `firebird-quake2` dropping its service worker,
-      and only then a change of default.
+      service worker and runs that build on GitHub Pages. Step 7: 0.8.0, on
+      npm, ships both builds. Left: `firebird-quake2` dropping its service
+      worker, and only then a change of default.
 - [x] **Cooperative garbage collection.** Found while tracing the threads:
       under the engine's default `GCPolicy = combined` the statement and the
       garbage collector thread fight over the same pages, and every handoff
