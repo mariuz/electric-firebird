@@ -5,7 +5,7 @@ electric-firebird's stated goal is "Firebird embedded in WASM, similar to
 that goal actually is, compares the API surface against PGlite feature by
 feature, and proposes a staged roadmap.
 
-Last reviewed: 2026-08-08.
+Last reviewed: 2026-10-18.
 
 ---
 
@@ -285,28 +285,29 @@ Consequences worth knowing:
 
 ### What is still open
 
-Typed results, multi-statement `exec()`, `affectedRows`, `tx.rollback()` and
-multi-tab safety have all landed since this list was written; what remains:
+Typed results, multi-statement `exec()`, `affectedRows`, `tx.rollback()`,
+multi-tab safety and live queries have all landed since this list was
+written; what remains:
 
-- Live queries (§M4). Firebird's `POST_EVENT` is the natural fit; the C API
-  exists on `events-wip` and the engine delivers exactly one event and then
-  stops — see §1 for where it stops.
+- ~~Live queries (§M4).~~ Done in 0.3.0: `db.listen`, `db.notify` and
+  `db.live`, on `POST_EVENT`, once event delivery under Emscripten was fixed.
 - ~~Two tabs cannot *share* a database.~~ Done: `multiTab: 'shared'` elects one
   tab to run the engine and serves the rest over a `BroadcastChannel`. The
   default is still `'exclusive'`, so sharing is opt-in.
 - A typed *binary* result encoding, so exact numerics need not travel as
   strings at all. (Parameters already go the other way in binary where it is
   exact; see M2.)
-- A build without `SharedArrayBuffer`, so a page could run the engine without
-  COOP/COEP headers or a service worker to fake them. Not a link flag: the
-  engine starts threads and blocks on them. What it would take is in
-  [plans/sab-free-build.md](./plans/sab-free-build.md).
+- ~~A build without `SharedArrayBuffer`.~~ Built: `firebird-embedded-st`
+  runs with no COOP/COEP headers and the demo uses it (M6). Left: a release
+  with both builds, then a change of default.
 - `loadFirebirdWasm()` caches one module process-wide with no way to dispose
   it; `close()` does not release the WASM heap.
 - Only the built-in character sets are compiled in, and the UNICODE collations
   do not work. Both are solved on `icu-collation` (§6, PR #12) and neither is
   merged.
-- ElectricSQL sync (§M5) — the project's namesake.
+- ElectricSQL sync (§M5) — the project's namesake. The read path is in, from
+  Postgres through Electric and from a Firebird server through
+  `firebird-wasm/electric-server`; writes back are not.
 
 ### Persistence is atomic and incremental
 
@@ -449,7 +450,11 @@ an empty project, created a database, and read back `NUMERIC(10,2)` as the
 exact string `"20.25"`. The published shasum matches the tarball that was
 tested before release.
 
-### Live queries: what is actually blocking them
+### Live queries: what was blocking them
+
+**Solved, and shipped in 0.3.0** (`db.listen`, `db.notify`, `db.live`): the
+engine now delivers every event, not only the first. What follows is kept as
+the record of how the fault was narrowed down.
 
 Attempted, and stopped at a specific engine-side wall.  The work is on the
 `events-wip` branch (`fedbd8e`) rather than `main`, because the C API is
@@ -583,7 +588,7 @@ Legend: ✅ shipped · 🟡 partial · ❌ missing · n/a not applicable
 | Web Worker offloading | ✅ | ✅ | Required rather than optional: the build uses pthreads and Firebird blocks on mutexes while opening a database, so an engine on the main thread deadlocks the page. `WorkerTransport` forwards to `serveEngine` |
 | Live / reactive queries | ✅ `live` extension | ✅ | `db.live(sql, { events }, onChange)` re-runs the statement when a named event fires. Event names are the caller's to give: nothing in Firebird connects a posted event to the tables a query reads |
 | `listen()` / `notify()` | ✅ | ✅ | `db.listen(names, cb)` and `db.notify(name)`, over the `fb_events_*` C API. Counts rather than individual events: two posts in quick succession arrive as one call with a count of 2. Delivery is after the posting transaction commits |
-| Sync with a server | ✅ (ElectricSQL) | ❌ | This is the "electric" in the project name |
+| Sync with a server | ✅ (ElectricSQL) | 🟡 | Read path only. `firebird-wasm/electric`'s `syncShapeToTable` follows an Electric shape into a table, from Postgres through Electric or from a Firebird server through `firebird-wasm/electric-server`. No writes back yet |
 
 ### Packaging & ecosystem
 
@@ -592,10 +597,10 @@ Legend: ✅ shipped · 🟡 partial · ❌ missing · n/a not applicable
 | Prebuilt WASM on npm | ✅ | ✅ | `npm install firebird-wasm` ships the engine |
 | CDN distribution | ✅ | ✅ | `cdnArtifacts()` gives the jsDelivr/unpkg URLs and their `locateFile`; both builds tested from another origin |
 | Bundler guides (Vite/webpack) | ✅ | ✅ | Vite, webpack, esbuild and Next.js in [integration.md](./integration.md); `examples/vite` and `examples/webpack` are built and run in CI |
-| Framework hooks (React/Vue) | ✅ | ❌ | |
+| Framework hooks (React/Vue) | ✅ | ✅ | `firebird-wasm/react` and `firebird-wasm/vue`: a provider, `useQuery` and `useLiveQuery` |
 | ORM / query-builder support | ✅ | ❌ | |
 | Extensions / plugin API | ✅ | n/a | Firebird UDRs are a different model; not a near-term goal |
-| REPL component | ✅ | 🟡 | The [demo](https://mariuz.github.io/electric-firebird/) is one, but it is a page, not a reusable component |
+| REPL component | ✅ | ✅ | `<firebird-repl>` in `firebird-wasm/repl`, a custom element that works in plain pages, React and Vue |
 
 ### Where Firebird can beat the comparison
 
@@ -636,16 +641,15 @@ order it was ranked:
 Nothing here produces a wrong answer. Ranked by how much they limit what can
 be built:
 
-1. **No live queries.** An application has no way to learn that data changed
-   except by polling. Not for want of trying: the C API exists on the
-   `events-wip` branch and Firebird's event manager starts, but delivery stops
-   after the first event under Emscripten. See §1 for exactly where it stops
-   and what to try next.
+1. ~~**No live queries.**~~ Fixed in 0.3.0: `db.live()` re-runs a query
+   when a `POST_EVENT` it names fires, and `listen()` / `notify()` are there
+   for everything else. §1 records how the delivery fault was found.
 2. ~~**Two tabs cannot share a database.**~~ Fixed: `multiTab: 'shared'` elects
    one tab to run the engine and serves the rest from it. What remains is that
    the default is still `'exclusive'`, so sharing is opt-in.
-3. **9 MB artifact, unbudgeted.** Compresses to about a third, but it is the
-   first thing anyone notices.
+3. ~~**9 MB artifact, unbudgeted.**~~ Budgeted: `scripts/size-budget.mjs`
+   fails CI past 9.5 MB raw or 3.2 MB gzipped (2.05 MB with brotli). Still
+   the first thing anyone notices.
 4. **The module cannot be disposed.** `loadFirebirdWasm()` caches one instance
    process-wide and `close()` does not release the heap.
 5. **Only built-in character sets, and no working UNICODE collations.**
@@ -793,7 +797,9 @@ be built:
       naming all 89 charsets, and a subset build leaves 175 undefined symbols.
       Trimming that table is possible but buys 616 KB in exchange for a new
       invasive patch to rebase onto every Firebird release.
-6. **No sync.** The "electric" in the project name is still aspirational.
+6. **Sync is one-way.** Shapes sync into the browser from Postgres (through
+   Electric) and from a Firebird server; changes made in the browser do not
+   go back.
 7. Everything in §2 marked ❌ — real gaps, but none of them mislead a user.
 
 ---
