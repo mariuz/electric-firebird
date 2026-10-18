@@ -4,6 +4,28 @@ All notable changes to `firebird-wasm`. This project follows
 [semantic versioning](https://semver.org/); while the major version is 0 the
 API may still move between minor releases.
 
+## Unreleased
+
+### Added
+
+- **An example app that syncs from two servers:
+  [`examples/electric`](./examples/electric).** Two lists of notes, each a
+  table in the page's Firebird: one follows Postgres through Electric, the
+  other a Firebird server through `firebird-wasm/electric-server`. Writes go
+  to the source and come back down the shape; `db.live()` draws the lists;
+  `<firebird-repl>` queries the local copy. A Node server and a
+  `docker-compose.yml` run the sources. CI runs it in Chromium against real
+  containers, with both engine builds.
+
+### Fixed
+
+- **Two `syncShapeToTable` calls started together on a new database no
+  longer stop one of them.** Both found no `ELECTRIC_SHAPES` table and both
+  created it; the second creation failed ("unsuccessful metadata update")
+  and that sync stopped before it began. The loser now looks again and goes
+  on with the table the other made. Found by the example, which starts its
+  two syncs at once.
+
 ## 0.8.0 — 2026-10-18
 
 ### Security

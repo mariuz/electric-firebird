@@ -178,16 +178,22 @@ jobs:
       # The example apps, each built by its own bundler from the package as
       # just built, then run in Chromium with and without cross-origin
       # isolation (the threaded engine and the build without threads).
-      - name: Build the Vite and webpack examples
+      - name: Build the Vite, webpack and Electric examples
         run: |
-          for example in vite webpack; do
+          for example in vite webpack electric; do
             (cd examples/$example && npm install --no-audit --no-fund && npm run build)
           done
 
+      # examples/electric's server syncs from the Postgres, Electric and
+      # Firebird containers started above.
       - name: Run the example apps (Playwright)
         working-directory: e2e
         env:
           CI: 'true'
+          ELECTRIC_URL: http://localhost:3000
+          PG_URL: postgresql://postgres:pg@localhost:54321/postgres
+          FIREBIRD_SHAPES_HOST: localhost
+          FIREBIRD_SHAPES_PASSWORD: masterkey
         run: npx playwright test --config playwright.examples.config.ts
 
       - name: Upload demo Playwright report

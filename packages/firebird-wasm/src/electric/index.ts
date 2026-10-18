@@ -112,7 +112,7 @@ export async function syncShapeToTable(
   let position: { handle: string; offset: string; schema: ElectricSchema } | undefined;
   // Its own transaction: Firebird applies DDL at commit, so a table made in
   // a transaction cannot be read in that same transaction.
-  await db.transaction((tx) => ensureMetadata(tx));
+  await ensureMetadata(db);
   await db.transaction(async (tx) => {
     if (options.shapeKey !== null) {
       const { rows } = await tx.query(
@@ -267,14 +267,35 @@ export async function syncShapeToTable(
 }
 
 /** The table holding each shape's position, made on first use. */
-async function ensureMetadata(tx: ElectricTransaction): Promise<void> {
+async function hasMetadata(tx: ElectricTransaction): Promise<boolean> {
   const { rows } = await tx.query(
     "SELECT 1 AS X FROM RDB$RELATIONS WHERE RDB$RELATION_NAME = 'ELECTRIC_SHAPES'",
   );
-  if (rows.length > 0) return;
-  await tx.exec(
-    `CREATE TABLE ${METADATA} (` +
-      'SHAPE_KEY VARCHAR(255) NOT NULL PRIMARY KEY, ' +
-      'SHAPE_HANDLE VARCHAR(255), SHAPE_OFFSET VARCHAR(64), SHAPE_SCHEMA BLOB SUB_TYPE TEXT)',
-  );
+  return rows.length > 0;
+}
+
+/**
+ * Create the metadata table unless it is there.  Two syncs started together
+ * on a new database both find it missing and both create it; the one whose
+ * creation fails looks again and goes on with the table the other made.
+ */
+async function ensureMetadata(db: ElectricDatabase): Promise<void> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await db.transaction(async (tx) => {
+        if (await hasMetadata(tx)) return;
+        await tx.exec(
+          `CREATE TABLE ${METADATA} (` +
+            'SHAPE_KEY VARCHAR(255) NOT NULL PRIMARY KEY, ' +
+            'SHAPE_HANDLE VARCHAR(255), SHAPE_OFFSET VARCHAR(64), SHAPE_SCHEMA BLOB SUB_TYPE TEXT)',
+        );
+      });
+      return;
+    } catch (error) {
+      if (await db.transaction((tx) => hasMetadata(tx))) return;
+      // The other creation may not have committed yet.
+      if (attempt >= 5) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 20 * attempt));
+    }
+  }
 }

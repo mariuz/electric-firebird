@@ -1108,8 +1108,10 @@ gaps it ran into, with its numbers, in rough order of what they would buy.
       [plans/electric-sync.md](./plans/electric-sync.md). **The read path
       is in:** `firebird-wasm/electric`'s `syncShapeToTable`, tested in
       Chromium against a real Postgres and Electric in CI (types, live
-      changes, resume after a reload, must-refetch). Left: several shapes in
-      one transaction, a write path, `bytea`, and a demo page.
+      changes, resume after a reload, must-refetch). A demo:
+      [`examples/electric`](../examples/electric) syncs from both kinds of
+      source into one page, tested against real containers in CI. Left:
+      several shapes in one transaction, a write path, and `bytea`.
       **A Firebird server as the source** works the same way through
       `firebird-wasm/electric-server` (Electric reads only Postgres): see
       [plans/firebird-shape-server.md](./plans/firebird-shape-server.md).

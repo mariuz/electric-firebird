@@ -10,6 +10,14 @@ where it loads the build without threads.
 | [`vite/`](./vite) | Vite 8 (Rolldown) | `new Worker(new URL('./engine-worker.js', import.meta.url))` |
 | [`webpack/`](./webpack) | webpack 5 | the same |
 
+And one that does something with it:
+
+- [`electric/`](./electric): two lists of notes, each a table in the page's
+  Firebird kept in step with a server, one Postgres through Electric and one
+  a Firebird server through `firebird-wasm/electric-server`, with a Node
+  server and a `docker-compose.yml` for the sources. Built with Vite. CI runs
+  it against real containers.
+
 Both are the same four files around the bundler's configuration:
 
 - `src/main.js` — the page: open a database, create, insert, read back.
@@ -28,6 +36,7 @@ webpack). See [docs/integration.md](../docs/integration.md) §3 and §4.
 npm run build -w packages/firebird-wasm          # the package, from the repository root
 (cd examples/vite && npm install && npm run build)
 (cd examples/webpack && npm install && npm run build)
+(cd examples/electric && npm install && npm run build)   # its test needs the services: see electric/
 cd e2e && npx playwright test --config playwright.examples.config.ts
 ```
 
