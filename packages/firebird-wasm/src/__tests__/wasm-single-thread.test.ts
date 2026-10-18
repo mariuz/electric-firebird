@@ -26,7 +26,9 @@ describe('wasmGlueFile', () => {
   it('names each build, and picks the threaded one in Node', () => {
     expect(wasmGlueFile(true)).toBe('firebird-embedded.js');
     expect(wasmGlueFile(false)).toBe('firebird-embedded-st.js');
-    expect(wasmGlueFile()).toBe('firebird-embedded.js');
+    // The default since 0.9.0, in Node too: the build without threads.
+    expect(wasmGlueFile()).toBe('firebird-embedded-st.js');
+    expect(wasmGlueFile('auto')).toBe('firebird-embedded-st.js');
   });
 });
 

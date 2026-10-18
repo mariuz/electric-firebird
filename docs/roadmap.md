@@ -299,8 +299,9 @@ written; what remains:
   strings at all. (Parameters already go the other way in binary where it is
   exact; see M2.)
 - ~~A build without `SharedArrayBuffer`.~~ Built: `firebird-embedded-st`
-  runs with no COOP/COEP headers, the demo uses it, and 0.8.0 ships it beside
-  the threaded build (M6). Left: a change of default.
+  runs with no COOP/COEP headers, the demo and `firebird-quake2` run it on
+  GitHub Pages, 0.8.0 ships it beside the threaded build, and it is now the
+  default (M6).
 - `loadFirebirdWasm()` caches one module process-wide with no way to dispose
   it; `close()` does not release the WASM heap.
 - Only the built-in character sets are compiled in, and the UNICODE collations
@@ -1070,7 +1071,7 @@ gaps it ran into, with its numbers, in rough order of what they would buy.
       none of these showed there. Still open: a CI job that builds twice.
 - [x] **The linter runs.** `npm run lint` had a script and its dependencies
       but no configuration, so it never ran. Fixed in #15, with a CI step.
-- [ ] **No `SharedArrayBuffer` requirement.** Every static-hosted consumer
+- [x] **No `SharedArrayBuffer` requirement.** Every static-hosted consumer
       carries a service worker that only adds COOP/COEP. See
       [plans/sab-free-build.md](./plans/sab-free-build.md). Step 1 is done
       (`wasm/trace-threads.sh`): the engine starts five threads, none on a
@@ -1082,8 +1083,11 @@ gaps it ran into, with its numbers, in rough order of what they would buy.
       the page thread or in a Worker, and starts in a third of the time. It
       gives up statement and idle timeouts. Step 6: the demo dropped its
       service worker and runs that build on GitHub Pages. Step 7: 0.8.0, on
-      npm, ships both builds. Left: `firebird-quake2` dropping its service
-      worker, and only then a change of default.
+      npm, ships both builds. Step 8: `firebird-quake2` dropped its service
+      worker (its PR #1) and runs the build without threads on Pages, a 5 ms
+      tic on demo1 as on the threaded build. Step 9: the build without
+      threads is the default, threads on request (`wasmGlueFile(true)`,
+      `threads: true`).
 - [x] **Cooperative garbage collection.** Found while tracing the threads:
       under the engine's default `GCPolicy = combined` the statement and the
       garbage collector thread fight over the same pages, and every handoff

@@ -6,6 +6,21 @@ API may still move between minor releases.
 
 ## Unreleased
 
+### Changed
+
+- **The build without threads is the default.** `wasmGlueFile()`,
+  `loadFirebirdWasm()`, `DirectTransport` and `cdnArtifacts()` now pick
+  `firebird-embedded-st` unless asked for threads, in Node and in a cross-origin
+  isolated page too; until now `'auto'` picked the threaded build wherever it
+  could run. The build without threads needs no `SharedArrayBuffer` and no
+  Worker, starts in about a third of the time (0.33–0.43 s against
+  0.87–1.06 s), and was not slower in anything measured; `firebird-quake2`
+  plays the same on it (a 5 ms tic on demo1 either way). What it gives up is
+  statement and idle timeouts. To keep the threaded build, ask for it:
+  `wasmGlueFile(true)` (or `wasmGlueFile(self.crossOriginIsolated)` for
+  threads where the page allows them), `loadFirebirdWasm({ threads: true })`,
+  `new DirectTransport({ threads: true })`, `cdnArtifacts({ threads: true })`.
+
 ### Added
 
 - **Bytes as parameters.** A `Uint8Array` or `ArrayBuffer` binds as its own

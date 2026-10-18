@@ -1,5 +1,10 @@
 # Plan: a build without SharedArrayBuffer
 
+**Status:** done. The build without threads ships beside the threaded one
+(0.8.0), both consumers run it on GitHub Pages without a service worker, and
+it is the default; the threaded build is asked for with `threads: true` /
+`wasmGlueFile(true)`.
+
 The artifact is built with `-pthread`, so its memory is a `SharedArrayBuffer`
 and a browser only hands one out to a cross-origin isolated page: one served
 with `Cross-Origin-Opener-Policy: same-origin` and
