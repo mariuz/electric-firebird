@@ -18,8 +18,9 @@
  * Firebird source.  It installs triggers that log each changed row's key,
  * numbers the log in commit order itself (see
  * docs/plans/firebird-shape-server.md), and serves a snapshot and then the
- * changes after it.  One server per database: two would number the log
- * against each other.  Node only: it uses the native client (`node-firebird-driver-
+ * changes after it, in pages for a snapshot, and with a `where` if asked.
+ * Several servers can share a database: they number the log one at a time.
+ * Node only: it uses the native client (`node-firebird-driver-
  * native`, an optional dependency of this package).
  */
 
@@ -28,9 +29,12 @@ import type { Attachment, Blob as FbBlob, Client, Transaction } from 'node-fireb
 import { TransactionIsolation } from 'node-firebird-driver';
 import { planTable, quote, relationName, renderValue } from './catalog';
 import type { FirebirdColumn, TablePlan } from './catalog';
-import { CHANGES, KEY_COLUMNS, META, installCapture, stampCommitted } from './capture';
+import { CHANGES, CHANGE_EVENT, KEY_COLUMNS, META, installCapture, pruneLog, stampCommitted } from './capture';
+import { WhereError, translateWhere } from './where';
+import type { FirebirdWhere } from './where';
 
 export { triggerName, tableTrigger } from './capture';
+export { translateWhere, WhereError } from './where';
 export { planTable, planColumn, shapeName } from './catalog';
 export type { TablePlan, ColumnPlan, FirebirdColumn } from './catalog';
 
@@ -48,8 +52,21 @@ export interface ShapeServerOptions {
   install?: boolean;
   /** How long a live request waits for a change.  Default 20 000 ms, as Electric. */
   liveTimeoutMs?: number;
-  /** How often a waiting live request looks at the log.  Default 100 ms. */
+  /**
+   * How often a waiting live request looks at the log when no event woke it.
+   * Default 1000 ms: a commit that logged a change wakes it at once.
+   */
   pollIntervalMs?: number;
+  /** Wake live requests on Firebird events (`ELECTRIC_CHANGES`), on a connection of its own.  Default true. */
+  events?: boolean;
+  /** Rows per response while serving a snapshot.  Default 10 000. */
+  snapshotPageRows?: number;
+  /**
+   * How long the log keeps a change after numbering it, in ms; a client
+   * further behind starts again from a snapshot.  Default 7 days; `null` or
+   * 0 keeps everything (prune with {@link ShapeServer.prune}).
+   */
+  retainLogMs?: number | null;
 }
 
 /** A running shape server. */
@@ -58,6 +75,11 @@ export interface ShapeServer {
   handler: (req: IncomingMessage, res: ServerResponse) => void;
   /** The plans of the served tables, by Firebird name. */
   readonly tables: ReadonlyMap<string, TablePlan>;
+  /**
+   * Drop what the log numbered before `before` (default: now less
+   * `retainLogMs`), and return the highest number dropped, or 0.
+   */
+  prune(before?: Date): Promise<number>;
   /** Stop answering and close the connection. */
   close(): Promise<void>;
 }
@@ -77,13 +99,13 @@ export async function createShapeServer(options: ShapeServerOptions): Promise<Sh
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const native = require('node-firebird-driver-native') as typeof import('node-firebird-driver-native');
   const client: Client = native.createNativeClient(options.libraryPath ?? native.getDefaultLibraryFilename());
-  const attachment: Attachment = await client.connect(options.database, {
-    username: options.username,
-    password: options.password,
-  });
+  const credentials = { username: options.username, password: options.password };
+  const attachment: Attachment = await client.connect(options.database, credentials);
 
   const liveTimeoutMs = options.liveTimeoutMs ?? 20_000;
-  const pollIntervalMs = options.pollIntervalMs ?? 100;
+  const pollIntervalMs = options.pollIntervalMs ?? 1_000;
+  const pageRows = options.snapshotPageRows ?? 10_000;
+  const retainLogMs = options.retainLogMs === undefined ? 7 * 24 * 60 * 60 * 1000 : options.retainLogMs;
 
   const tables = new Map<string, TablePlan>();
   try {
@@ -107,38 +129,85 @@ export async function createShapeServer(options: ShapeServerOptions): Promise<Sh
 
   let closed = false;
 
-  /** Number what has committed since, then read in a snapshot. */
-  const stampedSnapshot = async <T>(fn: (tx: Transaction, top: number) => Promise<T>): Promise<T> => {
+  // A commit that logged a change posts ELECTRIC_CHANGES; it wakes every
+  // waiting live request at once.  Polling stays, as the fallback.
+  let wake: () => void = () => undefined;
+  let woken = new Promise<void>((resolve) => { wake = resolve; });
+  const signal = () => {
+    const release = wake;
+    woken = new Promise<void>((resolve) => { wake = resolve; });
+    release();
+  };
+  let eventAttachment: Attachment | undefined;
+  let events: { cancel(): Promise<void> } | undefined;
+  if (options.events ?? true) {
+    try {
+      // A connection of its own: the main one runs one call at a time.
+      eventAttachment = await client.connect(options.database, credentials);
+      events = await eventAttachment.queueEvents([CHANGE_EVENT], async () => {
+        signal();
+      });
+    } catch {
+      await eventAttachment?.disconnect().catch(() => undefined);
+      eventAttachment = undefined;
+    }
+  }
+
+  /** Number what has committed since, then read in a snapshot: `top` is the log's position in it. */
+  const stampedSnapshot = async <T>(fn: (tx: Transaction, top: number, pruned: number) => Promise<T>): Promise<T> => {
     await serialized(attachment, () => stampCommitted(attachment));
     return readOnly(attachment, async (tx) => {
-      const rs = await attachment.executeQuery(tx, `SELECT MAX(COMMIT_SEQ) FROM ${CHANGES}`);
-      const top = Number((await rs.fetch())[0]?.[0] ?? 0);
-      await rs.close();
-      return fn(tx, top);
-    });
-  };
-
-  const handleOf = (table: TablePlan) => `${epoch}-${hashName(table.name)}`;
-
-  // A snapshot may hold changes not numbered yet; they are numbered above
-  // its offset and served again later, which re-applies them as no-ops.
-  const snapshot = async (table: TablePlan, columns: TablePlan['columns']) => {
-    return stampedSnapshot(async (tx, top) => {
       const rs = await attachment.executeQuery(
-        tx, `SELECT ${columns.map((c) => c.select).join(', ')} FROM ${quote(table.name)}`);
-      const messages: Message[] = [];
-      for (const row of await rs.fetch()) {
-        messages.push(await change('insert', table, columns, row, tx));
-      }
+        tx, `SELECT (SELECT MAX(COMMIT_SEQ) FROM ${CHANGES}), MAX(PRUNED_THROUGH) FROM ${META}`);
+      const row = (await rs.fetch())[0];
       await rs.close();
-      return { messages, offset: top, seen: top };
+      const pruned = Number(row?.[1] ?? 0);
+      return fn(tx, Math.max(Number(row?.[0] ?? 0), pruned), pruned);
     });
   };
 
-  /** The changes to `table` after `after`, up to the watermark, one per key. */
-  const changesAfter = async (table: TablePlan, columns: TablePlan['columns'], after: number) => {
-    return stampedSnapshot(async (tx, top) => {
-      if (top <= after) return { messages: [] as Message[], offset: after, seen: top };
+  // Pages of a snapshot being read, by the cursor number in their offset.
+  const cursors = new Map<number, { handle: string; top: number; after: unknown[]; used: number }>();
+  let nextCursor = 1;
+
+  /** One page of a shape's rows, in key order, after the key `after`. */
+  const page = async (shape: Shape, tx: Transaction, after: unknown[] | null) => {
+    const conditions: string[] = [];
+    const params: unknown[] = [];
+    if (shape.where) {
+      conditions.push(`(${shape.where.sql})`);
+      params.push(...shape.where.params);
+    }
+    if (after) {
+      const keyset = keysetAfter(shape.table.key.map(quote), after);
+      conditions.push(keyset.sql);
+      params.push(...keyset.params);
+    }
+    const rs = await attachment.executeQuery(
+      tx,
+      `SELECT FIRST ${pageRows + 1} ${shape.columns.map((c) => c.select).join(', ')} FROM ${quote(shape.table.name)}` +
+        (conditions.length ? ` WHERE ${conditions.join(' AND ')}` : '') +
+        ` ORDER BY ${shape.table.key.map(quote).join(', ')}`,
+      params,
+    );
+    const rows = await rs.fetch();
+    await rs.close();
+    const more = rows.length > pageRows;
+    const kept = more ? rows.slice(0, pageRows) : rows;
+    const messages: Message[] = [];
+    for (const row of kept) messages.push(await change('insert', shape.table, shape.columns, row, tx));
+    const last = kept[kept.length - 1];
+    const keyIndexes = shape.table.key.map((k) => shape.columns.findIndex((c) => c.name === k));
+    return { messages, more, last: last ? keyIndexes.map((i) => last[i]) : null };
+  };
+
+  /** The changes to a shape after `after`, up to the watermark, one per key. */
+  const changesAfter = async (shape: Shape, after: number) => {
+    return stampedSnapshot(async (tx, top, pruned) => {
+      // What this client needs was pruned: it starts again from a snapshot.
+      if (after < pruned) return { gone: true, messages: [] as Message[], offset: after, seen: top };
+      if (top <= after) return { gone: false, messages: [] as Message[], offset: after, seen: top };
+      const table = shape.table;
       const keys = Array.from({ length: KEY_COLUMNS }, (_, i) => `K${i + 1}`).join(', ');
       const rs = await attachment.executeQuery(
         tx,
@@ -154,21 +223,22 @@ export async function createShapeServer(options: ShapeServerOptions): Promise<Sh
       }
       await rs.close();
 
-      const where = table.key.map((k) => `${quote(k)} = ?`).join(' AND ');
-      const select = `SELECT ${columns.map((c) => c.select).join(', ')} FROM ${quote(table.name)} WHERE ${where}`;
+      // A row that no longer matches the shape's where has left it: a delete.
+      const where = table.key.map((k) => `${quote(k)} = ?`).join(' AND ') + (shape.where ? ` AND (${shape.where.sql})` : '');
+      const select = `SELECT ${shape.columns.map((c) => c.select).join(', ')} FROM ${quote(table.name)} WHERE ${where}`;
       const messages: Message[] = [];
       for (const { op, key } of last.values()) {
         let current: unknown[] | null = null;
         if (op !== 'D') {
-          const found = await attachment.executeQuery(tx, select, key);
+          const found = await attachment.executeQuery(tx, select, [...key, ...(shape.where?.params ?? [])]);
           current = (await found.fetch({ fetchSize: 1 }))[0] ?? null;
           await found.close();
         }
         messages.push(current
-          ? await change('insert', table, columns, current, tx)
+          ? await change('insert', table, shape.columns, current, tx)
           : deletion(table, key));
       }
-      return { messages, offset: top, seen: top };
+      return { gone: false, messages, offset: top, seen: top };
     });
   };
 
@@ -219,6 +289,35 @@ export async function createShapeServer(options: ShapeServerOptions): Promise<Sh
     res.end(JSON.stringify(body));
   };
 
+  // As Electric's: the last position of the whole log this response has
+  // seen, so a client of several shapes can tell when they are all at the
+  // same one (syncShapesToTables).
+  const upToDate = (seen: number) => ({ headers: { control: 'up-to-date', global_last_seen_lsn: String(seen) } });
+
+  /** The rest of a snapshot, or all of it: a page, and where the next one starts. */
+  const servePage = async (res: ServerResponse, shape: Shape, top: number, messages: Message[], more: boolean, last: unknown[] | null) => {
+    const schema = JSON.stringify(shape.schema);
+    if (!more) {
+      respond(res, 200, [...messages, upToDate(top)], {
+        'electric-handle': shape.handle,
+        'electric-offset': `${top}_0`,
+        'electric-schema': schema,
+        'electric-up-to-date': '',
+      });
+      return;
+    }
+    // Forget cursors nobody came back for.
+    const now = Date.now();
+    for (const [id, c] of cursors) if (now - c.used > 10 * 60 * 1000) cursors.delete(id);
+    const id = nextCursor++;
+    cursors.set(id, { handle: shape.handle, top, after: last!, used: now });
+    respond(res, 200, messages, {
+      'electric-handle': shape.handle,
+      'electric-offset': `${top}_${id}`,
+      'electric-schema': schema,
+    });
+  };
+
   const serve = async (req: IncomingMessage, res: ServerResponse) => {
     if (req.method === 'OPTIONS') {
       res.writeHead(204, {
@@ -234,57 +333,78 @@ export async function createShapeServer(options: ShapeServerOptions): Promise<Sh
       throw new HttpError(404, 'Only GET /v1/shape is served');
     }
     const params = url.searchParams;
-    const given = params.get('table');
-    if (!given) throw new HttpError(400, 'table is required');
-    const table = tables.get(relationName(given));
-    if (!table) throw new HttpError(404, `Table ${given} is not served`);
-    if (params.get('where')) throw new HttpError(400, 'where is not supported by this server yet');
-    const columns = selectColumns(table, params.get('columns'));
-    const schema = Object.fromEntries(columns.map((c) => [c.shapeName, table.schema[c.shapeName]]));
-    const handle = handleOf(table);
-    // As Electric's: the last position of the whole log this response has
-    // seen, so a client of several shapes can tell when they are all at the
-    // same one (syncShapesToTables).
-    const upToDate = (seen: number) => ({ headers: { control: 'up-to-date', global_last_seen_lsn: String(seen) } });
+    const shape = shapeOfRequest(params, tables, epoch);
     const offsetParam = params.get('offset') ?? '-1';
 
     if (offsetParam === '-1') {
-      const { messages, offset, seen } = await snapshot(table, columns);
-      respond(res, 200, [...messages, upToDate(seen)], {
-        'electric-handle': handle,
-        'electric-offset': `${offset}_0`,
-        'electric-schema': JSON.stringify(schema),
-        'electric-up-to-date': '',
+      await stampedSnapshot(async (tx, top) => {
+        const first = await page(shape, tx, null);
+        await servePage(res, shape, top, first.messages, first.more, first.last);
       });
       return;
     }
 
-    if (params.get('handle') !== handle) {
-      respond(res, 409, [{ headers: { control: 'must-refetch' } }], { 'electric-handle': handle });
+    if (params.get('handle') !== shape.handle) {
+      respond(res, 409, [{ headers: { control: 'must-refetch' } }], { 'electric-handle': shape.handle });
       return;
     }
-    const after = offsetParam === 'now'
+    const [position, part] = offsetParam === 'now' ? ['now', '0'] : offsetParam.split('_');
+    if (part !== undefined && part !== '0') {
+      // The next page of a snapshot.
+      const cursor = cursors.get(Number(part));
+      if (!cursor || cursor.handle !== shape.handle || String(cursor.top) !== position) {
+        respond(res, 409, [{ headers: { control: 'must-refetch' } }], { 'electric-handle': shape.handle });
+        return;
+      }
+      cursors.delete(Number(part));
+      await readOnly(attachment, async (tx) => {
+        const next = await page(shape, tx, cursor.after);
+        await servePage(res, shape, cursor.top, next.messages, next.more, next.last);
+      });
+      return;
+    }
+
+    const after = position === 'now'
       ? await stampedSnapshot(async (_tx, top) => top)
-      : Number(offsetParam.split('_')[0]);
+      : Number(position);
     if (!Number.isSafeInteger(after) || after < 0) throw new HttpError(400, `offset ${offsetParam} is not one this server gave`);
 
     const live = params.get('live') === 'true';
     const deadline = Date.now() + (live ? liveTimeoutMs : 0);
-    let result = await changesAfter(table, columns, after);
-    while (live && result.messages.length === 0 && Date.now() < deadline && !closed && !req.destroyed) {
-      await new Promise((r) => setTimeout(r, pollIntervalMs));
+    let result = await changesAfter(shape, after);
+    while (!result.gone && live && result.messages.length === 0 && Date.now() < deadline && !closed && !req.destroyed) {
+      const next = woken;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        next,
+        new Promise((r) => { timer = setTimeout(r, Math.min(pollIntervalMs, Math.max(0, deadline - Date.now()))); }),
+      ]);
+      clearTimeout(timer);
       if (closed) throw new HttpError(503, 'The shape server is closing');
-      result = await changesAfter(table, columns, after);
+      result = await changesAfter(shape, after);
+    }
+    if (result.gone) {
+      respond(res, 409, [{ headers: { control: 'must-refetch' } }], { 'electric-handle': shape.handle });
+      return;
     }
     const headers: Record<string, string> = {
-      'electric-handle': handle,
+      'electric-handle': shape.handle,
       'electric-offset': `${result.offset}_0`,
       'electric-up-to-date': '',
     };
     if (live) headers['electric-cursor'] = String(Math.floor(Date.now() / 1000));
-    else headers['electric-schema'] = JSON.stringify(schema);
+    else headers['electric-schema'] = JSON.stringify(shape.schema);
     respond(res, 200, [...result.messages, upToDate(result.seen)], headers);
   };
+
+  const prune = async (before?: Date): Promise<number> => {
+    if (closed) return 0;
+    return serialized(attachment, () => pruneLog(attachment, before ?? new Date(Date.now() - (retainLogMs ?? 0))));
+  };
+  const pruning = retainLogMs !== null && retainLogMs > 0
+    ? setInterval(() => { void prune().catch(() => undefined); }, Math.min(retainLogMs, 60 * 60 * 1000))
+    : undefined;
+  pruning?.unref?.();
 
   return {
     tables,
@@ -294,14 +414,19 @@ export async function createShapeServer(options: ShapeServerOptions): Promise<Sh
         return;
       }
       serve(req, res).catch((err: unknown) => {
-        const status = err instanceof HttpError ? err.status : 500;
+        const status = err instanceof HttpError ? err.status : err instanceof WhereError ? 400 : 500;
         if (!res.headersSent) respond(res, status, { message: err instanceof Error ? err.message : String(err) });
         else res.end();
       });
     },
+    prune,
     close: async () => {
       if (closed) return;
       closed = true;
+      if (pruning) clearInterval(pruning);
+      signal();
+      await events?.cancel().catch(() => undefined);
+      await eventAttachment?.disconnect().catch(() => undefined);
       // In the connection's queue, after whatever is running on it: a live
       // request polls the log, and a native call on a disconnected
       // attachment crashes the process rather than throwing. Whatever is
@@ -313,6 +438,58 @@ export async function createShapeServer(options: ShapeServerOptions): Promise<Sh
       await client.dispose().catch(() => undefined);
     },
   };
+}
+
+/** One shape: a table, its columns, its where, and the handle that names them. */
+interface Shape {
+  table: TablePlan;
+  columns: TablePlan['columns'];
+  schema: Record<string, unknown>;
+  where: FirebirdWhere | undefined;
+  handle: string;
+}
+
+/** The shape a request asks for. */
+function shapeOfRequest(params: URLSearchParams, tables: ReadonlyMap<string, TablePlan>, epoch: string): Shape {
+  const given = params.get('table');
+  if (!given) throw new HttpError(400, 'table is required');
+  const table = tables.get(relationName(given));
+  if (!table) throw new HttpError(404, `Table ${given} is not served`);
+  const columnsParam = params.get('columns');
+  const columns = selectColumns(table, columnsParam);
+  const schema = Object.fromEntries(columns.map((c) => [c.shapeName, table.schema[c.shapeName]]));
+
+  const whereText = params.get('where');
+  // Electric's positional parameters: params[1]=…, params[2]=…
+  const values = new Map<number, string>();
+  for (const [name, value] of params) {
+    const m = /^params\[(\d+)\]$/.exec(name);
+    if (m) values.set(Number(m[1]), value);
+  }
+  let where: FirebirdWhere | undefined;
+  if (whereText) {
+    const names = new Map(table.columns.map((c) => [c.shapeName, quote(c.name)]));
+    where = translateWhere(whereText, names, values);
+  }
+  // Each shape of a table its own handle: the table alone, as before, when
+  // the shape is the whole table.
+  const definition = whereText || columnsParam
+    ? `${table.name}\u0000${columns.map((c) => c.name).join(',')}\u0000${whereText ?? ''}\u0000${JSON.stringify([...values].sort())}`
+    : table.name;
+  return { table, columns, schema, where, handle: `${epoch}-${hashName(definition)}` };
+}
+
+/** `(k1, k2, …) > (v1, v2, …)`, as Firebird 3 can write it. */
+function keysetAfter(keys: string[], values: unknown[]): { sql: string; params: unknown[] } {
+  const ors: string[] = [];
+  const params: unknown[] = [];
+  for (let i = 0; i < keys.length; i++) {
+    const ands = keys.slice(0, i).map((k) => `${k} = ?`);
+    ands.push(`${keys[i]} > ?`);
+    ors.push(`(${ands.join(' AND ')})`);
+    params.push(...values.slice(0, i), values[i]);
+  }
+  return { sql: `(${ors.join(' OR ')})`, params };
 }
 
 /**

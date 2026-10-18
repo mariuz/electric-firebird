@@ -31,7 +31,8 @@
  * chosen to be lossless-or-explicit rather than silently approximate:
  *
  *     CHAR/VARCHAR/text BLOB      → string
- *     binary BLOB                 → base64 string
+ *     binary BLOB, BINARY,        → base64 string (or bytes beside the JSON,
+ *     VARBINARY (OCTETS)            with the side-buffer flag)
  *     SMALLINT/INTEGER            → number
  *     BIGINT/INT128               → number when exactly representable as an
  *                                   IEEE-754 double, otherwise string
@@ -834,6 +835,35 @@ void appendDateText(unsigned year, unsigned month, unsigned day, std::string& ou
 	appendPadded(day, 2, out);
 }
 
+/** RDB$CHARACTER_SETS id of OCTETS, the set of BINARY and VARBINARY. */
+constexpr unsigned CHARSET_OCTETS = 1;
+
+/**
+ * Append bytes as a binary value: a placeholder for the side buffer when the
+ * caller asked for bytes, otherwise a base64 string.
+ */
+void appendBytes(const std::vector<unsigned char>& bytes, std::string& out, BlobSink* sink)
+{
+	if (sink && sink->enabled)
+	{
+		// Out of band: the JSON keeps a reference and the bytes go beside it.
+		// The index is the value's position in the side buffer, which is
+		// simply how many have been collected so far.
+		char placeholder[32];
+		snprintf(placeholder, sizeof(placeholder), "{\"$blob\":%u}",
+			static_cast<unsigned>(sink->lengths.size()));
+		out += placeholder;
+
+		sink->lengths.push_back(static_cast<unsigned>(bytes.size()));
+		sink->data.insert(sink->data.end(), bytes.begin(), bytes.end());
+		return;
+	}
+
+	out += '"';
+	base64Encode(bytes, out);
+	out += '"';
+}
+
 /** Read a text or binary BLOB in full and append it as a JSON string. */
 void appendBlob(IAttachment* attachment, ITransaction* transaction,
 	ISC_QUAD* blobId, int subType, std::string& out, BlobSink* sink)
@@ -875,24 +905,7 @@ void appendBlob(IAttachment* attachment, ITransaction* transaction,
 		return;
 	}
 
-	if (sink && sink->enabled)
-	{
-		// Out of band: the JSON keeps a reference and the bytes go beside it.
-		// The index is the blob's position in the side buffer, which is simply
-		// how many have been collected so far.
-		char placeholder[32];
-		snprintf(placeholder, sizeof(placeholder), "{\"$blob\":%u}",
-			static_cast<unsigned>(sink->lengths.size()));
-		out += placeholder;
-
-		sink->lengths.push_back(static_cast<unsigned>(bytes.size()));
-		sink->data.insert(sink->data.end(), bytes.begin(), bytes.end());
-		return;
-	}
-
-	out += '"';
-	base64Encode(bytes, out);
-	out += '"';
+	appendBytes(bytes, out, sink);
 }
 
 /**
@@ -942,16 +955,24 @@ void appendValue(IAttachment* attachment, ITransaction* transaction,
 	switch (type)
 	{
 		case SQL_TEXT:
-			jsonEscape(reinterpret_cast<const char*>(data),
-				charTextLength(data, length, charSet), out);
+			// OCTETS (BINARY(n), GEN_UUID()) is bytes, not text: as a binary BLOB.
+			if ((charSet & 0xff) == CHARSET_OCTETS)
+				appendBytes(std::vector<unsigned char>(data, data + length), out, sink);
+			else
+				jsonEscape(reinterpret_cast<const char*>(data),
+					charTextLength(data, length, charSet), out);
 			break;
 
 		case SQL_VARYING:
 		{
 			unsigned short varLength = 0;
 			memcpy(&varLength, data, sizeof(varLength));
-			jsonEscape(reinterpret_cast<const char*>(data + sizeof(varLength)),
-				varLength, out);
+			if ((charSet & 0xff) == CHARSET_OCTETS)
+				appendBytes(std::vector<unsigned char>(data + sizeof(varLength), data + sizeof(varLength) + varLength),
+					out, sink);
+			else
+				jsonEscape(reinterpret_cast<const char*>(data + sizeof(varLength)),
+					varLength, out);
 			break;
 		}
 
@@ -1205,9 +1226,6 @@ void appendValue(IAttachment* attachment, ITransaction* transaction,
  * whole-number column gets, so a NUMERIC(18,2) still sees "1.1" and a VARCHAR
  * "1.5"; those two kinds of column take the binary form, exactly.
  */
-/** RDB$CHARACTER_SETS id of OCTETS, the set of BINARY and VARBINARY. */
-constexpr unsigned CHARSET_OCTETS = 1;
-
 struct ParamValue
 {
 	bool          isNull = true;
@@ -1477,7 +1495,7 @@ public:
 				// Bytes go where bytes are kept: a BLOB (above) or a CHAR or
 				// VARCHAR in OCTETS (BINARY, VARBINARY).  Anywhere else they
 				// would be read as text in the connection's character set.
-				const bool octets = (f.type == SQL_TEXT || f.type == SQL_VARYING) && f.charSet == CHARSET_OCTETS;
+				const bool octets = (f.type == SQL_TEXT || f.type == SQL_VARYING) && (f.charSet & 0xff) == CHARSET_OCTETS;
 				if (!octets)
 				{
 					char message[160];

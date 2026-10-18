@@ -1,6 +1,8 @@
 # Plan: a Firebird server as the source of a shape
 
-**Status:** built as described (`firebird-wasm/electric-server`).
+**Status:** built as described (`firebird-wasm/electric-server`), and the
+prototype's open items since: `where`, pages, pruning, events, and several
+servers on one database (see the end).
 
 [electric-sync.md](./electric-sync.md) syncs a Postgres table into Firebird in
 the browser through Electric. Electric reads Postgres's logical replication
@@ -78,9 +80,10 @@ HTTP handler for `GET /v1/shape`:
 |---|---|
 | `offset=-1` | every row as an insert, `electric-schema`, `electric-handle`, `electric-offset` = the highest number in the snapshot, `up-to-date` |
 | `handle`, `offset` | the changes numbered after `offset`, collapsed per key (the last operation wins), then `up-to-date` |
-| `live=true` | the same, waiting (polling the log) up to 20 s for something to send |
+| `live=true` | the same, waiting up to 20 s for something to send: woken by the `ELECTRIC_CHANGES` event a commit posts, polling as the fallback |
 | a handle it did not issue | `409` with `must-refetch` and the current handle |
-| `where` | `400`: not in the prototype |
+| `where`, `params[n]` | a shape of the rows that match; see below |
+| an offset older than the pruned log | `409` with `must-refetch` |
 
 The handle is the capture's epoch (made when it is installed) and the table:
 reinstalling the capture, which forgets the log, sends every client back to a
@@ -95,14 +98,42 @@ PRECISION` float8 (the shortest text that reads back as the same double),
 a binary `BLOB`, `BINARY` and `VARBINARY` bytea (Postgres's `\x` hex).
 `DECFLOAT` is reported as a type the client refuses by name.
 
-## Out of the prototype
+## Since the prototype
 
-- Paging a large snapshot (it is one response).
-- Pruning the log (it grows until truncated by hand).
-- `where` and several shapes of one table.
-- Waking on Firebird events instead of polling the log.
-- More than one shape server per database (each numbers the log).
-- Writes from the browser back to the server.
+- **`where`.** Read by a small parser (`where.ts`) that takes comparisons,
+  `AND` / `OR` / `NOT`, `IS [NOT] NULL`, `IN`, `LIKE` / `ILIKE`, `BETWEEN`,
+  literals and Electric's `$n` parameters over the table's columns, and
+  writes Firebird SQL with every value bound; anything else is a 400 naming
+  it. The text comes from a client and the server runs what it writes, so
+  nothing passes through unread. A changed row is read with the `where`: if
+  it no longer matches, it is sent as a delete. The handle covers the table,
+  the columns, the `where` and its values, so one table has as many shapes
+  as clients ask for; the whole table keeps its old handle.
+- **Pages.** A snapshot is read in key order, `snapshotPageRows` at a time
+  (keyset, not `ROWS`: a delete between pages must not shift a row past the
+  boundary). A page that is not the last answers with offset
+  `<top>_<cursor>` and no up-to-date; the client asks for the next. Pages
+  after the first are read in later transactions, which is safe for the
+  same reason the log is: anything that changed after the first page's
+  position is in the log above it and served again.
+- **Pruning.** Each number is recorded with its time (`ELECTRIC_STAMPS`).
+  `prune(before)` drops the changes numbered before it and records the
+  highest dropped (`ELECTRIC_META.PRUNED_THROUGH`); a client whose offset is
+  below that is answered `409 must-refetch`. By default the server prunes
+  hourly what is older than 7 days (`retainLogMs`).
+- **Events.** Each logging trigger posts `ELECTRIC_CHANGES`, which Firebird
+  delivers once per committing transaction; the server listens on a second
+  connection and wakes every waiting live request. Polling stays as the
+  fallback, at 1 s by default.
+- **Several servers.** Numbering takes the `ELECTRIC_META` row first (and
+  retries if another server holds it), and only then a number, so numbers
+  commit in order: a snapshot that sees a number sees every one below it.
+  Without it, two servers numbering at once failed on each other's rows, or
+  could commit a higher number before a lower one, and a client that had
+  seen the higher would never be sent the lower.
+
+Still out: writes from the browser back to the server (see the write path in
+[electric-sync.md](./electric-sync.md)).
 
 ## Tests
 

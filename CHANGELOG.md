@@ -27,6 +27,19 @@ API may still move between minor releases.
   it; a shape behind is refreshed. The shape server now sends
   `global_last_seen_lsn` (its log position) as Electric does.
   `syncShapeToTable` is the one-shape case of the same code.
+- **The shape server takes `where`, pages its snapshots, prunes its log,
+  wakes on events, and runs beside others.**
+  - `where` (and Electric's `params[n]`) is parsed and written as Firebird
+    SQL with every value bound; functions, casts and subqueries are refused
+    with a 400. Each `where` and `columns` is a shape with its own handle,
+    and a row that stops matching leaves as a delete.
+  - Snapshots are served `snapshotPageRows` (10 000) rows a response, by
+    key.
+  - The log is pruned of changes older than `retainLogMs` (7 days), or by
+    `prune(before)`; a client further behind is sent back to a snapshot.
+  - Commits wake live requests through the `ELECTRIC_CHANGES` event, with
+    polling (now every 1 s) as the fallback.
+  - Numbering takes a lock, so several servers can serve one database.
 - **An example app that syncs from two servers:
   [`examples/electric`](./examples/electric).** Two lists of notes, each a
   table in the page's Firebird: one follows Postgres through Electric, the
@@ -38,6 +51,10 @@ API may still move between minor releases.
 
 ### Fixed
 
+- **The browser engine reads `BINARY` and `VARBINARY` (`OCTETS`) values as
+  bytes**, as it reads a binary `BLOB`: base64 by default, a `Uint8Array`
+  with `types: { binary: true }`. They were read as text, which turned bytes
+  that are not UTF-8 into replacement characters (`GEN_UUID()` among them).
 - **Two `syncShapeToTable` calls started together on a new database no
   longer stop one of them.** Both found no `ELECTRIC_SHAPES` table and both
   created it; the second creation failed ("unsuccessful metadata update")

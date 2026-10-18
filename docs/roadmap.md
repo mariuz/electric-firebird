@@ -1116,7 +1116,9 @@ gaps it ran into, with its numbers, in rough order of what they would buy.
       bytes into, and `syncShapesToTables` applies several shapes in one
       transaction.
       **A Firebird server as the source** works the same way through
-      `firebird-wasm/electric-server` (Electric reads only Postgres): see
+      `firebird-wasm/electric-server` (Electric reads only Postgres), with
+      `where`, paged snapshots, a pruned log, event wake-ups and several
+      servers per database: see
       [plans/firebird-shape-server.md](./plans/firebird-shape-server.md).
 - [ ] A Firebird version build matrix. The submodule tracks `master` and the
       shipped engine reports `ENGINE_VERSION 6.0.0`, so the recurring "Firebird

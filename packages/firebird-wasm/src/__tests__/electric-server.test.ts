@@ -85,12 +85,17 @@ describeIfFirebird('createShapeServer against a Firebird server', () => {
   const aborts: AbortController[] = [];
 
   /** A live Shape of `table`, the way a client follows it. */
-  function follow(table: string, from?: { offset: string; handle: string }) {
+  function follow(
+    table: string,
+    from?: { offset: string; handle: string },
+    at: string = url,
+    extra: Record<string, unknown> = {},
+  ) {
     const abort = new AbortController();
     aborts.push(abort);
     const stream = new ShapeStream({
-      url,
-      params: { table },
+      url: at,
+      params: { table, ...extra } as never,
       parser: TEXT,
       signal: abort.signal,
       ...(from ? { offset: from.offset as never, handle: from.handle } : {}),
@@ -257,9 +262,150 @@ describeIfFirebird('createShapeServer against a Firebird server', () => {
     expect(response.headers.get('electric-handle')).toBeTruthy();
   });
 
-  it('serves only the tables it was given, and refuses where', async () => {
+  it('serves only the tables it was given, and refuses a where it does not take', async () => {
     expect((await fetch(`${url}?table=rdb$database&offset=-1`)).status).toBe(404);
-    expect((await fetch(`${url}?table=items&offset=-1&where=id%3D1`)).status).toBe(400);
+    const refused = await fetch(`${url}?table=items&offset=-1&where=${encodeURIComponent('lower(title) = 1')}`);
+    expect(refused.status).toBe(400);
+    expect((await refused.json()).message).toMatch(/functions \(lower\) are not supported/);
+  });
+
+  /** Another server on the same database, with its own options. */
+  async function another(extra: Partial<Parameters<typeof createShapeServer>[0]> = {}) {
+    const other = await createShapeServer({ database, ...credentials, tables: ['items', 'pairs'], pollIntervalMs: 50, liveTimeoutMs: 2_000, ...extra });
+    const otherHttp = http.createServer(other.handler);
+    await new Promise<void>((r) => otherHttp.listen(0, '127.0.0.1', r));
+    const at = `http://127.0.0.1:${(otherHttp.address() as AddressInfo).port}/v1/shape`;
+    return {
+      server: other,
+      url: at,
+      close: async () => {
+        otherHttp.closeAllConnections();
+        await new Promise((r) => otherHttp.close(r));
+        await other.close();
+      },
+    };
+  }
+
+  it('serves a where: only matching rows, and rows moving in and out of it', async () => {
+    await source.exec("INSERT INTO items (id, title) VALUES (50, 'w-in')");
+    await source.exec("INSERT INTO items (id, title) VALUES (51, 'w-out')");
+    const { shape, stream } = follow('items', undefined, url, { where: "id >= $1 AND title LIKE 'w-%' AND title <> $2", params: { 1: '50', 2: 'w-out' } });
+    const ids = async () => byId(await shape.rows).map((r) => r['id']);
+    expect(await ids()).toEqual(['50']);
+    // A shape of its own: not the whole table's handle.
+    const whole = await fetch(`${url}?table=items&offset=-1`);
+    await whole.arrayBuffer();
+    expect(stream.shapeHandle).not.toBe(whole.headers.get('electric-handle'));
+
+    await source.exec("UPDATE items SET title = 'w-in-now' WHERE id = 51");   // moves in
+    await source.exec("UPDATE items SET title = 'w-out' WHERE id = 50");      // moves out
+    await source.exec("INSERT INTO items (id, title) VALUES (52, 'x-never')"); // never in
+    const rows = await until(() => byId(shape.currentRows).map((r) => r['id']), (r) => r.length === 1 && r[0] === '51', 'the moves');
+    expect(rows).toEqual(['51']);
+  });
+
+  it('serves a large snapshot in pages, keyed, and the client reads them all', async () => {
+    for (let id = 100; id < 107; id++) await source.exec('INSERT INTO items (id, title) VALUES (?, ?)', [id, `p${id}`]);
+    const paged = await another({ snapshotPageRows: 3 });
+    try {
+      const first = await fetch(`${paged.url}?table=items&offset=-1&where=${encodeURIComponent('id >= 100 AND id < 107')}`);
+      const body = await first.json() as Array<{ headers: Record<string, string> }>;
+      // A page: three rows, no up-to-date, an offset naming where the next starts.
+      expect(body).toHaveLength(3);
+      expect(body.some((m) => m.headers['control'] === 'up-to-date')).toBe(false);
+      expect(first.headers.get('electric-offset')).toMatch(/^\d+_[1-9]\d*$/);
+
+      const { shape } = follow('items', undefined, paged.url, { where: 'id >= 100 AND id < 107' });
+      expect(byId(await shape.rows).map((r) => r['id'])).toEqual(['100', '101', '102', '103', '104', '105', '106']);
+      // A page cursor the server does not know sends the client back to the start.
+      const lost = await fetch(`${paged.url}?table=items&offset=1_999&handle=${first.headers.get('electric-handle')}&where=${encodeURIComponent('id >= 100 AND id < 107')}`);
+      expect(lost.status).toBe(409);
+    } finally {
+      await paged.close();
+    }
+  });
+
+  it('prunes the log, and sends a client older than it back to a snapshot', async () => {
+    const pruned = await another({ retainLogMs: null });
+    try {
+      const first = follow('items', undefined, pruned.url);
+      await first.shape.rows;
+      const old = { offset: String(first.stream.lastOffset), handle: first.stream.shapeHandle! };
+      await source.exec("INSERT INTO items (id, title) VALUES (60, 'before pruning')");
+      await until(() => first.shape.currentRows.some((r) => r['id'] === '60'), Boolean, 'the change');
+
+      expect(await pruned.server.prune(new Date(Date.now() + 1_000))).toBeGreaterThan(0);
+      const { rows } = await source.query<{ N: number }>('SELECT COUNT(*) AS n FROM electric_changes WHERE commit_seq IS NOT NULL');
+      expect(Number(rows[0]!.N)).toBe(0);
+
+      // Behind the pruning: 409, then a snapshot, which has the row.
+      const behind = await fetch(`${pruned.url}?table=items&offset=${old.offset}&handle=${old.handle}`);
+      expect(behind.status).toBe(409);
+      const resumed = follow('items', old, pruned.url);
+      await until(() => resumed.shape.currentRows.some((r) => r['id'] === '60'), Boolean, 'the snapshot after pruning');
+      // And a client at the head goes on as before.
+      await source.exec("INSERT INTO items (id, title) VALUES (61, 'after pruning')");
+      await until(() => first.shape.currentRows.some((r) => r['id'] === '61'), Boolean, 'a change after pruning');
+    } finally {
+      await pruned.close();
+    }
+  });
+
+  it('wakes a live request on the commit, not the next poll', async () => {
+    // Polling every minute: only the event can bring the change in time.
+    const eventful = await another({ pollIntervalMs: 60_000, liveTimeoutMs: 30_000 });
+    try {
+      const { shape } = follow('items', undefined, eventful.url);
+      await shape.rows;
+      await new Promise((r) => setTimeout(r, 300)); // the client is waiting in a live request
+      const wrote = Date.now();
+      await source.exec("INSERT INTO items (id, title) VALUES (70, 'by event')");
+      await until(() => shape.currentRows.some((r) => r['id'] === '70'), Boolean, 'the change');
+      expect(Date.now() - wrote).toBeLessThan(5_000);
+    } finally {
+      await eventful.close();
+    }
+  });
+
+  it('numbers only under the lock every server takes, so numbers commit in order', async () => {
+    // Another server mid-numbering holds the ELECTRIC_META row.  Numbering
+    // past it could commit a higher number before its lower one, and a
+    // client that saw the higher would never be sent the lower.
+    const { shape } = follow('items');
+    await shape.rows;
+    const holder = new FirebirdLite(database, credentials);
+    try {
+      await holder.transaction(async (tx) => {
+        await tx.exec('UPDATE electric_meta SET epoch = epoch');
+        await source.exec("INSERT INTO items (id, title) VALUES (80, 'held')");
+        await new Promise((r) => setTimeout(r, 800));
+        expect(shape.currentRows.some((r) => r['id'] === '80')).toBe(false);
+      });
+      await until(() => shape.currentRows.some((r) => r['id'] === '80'), Boolean, 'the change once the lock is free');
+    } finally {
+      await holder.close();
+    }
+  });
+
+  it('runs two servers on one database: each serves every commit, in order', async () => {
+    const second = await another();
+    try {
+      const a = follow('items');
+      const b = follow('items', undefined, second.url);
+      await Promise.all([a.shape.rows, b.shape.rows]);
+      // Writers committing while both servers number the log.
+      await Promise.all(Array.from({ length: 12 }, (_, i) =>
+        source.exec('INSERT INTO items (id, title) VALUES (?, ?)', [200 + i, `two-${i}`])));
+      const want = Array.from({ length: 12 }, (_, i) => String(200 + i));
+      for (const { shape } of [a, b]) {
+        await until(() => want.every((id) => shape.currentRows.some((r) => r['id'] === id)), Boolean, 'every row on both');
+      }
+      // Numbers given once each: no change numbered twice or skipped.
+      const { rows } = await source.query<{ N: number }>('SELECT COUNT(*) AS n FROM electric_changes WHERE commit_seq IS NULL');
+      expect(Number(rows[0]!.N)).toBe(0);
+    } finally {
+      await second.close();
+    }
   });
 
   it('closes while live requests are waiting, without touching the closed connection', async () => {

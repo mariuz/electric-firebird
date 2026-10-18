@@ -888,7 +888,8 @@ only `name` — so there is nothing for a parser to key on.
 
 #### `binary`
 
-Binary `BLOB` values as `Uint8Array` rather than base64.
+Binary `BLOB` values, and `BINARY` / `VARBINARY` (`OCTETS`) values, as
+`Uint8Array` rather than base64.
 
 ```ts
 new FirebirdBrowser('mydb', { worker, types: { binary: true } });

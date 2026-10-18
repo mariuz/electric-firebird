@@ -419,11 +419,29 @@ per served table that logs each changed row's key. Before every read it
 numbers the changes committed since, so the stream follows commit order: a
 transaction that wrote first and committed last is not skipped. Values are
 read from the table when served and sent as Firebird renders them (exact
-for `BIGINT`, `NUMERIC`, `INT128` and timestamps). Run one server per
-database, and put your own authentication in front of it, as Electric's
-documentation advises for Electric itself. Not yet: `where`, paging of a
-large snapshot, and pruning of the log. A binary `BLOB` and a `BINARY` or
-`VARBINARY` column are served as `bytea`. See
+for `BIGINT`, `NUMERIC`, `INT128` and timestamps). A binary `BLOB` and a
+`BINARY` or `VARBINARY` column are served as `bytea`. Put your own
+authentication in front of it, as Electric's documentation advises for
+Electric itself. What else it does:
+
+- **`where`**, as Electric takes it (`params: { table: 'items', where: 'done = $1', params: { 1: 'false' } }`):
+  comparisons, `AND` / `OR` / `NOT`, `IS [NOT] NULL`, `IN`, `LIKE` / `ILIKE`,
+  `BETWEEN`, literals and `$n` parameters over the table's columns, with every
+  value bound. Anything else (functions, casts, subqueries) is refused with a
+  400 naming it. A row that stops matching leaves the shape as a delete. Each
+  `where` and `columns` is a shape of its own, with its own handle.
+- **Pages.** A snapshot is served `snapshotPageRows` rows a response (default
+  10 000), in key order; the client reads on until up-to-date.
+- **Pruning.** The log keeps a change `retainLogMs` after numbering it
+  (default 7 days; `null` keeps all, and `shapes.prune(before)` prunes by
+  hand). A client further behind is sent back to a snapshot.
+- **Events.** A commit that logged a change posts `ELECTRIC_CHANGES`, which
+  wakes waiting live requests at once, through a connection of its own;
+  polling (`pollIntervalMs`, default 1 s) is the fallback.
+- **Several servers** can serve one database: numbering takes a lock, so the
+  log is numbered in commit order whichever server numbers it.
+
+See
 [plans/firebird-shape-server.md](./plans/firebird-shape-server.md).
 
 ---
@@ -551,7 +569,7 @@ Anything a `double` cannot hold arrives as an **exact decimal string**:
 | `NUMERIC`, `DECIMAL`, `DECFLOAT`, `INT128` | `string` |
 | `DATE`, `TIME`, `TIMESTAMP` | ISO-8601 `string` |
 | `BLOB SUB_TYPE TEXT` | `string` |
-| `BLOB SUB_TYPE BINARY` | base64 `string` |
+| `BLOB SUB_TYPE BINARY`, `BINARY`, `VARBINARY` (`OCTETS`) | base64 `string` |
 
 Which means a money column is a string, and `+` will concatenate it:
 
