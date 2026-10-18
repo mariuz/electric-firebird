@@ -158,7 +158,9 @@ export class FirebirdLite {
    * Execute a (parameterised) SQL statement and return the result rows.
    *
    * For SELECT queries the rows are returned as plain objects keyed by the
-   * (upper-cased) column name, mirroring the PGlite convention.
+   * column name as Firebird reports it, mirroring the PGlite convention: an
+   * unquoted name in upper case (`SELECT title` gives `TITLE`), a quoted alias
+   * as written (`SELECT title AS "title"` gives `title`).
    *
    * ```ts
    * await db.query('SELECT * FROM items WHERE id = ?', [id]);
@@ -230,7 +232,7 @@ export class FirebirdLite {
       let failed = true;
       try {
         const columnLabels = await stmt.columnLabels;
-        fields = columnLabels.map((label) => ({ name: label.toUpperCase() }));
+        fields = columnLabels.map((label) => ({ name: label }));
 
         rows = shapeRows<T>(
           await fetchRows(stmt, transaction, statement.params, fields.length),
@@ -290,7 +292,7 @@ export class FirebirdLite {
         return undefined;
       }
       const fields: FieldInfo[] = (await stmt.columnLabels).map((label) => ({
-        name: label.toUpperCase(),
+        name: label,
       }));
       const rawRows = await fetchRows(stmt, transaction, params, fields.length);
       return { rows: shapeRows<T>(rawRows, fields, rowMode), fields };
@@ -361,7 +363,7 @@ export class FirebirdLite {
 
         return {
           params: undefined,
-          fields: columnLabels.map((label) => ({ name: label.toUpperCase() })),
+          fields: columnLabels.map((label) => ({ name: label })),
           statementType: statementKind(type),
           hasResultSet: stmt.hasResultSet,
         };
@@ -640,7 +642,7 @@ export class FirebirdTransaction {
     try {
       const columnLabels = await stmt.columnLabels;
       const fields: FieldInfo[] = columnLabels.map((label) => ({
-        name: label.toUpperCase(),
+        name: label,
       }));
 
       const rawRows = await fetchRows(stmt, this.transaction, statement.params, fields.length);

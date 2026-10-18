@@ -114,7 +114,7 @@ Execute a query and return a `QueryResult<T>`:
 
 ```ts
 interface QueryResult<T> {
-  rows: T[];       // result rows keyed by UPPER-CASE column name
+  rows: T[];       // result rows keyed by column name (upper case unless quoted)
   fields: FieldInfo[];  // column metadata
 }
 ```

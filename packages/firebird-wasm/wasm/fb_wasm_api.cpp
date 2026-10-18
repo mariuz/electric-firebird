@@ -123,7 +123,7 @@ struct OutputShape
 	unsigned columnCount = 0;
 	unsigned messageLength = 0;
 	bool hasCursor = true;                  // EXECUTE PROCEDURE has columns but no cursor
-	std::vector<unsigned> types, lengths, offsets, nullOffsets;
+	std::vector<unsigned> types, lengths, charSets, offsets, nullOffsets;
 	std::vector<int> subTypes, scales;
 	std::string header;                     // {"columns":[...],"rows":[
 	std::string idHeader;                   // {"shape":N,"rows":[  (kept shapes only)
@@ -896,17 +896,54 @@ void appendBlob(IAttachment* attachment, ITransaction* transaction,
 }
 
 /**
+ * Character-set ids from Firebird's src/intl/charsets.h, which is
+ * engine-internal and not reachable from the public API headers this file is
+ * written against.  UNICODE_FSS is UTF-8 limited to three bytes a character.
+ */
+constexpr unsigned FB_CS_UNICODE_FSS = 3;
+constexpr unsigned FB_CS_UTF8 = 4;
+
+/**
+ * How many bytes of a CHAR(n) value to keep.
+ *
+ * Firebird pads a CHAR to its length in bytes, which for a multi-byte
+ * character set is n times the widest character: a CHAR(36) in UTF-8 arrives
+ * as 144 bytes.  The value is its first n characters, padding included, as
+ * other Firebird drivers return it.  The attachment's character set is UTF-8,
+ * so every text column arrives in UTF-8 except OCTETS and NONE, which are one
+ * byte a character and kept whole.
+ */
+unsigned charTextLength(const unsigned char* data, unsigned length, unsigned charSet)
+{
+	charSet &= 0xff;   // the high byte is the collation
+	const unsigned bytesPerChar =
+		charSet == FB_CS_UTF8 ? 4 : charSet == FB_CS_UNICODE_FSS ? 3 : 1;
+	if (bytesPerChar == 1)
+		return length;
+
+	const unsigned chars = length / bytesPerChar;
+	unsigned pos = 0;
+	for (unsigned n = 0; n < chars && pos < length; n++)
+	{
+		const unsigned char c = data[pos];
+		pos += c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xe ? 3 : (c >> 3) == 0x1e ? 4 : 1;
+	}
+	return pos < length ? pos : length;
+}
+
+/**
  * Append one column value, already located inside the fetched message buffer,
  * as JSON.
  */
 void appendValue(IAttachment* attachment, ITransaction* transaction,
-	unsigned type, int subType, int scale, unsigned length,
+	unsigned type, int subType, int scale, unsigned length, unsigned charSet,
 	const unsigned char* data, std::string& out, BlobSink* sink)
 {
 	switch (type)
 	{
 		case SQL_TEXT:
-			jsonEscape(reinterpret_cast<const char*>(data), length, out);
+			jsonEscape(reinterpret_cast<const char*>(data),
+				charTextLength(data, length, charSet), out);
 			break;
 
 		case SQL_VARYING:
@@ -1160,13 +1197,6 @@ void appendValue(IAttachment* attachment, ITransaction* transaction,
 // makes one code path work for integers, dates and strings alike; the
 // alternative is reimplementing Firebird's conversion rules in the binding
 // layer and getting them subtly wrong.
-
-/**
- * UTF-8's character-set id.  Firebird defines CS_UTF8 in src/intl/charsets.h,
- * which is engine-internal and not reachable from the public API headers this
- * file is written against.
- */
-constexpr unsigned FB_CS_UTF8 = 4;
 
 /**
  * One bound parameter: SQL NULL, or text for the engine to convert, with the
@@ -1995,6 +2025,7 @@ std::shared_ptr<OutputShape> describeOutput(IStatement* statement, const char* c
 	shape->subTypes.resize(columnCount);
 	shape->scales.resize(columnCount);
 	shape->lengths.resize(columnCount);
+	shape->charSets.resize(columnCount);
 	shape->offsets.resize(columnCount);
 	shape->nullOffsets.resize(columnCount);
 
@@ -2015,6 +2046,7 @@ std::shared_ptr<OutputShape> describeOutput(IStatement* statement, const char* c
 		shape->subTypes[i]    = metadata->getSubType(status.ptr(), i);
 		shape->scales[i]      = metadata->getScale(status.ptr(), i);
 		shape->lengths[i]     = metadata->getLength(status.ptr(), i);
+		shape->charSets[i]    = metadata->getCharSet(status.ptr(), i);
 		shape->offsets[i]     = metadata->getOffset(status.ptr(), i);
 		shape->nullOffsets[i] = metadata->getNullOffset(status.ptr(), i);
 
@@ -2163,7 +2195,8 @@ bool serialiseCursor(IAttachment* attachment, ITransaction* transaction,
 				else
 				{
 					appendValue(attachment, transaction, shape.types[i], shape.subTypes[i],
-						shape.scales[i], shape.lengths[i], buffer.data() + shape.offsets[i],
+						shape.scales[i], shape.lengths[i], shape.charSets[i],
+						buffer.data() + shape.offsets[i],
 						json, sink);
 				}
 			}

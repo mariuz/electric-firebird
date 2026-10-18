@@ -103,8 +103,8 @@ test.describe('firebird-wasm/electric with Postgres and Electric', () => {
     expect(rows[0]).toMatchObject({
       ID: 1, SMALL: -2, PRICE: '12.50', RATIO: 0.1, TITLE: `it's "x"`, CODE: 'abc', DONE: true,
       UID: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', DOC: '{"a": [1, 2]}', TAGS: '["a","b,c"]',
-      // Stored under its quoted name; the library upper-cases result names.
-      CAMELCASE: 'cc', NOTHING: null,
+      // Stored under its quoted name, and read back under it.
+      camelCase: 'cc', NOTHING: null,
     });
     expect(String(rows[0].BIG)).toBe('9007199254740993');
     expect(String(rows[0].DAY)).toContain('2024-02-29');

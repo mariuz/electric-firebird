@@ -104,6 +104,24 @@ API may still move between minor releases.
   Worker that imported the library before setting
   `FIREBIRD_WORKER_OPTIONS`, the side effect above started the engine without
   them, so its `.wasm` was looked for next to the Worker script.
+- **A `CHAR(n)` in UTF-8 reads back as n characters.** Firebird pads a
+  `CHAR` to its length in bytes, four a character in UTF-8, and the browser
+  engine returned all of them: a `CHAR(36)` holding a uuid came back as the
+  uuid and 108 spaces. It is now cut to n characters, its own padding kept
+  (`'ab'` in a `CHAR(5)` is `'ab   '`, `'žš'` is `'žš   '`), as other
+  Firebird drivers return it. `OCTETS` and `NONE` columns, one byte a
+  character, are unchanged.
+
+### Changed
+
+- **A quoted column name keeps its case in results.** `query` upper-cased
+  every column name, so `SELECT title AS "title"` gave `TITLE`, unlike what
+  the integration guide said, and `SELECT "camelCase" FROM t` gave
+  `CAMELCASE`. Names are now as Firebird reports them, in the browser engine
+  and in `FirebirdLite` alike: unquoted names are still upper case (Firebird
+  folds them), so only quoted names change. Code that read a quoted name by
+  its upper-cased key (`row.CAMELCASE`) must use the name as written
+  (`row.camelCase`), or drop the quotes from the alias.
 
 ## 0.7.0 — 2026-10-18
 

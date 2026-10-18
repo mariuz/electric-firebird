@@ -221,10 +221,10 @@ await db.close();
 Nothing needs initialising. The first call opens the database — restoring it
 from IndexedDB if it exists, creating it if not.
 
-> **Column names come back uppercase.** Firebird folds unquoted identifiers to
-> upper case, so `SELECT title` yields `TITLE`. Use `SELECT title AS "title"`
-> if you want it lowercase, and be consistent — quoted identifiers are
-> case-sensitive from then on.
+> **Column names come back uppercase unless quoted.** Firebird folds unquoted
+> identifiers to upper case, so `SELECT title` yields `TITLE`. Use
+> `SELECT title AS "title"` if you want it lowercase, and be consistent —
+> quoted identifiers are case-sensitive from then on.
 
 ### React and Vue
 
