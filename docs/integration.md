@@ -360,6 +360,45 @@ await sync.unsubscribe();
 
 See [plans/electric-sync.md](./plans/electric-sync.md) for the design.
 
+### Syncing from a Firebird server
+
+Electric reads only Postgres. For a table on a **Firebird server**,
+`firebird-wasm/electric-server` stands in its place: a Node handler that
+serves the server's tables over Electric's protocol, so the browser side is
+the same `syncShapeToTable`.
+
+```js
+// Node, next to the Firebird server (needs node-firebird-driver-native)
+import * as http from 'node:http';
+import { createShapeServer } from 'firebird-wasm/electric-server';
+
+const shapes = await createShapeServer({
+  database: 'localhost:/data/app.fdb',
+  username: 'SYSDBA',
+  password: process.env.FIREBIRD_PASSWORD,
+  tables: ['items'],           // each needs a primary key
+});
+http.createServer(shapes.handler).listen(3000);
+
+// the browser: as with Electric
+await syncShapeToTable(db, {
+  shape: { url: 'http://localhost:3000/v1/shape', params: { table: 'items' } },
+  table: 'items',
+  shapeKey: 'items',
+});
+```
+
+On start it installs, once, a change log (`ELECTRIC_CHANGES`) and a trigger
+per served table that logs each changed row's key. Before every read it
+numbers the changes committed since, so the stream follows commit order: a
+transaction that wrote first and committed last is not skipped. Values are
+read from the table when served and sent as Firebird renders them (exact
+for `BIGINT`, `NUMERIC`, `INT128` and timestamps). Run one server per
+database, and put your own authentication in front of it, as Electric's
+documentation advises for Electric itself. Not yet: `where`, paging of a
+large snapshot, and pruning of the log. See
+[plans/firebird-shape-server.md](./plans/firebird-shape-server.md).
+
 ---
 
 ## 4. Bundlers

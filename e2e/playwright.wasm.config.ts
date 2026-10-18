@@ -29,6 +29,7 @@ export default defineConfig({
     '**/browser-frameworks.spec.ts',
     '**/browser-repl.spec.ts',
     '**/browser-electric.spec.ts',
+    '**/browser-firebird-shapes.spec.ts',
   ],
   fullyParallel: false,
   forbidOnly: !!process.env['CI'],

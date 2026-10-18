@@ -140,12 +140,30 @@ jobs:
             sleep 1
           done
 
+      # And a Firebird server, for browser-firebird-shapes.spec.ts: its
+      # tables served by firebird-wasm/electric-server into the engine. The
+      # shape server runs in the test process, through the native client.
+      - name: Start a Firebird server, and install its client library
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libfbclient2
+          sudo ln -sf /usr/lib/x86_64-linux-gnu/libfbclient.so.2 \
+                      /usr/lib/x86_64-linux-gnu/libfbclient.so
+          docker run -d --name firebird -p 3050:3050 \
+            -e FIREBIRD_ROOT_PASSWORD=masterkey firebirdsql/firebird:5
+          for i in $(seq 1 30); do
+            (echo > /dev/tcp/localhost/3050) 2>/dev/null && break
+            sleep 1
+          done
+
       - name: Run WASM browser (Playwright) e2e tests
         working-directory: e2e
         env:
           CI: 'true'
           ELECTRIC_URL: http://localhost:3000
           PG_URL: postgresql://postgres:pg@localhost:54321/postgres
+          FIREBIRD_SHAPES_HOST: localhost
+          FIREBIRD_SHAPES_PASSWORD: masterkey
         run: npx playwright test --config playwright.wasm.config.ts
 
       - name: Run demo site (Playwright) e2e tests

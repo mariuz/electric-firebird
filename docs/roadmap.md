@@ -1104,6 +1104,9 @@ gaps it ran into, with its numbers, in rough order of what they would buy.
       Chromium against a real Postgres and Electric in CI (types, live
       changes, resume after a reload, must-refetch). Left: several shapes in
       one transaction, a write path, `bytea`, and a demo page.
+      **A Firebird server as the source** works the same way through
+      `firebird-wasm/electric-server` (Electric reads only Postgres): see
+      [plans/firebird-shape-server.md](./plans/firebird-shape-server.md).
 - [ ] A Firebird version build matrix. The submodule tracks `master` and the
       shipped engine reports `ENGINE_VERSION 6.0.0`, so the recurring "Firebird
       4 & 5 support" line was always mis-stated: what is missing is *testing

@@ -97,6 +97,26 @@ describeIfFirebird('FirebirdLite', () => {
     }
   });
 
+  it('binds a string into a BLOB parameter, by every route', async () => {
+    // The driver takes a Buffer there and refused a string.
+    await db.exec('CREATE TABLE notes (id INTEGER, body BLOB SUB_TYPE TEXT)');
+    const big = 'ž€ '.repeat(30_000);
+    await db.exec('INSERT INTO notes VALUES (?, ?)', [1, 'exec']);
+    await db.query('INSERT INTO notes VALUES (?, ?)', [2, big]);
+    await db.transaction(async (tx) => {
+      await tx.exec('INSERT INTO notes VALUES (?, ?)', [3, 'in a transaction']);
+      await tx.execBatch('INSERT INTO notes VALUES (?, ?)', [[4, 'batch a'], [5, null], [6, 'batch b']]);
+    });
+    // In bytes: the database's default character set may be NONE, which
+    // counts characters as bytes.
+    const lengths = await db.query<{ ID: number; L: number }>('SELECT id, OCTET_LENGTH(body) AS l FROM notes ORDER BY id');
+    expect(lengths.rows).toEqual([
+      { ID: 1, L: 4 }, { ID: 2, L: Buffer.byteLength(big) }, { ID: 3, L: 16 }, { ID: 4, L: 7 }, { ID: 5, L: null }, { ID: 6, L: 7 },
+    ]);
+    const match = await db.query('SELECT id FROM notes WHERE body = ?', ['batch b']);
+    expect(match.rows).toEqual([{ ID: 6 }]);
+  });
+
   it('creates a new database and queries it', async () => {
     const result = await db.query(
       "SELECT 'Hello world' as MESSAGE FROM RDB$DATABASE",

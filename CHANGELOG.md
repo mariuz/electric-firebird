@@ -24,6 +24,15 @@ API may still move between minor releases.
 
 ### Added
 
+- **`firebird-wasm/electric-server`: a Firebird server's tables over
+  Electric's protocol.** `createShapeServer({ database, tables })` returns a
+  Node HTTP handler that `syncShapeToTable` syncs from as it would from
+  Electric, so a table on a Firebird server reaches Firebird in the browser
+  with no Postgres. Triggers log each changed row's key; the server numbers
+  the log in commit order before every read, so a transaction that wrote
+  first and committed last is never skipped, and a connection opened before
+  the capture was installed is captured too. Tested on Firebird 3, 4 and 5,
+  and end to end into the engine in Chromium.
 - **`firebird-wasm/electric`: sync a Postgres table through Electric.**
   `syncShapeToTable(db, { shape, table, shapeKey })` keeps a Firebird table in
   step with an Electric shape: each batch Electric marks up-to-date applied in
@@ -33,7 +42,8 @@ API may still move between minor releases.
   an event per batch for `live()` and the hooks. `tableFromSchema()` writes a
   `CREATE TABLE` from a shape's schema to review. Read-only, as Electric is.
   `@electric-sql/client` is an optional peer dependency. Tested against a real
-  Postgres and Electric in CI.
+  Postgres and Electric in CI. A Postgres `int8` is bound as its text, which
+  converts into `BIGINT` exactly and which the Node driver can bind.
 - **`firebird-wasm/repl`: a SQL console as a custom element.**
   `defineFirebirdRepl()` registers `<firebird-repl>`; give it a database
   through its `db` property. Ctrl+Enter runs a script statement by statement
@@ -57,6 +67,11 @@ API may still move between minor releases.
 
 ### Fixed
 
+- **`FirebirdLite` binds a string into a BLOB parameter.** The native driver
+  takes a `Buffer` there and refused a string ("Unrecognized type used as
+  BLOB"); a string bound to a BLOB parameter is now passed as its UTF-8
+  bytes, in `exec`, `query`, transactions and `execBatch`. The browser engine
+  had the same gap, fixed above.
 - **A string binds into a BLOB parameter.** `INSERT INTO notes (body) VALUES
   (?)` with a `BLOB SUB_TYPE TEXT` column failed in the browser engine ("BLOB
   and array data types are not supported for move operation"): a BLOB

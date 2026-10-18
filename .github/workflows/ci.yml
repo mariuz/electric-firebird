@@ -142,6 +142,8 @@ jobs:
       # FIREBIRD_REQUIRE_SERVER fails the run if the client library cannot
       # load, where the suite would otherwise skip itself and pass;
       # FIREBIRD_EXPECT_MAJOR checks the server is the version named here.
+      # firebird.test.ts is the Node driver; electric-server.test.ts serves
+      # this server's tables over Electric's protocol to Electric's client.
       - name: Run the server-backed tests
         working-directory: packages/firebird-wasm
         env:
@@ -150,4 +152,4 @@ jobs:
           FIREBIRD_PASSWORD: masterkey
           FIREBIRD_REQUIRE_SERVER: '1'
           FIREBIRD_EXPECT_MAJOR: ${{ matrix.firebird }}
-        run: npx jest src/__tests__/firebird.test.ts
+        run: npx jest src/__tests__/firebird.test.ts src/__tests__/electric-server.test.ts

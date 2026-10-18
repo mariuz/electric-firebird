@@ -254,7 +254,7 @@ describe('values', () => {
 
   it('converts each mapped type to what Firebird stores exactly', () => {
     expect(toFirebird('42', 'c', col('int4'))).toBe(42);
-    expect(toFirebird('9007199254740993', 'c', col('int8'))).toBe(9007199254740993n);
+    expect(toFirebird('9007199254740993', 'c', col('int8'))).toBe('9007199254740993');
     expect(toFirebird('12.50', 'c', col('numeric'))).toBe('12.50');
     expect(toFirebird('0.1', 'c', col('float8'))).toBe(0.1);
     expect(toFirebird('true', 'c', col('bool'))).toBe(true);
