@@ -8,9 +8,10 @@ const encode = (columns: { name: string; type: number }[], rows: unknown[][]): s
   });
 
 describe('decodeResultSet', () => {
+  // As the engine names them: unquoted names folded to upper case.
   const columns = [
-    { name: 'id', type: 496 },
-    { name: 'name', type: 448 },
+    { name: 'ID', type: 496 },
+    { name: 'NAME', type: 448 },
   ];
 
   it('decodes columns and rows, in both row modes', () => {
@@ -38,7 +39,7 @@ describe('decodeResultSet', () => {
   it('is not misled by a column name that contains the boundary text', () => {
     const odd = [{ name: '],"rows":[', type: 496 }, { name: 'x', type: 496 }];
     const result = decodeResultSet(encode(odd, [[1, 2]]), 'array');
-    expect(result.fields.map((f) => f.name)).toEqual(['],"ROWS":[', 'X']);
+    expect(result.fields.map((f) => f.name)).toEqual(['],"rows":[', 'x']);
     expect(result.rows).toEqual([[1, 2]]);
   });
 
@@ -63,7 +64,14 @@ describe('decodeResultSet', () => {
 
   it('parses any other shape whole', () => {
     // Keys in another order: not the bridge's layout, so no split is attempted.
-    const json = JSON.stringify({ rows: [[7]], columns: [{ name: 'n', type: 496, subType: 0, scale: 0, length: 4, nullable: false }] });
+    const json = JSON.stringify({ rows: [[7]], columns: [{ name: 'N', type: 496, subType: 0, scale: 0, length: 4, nullable: false }] });
     expect(decodeResultSet(json, 'array')).toMatchObject({ rows: [[7]], fields: [{ name: 'N' }] });
+  });
+
+  it('keeps a quoted name as the engine reports it', () => {
+    const quoted = [{ name: 'camelCase', type: 496 }, { name: 'TITLE', type: 448 }];
+    const result = decodeResultSet(encode(quoted, [[1, 'a']]));
+    expect(result.fields.map((f) => f.name)).toEqual(['camelCase', 'TITLE']);
+    expect(result.rows).toEqual([{ camelCase: 1, TITLE: 'a' }]);
   });
 });

@@ -179,6 +179,55 @@ test.describe('FirebirdBrowser against the real engine', () => {
     expect(result.nulls).toEqual([{ ID: 3 }]);
   });
 
+  test('reads a UTF-8 CHAR(n) back as n characters, not n × 4 bytes', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('memory://engine-char', {
+        worker: new Worker('/firebird-engine-worker.js'),
+      });
+
+      await db.exec('CREATE TABLE t (id INTEGER, c CHAR(5))');
+      await db.exec('INSERT INTO t VALUES (?, ?)', [1, 'ab']);
+      await db.exec('INSERT INTO t VALUES (?, ?)', [2, 'žš']);
+      await db.exec('INSERT INTO t VALUES (?, ?)', [3, 'žšžšž']);
+
+      const rows = await db.query('SELECT c FROM t ORDER BY id');
+      // A literal is a CHAR too: 'abc' is CHAR(3).
+      const literal = await db.query("SELECT 'abc' AS x FROM rdb$database");
+
+      await db.close();
+      return { rows: rows.rows, literal: literal.rows };
+    });
+
+    // Padded to 5 characters, as Firebird pads a CHAR, but not to its 20 bytes.
+    expect(result.rows).toEqual([{ C: 'ab   ' }, { C: 'žš   ' }, { C: 'žšžšž' }]);
+    expect(result.literal).toEqual([{ X: 'abc' }]);
+  });
+
+  test('keeps a quoted column name as written, and folds an unquoted one', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('memory://engine-names', {
+        worker: new Worker('/firebird-engine-worker.js'),
+      });
+
+      await db.exec('CREATE TABLE t ("camelCase" INTEGER, title VARCHAR(8))');
+      await db.exec('INSERT INTO t VALUES (?, ?)', [1, 'one']);
+
+      const quoted = await db.query('SELECT "camelCase", title, title AS "title" FROM t');
+      const described = await db.describeQuery('SELECT "camelCase" FROM t');
+
+      await db.close();
+      return {
+        rows: quoted.rows,
+        fields: quoted.fields.map((f) => f.name),
+        described: described.fields.map((f) => f.name),
+      };
+    });
+
+    expect(result.fields).toEqual(['camelCase', 'TITLE', 'title']);
+    expect(result.rows).toEqual([{ camelCase: 1, TITLE: 'one', title: 'one' }]);
+    expect(result.described).toEqual(['camelCase']);
+  });
+
   test('reports a parameter count mismatch instead of failing obscurely', async ({
     page,
   }) => {

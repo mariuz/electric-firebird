@@ -145,7 +145,8 @@ export interface TransactionOptions {
 /**
  * What each row is.
  *
- * - `'object'` (default) keys every value by its upper-cased column name.
+ * - `'object'` (default) keys every value by its column name as Firebird
+ *   reports it: upper case unless quoted (`AS "title"` stays `title`).
  * - `'array'` gives the values in column order, positionally.
  *
  * Names live in `fields` either way, so `'array'` loses nothing — it trades
