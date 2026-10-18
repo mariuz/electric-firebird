@@ -4,6 +4,147 @@ All notable changes to `firebird-wasm`. This project follows
 [semantic versioning](https://semver.org/); while the major version is 0 the
 API may still move between minor releases.
 
+## 0.8.0 — 2026-10-18
+
+### Security
+
+- **Importing the library no longer starts an engine server, and a page's
+  window is never served.** `firebird-wasm/browser` re-exported
+  `serveEngine` from the Worker entry, which started serving as soon as it
+  was loaded wherever `self.postMessage` existed, and a page's `window` has
+  one. So every page that imported the library listened for engine requests
+  on its window. With the engine on the page thread (the build without
+  threads, new in 0.7.0) that listener shared the page's engine, and any
+  window able to `postMessage` to the page, a frame or an opener of another
+  origin, could run SQL against its databases. With the engine in a Worker it
+  had no engine to reach. Now `serveEngine` lives in a module without side
+  effects, the Worker entry starts only in a dedicated Worker, and
+  `serveEngine` refuses a scope that has a `document`. Upgrade from 0.7.0 if
+  you run the engine on the page thread.
+
+### Added
+
+- **`firebird-wasm/electric-server`: a Firebird server's tables over
+  Electric's protocol.** `createShapeServer({ database, tables })` returns a
+  Node HTTP handler that `syncShapeToTable` syncs from as it would from
+  Electric, so a table on a Firebird server reaches Firebird in the browser
+  with no Postgres. Triggers log each changed row's key; the server numbers
+  the log in commit order before every read, so a transaction that wrote
+  first and committed last is never skipped, and a connection opened before
+  the capture was installed is captured too. Tested on Firebird 3, 4 and 5,
+  and end to end into the engine in Chromium.
+- **`firebird-wasm/electric`: sync a Postgres table through Electric.**
+  `syncShapeToTable(db, { shape, table, shapeKey })` keeps a Firebird table in
+  step with an Electric shape: each batch Electric marks up-to-date applied in
+  one transaction with the sync position, a resume from that position after a
+  reload, a full reload in one transaction on must-refetch, Postgres text
+  converted exactly per column type (and unmapped types refused by name), and
+  an event per batch for `live()` and the hooks. `tableFromSchema()` writes a
+  `CREATE TABLE` from a shape's schema to review. Read-only, as Electric is.
+  `@electric-sql/client` is an optional peer dependency. Tested against a real
+  Postgres and Electric in CI. A Postgres `int8` is bound as its text, which
+  converts into `BIGINT` exactly and which the Node driver can bind.
+- **`firebird-wasm/repl`: a SQL console as a custom element.**
+  `defineFirebirdRepl()` registers `<firebird-repl>`; give it a database
+  through its `db` property. Ctrl+Enter runs a script statement by statement
+  (`SET TERM` included) and stops at the first error; rows show as a table,
+  other statements with the rows they changed; ArrowUp and ArrowDown walk the
+  history. Values are drawn as text, never as HTML. A `db` set before the
+  element was defined, as frameworks do, is kept.
+- **`firebird-wasm/react` and `firebird-wasm/vue`.** `useQuery` runs a
+  statement and re-runs it when its SQL or parameters change by value;
+  `useLiveQuery` re-runs it each time one of its events fires (`live()`
+  under a hook). Both give `rows`, `error`, `loading` and `refresh()`, keep
+  the previous rows while the next ones load, drop results that arrive after
+  the component moved on, and unsubscribe on unmount, StrictMode's double
+  mount included. React through `FirebirdProvider`, Vue through
+  `provideFirebird(db)` or `app.provide(FIREBIRD, db)`; the statement and
+  parameters may be refs or getters in Vue. React 18+ and Vue 3.3+ are
+  optional peer dependencies.
+- **`examples/vite` and `examples/webpack`.** Minimal apps built by their own
+  bundlers from the package, run by CI in Chromium with and without
+  cross-origin isolation.
+
+### Fixed
+
+- **`FirebirdLite` binds a string into a DATE, TIME or TIMESTAMP parameter,
+  exactly.** The native driver takes a JS `Date` there and failed on a string
+  (`date.getFullYear is not a function`), so `firebird-wasm/electric`'s
+  `syncShapeToTable`, which sends dates and times as text, could not write to
+  a `FirebirdLite` database. Such a string is now sent as text and Firebird
+  converts it, as the browser engine does: to 1/10000 s, with no detour
+  through milliseconds or the process's time zone, and `WITH TIME ZONE` too
+  (with a Firebird 4 or later client library). A `Date` binds as before.
+- **`FirebirdLite` binds a string into an integer or NUMERIC parameter digit
+  for digit.** The driver binds those as doubles: `'9007199254740993'` into
+  a BIGINT arrived as 9007199254740992, and `syncShapeToTable` sends `int8`
+  and `numeric` as text. Such a string is now sent as text too; a JS number
+  is unchanged, and `execBatch` declares a block's parameter as the column's
+  own type rather than DOUBLE PRECISION.
+- **A bad parameter beside a BLOB no longer kills the process.** The driver
+  wrote a BLOB parameter while encoding the others, under a `Promise.all`
+  that rejected as soon as one failed, and the transaction was rolled back
+  under the blob's native calls: a date as a string, or a string too long for
+  its VARCHAR, beside a BLOB ended Node with a segmentation fault (seen in
+  Jest syncing a shape into a `FirebirdLite` database). `FirebirdLite` now
+  writes the blob before the driver encodes anything, so the failure is the
+  error it should be.
+- **An event posted right after subscribing is no longer lost.** A
+  subscription's first delivery from the engine is a baseline, not news, and
+  the bridge absorbed whatever it said. With threads that delivery comes from
+  the engine's watcher thread some time after the subscription returns, so a
+  `POST_EVENT` that committed first was folded into it and never reported: a
+  `live()` query missed its first change in about one browser run in three.
+  Subscribing now waits for the baseline before returning (the build without
+  threads delivered it in time already).
+- **`live()` no longer drops an event heard during a refresh.** It ran one
+  refresh at a time by ignoring events while one ran, but that refresh may
+  have read before the change committed, so the rows stayed stale until some
+  later event. An event during a refresh now earns exactly one more. `live()`
+  also subscribes before its first query rather than after, so a change
+  committed between the two is no longer in neither, and releases the
+  subscription if that query fails.
+- **`FirebirdLite` binds a string into a BLOB parameter.** The native driver
+  takes a `Buffer` there and refused a string ("Unrecognized type used as
+  BLOB"); a string bound to a BLOB parameter is now passed as its UTF-8
+  bytes, in `exec`, `query`, transactions and `execBatch`. The browser engine
+  had the same gap, fixed above.
+- **A string binds into a BLOB parameter.** `INSERT INTO notes (body) VALUES
+  (?)` with a `BLOB SUB_TYPE TEXT` column failed in the browser engine ("BLOB
+  and array data types are not supported for move operation"): a BLOB
+  parameter takes a blob's id, and the bridge only converted values. It now
+  writes the text as a blob in the statement's transaction and binds its id,
+  through `exec`, `query`, transactions and `execBatch` alike, with no size
+  limit of its own (text parameters were capped at 64 KB). A batch with a
+  BLOB parameter runs as one execute per row, since Firebird's batch takes no
+  blob written outside it.
+- **`firebird-wasm/browser/worker-entry` can be imported.** The package's
+  `exports` did not list it, so the import the integration guide showed failed
+  in any bundler that honours `exports` (Vite and webpack both). It is now
+  exported, and so is `./package.json`.
+- **`firebird-wasm/browser/worker-entry` imported with a bundler.** In a
+  Worker that imported the library before setting
+  `FIREBIRD_WORKER_OPTIONS`, the side effect above started the engine without
+  them, so its `.wasm` was looked for next to the Worker script.
+- **A `CHAR(n)` in UTF-8 reads back as n characters.** Firebird pads a
+  `CHAR` to its length in bytes, four a character in UTF-8, and the browser
+  engine returned all of them: a `CHAR(36)` holding a uuid came back as the
+  uuid and 108 spaces. It is now cut to n characters, its own padding kept
+  (`'ab'` in a `CHAR(5)` is `'ab   '`, `'žš'` is `'žš   '`), as other
+  Firebird drivers return it. `OCTETS` and `NONE` columns, one byte a
+  character, are unchanged.
+
+### Changed
+
+- **A quoted column name keeps its case in results.** `query` upper-cased
+  every column name, so `SELECT title AS "title"` gave `TITLE`, unlike what
+  the integration guide said, and `SELECT "camelCase" FROM t` gave
+  `CAMELCASE`. Names are now as Firebird reports them, in the browser engine
+  and in `FirebirdLite` alike: unquoted names are still upper case (Firebird
+  folds them), so only quoted names change. Code that read a quoted name by
+  its upper-cased key (`row.CAMELCASE`) must use the name as written
+  (`row.camelCase`), or drop the quotes from the alias.
+
 ## 0.7.0 — 2026-10-18
 
 ### Fixed
