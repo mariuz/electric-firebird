@@ -861,6 +861,54 @@ for (const variant of VARIANTS) {
       expect(mod._fb_detach_database(db)).toBe(0);
     });
 
+    it('counts an event posted the moment a subscription exists', async () => {
+      // The subscription's first delivery is a baseline, not news, and with
+      // threads it comes from the event manager's watcher thread some time
+      // after queEvents() returns.  A post that overtook it used to be folded
+      // into the baseline and never reported, which made a live query miss
+      // its first change about one browser run in three.  Subscribing now
+      // waits for the baseline, so a post right after it is always counted.
+      const db = freshDatabase('events-baseline');
+      const post = (name: string) =>
+        expect(execParams(db, 0, `EXECUTE BLOCK AS BEGIN POST_EVENT '${name}'; END`, [])).toBe(0);
+      const poll = (handle: number): Record<string, number> => {
+        const ptr = mod._fb_events_poll(handle);
+        expect({ pointer: ptr > 0, error: errorText() }).toEqual({ pointer: true, error: '' });
+        const counts = JSON.parse(mod.UTF8ToString(ptr)) as Record<string, number>;
+        mod._fb_free_result(ptr);
+        return counts;
+      };
+
+      // Some names posted before, so the baseline is not always the same
+      // count; some never, so it is sometimes the engine's first event.
+      post('seen_before');
+      const heard: number[] = [];
+      for (let round = 0; round < 40; round++) {
+        const name = round % 2 === 0 ? 'seen_before' : `fresh_${round}`;
+        const namesPtr = allocString(mod, name);
+        const handle = mod._fb_events_subscribe(db, namesPtr);
+        mod._free(namesPtr);
+        expect({ handle: handle > 0, error: errorText() }).toEqual({ handle: true, error: '' });
+
+        post(name);
+
+        // Delivery of the post itself is still asynchronous; wait for it.
+        let total = 0;
+        for (let i = 0; i < 200 && total === 0; i++) {
+          total += poll(handle)[name] ?? 0;
+          if (total === 0) await new Promise((r) => setTimeout(r, 5));
+        }
+        // And nothing more after it: one post is one count.
+        await new Promise((r) => setTimeout(r, 5));
+        total += poll(handle)[name] ?? 0;
+        heard.push(total);
+        expect(mod._fb_events_cancel(handle)).toBe(0);
+      }
+
+      expect(heard).toEqual(Array(40).fill(1));
+      expect(mod._fb_detach_database(db)).toBe(0);
+    });
+
     it('reports a readable message for invalid SQL', () => {
       mod._fb_init();
 
