@@ -306,9 +306,10 @@ written; what remains:
 - Only the built-in character sets are compiled in, and the UNICODE collations
   do not work. Both are solved on `icu-collation` (§6, PR #12) and neither is
   merged.
-- ElectricSQL sync (§M5) — the project's namesake. The read path is in, from
-  Postgres through Electric and from a Firebird server through
-  `firebird-wasm/electric-server`; writes back are not.
+- ~~ElectricSQL sync (§M5)~~ — the project's namesake. Done: shapes sync in
+  from Postgres through Electric and from a Firebird server through
+  `firebird-wasm/electric-server`, and writes go back through
+  `createWriteQueue`.
 
 ### Persistence is atomic and incremental
 
@@ -589,7 +590,7 @@ Legend: ✅ shipped · 🟡 partial · ❌ missing · n/a not applicable
 | Web Worker offloading | ✅ | ✅ | Required rather than optional: the build uses pthreads and Firebird blocks on mutexes while opening a database, so an engine on the main thread deadlocks the page. `WorkerTransport` forwards to `serveEngine` |
 | Live / reactive queries | ✅ `live` extension | ✅ | `db.live(sql, { events }, onChange)` re-runs the statement when a named event fires. Event names are the caller's to give: nothing in Firebird connects a posted event to the tables a query reads |
 | `listen()` / `notify()` | ✅ | ✅ | `db.listen(names, cb)` and `db.notify(name)`, over the `fb_events_*` C API. Counts rather than individual events: two posts in quick succession arrive as one call with a count of 2. Delivery is after the posting transaction commits |
-| Sync with a server | ✅ (ElectricSQL) | 🟡 | Read path only. `firebird-wasm/electric`'s `syncShapeToTable` follows an Electric shape into a table, from Postgres through Electric or from a Firebird server through `firebird-wasm/electric-server`. No writes back yet |
+| Sync with a server | ✅ (ElectricSQL) | ✅ | `firebird-wasm/electric`'s `syncShapeToTable` and `syncShapesToTables` follow Electric shapes into tables, from Postgres through Electric or from a Firebird server through `firebird-wasm/electric-server`. Writes go back through `createWriteQueue`: applied locally at once, sent to the app's API, kept over the sync until they come back |
 
 ### Packaging & ecosystem
 
@@ -798,9 +799,9 @@ be built:
       naming all 89 charsets, and a subset build leaves 175 undefined symbols.
       Trimming that table is possible but buys 616 KB in exchange for a new
       invasive patch to rebase onto every Firebird release.
-6. **Sync is one-way.** Shapes sync into the browser from Postgres (through
-   Electric) and from a Firebird server; changes made in the browser do not
-   go back.
+6. ~~**Sync is one-way.**~~ Fixed: `createWriteQueue` applies a write
+   locally at once, sends it to the app's API, and keeps it over the sync
+   until its transaction comes back.
 7. Everything in §2 marked ❌ — real gaps, but none of them mislead a user.
 
 ---
