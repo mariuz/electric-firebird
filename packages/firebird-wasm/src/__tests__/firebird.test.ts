@@ -5,6 +5,9 @@ import { FirebirdLite } from '../firebird';
 import { sql } from '../sql-tag';
 import type { SqlFragment } from '../sql-tag';
 
+/** The major version of the client library the driver loads; set by the probe below. */
+let clientMajor = 0;
+
 // Skip tests if Firebird client library is not available or server is not running
 const hasFirebirdLib = (() => {
   try {
@@ -14,7 +17,7 @@ const hasFirebirdLib = (() => {
     const { createNativeClient, getDefaultLibraryFilename } = require('node-firebird-driver-native');
     const client = createNativeClient(getDefaultLibraryFilename());
     // If we get here without throwing, the library loaded successfully
-    void client;
+    clientMajor = client.util.getClientVersionSync() >> 8;
     return true;
   } catch {
     return false;
@@ -115,6 +118,132 @@ describeIfFirebird('FirebirdLite', () => {
     ]);
     const match = await db.query('SELECT id FROM notes WHERE body = ?', ['batch b']);
     expect(match.rows).toEqual([{ ID: 6 }]);
+  });
+
+  describe('dates and times given as text', () => {
+    // As firebird-wasm/electric's syncShapeToTable sends them, and as the
+    // browser engine takes them: Firebird converts the text, to 1/10000 s.
+    const asText = 'CAST(d AS VARCHAR(10)), CAST(t AS VARCHAR(13)), CAST(ts AS VARCHAR(24))';
+
+    beforeEach(async () => {
+      await db.exec('CREATE TABLE dt (id INTEGER, d DATE, t TIME, ts TIMESTAMP)');
+    });
+
+    it('binds them exactly, by every route', async () => {
+      const row = ['2024-02-29', '13:45:01.5', '2024-05-01 12:00:00.1234'];
+      await db.exec('INSERT INTO dt VALUES (?, ?, ?, ?)', [1, ...row]);
+      await db.query('INSERT INTO dt VALUES (?, ?, ?, ?)', [2, ...row]);
+      await db.transaction(async (tx) => {
+        await tx.exec('INSERT INTO dt VALUES (?, ?, ?, ?)', [3, ...row]);
+        // Blocks of rows, and one row at a time.
+        await tx.execBatch('INSERT INTO dt VALUES (?, ?, ?, ?)', [[4, ...row], [5, null, null, null], [6, ...row]]);
+        await tx.execBatch('INSERT INTO dt VALUES (?, ?, ?, ?)', [[7, ...row]]);
+      });
+      const { rows } = await db.query(`SELECT id, ${asText} FROM dt ORDER BY id`, [], { rowMode: 'array' });
+      const exact = ['2024-02-29', '13:45:01.5000', '2024-05-01 12:00:00.1234'];
+      expect(rows).toEqual([
+        [1, ...exact], [2, ...exact], [3, ...exact], [4, ...exact], [5, null, null, null], [6, ...exact], [7, ...exact],
+      ]);
+      // In a WHERE clause too, to the last digit.
+      const hit = await db.query('SELECT id FROM dt WHERE ts = ? AND d = ? AND t = ? ORDER BY id', [
+        '2024-05-01 12:00:00.1234', '2024-02-29', '13:45:01.5',
+      ], { rowMode: 'array' });
+      expect(hit.rows).toEqual([[1], [2], [3], [4], [6], [7]]);
+      const miss = await db.query('SELECT id FROM dt WHERE ts = ?', ['2024-05-01 12:00:00.1235']);
+      expect(miss.rows).toEqual([]);
+    });
+
+    it('still takes a Date, and both on one kept statement', async () => {
+      const cached = makeDb(tmpDbName('dates-cached'), { statementCache: 8 });
+      try {
+        await cached.exec('CREATE TABLE dt (id INTEGER, d DATE, t TIME, ts TIMESTAMP)');
+        const sql = 'INSERT INTO dt VALUES (?, ?, ?, ?)';
+        const date = new Date(2024, 4, 1, 12, 30, 15, 250); // the driver reads a Date in local time
+        await cached.exec(sql, [1, '2024-02-29', '13:45:01.5', '2024-05-01 12:00:00.1234']);
+        await cached.exec(sql, [2, date, date, date]);
+        await cached.exec(sql, [3, date, '23:59:59.9999', date]); // some as text, some not
+        await cached.exec(sql, [4, '2024-01-02', date, '2024-01-02 03:04:05']);
+        await cached.exec(sql, [5, date, date, date]);
+        const { rows } = await cached.query(`SELECT id, ${asText} FROM dt ORDER BY id`, [], { rowMode: 'array' });
+        expect(rows).toEqual([
+          [1, '2024-02-29', '13:45:01.5000', '2024-05-01 12:00:00.1234'],
+          [2, '2024-05-01', '12:30:15.2500', '2024-05-01 12:30:15.2500'],
+          [3, '2024-05-01', '23:59:59.9999', '2024-05-01 12:30:15.2500'],
+          [4, '2024-01-02', '12:30:15.2500', '2024-01-02 03:04:05.0000'],
+          [5, '2024-05-01', '12:30:15.2500', '2024-05-01 12:30:15.2500'],
+        ]);
+      } finally {
+        await cached.close();
+      }
+    });
+
+    it('takes the zoned types as text where the server has them', async () => {
+      const { rows } = await db.query<{ V: string }>(
+        "SELECT rdb$get_context('SYSTEM', 'ENGINE_VERSION') AS v FROM rdb$database");
+      // Firebird 3 has no time zones, neither as a server nor as a client
+      // library: a 3.0 libfbclient (Ubuntu's libfbclient2, as CI installs)
+      // refuses the statement with "Data type unknown" before it is sent.
+      if (Number(rows[0]!.V.split('.')[0]) < 4 || clientMajor < 4) return;
+      await db.exec('CREATE TABLE z (id INTEGER, tz TIME WITH TIME ZONE, tstz TIMESTAMP WITH TIME ZONE)');
+      await db.exec('INSERT INTO z VALUES (?, ?, ?)', [1, '10:00:00.1234 +02:00', '2024-05-01 12:00:00.1234 +02:00']);
+      await db.execBatch('INSERT INTO z VALUES (?, ?, ?)', [
+        [2, '10:00:00 America/Sao_Paulo', '2024-05-01 12:00:00 America/Argentina/ComodRivadavia'],
+        [3, null, '2024-12-31 23:59:59.9999 -05:30'],
+      ]);
+      const read = await db.query(
+        "SELECT id, CAST(tz AS VARCHAR(60)), CAST(tstz AS VARCHAR(80)) FROM z ORDER BY id", [], { rowMode: 'array' });
+      expect(read.rows).toEqual([
+        [1, '10:00:00.1234 +02:00', '2024-05-01 12:00:00.1234 +02:00'],
+        [2, '10:00:00.0000 America/Sao_Paulo', '2024-05-01 12:00:00.0000 America/Argentina/ComodRivadavia'],
+        [3, null, '2024-12-31 23:59:59.9999 -05:30'],
+      ]);
+    });
+
+    it('fails with the engine error for text that is not a date', async () => {
+      await expect(db.exec('INSERT INTO dt (id, d) VALUES (?, ?)', [1, '2023-02-29'])).rejects.toThrow(/conversion error/i);
+      await expect(db.exec('INSERT INTO dt (id, ts) VALUES (?, ?)', [1, 'soon'])).rejects.toThrow(/conversion error/i);
+      expect((await db.query('SELECT COUNT(*) AS N FROM dt')).rows).toEqual([{ N: 0 }]);
+    });
+  });
+
+  it('binds a string into an integer or NUMERIC parameter digit for digit', async () => {
+    // The driver binds these as doubles: a string used to go through one.
+    // syncShapeToTable sends int8 and numeric values as text.
+    await db.exec('CREATE TABLE nums (id INTEGER, big BIGINT, money NUMERIC(18,4), tiny NUMERIC(18,17), f DOUBLE PRECISION)');
+    const row = ['9007199254740993', '12345678901234.5678', '0.12345678901234567', '0.1'];
+    await db.exec('INSERT INTO nums VALUES (?, ?, ?, ?, ?)', ['1', ...row]);
+    await db.execBatch('INSERT INTO nums VALUES (?, ?, ?, ?, ?)', [[2, ...row], [3, '-9007199254740993', '-0.0001', null, 2.5]]);
+    // A number is still a number: as exact as a double is.
+    await db.exec('INSERT INTO nums VALUES (?, ?, ?, ?, ?)', [4, 9007199254740992, 12.25, 0.5, 0.1]);
+    const { rows } = await db.query(
+      'SELECT id, CAST(big AS VARCHAR(21)), CAST(money AS VARCHAR(21)), CAST(tiny AS VARCHAR(21)), f FROM nums ORDER BY id',
+      [], { rowMode: 'array' });
+    expect(rows).toEqual([
+      [1, '9007199254740993', '12345678901234.5678', '0.12345678901234567', 0.1],
+      [2, '9007199254740993', '12345678901234.5678', '0.12345678901234567', 0.1],
+      [3, '-9007199254740993', '-0.0001', null, 2.5],
+      [4, '9007199254740992', '12.2500', '0.50000000000000000', 0.1],
+    ]);
+    const hit = await db.query('SELECT id FROM nums WHERE big = ? ORDER BY id', ['9007199254740993'], { rowMode: 'array' });
+    expect(hit.rows).toEqual([[1], [2]]);
+    await expect(db.exec('INSERT INTO nums (id, big) VALUES (?, ?)', [5, 'many'])).rejects.toThrow(/conversion error/i);
+  });
+
+  it('throws, and does not crash, when a parameter beside a BLOB is wrong', async () => {
+    // The driver used to write the blob while encoding the other parameters,
+    // and roll back under it when one failed: the process died with SIGSEGV
+    // within a few rounds of this.
+    await db.exec('CREATE TABLE nb (note BLOB SUB_TYPE TEXT, s VARCHAR(2), d DATE)');
+    const note = 'x'.repeat(1000);
+    for (let i = 0; i < 40; i++) {
+      await expect(db.exec('INSERT INTO nb (note, s) VALUES (?, ?)', [note, 'too long'])).rejects.toThrow(/Length in bytes/);
+      await expect(db.exec('INSERT INTO nb (note, s) VALUES (?, ?)', [Buffer.from(note), 'too long'])).rejects.toThrow(/Length in bytes/);
+      await expect(db.exec('INSERT INTO nb (note, d) VALUES (?, ?)', [note, 'not a date'])).rejects.toThrow(/conversion error/i);
+    }
+    await db.exec('INSERT INTO nb (note, s, d) VALUES (?, ?, ?)', [note, 'ok', '2024-02-29']);
+    const { rows } = await db.query(
+      'SELECT OCTET_LENGTH(note), s, CAST(d AS VARCHAR(10)) FROM nb', [], { rowMode: 'array' });
+    expect(rows).toEqual([[1000, 'ok', '2024-02-29']]);
   });
 
   it('creates a new database and queries it', async () => {

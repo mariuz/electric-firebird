@@ -20,6 +20,8 @@ import { Shape, ShapeStream } from '@electric-sql/client';
 import type { Message, Row } from '@electric-sql/client';
 import { FirebirdLite } from '../firebird';
 import { createShapeServer } from '../electric-server';
+import { syncShapeToTable } from '../electric';
+import type { ElectricDatabase } from '../electric';
 import type { ShapeServer } from '../electric-server';
 
 const hasFirebirdLib = (() => {
@@ -62,6 +64,10 @@ async function until<T>(read: () => T | Promise<T>, ok: (v: T) => boolean, what:
   }
   return last;
 }
+
+/** A BLOB beside the dates: a failing date beside a blob used to kill the process. */
+const DATED =
+  '(id INTEGER NOT NULL PRIMARY KEY, note BLOB SUB_TYPE TEXT, day_ DATE, at_ TIME, ts TIMESTAMP, big BIGINT, price NUMERIC(10,2))';
 
 const byId = (rows: Row[]) => [...rows].sort((a, b) => Number(a['id']) - Number(b['id']));
 
@@ -112,11 +118,15 @@ describeIfFirebird('createShapeServer against a Firebird server', () => {
         "UPDATE items SET tstz = TIMESTAMP '2024-05-01 12:00:00 +02:00', huge = 170141183460469231731687303715884105727 WHERE id = 1");
     }
     await source.exec("INSERT INTO pairs VALUES (1, 'x', 'one-x')");
+    await source.exec(`CREATE TABLE dated ${DATED}`);
+    await source.exec(
+      "INSERT INTO dated VALUES (1, 'a note', '2024-02-29', '13:45:01.5', '2024-05-01 12:00:00.1234', 9007199254740993, 12.5)");
+    await source.exec('INSERT INTO dated (id) VALUES (2)');
 
     server = await createShapeServer({
       database,
       ...credentials,
-      tables: ['items', 'pairs'],
+      tables: ['items', 'pairs', 'dated'],
       pollIntervalMs: 50,
       liveTimeoutMs: 2_000,
     });
@@ -255,5 +265,40 @@ describeIfFirebird('createShapeServer against a Firebird server', () => {
     await shape.rows;
     await source.exec("INSERT INTO items (id, title) VALUES (30, 'old connection')");
     await until(() => shape.currentRows.some((r) => r['id'] === '30'), Boolean, 'the change');
+  });
+  it('syncs into a FirebirdLite database in the same process, dates and times exact', async () => {
+    // The source, the shape server and the target all in this one process,
+    // on one client library: the case that died with SIGSEGV when the target
+    // could not take a date as text.
+    const target = new FirebirdLite(`${host}:${path.join(os.tmpdir(), `shape-target-${Date.now()}.fdb`)}`, credentials);
+    try {
+      await target.exec(`CREATE TABLE dated ${DATED}`);
+      const sync = await syncShapeToTable(target as unknown as ElectricDatabase, {
+        shape: { url, params: { table: 'dated' } },
+        table: 'dated',
+        shapeKey: null,
+        onError: () => undefined,
+      });
+      try {
+        await sync.upToDate;
+        const columns =
+          'id, CAST(note AS VARCHAR(40)), CAST(day_ AS VARCHAR(10)), CAST(at_ AS VARCHAR(13)), ' +
+          'CAST(ts AS VARCHAR(24)), CAST(big AS VARCHAR(20)), CAST(price AS VARCHAR(12))';
+        const read = async (db: FirebirdLite) =>
+          (await db.query(`SELECT ${columns} FROM dated ORDER BY id`, [], { rowMode: 'array' })).rows;
+        expect(await read(target)).toEqual([
+          [1, 'a note', '2024-02-29', '13:45:01.5000', '2024-05-01 12:00:00.1234', '9007199254740993', '12.50'],
+          [2, null, null, null, null, null, null],
+        ]);
+
+        await source.exec("UPDATE dated SET ts = '1999-12-31 23:59:59.9999', at_ = '00:00:00.0001' WHERE id = 2");
+        await until(() => read(target), (rows) => rows[1]?.[4] !== null, 'the update');
+        expect(await read(target)).toEqual(await read(source));
+      } finally {
+        await sync.unsubscribe();
+      }
+    } finally {
+      await target.close();
+    }
   });
 });
