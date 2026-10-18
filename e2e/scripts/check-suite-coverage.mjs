@@ -1,10 +1,10 @@
 /**
  * check-suite-coverage.mjs – every spec belongs to exactly one config.
  *
- * There are three Playwright configs because there are three incompatible
+ * There are four Playwright configs because there are four incompatible
  * servers: one that talks to a real Firebird server, one that serves the WASM
- * artifact with COOP/COEP, and one that serves the built demo *without* those
- * headers on purpose. A spec run under the wrong one fails confusingly, and a
+ * artifact with COOP/COEP, one that serves the built demo *without* those
+ * headers on purpose, and one that serves the example apps' bundler output. A spec run under the wrong one fails confusingly, and a
  * spec run under none of them passes by not existing.
  *
  * Both mistakes are silent, and both have happened. This makes them loud.
@@ -21,6 +21,7 @@ const CONFIGS = [
   'playwright.config.ts',
   'playwright.wasm.config.ts',
   'playwright.demo.config.ts',
+  'playwright.examples.config.ts',
 ];
 
 /**
@@ -39,7 +40,7 @@ function patternsOf(configFile) {
     throw new Error(
       `${configFile} has no testMatch array. Every config needs one — a ` +
         `config without it runs every spec in tests/, including the ones ` +
-        `belonging to the other two.`,
+        `belonging to the others.`,
     );
   }
 
