@@ -182,8 +182,16 @@ shape. Two patterns are known to work on top, both left to the app at first:
    examples do this with a view and triggers; Firebird has updatable views and
    triggers to do the same.
 
-A built-in write path (a queue of local changes sent to an endpoint, with
-conflict rules) is the second step, once the read path is in use.
+A built-in write path (a queue of local changes sent to an endpoint) was the
+second step, and is built: `createWriteQueue` does the optimistic pattern
+above without a view. A write goes to the synced table and to
+`ELECTRIC_WRITES` in one transaction; the sync applies the pending writes
+again after each batch; a sent write is dropped when the change carrying the
+transaction id `send` returned comes back (Electric's `txids`), or the row
+changes, or a timeout passes; a rejected write is rolled back by fetching
+the table's shape again, since the source's row as it was is not kept
+locally. Conflicts are the API's to decide: the last write the source
+accepts is what comes back.
 
 ## The first step
 

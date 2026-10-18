@@ -27,6 +27,17 @@ API may still move between minor releases.
   it; a shape behind is refreshed. The shape server now sends
   `global_last_seen_lsn` (its log position) as Electric does.
   `syncShapeToTable` is the one-shape case of the same code.
+- **A write path: `createWriteQueue`.** `insert`, `update` and `delete`
+  apply to the synced table at once and are recorded in `ELECTRIC_WRITES`
+  in the same transaction (so they survive a reload and an offline spell),
+  then go to the app's API through `send`, in order, retried on failure. A
+  sync given `writes` applies the pending writes again after every batch, so
+  the source's older state never shows over them, and drops each write once
+  its change comes back: by the transaction id `send` returned (Electric's
+  `txids`, which the shape server now sends too), by the row changing, or
+  after `confirmTimeoutMs`. A `WriteRejected` rolls the write back by
+  fetching the table's shape again. Syncs and the queue now run their
+  transactions on a database one at a time.
 - **The shape server takes `where`, pages its snapshots, prunes its log,
   wakes on events, and runs beside others.**
   - `where` (and Electric's `params[n]`) is parsed and written as Firebird

@@ -2244,16 +2244,16 @@ test.describe('FirebirdBrowser', () => {
         }
       };
 
-      const binary = await capture([new Uint8Array([1, 2, 3])]);
       const nan = await capture([Number.NaN]);
       const object = await capture([{ nope: true }]);
 
       await db.close();
-      return { binary, nan, object };
+      return { nan, object };
     });
 
     // Each names what is wrong rather than corrupting the value silently.
-    expect(result.binary).toContain('binary');
+    // (Bytes have a form now: the engine takes them where bytes are kept and
+    // refuses them elsewhere; see browser-engine.spec.ts.)
     expect(result.nan).toContain('NaN');
     expect(result.object).toContain('unsupported type');
   });

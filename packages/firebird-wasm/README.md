@@ -183,10 +183,11 @@ Shipped since:
       both ([`examples/electric`](../../examples/electric)), `bytea`
       included, and several tables in one transaction
       (`syncShapesToTables`)
+- [x] ElectricSQL writes: `createWriteQueue` applies a write at once, sends
+      it to the app's API, and keeps it over the sync until it comes back
 
 Next:
 
-- [ ] ElectricSQL sync: writes back to the server
 - [ ] A typed binary result ABI, so exact numerics need not travel as strings
 - [ ] Module disposal — `close()` does not currently release the WASM heap
 - [ ] UNICODE collations (case- and accent-insensitive comparison), which

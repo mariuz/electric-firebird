@@ -20,7 +20,8 @@ import { Shape, ShapeStream } from '@electric-sql/client';
 import type { Message, Row } from '@electric-sql/client';
 import { FirebirdLite } from '../firebird';
 import { createShapeServer } from '../electric-server';
-import { syncShapeToTable, syncShapesToTables } from '../electric';
+import { createWriteQueue, syncShapeToTable, syncShapesToTables, WriteRejected } from '../electric';
+import type { LocalWrite } from '../electric';
 import type { ElectricDatabase } from '../electric';
 import type { ShapeServer } from '../electric-server';
 
@@ -435,6 +436,90 @@ describeIfFirebird('createShapeServer against a Firebird server', () => {
       for (const status of await Promise.all(waiting)) expect([200, 500, 503, 0]).toContain(status);
       otherHttp.closeAllConnections();
       await new Promise((r) => otherHttp.close(r));
+    }
+  });
+
+  it('writes locally at once, sends to the source, and drops each write once its transaction comes back', async () => {
+    await source.exec('CREATE TABLE todos (id INTEGER NOT NULL PRIMARY KEY, title VARCHAR(40), done BOOLEAN)');
+    await source.exec("INSERT INTO todos VALUES (1, 'from the server', FALSE)");
+    const served = await another({ tables: ['todos'] });
+    const target = new FirebirdLite(`${host}:${path.join(os.tmpdir(), `writes-target-${Date.now()}.fdb`)}`, credentials);
+    let online = true;
+    const sent: LocalWrite[] = [];
+    const errors: string[] = [];
+    try {
+      await target.exec('CREATE TABLE todos (id INTEGER NOT NULL PRIMARY KEY, title VARCHAR(40), done BOOLEAN)');
+      const db = target as unknown as ElectricDatabase;
+      // The app's API: writes to the source, says which transaction did it.
+      const writes = await createWriteQueue(db, {
+        retryMs: 100,
+        onError: (e) => errors.push(e.message),
+        send: async (w) => {
+          if (!online) throw new Error('offline');
+          if (w.value['title'] === 'refused') throw new WriteRejected('the server says no');
+          sent.push(w);
+          return source.transaction(async (tx) => {
+            if (w.operation === 'insert') {
+              await tx.exec('UPDATE OR INSERT INTO todos (id, title, done) VALUES (?, ?, ?) MATCHING (id)',
+                [w.key['id'], w.value['title'] ?? null, w.value['done'] ?? null]);
+            } else if (w.operation === 'update') {
+              await tx.exec('UPDATE todos SET title = COALESCE(?, title), done = COALESCE(?, done) WHERE id = ?',
+                [w.value['title'] ?? null, w.value['done'] ?? null, w.key['id']]);
+            } else {
+              await tx.exec('DELETE FROM todos WHERE id = ?', [w.key['id']]);
+            }
+            const { rows } = await tx.query<{ T: number }>('SELECT CURRENT_TRANSACTION AS t FROM rdb$database');
+            return { txid: rows[0]!.T };
+          });
+        },
+      });
+      const sync = await syncShapeToTable(db, {
+        shape: { url: served.url, params: { table: 'todos' } },
+        table: 'todos',
+        shapeKey: 'todos',
+        writes,
+        onError: (e) => errors.push(`sync: ${e.message}`),
+      });
+      const local = async () => (await target.query<{ ID: number; TITLE: string; DONE: boolean }>(
+        'SELECT id, title, done FROM todos ORDER BY id')).rows.map((r) => `${r.ID}:${r.TITLE}:${r.DONE}`);
+      try {
+        await sync.upToDate;
+        expect(await local()).toEqual(['1:from the server:false']);
+
+        // Seen here before the source has it; gone from the queue once its
+        // transaction has come back down the shape.
+        await writes.insert('todos', { id: 2, title: 'mine', done: false });
+        expect(await local()).toEqual(['1:from the server:false', '2:mine:false']);
+        await until(() => writes.pending(), (p) => p.length === 0, 'the write confirmed');
+        expect((await source.query('SELECT title FROM todos WHERE id = 2')).rows).toEqual([{ TITLE: 'mine' }]);
+
+        // Offline: kept, and kept over the server's own change to the row.
+        online = false;
+        await writes.update('todos', { id: 1 }, { title: 'edited offline' });
+        await source.exec('UPDATE todos SET done = TRUE WHERE id = 1');
+        await until(local, (r) => r[0] === '1:edited offline:true', 'the server change under the local one');
+        expect((await writes.pending()).map((w) => w.operation)).toEqual(['update']);
+
+        // Online again: sent, confirmed, and the source agrees.
+        online = true;
+        await writes.flush();
+        await until(() => writes.pending(), (p) => p.length === 0, 'the offline write confirmed');
+        expect((await source.query('SELECT title, done FROM todos WHERE id = 1')).rows)
+          .toEqual([{ TITLE: 'edited offline', DONE: true }]);
+
+        // Refused: rolled back to what the source has.
+        await writes.insert('todos', { id: 3, title: 'refused', done: false });
+        await until(local, (r) => !r.some((x) => x.startsWith('3:')), 'the rejected write rolled back');
+        expect(errors).toContain('the server says no');
+        expect(await writes.pending()).toEqual([]);
+        expect(sent.map((w) => w.value['title'])).toEqual(['mine', 'edited offline']);
+      } finally {
+        await sync.unsubscribe();
+        await writes.close();
+      }
+    } finally {
+      await target.close();
+      await served.close();
     }
   });
 

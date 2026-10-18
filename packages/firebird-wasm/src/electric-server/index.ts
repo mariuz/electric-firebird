@@ -211,15 +211,20 @@ export async function createShapeServer(options: ShapeServerOptions): Promise<Sh
       const keys = Array.from({ length: KEY_COLUMNS }, (_, i) => `K${i + 1}`).join(', ');
       const rs = await attachment.executeQuery(
         tx,
-        `SELECT OP, ${keys} FROM ${CHANGES} WHERE TABLE_NAME = ? AND COMMIT_SEQ > ? AND COMMIT_SEQ <= ? ` +
+        `SELECT OP, TX_ID, ${keys} FROM ${CHANGES} WHERE TABLE_NAME = ? AND COMMIT_SEQ > ? AND COMMIT_SEQ <= ? ` +
           'ORDER BY COMMIT_SEQ, CHANGE_ID',
         [table.name, after, top],
       );
-      // The last operation per key wins; the row is read as it is now.
-      const last = new Map<string, { op: string; key: unknown[] }>();
+      // The last operation per key wins; the row is read as it is now.  Every
+      // transaction that changed it is named, as Electric's txids, so a
+      // client can tell its own writes have come back.
+      const last = new Map<string, { op: string; key: unknown[]; txids: Set<string> }>();
       for (const row of await rs.fetch()) {
-        const key = row.slice(1, 1 + table.key.length);
-        last.set(JSON.stringify(key), { op: String(row[0]), key });
+        const key = row.slice(2, 2 + table.key.length);
+        const id = JSON.stringify(key);
+        const txids = last.get(id)?.txids ?? new Set<string>();
+        txids.add(String(row[1]));
+        last.set(id, { op: String(row[0]), key, txids });
       }
       await rs.close();
 
@@ -227,16 +232,18 @@ export async function createShapeServer(options: ShapeServerOptions): Promise<Sh
       const where = table.key.map((k) => `${quote(k)} = ?`).join(' AND ') + (shape.where ? ` AND (${shape.where.sql})` : '');
       const select = `SELECT ${shape.columns.map((c) => c.select).join(', ')} FROM ${quote(table.name)} WHERE ${where}`;
       const messages: Message[] = [];
-      for (const { op, key } of last.values()) {
+      for (const { op, key, txids } of last.values()) {
         let current: unknown[] | null = null;
         if (op !== 'D') {
           const found = await attachment.executeQuery(tx, select, [...key, ...(shape.where?.params ?? [])]);
           current = (await found.fetch({ fetchSize: 1 }))[0] ?? null;
           await found.close();
         }
-        messages.push(current
+        const message = current
           ? await change('insert', table, shape.columns, current, tx)
-          : deletion(table, key));
+          : deletion(table, key);
+        (message['headers'] as Record<string, unknown>)['txids'] = [...txids].map(Number);
+        messages.push(message);
       }
       return { gone: false, messages, offset: top, seen: top };
     });

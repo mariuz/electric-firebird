@@ -380,6 +380,42 @@ await sync.unsubscribe();
   position in the Postgres log (Electric and the shape server below do), once
   they are all at the same one: a shape left behind is asked to refresh. It
   posts one event per batch, `electric_<key>`.
+- **Writing back.** Electric takes no writes; your API does. A write queue
+  shows a write at once and sends it to your API in the background:
+
+  ```js
+  import { createWriteQueue, WriteRejected } from 'firebird-wasm/electric';
+
+  const writes = await createWriteQueue(db, {
+    // One write at a time, in order. Return the transaction id that applied
+    // it (Postgres: pg_current_xact_id()::xid::text; Firebird:
+    // CURRENT_TRANSACTION) so the queue knows when it has come back.
+    send: async (w) => {
+      const r = await fetch('/api/write', { method: 'POST', body: JSON.stringify(w) });
+      if (r.status === 422) throw new WriteRejected(await r.text());  // rolled back
+      if (!r.ok) throw new Error(r.statusText);                       // retried
+      return r.json();                                                // { txid }
+    },
+  });
+  const sync = await syncShapeToTable(db, { shape, table: 'items', shapeKey: 'items', writes });
+
+  await writes.insert('items', { id: 7, title: 'new' });     // in the table now
+  await writes.update('items', { id: 7 }, { done: true });
+  await writes.delete('items', { id: 7 });
+  ```
+
+  A write is applied to the table and recorded (`ELECTRIC_WRITES`) in one
+  transaction, so it survives a reload and an offline spell; the queue sends
+  it when it can. Each batch the sync applies is followed by the writes still
+  pending, so the source's older state never shows over them. A sent write
+  is dropped when its change comes back: by the transaction id `send`
+  returned (in Electric's `txids`; the shape server below sends them too),
+  otherwise when the row changes in the shape, or after
+  `confirmTimeoutMs`. A `WriteRejected` from `send` rolls the write back by
+  fetching the table's shape again. Values are keyed by the shape's column
+  names and may be strings, numbers, booleans, `null`, `Date` and
+  `Uint8Array`; the key needs the table's primary key columns. The sync and
+  the queue run their transactions one at a time on the database.
 
 See [plans/electric-sync.md](./plans/electric-sync.md) for the design.
 [`examples/electric`](../examples/electric) is a working app: two tables, one
