@@ -95,7 +95,10 @@ test.describe('<firebird-repl>', () => {
   test('walks the history with ArrowUp and ArrowDown', async ({ page }) => {
     const repl = await openRepl(page, 'memory://repl-history');
     const editor = repl.locator('textarea');
+    // Each run finished before the next is typed: a Ctrl+Enter while one is
+    // running is ignored, and its text stays in the editor.
     await runTyped(repl, 'SELECT 1 FROM RDB$DATABASE');
+    await expect(repl.locator('.entry')).toHaveCount(1);
     await runTyped(repl, 'SELECT 2 FROM RDB$DATABASE');
     await expect(repl.locator('.entry')).toHaveCount(2);
 

@@ -30,6 +30,10 @@
       "types": "./dist/repl/index.d.ts",
       "default": "./dist/repl/index.js"
     },
+    "./electric": {
+      "types": "./dist/electric/index.d.ts",
+      "default": "./dist/electric/index.js"
+    },
     "./package.json": "./package.json"
   },
   "scripts": {
@@ -59,7 +63,8 @@
   },
   "peerDependencies": {
     "react": ">=18",
-    "vue": ">=3.3"
+    "vue": ">=3.3",
+    "@electric-sql/client": ">=1.5"
   },
   "peerDependenciesMeta": {
     "react": {
@@ -67,9 +72,13 @@
     },
     "vue": {
       "optional": true
+    },
+    "@electric-sql/client": {
+      "optional": true
     }
   },
   "devDependencies": {
+    "@electric-sql/client": "^1.5.28",
     "@types/jest": "^29.5.12",
     "@types/node": "^20.14.10",
     "@types/react": "^19.2.2",

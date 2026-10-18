@@ -1099,9 +1099,11 @@ gaps it ran into, with its numbers, in rough order of what they would buy.
       `SET TERM`, results as tables, history, values drawn as text; six
       browser tests drive it by keyboard against the real engine.
 - [ ] ElectricSQL sync integration (the project's namesake). Planned in
-      [plans/electric-sync.md](./plans/electric-sync.md): Postgres through
-      Electric into Firebird in the browser, read-only first, modelled on
-      PGlite's `syncShapeToTable`; four questions to decide before building.
+      [plans/electric-sync.md](./plans/electric-sync.md). **The read path
+      is in:** `firebird-wasm/electric`'s `syncShapeToTable`, tested in
+      Chromium against a real Postgres and Electric in CI (types, live
+      changes, resume after a reload, must-refetch). Left: several shapes in
+      one transaction, a write path, `bytea`, and a demo page.
 - [ ] A Firebird version build matrix. The submodule tracks `master` and the
       shipped engine reports `ENGINE_VERSION 6.0.0`, so the recurring "Firebird
       4 & 5 support" line was always mis-stated: what is missing is *testing

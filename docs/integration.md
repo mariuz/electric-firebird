@@ -310,6 +310,56 @@ page. Colours follow the page's `color-scheme` and can be set through
 `--firebird-repl-bg`, `-fg`, `-muted`, `-border`, `-error`, `-accent` and
 `-font`. Nothing is defined on import, so the module is safe to import where
 there is no DOM.
+
+### Syncing from Postgres with Electric
+
+`firebird-wasm/electric` keeps a Firebird table in step with a Postgres table
+through [Electric](https://electric-sql.com), which streams Postgres changes
+over HTTP. Install `@electric-sql/client` beside the package (an optional
+peer dependency).
+
+```js
+import { syncShapeToTable, tableFromSchema } from 'firebird-wasm/electric';
+
+// The app creates the table. tableFromSchema() writes a CREATE TABLE from the
+// shape's schema (Electric's electric-schema header) to review and adjust.
+await db.exec('CREATE TABLE items (id INTEGER NOT NULL PRIMARY KEY, title BLOB SUB_TYPE TEXT, done BOOLEAN)');
+
+const sync = await syncShapeToTable(db, {
+  shape: { url: 'https://electric.example.com/v1/shape', params: { table: 'items' } },
+  table: 'items',
+  shapeKey: 'items',     // where the position is kept; null starts over every time
+});
+await sync.upToDate;     // the first complete copy is in
+// ... rows follow every Postgres commit until:
+await sync.unsubscribe();
+```
+
+- **Read-only.** Electric takes no writes: write through your own API to
+  Postgres, and the change comes back down the shape.
+- **Consistent.** Each batch Electric marks complete is applied in one Firebird
+  transaction together with the sync position (kept in a table
+  `ELECTRIC_SHAPES`), so after a reload the next sync with the same
+  `shapeKey` resumes exactly where the stored database is. When Electric
+  says the shape must be fetched again (a `TRUNCATE`, an expired shape), the
+  table is emptied and refilled in one transaction.
+- **Names.** A Postgres column `title` is the Firebird column `TITLE`; a name
+  that needed quotes in Postgres (`"camelCase"`) keeps them. `columns` maps
+  names that should differ. A name that is a Firebird reserved word (`day`,
+  `time`) must be quoted in your queries: `SELECT "DAY" FROM items`.
+- **Types.** Integers, `numeric` (exact), floats, `boolean`, text, `uuid`,
+  `date`, `time`, `timestamp`, `timestamptz` and `timetz`, `json` and `jsonb`
+  (as text), and arrays (as JSON text). A shape with any other type (`bytea`,
+  `interval`, ranges, `money`) is refused before any row is stored, naming
+  the columns: leave them out with the shape's `columns` parameter.
+- **Following it.** The sync posts the event `electric_<shapeKey>` with each
+  batch, so `useLiveQuery(sql, { events: ['electric_items'] })` and
+  `db.live()` follow it; triggers on the table fire as for any write.
+- **One shape per table**, and one tab syncing a database: with
+  `multiTab: 'shared'`, start the sync in the leading tab only.
+
+See [plans/electric-sync.md](./plans/electric-sync.md) for the design.
+
 ---
 
 ## 4. Bundlers
