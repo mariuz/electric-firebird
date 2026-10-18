@@ -67,6 +67,21 @@ API may still move between minor releases.
 
 ### Fixed
 
+- **An event posted right after subscribing is no longer lost.** A
+  subscription's first delivery from the engine is a baseline, not news, and
+  the bridge absorbed whatever it said. With threads that delivery comes from
+  the engine's watcher thread some time after the subscription returns, so a
+  `POST_EVENT` that committed first was folded into it and never reported: a
+  `live()` query missed its first change in about one browser run in three.
+  Subscribing now waits for the baseline before returning (the build without
+  threads delivered it in time already).
+- **`live()` no longer drops an event heard during a refresh.** It ran one
+  refresh at a time by ignoring events while one ran, but that refresh may
+  have read before the change committed, so the rows stayed stale until some
+  later event. An event during a refresh now earns exactly one more. `live()`
+  also subscribes before its first query rather than after, so a change
+  committed between the two is no longer in neither, and releases the
+  subscription if that query fails.
 - **`FirebirdLite` binds a string into a BLOB parameter.** The native driver
   takes a `Buffer` there and refused a string ("Unrecognized type used as
   BLOB"); a string bound to a BLOB parameter is now passed as its UTF-8

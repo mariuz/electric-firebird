@@ -798,8 +798,12 @@ export class FirebirdBrowser {
     let stopped = false;
     // One refresh at a time: a statement slower than the interval would
     // otherwise pile up, and the last to finish would win rather than the
-    // latest to start.
-    let running = false;
+    // latest to start.  But an event that arrives *during* a refresh is not
+    // covered by it — that refresh may have read before the change committed —
+    // so it is remembered in `again` and earns exactly one more run.  Dropping
+    // it, as this once did, left the rows stale until some later event.
+    let refreshing = false;
+    let again = false;
 
     const run = async (): Promise<void> => {
       const result = await this.query<T>(statement.sql, statement.params);
@@ -807,28 +811,55 @@ export class FirebirdBrowser {
       onChange(rows, result);
     };
 
-    // The first results before returning, so a caller that awaits live() has
-    // rendered once by the time it continues.
-    await run();
-
-    // Built on listen() rather than beside it: the subscription, the polling,
-    // the one-at-a-time rule and the teardown are the same problem, and a
-    // second copy would be a second thing to keep correct.
-    const subscription = await this.listen(
-      options.events,
-      () => {
-        if (running || stopped) return;
-        running = true;
-        void run()
-          .catch((err) => {
+    const drain = async (): Promise<void> => {
+      refreshing = true;
+      try {
+        while (again && !stopped) {
+          again = false;
+          try {
+            await run();
+          } catch (err) {
             if (!stopped) onError(err instanceof Error ? err : new Error(String(err)));
-          })
-          .finally(() => {
-            running = false;
-          });
-      },
-      { pollIntervalMs: options.pollIntervalMs, onError },
-    );
+          }
+        }
+      } finally {
+        refreshing = false;
+      }
+    };
+
+    const requestRefresh = (): void => {
+      if (stopped) return;
+      again = true;
+      if (!refreshing) void drain();
+    };
+
+    // Subscribed before the first query, not after: a change committed between
+    // the two would otherwise be in neither — too late for the query, too early
+    // for the subscription.  This way it can only be in both, which costs one
+    // redundant refresh.
+    //
+    // Built on listen() rather than beside it: the subscription, the polling
+    // and the teardown are the same problem, and a second copy would be a
+    // second thing to keep correct.
+    const subscription = await this.listen(options.events, requestRefresh, {
+      pollIntervalMs: options.pollIntervalMs,
+      onError,
+    });
+
+    // The first results before returning, so a caller that awaits live() has
+    // rendered once by the time it continues.  Marked as a refresh in progress
+    // so an event heard meanwhile queues behind it instead of racing it.
+    refreshing = true;
+    try {
+      await run();
+    } catch (err) {
+      stopped = true;
+      await subscription.unsubscribe();
+      throw err;
+    } finally {
+      refreshing = false;
+    }
+    if (again) void drain();
 
     const live: LiveQuery<T> = {
       get rows() {

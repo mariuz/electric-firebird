@@ -603,6 +603,40 @@ test.describe('FirebirdBrowser against the real engine', () => {
     expect(result.quietAfterUnsubscribe).toBe(true);
   });
 
+  test('hears an event posted the moment listen() resolves', async ({ page }) => {
+    // The ordering behind the flaky live-query test, forced: post as soon as
+    // the subscription exists, before the engine's watcher thread has had any
+    // reason to run. The engine used to fold such a post into the
+    // subscription's baseline delivery and report nothing.
+    const heard = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('listen-baseline', {
+        worker: new Worker('/firebird-engine-worker.js'),
+        autoPersist: false,
+      });
+      await db.exec('CREATE TABLE t (id INTEGER)');
+
+      const totals: number[] = [];
+      for (let round = 0; round < 20; round++) {
+        let total = 0;
+        const sub = await db.listen('ping', (c) => (total += c['ping'] ?? 0), {
+          pollIntervalMs: 20,
+        });
+        await db.notify('ping');
+        for (let i = 0; i < 100 && total === 0; i++) {
+          await new Promise((r) => setTimeout(r, 20));
+        }
+        // Long enough for a second, wrong, delivery to show up too.
+        await new Promise((r) => setTimeout(r, 60));
+        await sub.unsubscribe();
+        totals.push(total);
+      }
+      await db.close();
+      return totals;
+    });
+
+    expect(heard).toEqual(Array(20).fill(1));
+  });
+
   test('does not fire a live query for an event nobody posts', async ({ page }) => {
     const calls = await page.evaluate(async () => {
       const db = new window.FB.FirebirdBrowser('live-quiet', {
