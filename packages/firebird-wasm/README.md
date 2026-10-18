@@ -155,8 +155,7 @@ FIREBIRD_PASSWORD=masterkey npm test
 
 ## Roadmap
 
-Shipped in 0.1.0 — every item the previous roadmap listed as pending, except
-the last:
+Shipped in 0.1.0:
 
 - [x] True WASM build — Firebird 6.0 compiled with Emscripten
 - [x] Browser support via the WASM bundle, with the engine in a Web Worker
@@ -167,19 +166,30 @@ the last:
       letting it overwrite the first
 - [x] The prebuilt engine on npm, so using it needs no Emscripten
 
+Shipped since:
+
+- [x] Live queries built on Firebird's `POST_EVENT` (`live()`, `listen()`,
+      `notify()`)
+- [x] Multi-tab *sharing* (`multiTab: 'shared'`): one tab runs the engine,
+      the others are served by it
+- [x] OPFS backend (`opfs://name`), with no image copy and no persist step
+- [x] A build without `SharedArrayBuffer` (`firebird-embedded-st`), for pages
+      served without COOP/COEP headers
+- [x] React and Vue hooks (`firebird-wasm/react`, `firebird-wasm/vue`) and a
+      REPL element (`firebird-wasm/repl`)
+- [x] ElectricSQL sync, read path: a shape from Postgres through Electric
+      (`firebird-wasm/electric`), or from a Firebird server
+      (`firebird-wasm/electric-server`)
+
 Next:
 
-- [ ] Live queries built on Firebird's `POST_EVENT`
-- [ ] Multi-tab *sharing* — a `SharedWorker` leader, so a second tab is served
-      rather than refused
-- [ ] OPFS backend — a better match for page-oriented I/O than IndexedDB
+- [ ] ElectricSQL sync: a demo page, several shapes in one transaction,
+      writes back to the server
 - [ ] A typed binary result ABI, so exact numerics need not travel as strings
 - [ ] Module disposal — `close()` does not currently release the WASM heap
-- [ ] Loadable character sets. `src/intl` compiles under Emscripten and costs
-      +245 KB gzipped, measured; what is missing is a way for `IntlManager`
-      to reach it without `dlopen`. See
+- [ ] UNICODE collations (case- and accent-insensitive comparison), which
+      need ICU collation data in the build. See
       [docs/roadmap.md](../../docs/roadmap.md)
-- [ ] ElectricSQL sync
 
 **"Firebird 4 & 5 support" is gone from this list because it was never the
 gap.** The build tracks Firebird `master` and the shipped engine reports
