@@ -149,7 +149,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends libfbclient2
           sudo ln -sf /usr/lib/x86_64-linux-gnu/libfbclient.so.2 \
                       /usr/lib/x86_64-linux-gnu/libfbclient.so
-          docker run -d --name firebird -p 3050:3050 \
+          docker run -d --name firebird -p 3050:3050 -p 3051:3051 \
+            -e FIREBIRD_CONF_RemoteAuxPort=3051 \
             -e FIREBIRD_ROOT_PASSWORD=masterkey firebirdsql/firebird:5
           for i in $(seq 1 30); do
             (echo > /dev/tcp/localhost/3050) 2>/dev/null && break

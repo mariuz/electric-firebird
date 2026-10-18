@@ -76,6 +76,13 @@ export interface ShapeServer {
   /** The plans of the served tables, by Firebird name. */
   readonly tables: ReadonlyMap<string, TablePlan>;
   /**
+   * Whether live requests are woken by Firebird events.  False when the
+   * event connection could not be made (the server's `RemoteAuxPort` must
+   * be reachable from here; a container usually needs it pinned and
+   * published): live requests then poll every `pollIntervalMs`.
+   */
+  readonly events: boolean;
+  /**
    * Drop what the log numbered before `before` (default: now less
    * `retainLogMs`), and return the highest number dropped, or 0.
    */
@@ -147,7 +154,10 @@ export async function createShapeServer(options: ShapeServerOptions): Promise<Sh
       events = await eventAttachment.queueEvents([CHANGE_EVENT], async () => {
         signal();
       });
-    } catch {
+    } catch (err) {
+      console.warn(
+        `[firebird-wasm/electric-server] no Firebird events (${err instanceof Error ? err.message.split('\n').join(' ') : err}); ` +
+          `live requests poll every ${pollIntervalMs} ms. Events need the server's RemoteAuxPort reachable from here.`);
       await eventAttachment?.disconnect().catch(() => undefined);
       eventAttachment = undefined;
     }
@@ -415,6 +425,7 @@ export async function createShapeServer(options: ShapeServerOptions): Promise<Sh
 
   return {
     tables,
+    events: events !== undefined,
     handler: (req, res) => {
       if (closed) {
         respond(res, 503, { message: 'The shape server is closing' });

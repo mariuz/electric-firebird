@@ -473,7 +473,12 @@ Electric itself. What else it does:
   hand). A client further behind is sent back to a snapshot.
 - **Events.** A commit that logged a change posts `ELECTRIC_CHANGES`, which
   wakes waiting live requests at once, through a connection of its own;
-  polling (`pollIntervalMs`, default 1 s) is the fallback.
+  polling (`pollIntervalMs`, default 1 s) is the fallback. Firebird delivers
+  events on a second connection to the server's `RemoteAuxPort`, random by
+  default: for a Firebird in a container, pin it (`RemoteAuxPort = 3051`, or
+  `FIREBIRD_CONF_RemoteAuxPort=3051` in the official image) and publish it.
+  `shapes.events` says whether events are on; without them the server warns
+  once and polls.
 - **Several servers** can serve one database: numbering takes a lock, so the
   log is numbered in commit order whichever server numbers it.
 

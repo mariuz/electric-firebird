@@ -356,6 +356,9 @@ describeIfFirebird('createShapeServer against a Firebird server', () => {
     // Polling every minute: only the event can bring the change in time.
     const eventful = await another({ pollIntervalMs: 60_000, liveTimeoutMs: 30_000 });
     try {
+      // A Firebird in a container needs its RemoteAuxPort pinned and
+      // published for events to reach this process (CI does both).
+      expect(eventful.server.events).toBe(true);
       const { shape } = follow('items', undefined, eventful.url);
       await shape.rows;
       await new Promise((r) => setTimeout(r, 300)); // the client is waiting in a live request
