@@ -1098,7 +1098,10 @@ gaps it ran into, with its numbers, in rough order of what they would buy.
       element so that plain pages, React and Vue share one. Scripts with
       `SET TERM`, results as tables, history, values drawn as text; six
       browser tests drive it by keyboard against the real engine.
-- [ ] ElectricSQL sync integration (the project's namesake).
+- [ ] ElectricSQL sync integration (the project's namesake). Planned in
+      [plans/electric-sync.md](./plans/electric-sync.md): Postgres through
+      Electric into Firebird in the browser, read-only first, modelled on
+      PGlite's `syncShapeToTable`; four questions to decide before building.
 - [ ] A Firebird version build matrix. The submodule tracks `master` and the
       shipped engine reports `ENGINE_VERSION 6.0.0`, so the recurring "Firebird
       4 & 5 support" line was always mis-stated: what is missing is *testing
