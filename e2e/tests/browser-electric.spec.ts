@@ -177,6 +177,37 @@ test.describe('firebird-wasm/electric with Postgres and Electric', () => {
     expect(stored).toMatch(/^\d+_\d+$/);
   });
 
+  test('syncs two shapes started at once into one new database', async ({ page }) => {
+    // Both find no ELECTRIC_SHAPES table and both create it; one creation
+    // loses, and that sync must go on rather than stop.
+    const tables = [`first_${Date.now()}`, `second_${Date.now()}`];
+    const schemas = [];
+    for (const table of tables) {
+      await sql(`CREATE TABLE ${table} (id integer PRIMARY KEY, title text)`);
+      await sql(`INSERT INTO ${table} VALUES (1, '${table}')`);
+      schemas.push(await schemaOf(table));
+    }
+
+    await openPage(page);
+    await page.evaluate(async ({ tables, schemas, url }) => {
+      const w = window as any;
+      const db = new w.FB.FirebirdBrowser('memory://electric-two-at-once');
+      for (let i = 0; i < tables.length; i++) await db.exec(w.Frameworks.FBElectric.tableFromSchema(tables[i], schemas[i]));
+      w.db = db;
+      const syncs = await Promise.all(tables.map((table: string) => w.Frameworks.FBElectric.syncShapeToTable(db, {
+        shape: { url: `${url}/v1/shape`, params: { table } },
+        table,
+        shapeKey: table,
+      })));
+      await Promise.all(syncs.map((s: any) => s.upToDate));
+    }, { tables, schemas, url: ELECTRIC_URL });
+
+    for (const table of tables) {
+      const rows = await rowsWhen(page, `SELECT title FROM ${table}`, (r) => r.length === 1);
+      expect(rows).toEqual([{ TITLE: table }]);
+    }
+  });
+
   test('starts over when Postgres truncates the table (must-refetch)', async ({ page }) => {
     const table = `refetch_${Date.now()}`;
     await sql(`CREATE TABLE ${table} (id integer PRIMARY KEY, title text)`);

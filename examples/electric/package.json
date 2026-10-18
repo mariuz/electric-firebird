@@ -1,0 +1,19 @@
+{
+  "name": "firebird-wasm-example-electric",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "copy-engine": "node copy-engine.mjs public",
+    "build": "npm run copy-engine && vite build",
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "@electric-sql/client": "^1.5.28",
+    "firebird-wasm": "file:../../packages/firebird-wasm",
+    "node-firebird-driver-native": "^3.5.0",
+    "pg": "^8.16.3"
+  },
+  "devDependencies": {
+    "vite": "8.3.4"
+  }
+}

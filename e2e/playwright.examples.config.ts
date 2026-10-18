@@ -4,13 +4,17 @@
  *
  * Each example's dist is served twice: with COOP/COEP (the page is isolated
  * and loads the threaded engine) and without (it loads the build without
- * threads). Build them first:
+ * threads). examples/electric also needs Postgres with Electric and a
+ * Firebird server (see e2e/electric-example.ts); without them its servers are
+ * not started and its test skips. Build them first:
  *
  *   (cd examples/vite && npm install && npm run build)
  *   (cd examples/webpack && npm install && npm run build)
+ *   (cd examples/electric && npm install && npm run build)
  *   npx playwright test --config playwright.examples.config.ts
  */
 import { defineConfig } from '@playwright/test';
+import { ELECTRIC_EXAMPLE_PORTS, electricExampleConfigured, electricExampleEnv } from './electric-example';
 
 const serve = (example: string, port: number, isolated: boolean) => ({
   command: `node ../examples/serve.mjs ../examples/${example}/dist ${port}${isolated ? ' --isolated' : ''}`,
@@ -21,7 +25,7 @@ const serve = (example: string, port: number, isolated: boolean) => ({
 
 export default defineConfig({
   testDir: './tests',
-  testMatch: ['**/examples.spec.ts'],
+  testMatch: ['**/examples.spec.ts', '**/examples-electric.spec.ts'],
   fullyParallel: false,
   forbidOnly: !!process.env['CI'],
   retries: process.env['CI'] ? 2 : 0,
@@ -33,5 +37,14 @@ export default defineConfig({
     serve('vite', 4181, false),
     serve('webpack', 4182, true),
     serve('webpack', 4183, false),
+    ...(electricExampleConfigured
+      ? ELECTRIC_EXAMPLE_PORTS.map(({ port, isolated }) => ({
+          command: `node ../examples/electric/server.mjs${isolated ? ' --isolated' : ''}`,
+          env: electricExampleEnv(port),
+          url: `http://localhost:${port}/`,
+          reuseExistingServer: !process.env['CI'],
+          timeout: 60_000,
+        }))
+      : []),
   ],
 });

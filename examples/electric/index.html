@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>firebird-wasm: sync through Electric</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Two servers, one Firebird in your browser</h1>
+      <p>
+        Each list is a table in a Firebird database running in this page, kept in step with a
+        server by <code>firebird-wasm/electric</code>. Adding, ticking or deleting a note asks the
+        server; the change comes back down the shape into the local table, and
+        <code>db.live()</code> redraws the list. Reload, and the sync resumes from where the local
+        copy was.
+      </p>
+      <p id="engine" class="muted">Starting the engine…</p>
+    </header>
+
+    <main>
+      <section class="source" data-source="pg">
+        <h2>Postgres, through Electric</h2>
+        <p class="muted">Local table <code>PG_NOTES</code></p>
+        <p class="status" data-status>connecting…</p>
+        <form data-add>
+          <input name="title" placeholder="A note for Postgres" maxlength="200" required autocomplete="off" />
+          <button>Add</button>
+        </form>
+        <ul data-list></ul>
+      </section>
+
+      <section class="source" data-source="fb">
+        <h2>A Firebird server, through <code>electric-server</code></h2>
+        <p class="muted">Local table <code>FB_NOTES</code></p>
+        <p class="status" data-status>connecting…</p>
+        <form data-add>
+          <input name="title" placeholder="A note for Firebird" maxlength="200" required autocomplete="off" />
+          <button>Add</button>
+        </form>
+        <ul data-list></ul>
+      </section>
+    </main>
+
+    <section class="repl">
+      <h2>Query the local copy</h2>
+      <p class="muted">Both tables are in the same database: try
+        <code>SELECT 'pg', title FROM pg_notes UNION ALL SELECT 'fb', title FROM fb_notes</code>.
+        Changes made here stay local: the next change from the server overwrites them.</p>
+      <firebird-repl></firebird-repl>
+    </section>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

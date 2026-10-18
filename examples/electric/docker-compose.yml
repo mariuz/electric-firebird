@@ -1,0 +1,24 @@
+# The two sources the example syncs from, on the ports server.mjs expects:
+#   Postgres 54321, Electric 3000, Firebird 3050.
+#   docker compose up -d
+services:
+  postgres:
+    image: postgres:16
+    command: ["postgres", "-c", "wal_level=logical"]
+    environment:
+      POSTGRES_PASSWORD: pg
+    ports: ["54321:5432"]
+
+  electric:
+    image: electricsql/electric:1.8.1
+    environment:
+      DATABASE_URL: postgresql://postgres:pg@postgres:5432/postgres
+      ELECTRIC_INSECURE: "true"
+    ports: ["3000:3000"]
+    depends_on: [postgres]
+
+  firebird:
+    image: firebirdsql/firebird:5
+    environment:
+      FIREBIRD_ROOT_PASSWORD: masterkey
+    ports: ["3050:3050"]

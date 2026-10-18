@@ -359,6 +359,9 @@ await sync.unsubscribe();
   `multiTab: 'shared'`, start the sync in the leading tab only.
 
 See [plans/electric-sync.md](./plans/electric-sync.md) for the design.
+[`examples/electric`](../examples/electric) is a working app: two tables, one
+synced from Postgres through Electric and one from a Firebird server, with
+writes going through its server and `db.live()` drawing what comes back.
 
 ### Syncing from a Firebird server
 
