@@ -154,6 +154,12 @@ page is not cross-origin isolated and the demo runs the engine's build without
 threads, which needs no `SharedArrayBuffer`. See
 [`demo/README.md`](./demo/README.md).
 
+### Example apps
+
+[`examples/vite`](./examples/vite) and [`examples/webpack`](./examples/webpack)
+are minimal apps built by their own bundlers; CI builds them and runs each with
+and without cross-origin isolation. See [`examples/README.md`](./examples/README.md).
+
 ### Build the WASM module (optional)
 
 The Emscripten SDK is vendored at `third_party/emsdk`, and the version is

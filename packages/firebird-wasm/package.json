@@ -13,7 +13,12 @@
     "./browser": {
       "types": "./dist/browser/index.d.ts",
       "default": "./dist/browser/index.js"
-    }
+    },
+    "./browser/worker-entry": {
+      "types": "./dist/browser/worker-entry.d.ts",
+      "default": "./dist/browser/worker-entry.js"
+    },
+    "./package.json": "./package.json"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",

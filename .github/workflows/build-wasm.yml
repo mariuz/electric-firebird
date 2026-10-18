@@ -134,6 +134,21 @@ jobs:
         # here rather than after it is published.
         run: npx playwright test --config playwright.demo.config.ts
 
+      # The example apps, each built by its own bundler from the package as
+      # just built, then run in Chromium with and without cross-origin
+      # isolation (the threaded engine and the build without threads).
+      - name: Build the Vite and webpack examples
+        run: |
+          for example in vite webpack; do
+            (cd examples/$example && npm install --no-audit --no-fund && npm run build)
+          done
+
+      - name: Run the example apps (Playwright)
+        working-directory: e2e
+        env:
+          CI: 'true'
+        run: npx playwright test --config playwright.examples.config.ts
+
       - name: Upload demo Playwright report
         if: always()
         uses: actions/upload-artifact@v4

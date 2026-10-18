@@ -1,0 +1,4 @@
+node_modules/
+dist/
+**/public/firebird-embedded*
+package-lock.json
