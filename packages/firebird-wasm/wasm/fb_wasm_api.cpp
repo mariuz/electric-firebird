@@ -53,7 +53,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <condition_variable>
 #include <cstring>
+#include <chrono>
 #include <list>
 #include <map>
 #include <memory>
@@ -1580,6 +1582,16 @@ private:
  *    one delivery of 1.  What that earlier revision got right is the cost of
  *    guessing wrong, which is silently discarding the first event of every
  *    subscription.
+ *  - The baseline callback is not synchronous with queEvents().  With threads,
+ *    queEvents() only wakes the event manager's watcher thread, which delivers
+ *    later; without them (patch 0006) it delivers inline.  Absorbing "whatever
+ *    the first callback says" is only right if nothing was posted in between:
+ *    a POST_EVENT committed after queEvents() returned but before the watcher
+ *    ran arrives folded into the baseline (count 2 instead of 1) and is lost.
+ *    That was the intermittent "live query never refreshed" in the browser
+ *    tests, about one run in three.  fb_events_subscribe() therefore waits for
+ *    the baseline before returning, so everything posted after a subscription
+ *    exists is news.
  *
  *  A delivery also disarms the queue: until queEvents() is called again,
  *  further posts are counted but not delivered.  Re-arming from inside the
@@ -1645,9 +1657,27 @@ public:
 		{
 			m_baselined = true;
 			m_reported = m_seen;
+			m_baselineArrived.notify_all();
 		}
 
 		m_disarmed = true;
+	}
+
+	/**
+	 * Wait until the registration's baseline delivery has been absorbed.
+	 *
+	 * Returns false if it did not arrive in time.  Without threads the engine
+	 * delivers inside queEvents(), so it has always arrived by now.
+	 */
+	bool waitForBaseline(std::chrono::milliseconds timeout)
+	{
+		std::unique_lock<std::mutex> guard(m_mutex);
+#ifdef __EMSCRIPTEN_PTHREADS__
+		return m_baselineArrived.wait_for(guard, timeout, [this] { return m_baselined; });
+#else
+		(void) timeout;
+		return m_baselined;
+#endif
 	}
 
 	/** Names, in the order their counts appear in the event block. */
@@ -1727,6 +1757,7 @@ private:
 	}
 
 	mutable std::mutex        m_mutex;
+	std::condition_variable   m_baselineArrived;
 	int                       m_refs = 1;
 	std::vector<std::string>  m_names;
 	std::vector<unsigned>     m_seen;       // latest counts from the engine
@@ -2875,6 +2906,23 @@ int fb_events_subscribe(int db_handle, const char* names)
 	if (!armEvents(entry))
 	{
 		entry.subscription->release();
+		return 0;
+	}
+
+	// Not returning until the baseline is in: anything this attachment posts
+	// after the call returns must count as news, and a post that overtook the
+	// watcher thread's first delivery would otherwise be folded into it.
+	// Nothing on this attachment can post meanwhile, because its caller is
+	// here.  The watcher answers in microseconds; the timeout is for a broken
+	// engine, where reporting the failure beats a subscription that might
+	// silently swallow its first event.
+	if (!entry.subscription->waitForBaseline(std::chrono::seconds(10)))
+	{
+		Status status;
+		entry.queue->cancel(status.ptr());
+		entry.queue->release();
+		entry.subscription->release();
+		setError("fb_events_subscribe: the engine never delivered the subscription's baseline");
 		return 0;
 	}
 
