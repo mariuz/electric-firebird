@@ -1102,7 +1102,12 @@ gaps it ran into, with its numbers, in rough order of what they would buy.
 - [ ] A Firebird version build matrix. The submodule tracks `master` and the
       shipped engine reports `ENGINE_VERSION 6.0.0`, so the recurring "Firebird
       4 & 5 support" line was always mis-stated: what is missing is *testing
-      across versions*, not initial support for them.
+      across versions*, not initial support for them. **Half done:** the Node
+      driver's tests run against Firebird 3, 4 and 5 servers in CI
+      (`ci.yml`, `server-versions`), each run checking the server's
+      `ENGINE_VERSION` and failing rather than skipping when the client
+      library will not load. Left: the browser engine built from other
+      branches than `master`, each a build of its own.
 
 ---
 

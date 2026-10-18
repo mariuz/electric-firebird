@@ -156,7 +156,7 @@ electric-firebird/
 
 | Workflow | Trigger | What it does |
 |----------|---------|-------------|
-| `ci.yml` | push / PR | TypeScript build + unit tests (Firebird Docker) |
+| `ci.yml` | push / PR | TypeScript build + unit tests (Firebird Docker), and the Node driver's tests against Firebird 3, 4 and 5 |
 | `e2e.yml` | push / PR | Playwright browser tests (Firebird Docker) |
 
 Both workflows use the official

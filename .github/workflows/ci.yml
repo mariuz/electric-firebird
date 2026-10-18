@@ -88,3 +88,66 @@ jobs:
           name: decode-benchmark
           path: packages/firebird-wasm/bench-results/
           if-no-files-found: ignore
+
+  # The Node driver against every supported server. FirebirdLite talks to a
+  # server through libfbclient, so what it supports is what these pass on.
+  # (The browser engine is built from Firebird's master branch and reports
+  # 6.0; testing other engine versions there means building each one.)
+  server-versions:
+    name: Firebird ${{ matrix.firebird }} server
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        firebird: ['3', '4', '5']
+
+    services:
+      firebird:
+        image: firebirdsql/firebird:${{ matrix.firebird }}
+        env:
+          FIREBIRD_ROOT_PASSWORD: masterkey
+          FIREBIRD_DATABASE: test.fdb
+          FIREBIRD_USER: SYSDBA
+          FIREBIRD_PASSWORD: masterkey
+        ports:
+          - 3050:3050
+        options: >-
+          --health-cmd "/bin/bash -c 'echo > /dev/tcp/localhost/3050'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install Firebird client library
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libfbclient2
+          sudo ln -sf /usr/lib/x86_64-linux-gnu/libfbclient.so.2 \
+                      /usr/lib/x86_64-linux-gnu/libfbclient.so
+
+      - name: Install root dependencies
+        run: npm install
+
+      # FIREBIRD_REQUIRE_SERVER fails the run if the client library cannot
+      # load, where the suite would otherwise skip itself and pass;
+      # FIREBIRD_EXPECT_MAJOR checks the server is the version named here.
+      - name: Run the server-backed tests
+        working-directory: packages/firebird-wasm
+        env:
+          FIREBIRD_HOST: localhost
+          FIREBIRD_USER: SYSDBA
+          FIREBIRD_PASSWORD: masterkey
+          FIREBIRD_REQUIRE_SERVER: '1'
+          FIREBIRD_EXPECT_MAJOR: ${{ matrix.firebird }}
+        run: npx jest src/__tests__/firebird.test.ts
