@@ -246,7 +246,7 @@ function splitResultSet(
 
 function toFields(columns: EncodedColumn[]): FieldInfo[] {
   return columns.map((c) => ({
-    name: c.name.toUpperCase(),
+    name: c.name,
     type: c.type,
     typeName: firebirdTypeName(c.type, c.scale),
     subType: c.subType,
@@ -308,10 +308,8 @@ function stringLiteral(name: string): string {
  * - A column named `__proto__`. As a literal key that sets the prototype
  *   instead of defining a property, so the value would be silently lost.
  *   `Object.fromEntries` defines it correctly, so the slow path is also the
- *   right path here. Unreachable today, because column names are upper-cased
- *   before they get here and `__PROTO__` is an ordinary key — kept because the
- *   guard costs one comparison and the upper-casing is not this function's to
- *   rely on.
+ *   right path here. A quoted alias keeps its case, so
+ *   `SELECT 1 AS "__proto__"` reaches this.
  * - A Content-Security-Policy without `unsafe-eval`, where `new Function`
  *   throws. Remembered, so it is attempted once rather than per query.
  */
@@ -387,7 +385,7 @@ export function decodeResultSet<T = Row>(
 /** One field of a description, as the engine encodes it. */
 function decodeField(c: EncodedColumn): FieldInfo {
   return {
-    name: c.name.toUpperCase(),
+    name: c.name,
     type: c.type,
     typeName: firebirdTypeName(c.type, c.scale),
     subType: c.subType,
@@ -409,8 +407,7 @@ export function decodeDescription(json: string): QueryDescription {
 
   return {
     // Parameters are positional in Firebird and carry no name, so the engine
-    // sends "" and upper-casing it changes nothing — they are described by
-    // type and position alone.
+    // sends "" — they are described by type and position alone.
     params: parsed.params.map(decodeField),
     fields,
     statementType: statementKind(parsed.statementType),

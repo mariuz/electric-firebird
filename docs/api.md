@@ -127,7 +127,9 @@ const result = await db.query<{ ID: number; NAME: string }>(
 // result.fields → [{ name: 'ID' }, { name: 'NAME' }]
 ```
 
-Row keys are always **upper-cased** column names (or aliases).
+Row keys are column names (or aliases) as Firebird reports them: an unquoted
+name folds to upper case (`SELECT name` gives `NAME`), a quoted alias keeps
+its case (`SELECT name AS "name"` gives `name`).
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -251,7 +253,8 @@ is otherwise complete.
 
 ## `rowMode`
 
-Each row is an object keyed by upper-cased column name by default.  `'array'`
+Each row is an object keyed by column name by default (upper case unless
+quoted, as above).  `'array'`
 gives the values in column order instead:
 
 ```ts
@@ -773,7 +776,7 @@ interface QueryResult<T = Row> {
 
 ```ts
 interface FieldInfo {
-  /** Column name (upper-cased). */
+  /** Column name or alias: upper case unless it was quoted. */
   name: string;
 }
 ```

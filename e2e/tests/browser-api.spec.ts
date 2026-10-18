@@ -548,12 +548,10 @@ test.describe('Row construction', () => {
 
       const row = r.rows[0] as Record<string, unknown>;
       return {
-        // Column names are upper-cased, so this arrives as __PROTO__ and is an
-        // ordinary key. The assertion is a regression guard: if the
-        // upper-casing ever goes, the literal-key builder must not be what
-        // handles this column.
-        upperCased: Object.prototype.hasOwnProperty.call(row, '__PROTO__'),
-        value: row['__PROTO__'],
+        // A quoted name keeps its case, so this arrives as __proto__: it must
+        // be defined as an own property, not set the row's prototype.
+        own: Object.prototype.hasOwnProperty.call(row, '__proto__'),
+        value: Object.getOwnPropertyDescriptor(row, '__proto__')?.value,
         other: row['OK'],
         // Nothing was injected into the prototype either way.
         prototypeIsObject: Object.getPrototypeOf(row) === Object.prototype,
@@ -561,7 +559,7 @@ test.describe('Row construction', () => {
       };
     });
 
-    expect(result.upperCased).toBe(true);
+    expect(result.own).toBe(true);
     expect(result.value).toEqual({ injected: true });
     expect(result.other).toBe('value');
     expect(result.prototypeIsObject).toBe(true);
@@ -586,14 +584,14 @@ test.describe('Row construction', () => {
       return r.rows[0];
     });
 
-    // Upper-cased, as every column name is — see decodeResultSet. What matters
-    // here is that the quote, apostrophe, backslash and space survived being
-    // interpolated into generated source.
+    // Kept as the engine reports them. What matters here is that the quote,
+    // apostrophe, backslash and space survived being interpolated into
+    // generated source.
     expect(result).toEqual({
-      'A"B': '1',
-      "C'D": '2',
-      'E\\F': '3',
-      'HAS SPACE': '4',
+      'a"b': '1',
+      "c'd": '2',
+      'e\\f': '3',
+      'has space': '4',
       '123': '5',
     });
   });
@@ -1910,12 +1908,13 @@ test.describe('FirebirdBrowser', () => {
     expect(result.liveAllocations).toBe(0);
   });
 
-  test('query() decodes the result set into upper-cased column keys', async ({
+  test('query() decodes the result set into column keys', async ({
     page,
   }) => {
     const result = await page.evaluate(async () => {
+      // As the engine names them: unquoted names folded to upper case.
       window.__stub.queryResult = {
-        columns: ['id', 'name', 'created_at'],
+        columns: ['ID', 'NAME', 'CREATED_AT'],
         rows: [
           [1, 'alpha', '2024-01-01'],
           [2, 'béta', null],
@@ -1948,7 +1947,7 @@ test.describe('FirebirdBrowser', () => {
 
   test('query() handles an empty result set', async ({ page }) => {
     const res = await page.evaluate(async () => {
-      window.__stub.queryResult = { columns: ['id'], rows: [] };
+      window.__stub.queryResult = { columns: ['ID'], rows: [] };
       const db = new window.FB.FirebirdBrowser('empty');
       const out = await db.query('SELECT id FROM items WHERE 1 = 0');
       await db.close();
@@ -1985,7 +1984,7 @@ test.describe('FirebirdBrowser', () => {
 
   test('transaction() commits when the callback resolves', async ({ page }) => {
     const result = await page.evaluate(async () => {
-      window.__stub.queryResult = { columns: ['cnt'], rows: [[2]] };
+      window.__stub.queryResult = { columns: ['CNT'], rows: [[2]] };
       const db = new window.FB.FirebirdBrowser('tx-commit');
       await db.exec('CREATE TABLE t (id INTEGER)');
       window.__stub.resetCalls();
