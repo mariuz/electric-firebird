@@ -48,6 +48,7 @@
 
 #include <firebird/Interface.h>
 
+#include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <cstdio>
@@ -1289,6 +1290,26 @@ public:
 	InputMessage(const InputMessage&) = delete;
 	InputMessage& operator=(const InputMessage&) = delete;
 
+	/**
+	 * Where a BLOB parameter's value is written: the attachment and the
+	 * transaction the statement executes in.  Without them a BLOB parameter
+	 * is refused, as it always was.
+	 */
+	void writeBlobsTo(IAttachment* toAttachment, ITransaction* toTransaction) noexcept
+	{
+		blobAttachment = toAttachment;
+		blobTransaction = toTransaction;
+	}
+
+	/** Whether any parameter is a BLOB (known after describe()). */
+	bool hasBlobParameter() const noexcept
+	{
+		for (const Field& f : fields)
+			if (f.type == SQL_BLOB)
+				return true;
+		return false;
+	}
+
 	IMessageMetadata* meta() const noexcept { return metadata; }
 	void* data() noexcept { return buffer.empty() ? nullptr : buffer.data(); }
 	unsigned parameterCount() const noexcept { return expected; }
@@ -1400,6 +1421,18 @@ public:
 			if (values[i].isNull)
 				continue;
 
+			if (f.type == SQL_BLOB)
+			{
+				// Firebird converts no value to a BLOB in the message: a BLOB
+				// parameter takes a blob's id.  So the text is written as a
+				// blob in the statement's transaction, and its id bound.
+				ISC_QUAD blobId;
+				if (!writeBlob(values[i].text, blobId, i))
+					return false;
+				memcpy(buffer.data() + f.offset, &blobId, sizeof(blobId));
+				continue;
+			}
+
 			const bool floating = f.type == SQL_DOUBLE || f.type == SQL_FLOAT || f.type == SQL_D_FLOAT;
 			const bool whole    = (f.type == SQL_SHORT || f.type == SQL_LONG || f.type == SQL_INT64) && f.scale == 0;
 
@@ -1465,7 +1498,53 @@ private:
 		unsigned nullOffset = 0;
 	};
 
+	/** Write `text` as a new blob in the bound transaction; its id into `id`. */
+	bool writeBlob(const std::string& text, ISC_QUAD& id, unsigned index)
+	{
+		if (!blobAttachment || !blobTransaction)
+		{
+			char message[96];
+			snprintf(message, sizeof(message), "parameter %u is a BLOB, which this call cannot write", index);
+			setError(message);
+			return false;
+		}
+
+		Status status;
+		IBlob* blob = blobAttachment->createBlob(status.ptr(), blobTransaction, &id, 0, nullptr);
+		if (status.failed() || !blob)
+		{
+			setErrorFromStatus("could not create a blob for a parameter", status.ptr());
+			return false;
+		}
+
+		// Segments are at most 64 KB; 32 KB keeps well inside that.
+		constexpr size_t SEGMENT = 32 * 1024;
+		for (size_t at = 0; at < text.size() && !status.failed(); at += SEGMENT)
+		{
+			const size_t n = std::min(SEGMENT, text.size() - at);
+			blob->putSegment(status.ptr(), static_cast<unsigned>(n), text.data() + at);
+		}
+
+		if (status.failed())
+		{
+			setErrorFromStatus("could not write a blob parameter", status.ptr());
+			Status cancelStatus;
+			blob->cancel(cancelStatus.ptr());
+			return false;
+		}
+
+		blob->close(status.ptr());   // releases the blob too
+		if (status.failed())
+		{
+			setErrorFromStatus("could not close a blob parameter", status.ptr());
+			return false;
+		}
+		return true;
+	}
+
 	IMessageMetadata*          metadata = nullptr;
+	IAttachment*               blobAttachment = nullptr;
+	ITransaction*              blobTransaction = nullptr;
 	unsigned                   expected = 0;
 	std::vector<Field>         fields;
 	std::vector<unsigned char> buffer;
@@ -3134,6 +3213,7 @@ int fb_execute_params(int db_handle, int tx_handle, const char* sql,
 	}
 
 	InputMessage input;
+	input.writeBlobsTo(attachment, transaction);
 	const bool bound = input.build(statement, values);
 
 	if (bound)
@@ -3262,6 +3342,7 @@ int fb_execute_batch(int db_handle, int tx_handle, const char* sql,
 	}
 
 	InputMessage input;
+	input.writeBlobsTo(attachment, transaction);
 	bool ok = input.describe(statement);
 	ISC_INT64 total = 0;
 	std::vector<ParamValue> values;
@@ -3279,7 +3360,10 @@ int fb_execute_batch(int db_handle, int tx_handle, const char* sql,
 		ok = false;
 	}
 
-	if (ok && input.parameterCount() > 0)
+	// IBatch takes no blob ids written outside it (its default blob policy
+	// is none), so a statement with a BLOB parameter runs once per row, in
+	// the same transaction, as one without parameters does.
+	if (ok && input.parameterCount() > 0 && !input.hasBlobParameter())
 	{
 		std::vector<unsigned char> messages;
 		messages.reserve(static_cast<size_t>(stride) * rowCount);
@@ -3373,8 +3457,8 @@ int fb_execute_batch(int db_handle, int tx_handle, const char* sql,
 	}
 	else
 	{
-		// A statement without parameters has no message to batch: run it once
-		// per row, as the rows ask.
+		// A statement without parameters has no message to batch, and one with
+		// a BLOB parameter cannot be batched: run it once per row.
 		for (unsigned row = 0; ok && row < rowCount; row++)
 		{
 			if (!parseParamsAt(rows, length, pos, values))
@@ -3552,6 +3636,7 @@ const char* fb_query_params(int db_handle, int tx_handle, const char* sql,
 	}
 
 	InputMessage input;
+	input.writeBlobsTo(attachment, transaction);
 	if (!input.build(statement, values))
 	{
 		cleanup(false);

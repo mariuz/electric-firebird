@@ -47,6 +47,15 @@ API may still move between minor releases.
 
 ### Fixed
 
+- **A string binds into a BLOB parameter.** `INSERT INTO notes (body) VALUES
+  (?)` with a `BLOB SUB_TYPE TEXT` column failed in the browser engine ("BLOB
+  and array data types are not supported for move operation"): a BLOB
+  parameter takes a blob's id, and the bridge only converted values. It now
+  writes the text as a blob in the statement's transaction and binds its id,
+  through `exec`, `query`, transactions and `execBatch` alike, with no size
+  limit of its own (text parameters were capped at 64 KB). A batch with a
+  BLOB parameter runs as one execute per row, since Firebird's batch takes no
+  blob written outside it.
 - **`firebird-wasm/browser/worker-entry` can be imported.** The package's
   `exports` did not list it, so the import the integration guide showed failed
   in any bundler that honours `exports` (Vite and webpack both). It is now
