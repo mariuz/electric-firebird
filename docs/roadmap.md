@@ -591,7 +591,7 @@ Legend: ✅ shipped · 🟡 partial · ❌ missing · n/a not applicable
 |---|---|---|---|
 | Prebuilt WASM on npm | ✅ | ✅ | `npm install firebird-wasm` ships the engine |
 | CDN distribution | ✅ | ✅ | `cdnArtifacts()` gives the jsDelivr/unpkg URLs and their `locateFile`; both builds tested from another origin |
-| Bundler guides (Vite/webpack) | ✅ | 🟡 | Vite, webpack, esbuild and Next.js in [integration.md](./integration.md); still not built by a real example app in CI |
+| Bundler guides (Vite/webpack) | ✅ | ✅ | Vite, webpack, esbuild and Next.js in [integration.md](./integration.md); `examples/vite` and `examples/webpack` are built and run in CI |
 | Framework hooks (React/Vue) | ✅ | ❌ | |
 | ORM / query-builder support | ✅ | ❌ | |
 | Extensions / plugin API | ✅ | n/a | Firebird UDRs are a different model; not a near-term goal |
@@ -943,7 +943,15 @@ be built:
       Shipped in 0.3.0 (`db.listen`, `db.notify`, `db.live`), once event
       delivery under Emscripten was fixed: the engine had delivered exactly one
       event per subscription and then stopped (§1 records how it was found).
-- [ ] Verified Vite and webpack example apps in CI.
+- [x] Verified Vite and webpack example apps in CI. `examples/vite` (Vite 8)
+      and `examples/webpack` (webpack 5), each run in Chromium with and
+      without cross-origin isolation, so on both builds. Building them found
+      three things the guide got wrong (`worker-entry` was not exported; Vite 8
+      wants `rolldownOptions`, for the Worker too; webpack's `externals` keys
+      are the require strings inside the package) and one library bug: the
+      index re-exported `serveEngine` from the auto-starting Worker entry, so
+      importing the library started an engine server, on a page's window too
+      (fixed in #36).
 
 ### M6 — What a consumer measured
 

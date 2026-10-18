@@ -22,8 +22,18 @@ API may still move between minor releases.
   `serveEngine` refuses a scope that has a `document`. Upgrade from 0.7.0 if
   you run the engine on the page thread.
 
+### Added
+
+- **`examples/vite` and `examples/webpack`.** Minimal apps built by their own
+  bundlers from the package, run by CI in Chromium with and without
+  cross-origin isolation.
+
 ### Fixed
 
+- **`firebird-wasm/browser/worker-entry` can be imported.** The package's
+  `exports` did not list it, so the import the integration guide showed failed
+  in any bundler that honours `exports` (Vite and webpack both). It is now
+  exported, and so is `./package.json`.
 - **`firebird-wasm/browser/worker-entry` imported with a bundler.** In a
   Worker that imported the library before setting
   `FIREBIRD_WORKER_OPTIONS`, the side effect above started the engine without

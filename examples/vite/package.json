@@ -1,0 +1,16 @@
+{
+  "name": "firebird-wasm-example-vite",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "copy-engine": "node copy-engine.mjs public",
+    "build": "npm run copy-engine && vite build",
+    "preview": "vite preview --port 4174 --strictPort"
+  },
+  "dependencies": {
+    "firebird-wasm": "file:../../packages/firebird-wasm"
+  },
+  "devDependencies": {
+    "vite": "8.3.4"
+  }
+}

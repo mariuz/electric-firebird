@@ -1,0 +1,16 @@
+{
+  "name": "firebird-wasm-example-webpack",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "copy-engine": "node copy-engine.mjs dist && cp index.html dist/",
+    "build": "webpack --mode production && npm run copy-engine"
+  },
+  "dependencies": {
+    "firebird-wasm": "file:../../packages/firebird-wasm"
+  },
+  "devDependencies": {
+    "webpack": "5.112.0",
+    "webpack-cli": "6.0.1"
+  }
+}

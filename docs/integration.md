@@ -163,27 +163,34 @@ Omitting `worker` is only appropriate in Node or a test harness driving a stub.
 ## 3. Wiring it up
 
 Three files: the Worker entry, the engine assets, and your application code.
+[`examples/vite`](../examples/vite) and [`examples/webpack`](../examples/webpack)
+are complete apps built this way, and CI builds and runs both.
 
-**`src/firebird-engine-worker.ts`** — bundle this as a *classic* worker script:
+**The Worker** — two modules, bundled as a *classic* worker script. The first
+loads the Emscripten glue and says where the `.wasm` is; the second starts the
+engine, and must come second, because it reads those settings as it loads:
 
-```ts
+```js
+// engine-prelude.js
+import { wasmGlueFile } from 'firebird-wasm/browser';
+
+const base = new URL('/', self.location.href).href;   // where the engine files are served
+importScripts(base + wasmGlueFile());                  // threaded if isolated, else the build without threads
+self.FIREBIRD_WORKER_OPTIONS = { locateFile: (file) => base + file };
+```
+
+```js
+// engine-worker.js
+import './engine-prelude.js';
 import 'firebird-wasm/browser/worker-entry';
 ```
 
-The bundled output needs two lines in front of it, so the Worker loads the
-Emscripten glue and can find the `.wasm` next to itself:
-
-```js
-importScripts(new URL('./firebird-embedded.js', self.location.href).href);
-self.FIREBIRD_WORKER_OPTIONS = {
-  locateFile: (file) => new URL(file, self.location.href).href,
-};
-```
-
-Resolving against `self.location.href` rather than an absolute path keeps the
-app working under any path prefix — including the `/<repo>/` prefix a GitHub
-project site is served from. `demo/build.mjs` in this repository does exactly
-this and is a working reference.
+The `locateFile` matters: glue pulled in with `importScripts()` looks for its
+`.wasm` next to the *Worker script*, which a bundler puts somewhere like
+`/assets/`. Resolve against your site's base instead, including a path prefix
+such as the `/<repo>/` a GitHub project site is served from. With a bundler
+that does not process the Worker (`demo/build.mjs` uses esbuild), the same two
+settings can be prepended to the bundled entry as plain lines.
 
 **Your code:**
 
@@ -191,7 +198,7 @@ this and is a working reference.
 import { FirebirdBrowser } from 'firebird-wasm/browser';
 
 const db = new FirebirdBrowser('mydb', {
-  worker: new Worker('/firebird-engine-worker.js'),
+  worker: new Worker(new URL('./engine-worker.js', import.meta.url)),
 });
 
 await db.exec(`
@@ -223,17 +230,23 @@ from IndexedDB if it exists, creating it if not.
 
 ## 4. Bundlers
 
-The Worker must be a real, separately-built file. The awkward part is that
-`wasm-loader.ts` contains a Node branch that `require()`s the Emscripten glue;
-browsers never take it, but bundlers resolve string-literal requires eagerly
-and will drag `node:fs` into your bundle. Mark it external.
+The Worker must be a real, separately-built file; `new Worker(new URL(...,
+import.meta.url))` gets Vite and webpack to build it. The awkward part is that
+the loader has a Node branch that `require()`s the Emscripten glue
+(`../dist/wasm/firebird-embedded.js` and `-st.js`); browsers never take it, but
+bundlers resolve string-literal requires eagerly and drag `node:fs` into your
+bundle. Mark both external — in the Worker's bundle too. Either way, copy the
+four engine files out of `node_modules/firebird-wasm/dist/wasm/` to be served
+verbatim (the examples' `copy-engine.mjs` does it).
 
 ### Vite
 
-```ts
-// vite.config.ts
+```js
+// vite.config.js — Vite 8, which bundles with Rolldown (rollupOptions before it)
+const GLUE = [/firebird-embedded(-st)?\.js$/];
 export default defineConfig({
-  build: { rollupOptions: { external: [/firebird-embedded\.js$/] } },
+  build: { rolldownOptions: { external: GLUE } },
+  worker: { rolldownOptions: { external: GLUE } },   // the Worker is a bundle of its own
   server: {
     headers: {
       'Cross-Origin-Opener-Policy': 'same-origin',
@@ -252,13 +265,17 @@ export default defineConfig({
 Set the headers on `preview` as well as `server`. Getting them only on the dev
 server is a good way to ship a build that fails the moment it is deployed.
 
-Copy `firebird-embedded.{js,wasm}` into `public/` so they are served verbatim.
+Copy the engine files into `public/` so they are served verbatim.
 
 ### webpack
 
 ```js
-module.exports = {
-  externals: { './firebird-embedded.js': 'commonjs ./firebird-embedded.js' },
+// webpack.config.js — the keys are the require strings inside the package
+export default {
+  externals: {
+    '../dist/wasm/firebird-embedded.js': 'commonjs ../dist/wasm/firebird-embedded.js',
+    '../dist/wasm/firebird-embedded-st.js': 'commonjs ../dist/wasm/firebird-embedded-st.js',
+  },
   devServer: {
     headers: {
       'Cross-Origin-Opener-Policy': 'same-origin',
