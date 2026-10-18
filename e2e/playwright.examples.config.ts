@@ -6,8 +6,8 @@
  * and loads the threaded engine) and without (it loads the build without
  * threads). Build them first:
  *
- *   (cd examples/vite && npm install --install-links && npm run build)
- *   (cd examples/webpack && npm install --install-links && npm run build)
+ *   (cd examples/vite && npm install && npm run build)
+ *   (cd examples/webpack && npm install && npm run build)
  *   npx playwright test --config playwright.examples.config.ts
  */
 import { defineConfig } from '@playwright/test';

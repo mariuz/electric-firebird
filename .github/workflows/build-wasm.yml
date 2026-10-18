@@ -135,12 +135,12 @@ jobs:
         run: npx playwright test --config playwright.demo.config.ts
 
       # The example apps, each built by its own bundler from the package as
-      # just built (a packed copy, as from npm: --install-links), then run in Chromium with and without cross-origin
+      # just built, then run in Chromium with and without cross-origin
       # isolation (the threaded engine and the build without threads).
       - name: Build the Vite and webpack examples
         run: |
           for example in vite webpack; do
-            (cd examples/$example && npm install --install-links --no-audit --no-fund && npm run build)
+            (cd examples/$example && npm install --no-audit --no-fund && npm run build)
           done
 
       - name: Run the example apps (Playwright)
