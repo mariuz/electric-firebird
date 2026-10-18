@@ -264,7 +264,7 @@ The library provides two execution backends:
 - [x] Live queries / `POST_EVENT`-based notifications (`live()`, `listen()`, `notify()`)
 - [x] React and Vue hooks (`firebird-wasm/react`, `firebird-wasm/vue`)
 - [x] A REPL component: `<firebird-repl>` (`firebird-wasm/repl`)
-- [x] Sync a Postgres table through ElectricSQL (`firebird-wasm/electric`, read-only)
+- [x] Sync a Postgres table through ElectricSQL (`firebird-wasm/electric`)
 - [x] Sync a Firebird server's table the same way (`firebird-wasm/electric-server`), with `where`, paged snapshots and a pruned log
 - [x] `bytea`, several tables in one transaction (`syncShapesToTables`), and a write path (`createWriteQueue`)
 

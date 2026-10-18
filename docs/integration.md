@@ -335,8 +335,9 @@ await sync.upToDate;     // the first complete copy is in
 await sync.unsubscribe();
 ```
 
-- **Read-only.** Electric takes no writes: write through your own API to
-  Postgres, and the change comes back down the shape.
+- **Writes go through your API.** Electric takes no writes: write through
+  your own API to Postgres, and the change comes back down the shape.
+  `createWriteQueue` (below) shows the write at once while it does.
 - **Consistent.** Each batch Electric marks complete is applied in one Firebird
   transaction together with the sync position (kept in a table
   `ELECTRIC_SHAPES`), so after a reload the next sync with the same
