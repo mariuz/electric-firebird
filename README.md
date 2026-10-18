@@ -115,6 +115,8 @@ custom element.
 
 - Node.js 20+
 - Firebird client library (`libfbclient.so` / `fbclient.dll`)
+- For the Node.js driver, a Firebird 3, 4 or 5 server: CI runs its tests
+  against each
 
 ### Install
 
@@ -274,6 +276,7 @@ Both CI workflows use the official
 | Workflow | Job | Trigger |
 |----------|-----|---------|
 | [CI](.github/workflows/ci.yml) | Build, unit tests, decode benchmark | push / PR |
+| [CI](.github/workflows/ci.yml) | The Node driver's tests against Firebird 3, 4 and 5 servers | push / PR |
 | [E2E](.github/workflows/e2e.yml) | Playwright browser tests (no Firebird needed) | push / PR |
 | [E2E](.github/workflows/e2e.yml) | Playwright e2e tests (against Firebird) | push / PR |
 | [Build WASM](.github/workflows/build-wasm.yml) | Compiles the engine from source, then runs every suite that needs the artifact — including the real-engine browser tests | push / PR |

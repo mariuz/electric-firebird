@@ -50,6 +50,21 @@ function tmpDbName(name: string): string {
 
 const describeIfFirebird = hasFirebirdLib ? describe : describe.skip;
 
+/**
+ * CI's server matrix sets FIREBIRD_REQUIRE_SERVER=1: there, a client library
+ * that fails to load must fail the run, not skip every test and pass.
+ */
+if (process.env['FIREBIRD_REQUIRE_SERVER'] === '1' && !hasFirebirdLib) {
+  describe('Firebird server required', () => {
+    it('loads the Firebird client library', () => {
+      throw new Error(
+        'FIREBIRD_REQUIRE_SERVER=1 but node-firebird-driver-native could not load libfbclient: ' +
+          'the server suite would have been skipped',
+      );
+    });
+  });
+}
+
 describeIfFirebird('FirebirdLite', () => {
   let db: FirebirdLite;
   let dbPath: string;
@@ -65,6 +80,20 @@ describeIfFirebird('FirebirdLite', () => {
     // Remove db file if accessible
     if (fs.existsSync(dbPath)) {
       try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+    }
+  });
+
+  // CI runs this suite against Firebird 3, 4 and 5 (FIREBIRD_EXPECT_MAJOR);
+  // this is what makes a green run mean the version it names.
+  it('talks to the server version it was given', async () => {
+    const { rows } = await db.query<{ V: string }>(
+      "SELECT rdb$get_context('SYSTEM', 'ENGINE_VERSION') AS v FROM rdb$database",
+    );
+    const version = rows[0]!.V.trim();
+    expect(version).toMatch(/^\d+\.\d+\.\d+/);
+    const expected = process.env['FIREBIRD_EXPECT_MAJOR'];
+    if (expected !== undefined) {
+      expect(version.split('.')[0]).toBe(expected);
     }
   });
 
