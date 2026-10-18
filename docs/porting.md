@@ -186,7 +186,12 @@ long after it had become a bug.
 > defect even though nothing about it was edited.
 
 `fb_wasm_stubs.cpp` shrank from 1934 lines to 447 over the port, mostly by
-deleting stubs in favour of compiling the real thing.
+deleting stubs in favour of compiling the real thing, and to 172 in 0.9.0,
+when re-reading them found a third stub of that kind: the `EDS::*` no-ops
+stood in for `jrd/extds/`, excluded because it needed the `isc_*` API and
+`scl.epp`. Both had been compiled for a long time, and since `EXECUTE
+STATEMENT` runs through `jrd/extds` even without `ON EXTERNAL`, every one
+silently did nothing.
 
 ### Fix 7 — a trade-off, not a repair
 

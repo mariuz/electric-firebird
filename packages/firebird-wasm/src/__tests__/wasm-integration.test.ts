@@ -651,6 +651,59 @@ for (const variant of VARIANTS) {
       expect(mod._fb_detach_database(db)).toBe(0);
     });
 
+    // ── EXECUTE STATEMENT ───────────────────────────────────────────────
+    //
+    // It runs through jrd/extds even without ON EXTERNAL.  Until 0.9.0 that
+    // directory was stubbed out, and every EXECUTE STATEMENT did nothing,
+    // without an error: no row inserted, NULL for INTO, no rows for FOR.
+
+    it('runs EXECUTE STATEMENT: DML, INTO, FOR … DO, and parameters', () => {
+      const db = freshDatabase('exec-stmt');
+      expect(exec(db, 0, 'CREATE TABLE es (id INTEGER)')).toBe(0);
+      expect(`${exec(db, 0, "EXECUTE BLOCK AS BEGIN EXECUTE STATEMENT 'INSERT INTO es VALUES (1)'; END")} ${errorText()}`).toBe('0 ');
+      expect(exec(db, 0, "EXECUTE BLOCK AS BEGIN EXECUTE STATEMENT ('INSERT INTO es VALUES (?)') (2); END")).toBe(0);
+      expect(queryRows(db, 'SELECT id FROM es ORDER BY id')).toEqual([[1], [2]]);
+      expect(queryRows(db,
+        "EXECUTE BLOCK RETURNS (n INTEGER) AS BEGIN EXECUTE STATEMENT 'SELECT COUNT(*) FROM es' INTO :n; SUSPEND; END"))
+        .toEqual([[2]]);
+      expect(queryRows(db,
+        "EXECUTE BLOCK RETURNS (n INTEGER) AS BEGIN FOR EXECUTE STATEMENT ('SELECT id * CAST(:k AS INTEGER) FROM es ORDER BY id') (k := 10) INTO :n DO SUSPEND; END"))
+        .toEqual([[10], [20]]);
+      expect(mod._fb_detach_database(db)).toBe(0);
+    });
+
+    it('runs EXECUTE STATEMENT in the caller\'s transaction, and reports its errors', () => {
+      const db = freshDatabase('exec-stmt-tx');
+      expect(exec(db, 0, 'CREATE TABLE et (id INTEGER)')).toBe(0);
+      const tx = mod._fb_start_transaction(db);
+      expect(exec(db, tx, "EXECUTE BLOCK AS BEGIN EXECUTE STATEMENT 'INSERT INTO et VALUES (1)'; END")).toBe(0);
+      expect(mod._fb_rollback(tx)).toBe(0);
+      expect(queryRows(db, 'SELECT COUNT(*) FROM et')).toEqual([[0]]);
+      // …unless it asks for a transaction of its own
+      const tx2 = mod._fb_start_transaction(db);
+      expect(exec(db, tx2,
+        "EXECUTE BLOCK AS BEGIN EXECUTE STATEMENT 'INSERT INTO et VALUES (2)' WITH AUTONOMOUS TRANSACTION; END")).toBe(0);
+      expect(mod._fb_rollback(tx2)).toBe(0);
+      expect(queryRows(db, 'SELECT id FROM et')).toEqual([[2]]);
+      // DDL inside it is not seen by the statement cache: a kept SELECT still
+      // reads the dropped table, until _fb_statement_cache empties the caches
+      // (docs/api.md says so).
+      expect(queryRows(db, 'SELECT id FROM et')).toEqual([[2]]);
+      expect(exec(db, 0, "EXECUTE BLOCK AS BEGIN EXECUTE STATEMENT 'DROP TABLE et'; END")).toBe(0);
+      const size = mod._fb_statement_cache(64);
+      mod._fb_statement_cache(size);
+      const sqlPtr = allocString(mod, 'SELECT id FROM et');
+      try {
+        expect(mod._fb_query(db, 0, sqlPtr, 0)).toBe(0);
+        expect(errorText().toUpperCase()).toContain('ET');
+      } finally {
+        mod._free(sqlPtr);
+      }
+      expect(exec(db, 0, "EXECUTE BLOCK AS BEGIN EXECUTE STATEMENT 'INSERT INTO no_such_table VALUES (1)'; END")).not.toBe(0);
+      expect(errorText().toUpperCase()).toContain('NO_SUCH_TABLE');
+      expect(mod._fb_detach_database(db)).toBe(0);
+    });
+
     // ── The shared read transaction ─────────────────────────────────────
     //
     // With it on, an autocommit SELECT runs in a read-only transaction the
