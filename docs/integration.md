@@ -103,16 +103,24 @@ The package ships two builds of the engine:
 | Needs a Worker | yes | no: it can run on the page thread |
 | Statement and idle timeouts | yes | no (they need the timer thread) |
 
-The threaded build is the default. Both requirements below are structural for
-it; the build without threads has neither, and is what a page should load when
-it cannot be isolated. `wasmGlueFile()` names the build a page can run:
+The build without threads is the default (since 0.9.0): it runs anywhere,
+starts in about a third of the time, and was not slower in anything measured.
+The threaded build is the one to ask for when statement or idle timeouts
+matter and the page can be isolated. Both requirements below are structural
+for it; the build without threads has neither. `wasmGlueFile()` names the glue
+to load:
 
 ```ts
 import { wasmGlueFile } from 'firebird-wasm/browser';
-// in the engine's Worker, or in the page: 'firebird-embedded.js' when
-// crossOriginIsolated, else 'firebird-embedded-st.js'
-importScripts(`/wasm/${wasmGlueFile()}`);
+// in the engine's Worker, or in the page:
+importScripts(`/wasm/${wasmGlueFile()}`);                        // 'firebird-embedded-st.js'
+importScripts(`/wasm/${wasmGlueFile(self.crossOriginIsolated)}`); // threads where allowed
 ```
+
+In Node, `loadFirebirdWasm({ threads: true })` and
+`new DirectTransport({ threads: true })` ask for the threaded build. Until
+0.9.0 the default was the threaded build wherever it could run: in Node and in
+an isolated page.
 
 Loading the threaded build in a page that is not isolated fails at once, with
 a message naming the other build, rather than hanging.

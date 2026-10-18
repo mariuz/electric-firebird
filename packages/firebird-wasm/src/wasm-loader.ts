@@ -244,8 +244,10 @@ export interface WasmLoadOptions {
    * Workers, whose heap is a `SharedArrayBuffer` and which a browser gives
    * only to a cross-origin isolated page.  `false` is
    * `firebird-embedded-st.js`: no threads and a plain `ArrayBuffer` heap, at
-   * the cost of statement and idle timeouts.  `'auto'` (the default) is `true`
-   * in Node.
+   * the cost of statement and idle timeouts.  `'auto'` (the default) is
+   * `false` since 0.9.0: the build without threads runs everywhere, starts in
+   * about a third of the time and was not slower in anything measured.  Pass
+   * `true` for the threaded build (Node, or a cross-origin isolated page).
    *
    * In Node this picks the file the loader requires.  In a browser the page
    * loads the glue itself, so the choice is made there:
@@ -264,15 +266,18 @@ const cachedModules = new Map<string, FirebirdWasmModule>();
 /**
  * The glue script of the build `threads` selects.
  *
- * `'auto'` (the default) picks the threaded build where it can run: in Node,
- * and in a browser page or worker that is cross-origin isolated.  Elsewhere,
- * GitHub Pages and other static hosts that cannot send COOP/COEP among them,
- * it picks the build without threads, which needs neither.
+ * `'auto'` (the default) is the build without threads, which runs anywhere:
+ * it needs no `SharedArrayBuffer`, so no cross-origin isolation, and no
+ * Worker.  `true` is the threaded build, which a page can run only when it is
+ * cross-origin isolated; it adds statement and idle timeouts.  Until 0.9.0
+ * `'auto'` picked the threaded build where it could run.
  *
  * @example
  * ```js
  * // in the engine's Worker, before the transport loads the module
  * importScripts(`/wasm/${wasmGlueFile()}`);
+ * // threads where the page allows them
+ * importScripts(`/wasm/${wasmGlueFile(self.crossOriginIsolated)}`);
  * ```
  */
 export function wasmGlueFile(threads: boolean | 'auto' = 'auto'): string {
@@ -280,13 +285,8 @@ export function wasmGlueFile(threads: boolean | 'auto' = 'auto'): string {
 }
 
 function useThreads(threads: boolean | 'auto' | undefined): boolean {
-  if (threads === true || threads === false) return threads;
-  const g = globalThis as Record<string, unknown>;
-  if (typeof g['process'] !== 'undefined' && typeof g['window'] === 'undefined'
-    && typeof g['WorkerGlobalScope'] === 'undefined') {
-    return true;
-  }
-  return g['crossOriginIsolated'] === true;
+  // 'auto' and undefined: the build without threads, everywhere.
+  return threads === true;
 }
 
 // ---------------------------------------------------------------------------

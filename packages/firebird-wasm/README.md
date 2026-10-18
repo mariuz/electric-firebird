@@ -51,11 +51,13 @@ const { rows } = await db.query('SELECT * FROM notes');
 // [{ ID: 1, TITLE: 'Hello' }]
 ```
 
-Two constraints are structural for the default, threaded build: the page must
+The default build, `firebird-embedded-st.js`, has no threads: it needs no
+`SharedArrayBuffer`, so no cross-origin isolation, and can run without a
+Worker. The threaded build (`wasmGlueFile(true)`, `threads: true`) adds
+statement and idle timeouts, and has two structural constraints: the page must
 be [cross-origin isolated](../../docs/integration.md#2-the-two-hard-requirements-and-the-build-without-them),
 and the engine must run in a Worker — it blocks on mutexes, and a browser main
-thread may not block. `firebird-embedded-st.js`, the build without threads,
-has neither constraint and gives up statement and idle timeouts.
+thread may not block. Until 0.9.0 the threaded build was the default.
 
 ## Quick start
 

@@ -43,7 +43,8 @@ describe('cdnArtifacts', () => {
     }
   });
 
-  it("picks the build as wasmGlueFile does: threads in Node when 'auto'", () => {
-    expect(cdnArtifacts().glueUrl.endsWith('/firebird-embedded.js')).toBe(true);
+  it("picks the build as wasmGlueFile does: without threads when 'auto', in Node too", () => {
+    expect(cdnArtifacts().glueUrl.endsWith('/firebird-embedded-st.js')).toBe(true);
+    expect(cdnArtifacts({ threads: true }).glueUrl.endsWith('/firebird-embedded.js')).toBe(true);
   });
 });
