@@ -226,6 +226,62 @@ from IndexedDB if it exists, creating it if not.
 > if you want it lowercase, and be consistent — quoted identifiers are
 > case-sensitive from then on.
 
+### React and Vue
+
+`firebird-wasm/react` and `firebird-wasm/vue` keep a component's rows in step
+with a query. React 18+ and Vue 3.3+ are optional peer dependencies: install
+the one you use.
+
+```tsx
+import { FirebirdProvider, useQuery, useLiveQuery } from 'firebird-wasm/react';
+
+<FirebirdProvider db={db}><Notes /></FirebirdProvider>;
+
+function Notes() {
+  // Re-runs whenever a trigger posts 'notes' (POST_EVENT), or db.notify('notes').
+  const { rows, error, loading } = useLiveQuery<{ ID: number; TITLE: string }>(
+    'SELECT id, title FROM notes ORDER BY id',
+    { events: ['notes'] },
+  );
+  if (error) return <p>{error.message}</p>;
+  if (loading) return <p>Loading…</p>;
+  return <ul>{rows!.map((n) => <li key={n.ID}>{n.TITLE}</li>)}</ul>;
+}
+
+function Note({ id }: { id: number }) {
+  // Runs once, and again when `id` changes.
+  const { rows } = useQuery('SELECT title FROM notes WHERE id = ?', [id]);
+  return <h1>{rows?.[0]?.TITLE}</h1>;
+}
+```
+
+```ts
+import { FIREBIRD, useLiveQuery, useQuery } from 'firebird-wasm/vue';
+
+app.provide(FIREBIRD, db); // or provideFirebird(db) in a parent's setup()
+
+// in setup(): refs, and the statement or parameters may be refs or getters
+const { rows } = useLiveQuery('SELECT id, title FROM notes ORDER BY id', { events: ['notes'] });
+const { rows: note } = useQuery('SELECT title FROM notes WHERE id = ?', () => [props.id]);
+```
+
+Both return `rows` (`undefined` until the first result), `error`, `loading`
+and `refresh()`. Other SQL or parameters run the query again; equal
+parameters in a new array do not. While the new result loads, the previous
+rows stay, so a list does not blank out. A result that arrives after the
+component moved on, or unmounted, is dropped, and an unmounted component's
+live query is unsubscribed. Pass `{ db }` to a hook to use a database other
+than the provided one.
+
+A live query re-runs on events, not on table changes: Firebird has no way to
+say which tables a statement read, so the events are named, as for
+`db.live()`. A trigger per table that posts its name is the usual pattern:
+
+```sql
+CREATE TRIGGER notes_changed FOR notes AFTER INSERT OR UPDATE OR DELETE
+AS BEGIN POST_EVENT 'notes'; END
+```
+
 ---
 
 ## 4. Bundlers

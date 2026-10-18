@@ -94,6 +94,19 @@ const live = await db.live(
 await live.unsubscribe();
 ```
 
+In React or Vue, the same as a hook:
+
+```tsx
+import { FirebirdProvider, useLiveQuery } from 'firebird-wasm/react'; // or firebird-wasm/vue
+
+function Items() {
+  const { rows } = useLiveQuery('SELECT id, name FROM items ORDER BY id', { events: ['items_changed'] });
+  return <ul>{rows?.map((r) => <li key={r.ID}>{r.NAME}</li>)}</ul>;
+}
+```
+
+See [docs/integration.md](./docs/integration.md) §3 for both.
+
 ## Setup
 
 ### Requirements
@@ -245,6 +258,7 @@ The library provides two execution backends:
 - [x] Web Worker + multi-tab safety, and multi-tab *sharing* (`multiTab: 'shared'`)
 - [x] Pre-built WASM binary published to npm — `npm install firebird-wasm`
 - [x] Live queries / `POST_EVENT`-based notifications (`live()`, `listen()`, `notify()`)
+- [x] React and Vue hooks (`firebird-wasm/react`, `firebird-wasm/vue`)
 
 See [docs/roadmap.md](./docs/roadmap.md) for the full status audit, a
 feature-by-feature comparison with PGlite, and the staged plan.

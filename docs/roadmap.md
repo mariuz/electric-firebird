@@ -1090,7 +1090,11 @@ gaps it ran into, with its numbers, in rough order of what they would buy.
 
 ### M5 — Ecosystem
 
-- [ ] React/Vue hooks; REPL component.
+- [x] React/Vue hooks: `firebird-wasm/react` and `firebird-wasm/vue`, with
+      `useQuery` and `useLiveQuery` on one framework-free store
+      (`src/frameworks/query-store.ts`, unit-tested against forced orderings)
+      and run in Chromium against the real engine, React under StrictMode.
+- [ ] A REPL component.
 - [ ] ElectricSQL sync integration (the project's namesake).
 - [ ] A Firebird version build matrix. The submodule tracks `master` and the
       shipped engine reports `ENGINE_VERSION 6.0.0`, so the recurring "Firebird

@@ -26,6 +26,7 @@ export default defineConfig({
     '**/browser-shared.spec.ts',
     '**/browser-single-thread.spec.ts',
     '**/browser-cdn.spec.ts',
+    '**/browser-frameworks.spec.ts',
   ],
   fullyParallel: false,
   forbidOnly: !!process.env['CI'],
