@@ -95,7 +95,8 @@ runtime, so the check has to happen at build time.
 
 ## 2. The two hard requirements, and the build without them
 
-The package ships two builds of the engine:
+The package ships two builds of the engine (compared in full, with diagrams,
+in [builds.md](./builds.md)):
 
 | | `firebird-embedded.js` (threads) | `firebird-embedded-st.js` (no threads) |
 |---|---|---|

@@ -110,6 +110,9 @@ See [docs/integration.md](./docs/integration.md) §3 for both, and for
 `<firebird-repl>` (`firebird-wasm/repl`), an interactive SQL console as a
 custom element.
 
+The two engine builds, with threads and without, are compared (with
+diagrams) in [docs/builds.md](./docs/builds.md).
+
 ## Setup
 
 ### Requirements
