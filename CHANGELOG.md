@@ -77,14 +77,23 @@ API may still move between minor releases.
 
 ### Fixed
 
+- **The statement cache sees DDL it did not run.** It emptied itself before
+  DDL the bridge ran, but not for DDL inside `EXECUTE STATEMENT`, a
+  procedure, or another attachment: a kept `SELECT` of a table dropped that
+  way went on returning the dropped table's rows, and a kept call of a
+  procedure altered that way ran its old body. The engine now counts each
+  committed metadata change (patch 0007), and a database's kept statements go
+  when the count has moved. Reads and writes never move it, so the cache
+  works as before for them; `_fb_metadata_commits()` reads the count.
+  Calling `_fb_statement_cache()` after such DDL is no longer needed. Needs a
+  rebuilt artifact.
 - **`EXECUTE STATEMENT` runs in the browser engine.** It did nothing, without
   an error: an `INSERT` through it inserted no row, `INTO` gave `NULL`, and
   `FOR EXECUTE STATEMENT … DO` gave no rows. It runs through Firebird's
   External Data Sources (`jrd/extds`) even without `ON EXTERNAL`, and the
   build replaced that directory with no-op stubs. It is compiled now, so
   parameters, `WITH AUTONOMOUS TRANSACTION` and the caller's transaction work
-  as in Firebird, and its errors are reported. DDL run through it is not seen
-  by the statement cache: call `_fb_statement_cache()` after it (docs/api.md).
+  as in Firebird, and its errors are reported.
   Needs a rebuilt artifact: 170–200 KB larger, 54–55 KB gzipped (+2 %).
 - **The browser engine reads `BINARY` and `VARBINARY` (`OCTETS`) values as
   bytes**, as it reads a binary `BLOB`: base64 by default, a `Uint8Array`

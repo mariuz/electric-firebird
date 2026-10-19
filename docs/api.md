@@ -431,8 +431,12 @@ text, any parameters, any transaction) skips the prepare. DDL is never kept and
 empties the cache before it runs; a failed statement is dropped; closing frees
 them. Write a statement that varies with its values as one text with `?`
 placeholders (or the `sql` tag) so it is kept once rather than once per value.
+DDL the bridge does not run itself (inside `EXECUTE STATEMENT`, a procedure,
+another attachment) empties the cache too: the engine counts committed
+metadata changes, and the cache is emptied when the count has moved
+(`mod._fb_metadata_commits()` reads it; reads and writes never move it).
 `mod._fb_statement_cache(size)` on the module sets the size (0 turns it off)
-and empties the caches, as DDL run inside `EXECUTE STATEMENT` is not seen.
+and empties the caches.
 
 #### Reads can share a transaction (opt-in)
 
