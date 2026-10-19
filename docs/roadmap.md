@@ -73,7 +73,7 @@ fails on a concrete, locatable defect rather than on absence.
 | 3 | `persist()` rewrote the **whole** database, one IndexedDB transaction per page. | **Fixed.** One transaction for the whole import, and only changed pages are written. An interrupted persist now rolls back instead of leaving a half-written database. |
 | 4 | Two tabs on the same origin both open `firebird_<name>` and both persist whole images. | **Fixed** — a Web Lock per database refuses the second tab instead of letting it overwrite the first. Sharing one engine between tabs remains M4. |
 | 5 | JSON is the result ABI. | Improved, still lossy. Values are now decoded by real type: BLOBs read (text as string, binary as base64), `NUMERIC`/`DECFLOAT`/`INT128` as exact decimal strings, `BIGINT` as a string once it exceeds `Number.MAX_SAFE_INTEGER`, dates as ISO-8601. `FieldInfo` still carries only `name` — a typed ABI is M2. |
-| 6 | `loadFirebirdWasm()` caches one module in a module-level variable with no way to dispose it. | Open. `close()` does not release the WASM heap. |
+| 6 | `loadFirebirdWasm()` caches one module in a module-level variable with no way to dispose it. | **Fixed** in 0.9.0 — `disposeFirebirdWasm()`, and the last `close()` of a transport's databases disposes the module. |
 | 7 | Jest config sets `testPathIgnorePatterns: ["/src/browser/"]`, and there were no browser tests. | **Fixed** — 30 Playwright tests, see §5. |
 | 8 | `e2e` resolved WASM artifact paths one directory too high (`../../../packages/...` from `e2e/server`). | **Fixed.** The WASM suite would have skipped and the server 404'd *even after a successful build*. |
 | 9 | `build.sh` applied patches with `\|\| echo "(already applied or not applicable – skipping)"`. Patch 0002 was structurally corrupt (bad hunk headers) and 0003 had drifted, so **neither had ever been applied** to the tree being compiled. | **Fixed** — both regenerated against master, and the loop now distinguishes "already applied" from "does not apply" and exits non-zero on the latter. |
@@ -302,8 +302,9 @@ written; what remains:
   runs with no COOP/COEP headers, the demo and `firebird-quake2` run it on
   GitHub Pages, 0.8.0 ships it beside the threaded build, and it is now the
   default (M6).
-- `loadFirebirdWasm()` caches one module process-wide with no way to dispose
-  it; `close()` does not release the WASM heap.
+- ~~`loadFirebirdWasm()` caches one module process-wide with no way to
+  dispose it.~~ Disposed in 0.9.0: `disposeFirebirdWasm()`, and closing a
+  transport's last database disposes its module.
 - Only the built-in character sets are compiled in, and the UNICODE collations
   do not work. Both are solved on `icu-collation` (§6, PR #12) and neither is
   merged.
@@ -653,8 +654,15 @@ be built:
 3. ~~**9 MB artifact, unbudgeted.**~~ Budgeted: `scripts/size-budget.mjs`
    fails CI past 9.5 MB raw or 3.2 MB gzipped (2.05 MB with brotli). Still
    the first thing anyone notices.
-4. **The module cannot be disposed.** `loadFirebirdWasm()` caches one instance
-   process-wide and `close()` does not release the heap.
+4. ~~**The module cannot be disposed.**~~ Fixed in 0.9.0.
+   `disposeFirebirdWasm(mod)` detaches every database, shuts the engine down
+   (`fb_dispose`, which calls `fb_shutdown`), ends the threaded build's
+   workers and drops the module; the transports count their databases, and
+   the last `close()` disposes an unowned module.  Two things held a dropped
+   threaded module: its 32 workers, and the main thread's
+   `Atomics.waitAsync` on its mailbox, which only Emscripten's
+   `terminateRuntime` settles.  Over ten cycles in Node, RSS levels off at
+   about 200 MB (without threads) and 300 MB (threaded).
 5. **Only built-in character sets, and no working UNICODE collations.**
    Solved on a branch, not merged — see
    [PR #12](https://github.com/mariuz/electric-firebird/pull/12) and §6.

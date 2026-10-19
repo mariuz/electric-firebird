@@ -83,6 +83,10 @@ using namespace Firebird;
  * internal headers, which are not consumable from outside the engine build.
  */
 extern "C" void FB_PLUGIN_ENTRY_POINT(Firebird::IMaster* master);
+extern "C" int fb_shutdown(unsigned int timeout, const int reason);   // yvalve/why.cpp (ibase.h)
+#ifndef fb_shutrsn_app_stopped
+#define fb_shutrsn_app_stopped -3   // firebird/impl/consts_pub.h
+#endif
 
 namespace {
 
@@ -93,6 +97,8 @@ namespace {
 IMaster*   g_master   = nullptr;
 IProvider* g_provider = nullptr;
 IUtil*     g_util     = nullptr;
+/** fb_dispose() has run: the engine is shut down for good in this module. */
+bool       g_disposed = false;
 
 /**
  * The plugin set that produced g_provider, retained for the lifetime of the
@@ -2372,6 +2378,12 @@ int fb_init(void)
 {
 	clearError();
 
+	if (g_disposed)
+	{
+		setError("fb_init: this module's engine was disposed (fb_dispose); load a new module");
+		return 4;
+	}
+
 	if (g_provider)
 		return 0;
 
@@ -2571,6 +2583,53 @@ int fb_detach_database(int db_handle)
 	}
 
 	return 0;
+}
+
+/**
+ * End the engine for good, before the module is dropped: every database is
+ * detached (its transactions rolled back, its events cancelled, as
+ * fb_detach_database does), and Firebird is shut down (fb_shutdown), which
+ * stops the threads the engine started.  Without it a dropped module took
+ * attachments and engine threads with it mid-flight.  After it fb_init()
+ * fails: load a new module instead.  Idempotent.
+ *
+ * Returns 0, or non-zero when a detach or the shutdown failed (see
+ * fb_last_error()); the engine is disposed either way.
+ */
+FB_WASM_EXPORT
+int fb_dispose(void)
+{
+	clearError();
+	if (g_disposed)
+		return 0;
+
+	int rc = 0;
+	std::string firstError;
+	std::vector<int> handles;
+	for (const auto& db : g_databases)
+		handles.push_back(db.first);
+	for (int handle : handles)
+	{
+		if (fb_detach_database(handle) != 0 && !rc)
+		{
+			rc = 1;
+			firstError = g_lastError;
+		}
+	}
+
+	g_disposed = true;
+	if (g_provider && fb_shutdown(5000, fb_shutrsn_app_stopped) != 0 && !rc)
+	{
+		rc = 2;
+		firstError = "fb_dispose: fb_shutdown failed";
+	}
+	g_provider = nullptr;
+
+	if (rc)
+		setError(firstError.c_str());
+	else
+		clearError();
+	return rc;
 }
 
 /**

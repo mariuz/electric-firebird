@@ -38,7 +38,7 @@ export type {
 } from './types';
 
 // WASM loader (available on all platforms)
-export { loadFirebirdWasm, allocString, wasmGlueFile, hasSharedHeap, cdnArtifacts } from './wasm-loader';
+export { loadFirebirdWasm, disposeFirebirdWasm, allocString, wasmGlueFile, hasSharedHeap, cdnArtifacts } from './wasm-loader';
 export type { CdnOptions, CdnArtifacts } from './wasm-loader';
 export { VERSION } from './version';
 export type {

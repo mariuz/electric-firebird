@@ -428,7 +428,7 @@ endif()
 # The exported C API.  Built as a list so optional components (the pool probe)
 # can extend it; exporting a symbol that was not compiled is a link error.
 set(FB_EXPORTED_FUNCTIONS
-  _fb_init _fb_last_error _fb_last_affected_rows _fb_statement_cache _fb_metadata_commits _fb_read_transaction _fb_shape_columns
+  _fb_init _fb_dispose _fb_last_error _fb_last_affected_rows _fb_statement_cache _fb_metadata_commits _fb_read_transaction _fb_shape_columns
   _fb_create_database _fb_attach_database _fb_detach_database
   _fb_execute _fb_query _fb_execute_params _fb_query_params _fb_execute_batch _fb_free_result
   _fb_describe _fb_last_blobs _fb_last_blobs_size
@@ -482,6 +482,9 @@ if(FB_WASM_THREADS)
     # Marks the factory as this build, so the loader can refuse it, with a
     # message, where SharedArrayBuffer is not available instead of hanging.
     "--extern-post-js ${CMAKE_CURRENT_SOURCE_DIR}/glue-threads.js"
+    # Inside the module's scope: lets the loader end the worker pool when it
+    # disposes the module (disposeFirebirdWasm).
+    "--post-js ${CMAKE_CURRENT_SOURCE_DIR}/post-threads.js"
     # Must match the compile side; see FB_WASM_THREADS above.
     "-pthread"
     # Pre-spawn workers.  Creating one on demand while the requesting thread

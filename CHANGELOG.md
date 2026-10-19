@@ -8,6 +8,15 @@ API may still move between minor releases.
 
 ### Changed
 
+- **Closing the last database frees the engine.** A module used to stay for
+  the life of the page or process; now the transports count the databases
+  that use one, and the last `close()` disposes it, unless whoever called
+  `loadFirebirdWasm()` still owns it. The next database loads a new module
+  (0.33–0.43 s without threads, about 1 s threaded); to keep one loaded
+  across closes, call `loadFirebirdWasm()` once, which owns it. A `memory://` database
+  went with its `close()` already; nothing else kept state in the module. An
+  `opfs://` database's access handle is now closed on `close()` too, so the
+  same Worker can open it again.
 - **The build without threads is the default.** `wasmGlueFile()`,
   `loadFirebirdWasm()`, `DirectTransport` and `cdnArtifacts()` now pick
   `firebird-embedded-st` unless asked for threads, in Node and in a cross-origin
@@ -23,6 +32,13 @@ API may still move between minor releases.
 
 ### Added
 
+- **`disposeFirebirdWasm(mod)`** ends a module and lets it go: every database
+  detached, the engine shut down (`_fb_dispose`, which calls `fb_shutdown`),
+  the threaded build's workers terminated, and the module out of the cache.
+  Two things held a dropped threaded module: its 32 workers (about 400 MB in
+  Node) and the main thread's `Atomics.waitAsync` on its mailbox. Over ten
+  load/dispose cycles in Node, RSS levels off at about 200 MB without threads
+  and 300 MB threaded. Needs a rebuilt artifact.
 - **Bytes as parameters.** A `Uint8Array` or `ArrayBuffer` binds as its own
   bytes into a `BLOB` or a `BINARY` / `VARBINARY` (`OCTETS`) column, on both
   backends and by every route (`exec`, `query`, transactions, `execBatch`).

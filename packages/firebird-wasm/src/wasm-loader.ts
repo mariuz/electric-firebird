@@ -47,6 +47,19 @@ export interface FirebirdWasmModule {
    */
   _fb_init(): number;
   /**
+   * End the engine for good: detach every database (rolling back what is
+   * open) and shut Firebird down.  `_fb_init` fails afterwards.  Call
+   * {@link disposeFirebirdWasm} rather than this: it also ends the threaded
+   * build's workers and lets the module go.  Returns 0, or non-zero when a
+   * detach or the shutdown failed.
+   */
+  _fb_dispose(): number;
+  /**
+   * The threaded build only: terminate its worker pool (wasm/post-threads.js).
+   * Called by {@link disposeFirebirdWasm}.
+   */
+  fbTerminateThreads?: () => void;
+  /**
    * Pointer to a NUL-terminated message describing the most recent failure,
    * or to an empty string when the last call succeeded.
    *
@@ -266,8 +279,29 @@ export interface WasmLoadOptions {
 // Module state
 // ---------------------------------------------------------------------------
 
-/** One module per build: the two can live side by side in one process. */
-const cachedModules = new Map<string, FirebirdWasmModule>();
+/**
+ * One module per build: the two can live side by side in one process.
+ *
+ * A module is kept while anything uses it.  `pinned` is set by
+ * {@link loadFirebirdWasm}: whoever called it owns the module until
+ * {@link disposeFirebirdWasm}.  `users` counts the transports that took it
+ * with {@link acquireFirebirdWasm}; the last one to release an unpinned module
+ * disposes it, so closing the last database frees the engine's memory.
+ */
+interface ModuleEntry {
+  glueFile: string;
+  module: Promise<FirebirdWasmModule>;
+  loaded?: FirebirdWasmModule;
+  users: number;
+  pinned: boolean;
+  /** Process listeners the glue added when it loaded (Node), removed on dispose. */
+  listeners: Array<[string, (...args: unknown[]) => void]>;
+}
+
+const cachedModules = new Map<string, ModuleEntry>();
+
+/** Loads one at a time, so each knows which process listeners are its own. */
+let loading: Promise<unknown> = Promise.resolve();
 
 /**
  * The glue script of the build `threads` selects.
@@ -302,7 +336,10 @@ function useThreads(threads: boolean | 'auto' | undefined): boolean {
 /**
  * Load the Firebird Embedded WASM module.
  *
- * The result is cached – subsequent calls return the same module instance.
+ * The result is cached – subsequent calls return the same module instance –
+ * and kept until {@link disposeFirebirdWasm}: whoever calls this owns the
+ * module.  `FirebirdBrowser` does not call it; its transport takes the module
+ * with {@link acquireFirebirdWasm}, and closing the last database disposes it.
  *
  * @param options - optional overrides for locating the WASM artefacts.
  * @returns The initialised Emscripten module with Firebird bindings.
@@ -312,15 +349,96 @@ function useThreads(threads: boolean | 'auto' | undefined): boolean {
  * const mod = await loadFirebirdWasm();
  * mod._fb_init();
  * const dbHandle = mod._fb_create_database(allocString(mod, '/data/test.fdb'));
+ * // …
+ * await disposeFirebirdWasm(mod);
  * ```
  */
 export async function loadFirebirdWasm(
   options: WasmLoadOptions = {},
 ): Promise<FirebirdWasmModule> {
-  const glueFile = wasmGlueFile(options.threads);
-  const cached = cachedModules.get(glueFile);
-  if (cached) return cached;
+  const entry = moduleEntry(options);
+  entry.pinned = true;
+  return entry.module;
+}
 
+/**
+ * The module for `options`, counted as used until {@link releaseFirebirdWasm}.
+ * For transports: the last release of a module nobody loaded with
+ * {@link loadFirebirdWasm} disposes it.
+ */
+export async function acquireFirebirdWasm(
+  options: WasmLoadOptions = {},
+): Promise<FirebirdWasmModule> {
+  const entry = moduleEntry(options);
+  entry.users++;
+  try {
+    return await entry.module;
+  } catch (err) {
+    entry.users--;
+    throw err;
+  }
+}
+
+/** Done with a module from {@link acquireFirebirdWasm}. */
+export async function releaseFirebirdWasm(mod: FirebirdWasmModule): Promise<void> {
+  const entry = [...cachedModules.values()].find((e) => e.loaded === mod);
+  if (!entry) return;   // disposed already
+  entry.users = Math.max(0, entry.users - 1);
+  if (entry.users === 0 && !entry.pinned) await disposeFirebirdWasm(mod);
+}
+
+/**
+ * End a module and let it go: every database is detached (what is open is
+ * rolled back) and the engine shut down, the threaded build's workers are
+ * terminated, the process listeners its glue added are removed, and the
+ * module leaves the cache, so its memory can be collected.  Until 0.9.0 a
+ * module stayed for the life of the process; the threaded build's worker pool
+ * alone held about 400 MB in Node.
+ *
+ * Anything still holding the module must not use it afterwards: the engine
+ * refuses (`_fb_init` fails).  The next {@link loadFirebirdWasm} loads a new
+ * one.  Idempotent.
+ */
+export async function disposeFirebirdWasm(mod: FirebirdWasmModule): Promise<void> {
+  const entry = [...cachedModules.values()].find((e) => e.loaded === mod);
+  if (entry) cachedModules.delete(entry.glueFile);
+  mod._fb_dispose?.();
+  mod.fbTerminateThreads?.();
+  const proc = nodeProcess();
+  for (const [event, listener] of entry?.listeners ?? []) proc?.removeListener(event, listener);
+}
+
+function moduleEntry(options: WasmLoadOptions): ModuleEntry {
+  const glueFile = wasmGlueFile(options.threads);
+  let entry = cachedModules.get(glueFile);
+  if (!entry) {
+    const created: ModuleEntry = { glueFile, module: Promise.resolve(null as never), users: 0, pinned: false, listeners: [] };
+    const load = loading.catch(() => undefined).then(() => loadModule(glueFile, options, created));
+    loading = load;
+    created.module = load;
+    created.module.catch(() => {
+      // A failed load is not kept: the next call tries again.
+      if (cachedModules.get(glueFile) === created) cachedModules.delete(glueFile);
+    });
+    cachedModules.set(glueFile, created);
+    entry = created;
+  }
+  return entry;
+}
+
+const LISTENED = ['uncaughtException', 'unhandledRejection', 'exit'];
+
+type NodeProcessLike = {
+  listeners(event: string): Array<(...args: unknown[]) => void>;
+  removeListener(event: string, listener: (...args: unknown[]) => void): unknown;
+};
+
+function nodeProcess(): NodeProcessLike | undefined {
+  const proc = (globalThis as Record<string, unknown>)['process'] as NodeProcessLike | undefined;
+  return typeof proc?.listeners === 'function' && typeof proc.removeListener === 'function' ? proc : undefined;
+}
+
+async function loadModule(glueFile: string, options: WasmLoadOptions, entry: ModuleEntry): Promise<FirebirdWasmModule> {
   // The Emscripten glue script exports a factory function named
   // `createFirebirdModule` (configured via `-s EXPORT_NAME` in CMake).
   // In Node it can be `require()`-d; in browsers it is expected to be
@@ -353,8 +471,18 @@ export async function loadFirebirdWasm(
     }
   }
 
+  // The glue adds process listeners in Node (the threaded build an
+  // uncaughtException handler), which hold the whole module: note them so a
+  // dispose can take them off.
+  const proc = nodeProcess();
+  const before = new Map(LISTENED.map((event) => [event, new Set(proc?.listeners(event) ?? [])]));
   const mod: FirebirdWasmModule = await factory(moduleOptions);
-  cachedModules.set(glueFile, mod);
+  for (const event of LISTENED) {
+    for (const listener of proc?.listeners(event) ?? []) {
+      if (!before.get(event)!.has(listener)) entry.listeners.push([event, listener]);
+    }
+  }
+  entry.loaded = mod;
   return mod;
 }
 
