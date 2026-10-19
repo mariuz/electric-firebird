@@ -134,6 +134,12 @@ export interface FirebirdWasmModule {
    */
   _fb_statement_cache(size: number): number;
   /**
+   * How many metadata changes (committed DDL, from any statement, procedure
+   * or attachment) the engine has seen in this module.  A database's kept
+   * statements are emptied when it moves; reads and writes never move it.
+   */
+  _fb_metadata_commits(): number;
+  /**
    * 1 runs this database's autocommit SELECTs in a read-only transaction it
    * keeps open, 0 (the default) each in one of its own; returns the previous
    * setting, or -1 for an unknown handle.  A SELECT that writes is run again

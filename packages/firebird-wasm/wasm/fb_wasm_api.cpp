@@ -50,6 +50,7 @@
 #include <firebird/Interface.h>
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <cmath>
 #include <cstdio>
@@ -159,6 +160,7 @@ struct DbEntry
 	bool sharedReads = false;                  // autocommit SELECTs share readTransaction (fb_read_transaction)
 	ITransaction* readTransaction = nullptr;
 	std::set<std::string> writers;             // SELECTs that wrote: they get their own transaction
+	unsigned long long metadataSeen = 0;       // fb_wasm_metadata_commits when the cache was last checked
 };
 
 /** How many prepared statements each database keeps; 0 turns the cache off (fb_statement_cache). */
@@ -413,6 +415,19 @@ ITransaction* lookupTransaction(int handle)
 // DDL may be about to change (an altered procedure would otherwise keep
 // running its old body here, and a dropped table could be refused as in use).
 // A statement whose execution fails is dropped too, in case it went stale.
+//
+// DDL the bridge does not run itself (inside EXECUTE STATEMENT, a procedure,
+// another attachment) is seen through fb_wasm_metadata_commits, which patch
+// 0007 makes the engine count each time a metadata change commits: when it has
+// moved since a database last looked, its cache is emptied before a statement
+// is taken from it.  Without that, a kept SELECT of a table dropped through
+// EXECUTE STATEMENT went on returning the dropped table's rows.
+
+} // namespace
+
+extern std::atomic<unsigned long long> fb_wasm_metadata_commits;   // jrd/CacheVector.cpp, patch 0007
+
+namespace {
 
 void freeStatement(IStatement* statement)
 {
@@ -485,9 +500,14 @@ void endReadTransaction(DbEntry& entry)
 	entry.readTransaction = nullptr;
 }
 
+void noticeMetadataChanges(DbEntry& entry);
+
 /** The database's shared read transaction, started if need be; null if it cannot be. */
 ITransaction* sharedReadTransaction(DbEntry& entry)
 {
+	// Before it is handed out: one begun before DDL it did not see ends here,
+	// not under the statement about to run in it.
+	noticeMetadataChanges(entry);
 	if (entry.readTransaction)
 		return entry.readTransaction;
 
@@ -534,6 +554,17 @@ void forgetMetadata(DbEntry& entry)
 	entry.writers.clear();
 }
 
+/** DDL committed since this database last looked (fb_wasm_metadata_commits): forget the old metadata. */
+void noticeMetadataChanges(DbEntry& entry)
+{
+	const unsigned long long commits = fb_wasm_metadata_commits.load(std::memory_order_acquire);
+	if (commits != entry.metadataSeen)
+	{
+		forgetMetadata(entry);
+		entry.metadataSeen = commits;
+	}
+}
+
 /**
  * The prepared statement for `sql`: the kept one if there is one, else a new
  * prepare (kept when its kind allows).  `cached` says whether the cache owns
@@ -547,6 +578,9 @@ IStatement* acquireStatement(int db_handle, IAttachment* attachment, ITransactio
 	if (typeOut)
 		*typeOut = 0;
 	DbEntry* entry = lookupEntry(db_handle);
+
+	if (entry)
+		noticeMetadataChanges(*entry);
 
 	if (entry && g_statementCacheSize)
 	{
@@ -2561,8 +2595,8 @@ int fb_execute(int db_handle, int tx_handle, const char* sql)
 /**
  * How many prepared statements each database keeps (64 by default), and
  * returns the previous size.  0 turns the cache off.  Any change empties
- * every database's cache, so it is also the way to drop statements that DDL
- * run through EXECUTE STATEMENT, which the cache cannot see, made stale.
+ * every database's cache.  DDL from anywhere empties a database's cache by
+ * itself, through fb_metadata_commits().
  */
 /**
  * The columns of the kept shape `id`, as `{"columns":[...]}`, for a caller of
@@ -2585,6 +2619,17 @@ const char* fb_shape_columns(unsigned id)
 	const std::string& header = it->second->header;   // {"columns":[...],"rows":[
 	const std::string rowsKey = ",\"rows\":[";
 	return allocCString(header.substr(0, header.size() - rowsKey.size()) + "}");
+}
+
+/**
+ * How many metadata changes have committed in this process (patch 0007), as a
+ * double.  A database's kept statements are emptied when it has moved; plain
+ * reads and writes never move it.
+ */
+FB_WASM_EXPORT
+double fb_metadata_commits()
+{
+	return static_cast<double>(fb_wasm_metadata_commits.load(std::memory_order_acquire));
 }
 
 FB_WASM_EXPORT

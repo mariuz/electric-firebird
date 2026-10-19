@@ -855,12 +855,13 @@ be built:
       is `sem_timedwait`, the process-shared attributes, the RCU singleton,
       and the entry points of the utilities and the network provider a
       browser build leaves out, each with why it is accurate.
-      One consequence, now reachable: DDL run inside `EXECUTE STATEMENT` is
-      not seen by the statement cache, and a kept `SELECT` of a table it
-      dropped still reads the old rows (Firebird 6 rebinds a prepared
+      One consequence became reachable: DDL run inside `EXECUTE STATEMENT`
+      was not seen by the statement cache, and a kept `SELECT` of a table it
+      dropped still read the old rows (Firebird 6 rebinds a prepared
       statement to the newest metadata but keeps the dropped relation).
-      `_fb_statement_cache()` empties the caches; seeing that DDL from the
-      bridge needs the engine's metadata version (`MetadataCache::mdc_front`).
+      Fixed next: patch 0007 counts committed metadata changes where
+      `MetadataCache::mdc_front` moves, and the cache empties when the count
+      has.
 - **Acceptance:** in Chromium, `CREATE TABLE` → `INSERT` → `SELECT` returns the
   inserted rows — i.e. `wasm.spec.ts` runs instead of skipping.
 

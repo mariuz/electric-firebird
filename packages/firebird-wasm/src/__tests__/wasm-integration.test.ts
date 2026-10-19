@@ -368,6 +368,18 @@ for (const variant of VARIANTS) {
       }
     };
 
+    /** A second attachment to a database freshDatabase made. */
+    const attachDatabase = (name: string): number => {
+      const pathPtr = allocString(mod, `/data/${name}.fdb`);
+      try {
+        const db = mod._fb_attach_database(pathPtr);
+        expect({ handle: db > 0, error: errorText() }).toEqual({ handle: true, error: '' });
+        return db;
+      } finally {
+        mod._free(pathPtr);
+      }
+    };
+
     /** Copy a packed buffer onto the heap and hand it to one ABI call. */
     const withHeapBytes = <T>(bytes: Uint8Array, fn: (ptr: number, len: number) => T): T => {
       const ptr = mod._malloc(bytes.length);
@@ -685,23 +697,86 @@ for (const variant of VARIANTS) {
         "EXECUTE BLOCK AS BEGIN EXECUTE STATEMENT 'INSERT INTO et VALUES (2)' WITH AUTONOMOUS TRANSACTION; END")).toBe(0);
       expect(mod._fb_rollback(tx2)).toBe(0);
       expect(queryRows(db, 'SELECT id FROM et')).toEqual([[2]]);
-      // DDL inside it is not seen by the statement cache: a kept SELECT still
-      // reads the dropped table, until _fb_statement_cache empties the caches
-      // (docs/api.md says so).
-      expect(queryRows(db, 'SELECT id FROM et')).toEqual([[2]]);
-      expect(exec(db, 0, "EXECUTE BLOCK AS BEGIN EXECUTE STATEMENT 'DROP TABLE et'; END")).toBe(0);
-      const size = mod._fb_statement_cache(64);
-      mod._fb_statement_cache(size);
-      const sqlPtr = allocString(mod, 'SELECT id FROM et');
-      try {
-        expect(mod._fb_query(db, 0, sqlPtr, 0)).toBe(0);
-        expect(errorText().toUpperCase()).toContain('ET');
-      } finally {
-        mod._free(sqlPtr);
-      }
       expect(exec(db, 0, "EXECUTE BLOCK AS BEGIN EXECUTE STATEMENT 'INSERT INTO no_such_table VALUES (1)'; END")).not.toBe(0);
       expect(errorText().toUpperCase()).toContain('NO_SUCH_TABLE');
       expect(mod._fb_detach_database(db)).toBe(0);
+    });
+
+    // Until 0.9.0 DDL the bridge did not run itself was not seen by the
+    // statement cache, and a kept SELECT of a table dropped inside EXECUTE
+    // STATEMENT went on returning its rows.  The engine now counts committed
+    // metadata changes (patch 0007), and the cache empties when that moves.
+
+    const queryFails = (db: number, sql: string): string => {
+      const sqlPtr = allocString(mod, sql);
+      try {
+        expect(mod._fb_query(db, 0, sqlPtr, 0)).toBe(0);
+        return errorText();
+      } finally {
+        mod._free(sqlPtr);
+      }
+    };
+
+    it('sees DDL run inside EXECUTE STATEMENT or a procedure, and nothing else moves it', () => {
+      const db = freshDatabase('ddl-unseen');
+      expect(exec(db, 0, 'CREATE TABLE u (id INTEGER)')).toBe(0);
+      expect(exec(db, 0, 'INSERT INTO u VALUES (1)')).toBe(0);
+      expect(queryRows(db, 'SELECT id FROM u')).toEqual([[1]]);   // kept
+
+      // reads and writes leave the count alone, so the cache keeps working
+      const before = mod._fb_metadata_commits();
+      for (let i = 0; i < 3; i++) {
+        expect(execParams(db, 0, 'INSERT INTO u VALUES (?)', [i + 2])).toBe(0);
+        expect(queryRows(db, 'SELECT COUNT(*) FROM u')).toEqual([[i + 2]]);
+      }
+      expect(mod._fb_metadata_commits()).toBe(before);
+
+      // a drop the bridge cannot see: the kept SELECT is gone with it
+      expect(exec(db, 0, "EXECUTE BLOCK AS BEGIN EXECUTE STATEMENT 'DROP TABLE u'; END")).toBe(0);
+      expect(mod._fb_metadata_commits()).toBeGreaterThan(before);
+      expect(queryFails(db, 'SELECT id FROM u').toUpperCase()).toContain('U');
+
+      // a recreated table is read with its new columns
+      expect(exec(db, 0, "EXECUTE BLOCK AS BEGIN EXECUTE STATEMENT 'CREATE TABLE u (id INTEGER, w INTEGER)'; END")).toBe(0);
+      expect(exec(db, 0, 'INSERT INTO u VALUES (7, 8)')).toBe(0);
+      expect(queryRows(db, 'SELECT * FROM u')).toEqual([[7, 8]]);
+
+      // a procedure altered by a procedure runs its new body
+      expect(exec(db, 0, 'CREATE OR ALTER PROCEDURE v RETURNS (n INTEGER) AS BEGIN n = 1; SUSPEND; END')).toBe(0);
+      expect(exec(db, 0, `CREATE OR ALTER PROCEDURE alter_v AS BEGIN
+        EXECUTE STATEMENT 'CREATE OR ALTER PROCEDURE v RETURNS (n INTEGER) AS BEGIN n = 2; SUSPEND; END'; END`)).toBe(0);
+      expect(queryRows(db, 'SELECT n FROM v')).toEqual([[1]]);
+      expect(exec(db, 0, 'EXECUTE PROCEDURE alter_v')).toBe(0);
+      expect(queryRows(db, 'SELECT n FROM v')).toEqual([[2]]);
+      expect(mod._fb_detach_database(db)).toBe(0);
+    });
+
+    it('moves the count for DDL only, not for an attach or a first use', () => {
+      const db = freshDatabase('ddl-loads');
+      expect(exec(db, 0, 'CREATE TABLE l (id INTEGER)')).toBe(0);
+      expect(exec(db, 0, 'CREATE PROCEDURE lp RETURNS (n INTEGER) AS BEGIN n = 1; SUSPEND; END')).toBe(0);
+      expect(mod._fb_detach_database(db)).toBe(0);
+      const before = mod._fb_metadata_commits();
+      const again = attachDatabase('ddl-loads');
+      expect(queryRows(again, 'SELECT id FROM l')).toEqual([]);
+      expect(queryRows(again, 'SELECT n FROM lp')).toEqual([[1]]);
+      expect(queryRows(again, 'SELECT COUNT(*) FROM rdb$relations WHERE rdb$relation_name = \'L\'')).toEqual([[1]]);
+      expect(mod._fb_metadata_commits()).toBe(before);
+      expect(exec(again, 0, 'ALTER TABLE l ADD w INTEGER')).toBe(0);
+      expect(mod._fb_metadata_commits()).toBeGreaterThan(before);
+      expect(mod._fb_detach_database(again)).toBe(0);
+    });
+
+    it('sees DDL from another attachment to the same database', () => {
+      const a = freshDatabase('ddl-other');
+      expect(exec(a, 0, 'CREATE TABLE o (id INTEGER)')).toBe(0);
+      expect(exec(a, 0, 'INSERT INTO o VALUES (1)')).toBe(0);
+      expect(queryRows(a, 'SELECT id FROM o')).toEqual([[1]]);   // kept on a
+      const b = attachDatabase('ddl-other');
+      expect(exec(b, 0, 'DROP TABLE o')).toBe(0);
+      expect(queryFails(a, 'SELECT id FROM o').toUpperCase()).toContain('O');
+      expect(mod._fb_detach_database(b)).toBe(0);
+      expect(mod._fb_detach_database(a)).toBe(0);
     });
 
     // ── The shared read transaction ─────────────────────────────────────
