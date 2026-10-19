@@ -4,7 +4,7 @@ All notable changes to `firebird-wasm`. This project follows
 [semantic versioning](https://semver.org/); while the major version is 0 the
 API may still move between minor releases.
 
-## Unreleased
+## 0.9.0 — 2026-10-19
 
 ### Changed
 

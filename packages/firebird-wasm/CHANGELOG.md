@@ -4,6 +4,131 @@ All notable changes to `firebird-wasm`. This project follows
 [semantic versioning](https://semver.org/); while the major version is 0 the
 API may still move between minor releases.
 
+## 0.9.0 — 2026-10-19
+
+### Changed
+
+- **Closing the last database frees the engine.** A module used to stay for
+  the life of the page or process; now the transports count the databases
+  that use one, and the last `close()` disposes it, unless whoever called
+  `loadFirebirdWasm()` still owns it. The next database loads a new module
+  (0.33–0.43 s without threads, about 1 s threaded); to keep one loaded
+  across closes, call `loadFirebirdWasm()` once, which owns it. A `memory://` database
+  went with its `close()` already; nothing else kept state in the module. An
+  `opfs://` database's access handle is now closed on `close()` too, so the
+  same Worker can open it again.
+- **The build without threads is the default.** `wasmGlueFile()`,
+  `loadFirebirdWasm()`, `DirectTransport` and `cdnArtifacts()` now pick
+  `firebird-embedded-st` unless asked for threads, in Node and in a cross-origin
+  isolated page too; until now `'auto'` picked the threaded build wherever it
+  could run. The build without threads needs no `SharedArrayBuffer` and no
+  Worker, starts in about a third of the time (0.33–0.43 s against
+  0.87–1.06 s), and was not slower in anything measured; `firebird-quake2`
+  plays the same on it (a 5 ms tic on demo1 either way). What it gives up is
+  statement and idle timeouts. To keep the threaded build, ask for it:
+  `wasmGlueFile(true)` (or `wasmGlueFile(self.crossOriginIsolated)` for
+  threads where the page allows them), `loadFirebirdWasm({ threads: true })`,
+  `new DirectTransport({ threads: true })`, `cdnArtifacts({ threads: true })`.
+
+### Added
+
+- **`disposeFirebirdWasm(mod)`** ends a module and lets it go: every database
+  detached, the engine shut down (`_fb_dispose`, which calls `fb_shutdown`),
+  the threaded build's workers terminated, and the module out of the cache.
+  Two things held a dropped threaded module: its 32 workers (about 400 MB in
+  Node) and the main thread's `Atomics.waitAsync` on its mailbox. Over ten
+  load/dispose cycles in Node, RSS levels off at about 200 MB without threads
+  and 300 MB threaded. Needs a rebuilt artifact.
+- **Bytes as parameters.** A `Uint8Array` or `ArrayBuffer` binds as its own
+  bytes into a `BLOB` or a `BINARY` / `VARBINARY` (`OCTETS`) column, on both
+  backends and by every route (`exec`, `query`, transactions, `execBatch`).
+  The browser engine marks the bytes as bytes, so any other column refuses
+  them instead of reading them as text; `FirebirdLite` hands them to the
+  driver as a `Buffer`. They used to throw.
+- **`bytea` syncs.** `firebird-wasm/electric` decodes Electric's `\x…` hex
+  into bytes, and `tableFromSchema` maps `bytea` to `BLOB SUB_TYPE BINARY`
+  (`VARCHAR(255) CHARACTER SET OCTETS` in a key). The shape server serves a
+  binary `BLOB`, `BINARY` and `VARBINARY` as `bytea`, byte for byte.
+- **`syncShapesToTables`: several tables, one transaction per batch.** The
+  shapes are followed together and each batch is applied to every table in
+  one Firebird transaction with every shape's position, so a Postgres
+  transaction that wrote to two tables never shows in one of them alone. A
+  batch waits until every shape has reached up-to-date after its last change,
+  and until all are at the same `global_last_seen_lsn` where the server sends
+  it; a shape behind is refreshed. The shape server now sends
+  `global_last_seen_lsn` (its log position) as Electric does.
+  `syncShapeToTable` is the one-shape case of the same code.
+- **A write path: `createWriteQueue`.** `insert`, `update` and `delete`
+  apply to the synced table at once and are recorded in `ELECTRIC_WRITES`
+  in the same transaction (so they survive a reload and an offline spell),
+  then go to the app's API through `send`, in order, retried on failure. A
+  sync given `writes` applies the pending writes again after every batch, so
+  the source's older state never shows over them, and drops each write once
+  its change comes back: by the transaction id `send` returned (Electric's
+  `txids`, which the shape server now sends too), by the row changing, or
+  after `confirmTimeoutMs`. A `WriteRejected` rolls the write back by
+  fetching the table's shape again. Syncs and the queue now run their
+  transactions on a database one at a time.
+- **The shape server takes `where`, pages its snapshots, prunes its log,
+  wakes on events, and runs beside others.**
+  - `where` (and Electric's `params[n]`) is parsed and written as Firebird
+    SQL with every value bound; functions, casts and subqueries are refused
+    with a 400. Each `where` and `columns` is a shape with its own handle,
+    and a row that stops matching leaves as a delete.
+  - Snapshots are served `snapshotPageRows` (10 000) rows a response, by
+    key.
+  - The log is pruned of changes older than `retainLogMs` (7 days), or by
+    `prune(before)`; a client further behind is sent back to a snapshot.
+  - Commits wake live requests through the `ELECTRIC_CHANGES` event, with
+    polling (now every 1 s) as the fallback.
+  - Numbering takes a lock, so several servers can serve one database.
+- **An example app that syncs from two servers:
+  [`examples/electric`](./examples/electric).** Two lists of notes, each a
+  table in the page's Firebird: one follows Postgres through Electric, the
+  other a Firebird server through `firebird-wasm/electric-server`. Writes go
+  to the source and come back down the shape; `db.live()` draws the lists;
+  `<firebird-repl>` queries the local copy. A Node server and a
+  `docker-compose.yml` run the sources. CI runs it in Chromium against real
+  containers, with both engine builds.
+
+### Fixed
+
+- **The statement cache sees DDL it did not run.** It emptied itself before
+  DDL the bridge ran, but not for DDL inside `EXECUTE STATEMENT`, a
+  procedure, or another attachment: a kept `SELECT` of a table dropped that
+  way went on returning the dropped table's rows, and a kept call of a
+  procedure altered that way ran its old body. The engine now counts each
+  committed metadata change (patch 0007), and a database's kept statements go
+  when the count has moved. Reads and writes never move it, so the cache
+  works as before for them; `_fb_metadata_commits()` reads the count.
+  Calling `_fb_statement_cache()` after such DDL is no longer needed. Needs a
+  rebuilt artifact.
+- **`EXECUTE STATEMENT` runs in the browser engine.** It did nothing, without
+  an error: an `INSERT` through it inserted no row, `INTO` gave `NULL`, and
+  `FOR EXECUTE STATEMENT … DO` gave no rows. It runs through Firebird's
+  External Data Sources (`jrd/extds`) even without `ON EXTERNAL`, and the
+  build replaced that directory with no-op stubs. It is compiled now, so
+  parameters, `WITH AUTONOMOUS TRANSACTION` and the caller's transaction work
+  as in Firebird, and its errors are reported.
+  Needs a rebuilt artifact: 170–200 KB larger, 54–55 KB gzipped (+2 %).
+- **The browser engine reads `BINARY` and `VARBINARY` (`OCTETS`) values as
+  bytes**, as it reads a binary `BLOB`: base64 by default, a `Uint8Array`
+  with `types: { binary: true }`. They were read as text, which turned bytes
+  that are not UTF-8 into replacement characters (`GEN_UUID()` among them).
+- **Two `syncShapeToTable` calls started together on a new database no
+  longer stop one of them.** Both found no `ELECTRIC_SHAPES` table and both
+  created it; the second creation failed ("unsuccessful metadata update")
+  and that sync stopped before it began. The loser now looks again and goes
+  on with the table the other made. Found by the example, which starts its
+  two syncs at once.
+- **Closing a shape server while a live request waits no longer crashes the
+  process.** `close()` disconnected at once, and a waiting live request's next
+  poll started a transaction on the closed connection, where the native
+  client segfaults rather than throwing. `close()` now waits for whatever is
+  running on the connection, and the requests still waiting end with a 503.
+  Found as an intermittent crash of `browser-firebird-shapes.spec.ts`, which
+  closes its server while the browser is still following it.
+
 ## 0.8.0 — 2026-10-18
 
 ### Security
