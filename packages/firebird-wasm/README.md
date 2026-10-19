@@ -187,11 +187,12 @@ Shipped since:
       (`syncShapesToTables`)
 - [x] ElectricSQL writes: `createWriteQueue` applies a write at once, sends
       it to the app's API, and keeps it over the sync until it comes back
+- [x] Module disposal: `disposeFirebirdWasm()`, and closing the last
+      database frees the engine's memory
 
 Next:
 
 - [ ] A typed binary result ABI, so exact numerics need not travel as strings
-- [ ] Module disposal — `close()` does not currently release the WASM heap
 - [ ] UNICODE collations (case- and accent-insensitive comparison), which
       need ICU collation data in the build. See
       [docs/roadmap.md](../../docs/roadmap.md)

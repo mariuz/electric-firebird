@@ -20,7 +20,7 @@
  */
 
 import type { FirebirdWasmModule } from '../wasm-loader';
-import { loadFirebirdWasm, allocString, lastError } from '../wasm-loader';
+import { acquireFirebirdWasm, releaseFirebirdWasm, allocString, lastError } from '../wasm-loader';
 import type {
   Row,
   QueryResult,
@@ -530,6 +530,8 @@ export function attachBlobs<T>(
 export class DirectTransport implements EngineTransport {
   private mod: FirebirdWasmModule | null = null;
   private initPromise: Promise<void> | null = null;
+  /** The OPFS database this transport mounted, closed on dispose. */
+  private opfsHandle: { close(): void } | null = null;
   /** What each shape id of this module's engine means (see SHAPE_IDS). */
   private readonly shapes = new Map<number, readonly FieldInfo[]>();
 
@@ -571,7 +573,7 @@ export class DirectTransport implements EngineTransport {
   }
 
   private async doInit(): Promise<void> {
-    this.mod = await loadFirebirdWasm({
+    this.mod = await acquireFirebirdWasm({
       wasmBinary: this.options.wasmBinary,
       locateFile: this.options.locateFile,
       threads: this.options.threads,
@@ -861,13 +863,42 @@ export class DirectTransport implements EngineTransport {
     const handle = await openDatabaseHandle(dbName);
     const fileName = `${dbName}.fdb`;
     mountOpfsFilesystem(this.module, OPFS_MOUNT, new Map([[fileName, handle]]));
+    this.opfsHandle = handle;
     return `${OPFS_MOUNT}/${fileName}`;
   }
 
   async dispose(): Promise<void> {
-    // The module is cached process-wide by loadFirebirdWasm and shared with
-    // any other instance, so it is deliberately not torn down here.
+    // The module is shared with every other transport of the same build; the
+    // last one to let it go disposes it (unless loadFirebirdWasm pinned it),
+    // which ends the engine and frees its memory.
+    const mod = this.mod;
+    const init = this.initPromise;
+    const opfs = this.opfsHandle;
     this.mod = null;
     this.initPromise = null;
+    this.opfsHandle = null;
+    if (opfs && mod) {
+      // The database is detached by now.  The handle is exclusive: left open,
+      // it locked the file against the next open until the Worker went.
+      try {
+        (mod.FS as unknown as { unmount(path: string): void }).unmount(OPFS_MOUNT);
+      } catch {
+        // not mounted any more
+      }
+      try {
+        opfs.close();
+      } catch {
+        // closed already
+      }
+    }
+    if (mod) {
+      await releaseFirebirdWasm(mod);
+    } else if (init) {
+      // Disposed while still loading: release what the load acquires.
+      await init.then(() => undefined, () => undefined);
+      const late = this.mod as FirebirdWasmModule | null;
+      this.mod = null;
+      if (late) await releaseFirebirdWasm(late);
+    }
   }
 }

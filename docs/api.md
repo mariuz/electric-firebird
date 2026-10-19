@@ -726,7 +726,10 @@ class IndexedDBVFS {
 ### `loadFirebirdWasm(options?)`
 
 Load and initialise the Firebird Embedded WASM module.  The result is cached —
-subsequent calls return the same instance.
+subsequent calls return the same instance — and kept until
+`disposeFirebirdWasm(mod)`: whoever calls this owns the module.
+`FirebirdBrowser` does not need it: its transport counts the databases that
+use a module, and closing the last one disposes it.
 
 Both the Node.js and browser entry points export this function:
 
@@ -742,7 +745,23 @@ mod._fb_init();
 const ptr = allocString(mod, '/data/test.fdb');
 const handle = mod._fb_create_database(ptr);
 mod._free(ptr);
+// …
+await disposeFirebirdWasm(mod);
 ```
+
+### `disposeFirebirdWasm(mod)`
+
+End a module and let it go: every database is detached (what is open is
+rolled back), the engine is shut down (`fb_shutdown`), the threaded build's
+workers are terminated, and the module leaves the cache, so its memory can be
+collected.  Anything still holding the module must not use it afterwards
+(`_fb_init` fails); the next `loadFirebirdWasm()` loads a new one.
+Idempotent.
+
+Measured in Node, ten load/dispose cycles each: the build without threads
+levels off at about 200 MB of RSS, the threaded one at about 300 MB.  Before
+0.9.0 a module could not be let go, and the threaded build's worker pool alone
+held about 400 MB.
 
 ### `allocString(mod, str)`
 

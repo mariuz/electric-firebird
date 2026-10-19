@@ -75,7 +75,7 @@ export type {
 export { IndexedDBVFS } from './indexeddb-vfs';
 export type { IndexedDBVFSOptions, VFSMetadata } from './indexeddb-vfs';
 
-export { loadFirebirdWasm, allocString } from '../wasm-loader';
+export { loadFirebirdWasm, disposeFirebirdWasm, allocString } from '../wasm-loader';
 export type {
   FirebirdWasmModule,
   WasmLoadOptions,
