@@ -152,7 +152,7 @@ if [[ ! -f "${PATCH_MARKER}" ]]; then
 
     # Already applied?  `git apply --reverse --check` succeeding means the
     # change is present, which is fine on a re-run.
-    if git -C "${FIREBIRD_SRC}" apply --reverse --check "$p" 2>/dev/null; then
+    if git -C "${FIREBIRD_SRC}" apply --reverse --check -C1 "$p" 2>/dev/null; then
       echo "    (already applied)"
       continue
     fi
