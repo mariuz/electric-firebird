@@ -104,6 +104,7 @@ import type {
   Row,
   TransactionOptions,
 } from '../types';
+import { parseMultiRowInsert } from '../kysely';
 
 export {
   pgTable,
@@ -180,6 +181,7 @@ export interface FirebirdDrizzleTransactionClient {
     options?: { rowMode?: 'object' | 'array' },
   ): Promise<FbQueryResult<T>>;
   exec(sql: string, params?: QueryParams): Promise<unknown>;
+  execBatch?(sql: string, rows: QueryParams[]): Promise<unknown>;
   rollback(): Promise<void>;
 }
 
@@ -499,6 +501,7 @@ export class FirebirdDrizzlePreparedQuery<
   ): Promise<T['execute']> {
     const params = normalizeParams(fillPlaceholders(this.#params, placeholderValues));
     this.#logger.logQuery(this.#queryString, params);
+    const multiInsert = parseMultiRowInsert(this.#queryString, params);
 
     const fields = this.#fields;
     const customResultMapper = this.#customResultMapper;
@@ -517,6 +520,27 @@ export class FirebirdDrizzlePreparedQuery<
           !/\breturning\b/i.test(this.#queryString));
 
       if (isDmlWithoutReturning) {
+        if (multiInsert && typeof this.#client.execBatch === 'function') {
+          if (multiInsert.uniformSql) {
+            const res = await this.#client.execBatch(
+              multiInsert.uniformSql,
+              multiInsert.rows.map((r) => r.params),
+            );
+            return {
+              rows: [],
+              fields: [],
+              affectedRows: extractAffectedRows(res) ?? multiInsert.rows.length,
+            } as T['execute'];
+          }
+          for (const row of multiInsert.rows) {
+            await this.#client.exec(row.sql, row.params);
+          }
+          return {
+            rows: [],
+            fields: [],
+            affectedRows: multiInsert.rows.length,
+          } as T['execute'];
+        }
         const res = await this.#client.exec(this.#queryString, params);
         return {
           rows: [],
@@ -536,15 +560,27 @@ export class FirebirdDrizzlePreparedQuery<
       } as T['execute'];
     }
 
-    const result = await this.#client.query(this.#queryString, params, {
-      rowMode: 'array',
-    });
-
-    if (customResultMapper) {
-      return customResultMapper(result.rows as unknown[][]);
+    let resultRows: unknown[][];
+    if (multiInsert && multiInsert.hasReturning && typeof this.#client.execBatch === 'function') {
+      resultRows = [];
+      for (const row of multiInsert.rows) {
+        const res = await this.#client.query(row.sql, row.params, {
+          rowMode: 'array',
+        });
+        resultRows.push(...(res.rows as unknown[][]));
+      }
+    } else {
+      const result = await this.#client.query(this.#queryString, params, {
+        rowMode: 'array',
+      });
+      resultRows = result.rows as unknown[][];
     }
 
-    return result.rows.map((row) =>
+    if (customResultMapper) {
+      return customResultMapper(resultRows);
+    }
+
+    return resultRows.map((row) =>
       mapDrizzleResultRow<T['execute']>(
         fields!,
         row as unknown[],

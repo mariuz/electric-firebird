@@ -103,6 +103,7 @@ export interface FirebirdKyselyTransaction {
     options?: { rowMode?: 'object' | 'array' },
   ): Promise<FbQueryResult<T>>;
   exec(sql: string, params?: QueryParams): Promise<unknown>;
+  execBatch?(sql: string, rows: QueryParams[]): Promise<unknown>;
   rollback(): Promise<void>;
   queryStream?<T = Row>(
     sql: string,
@@ -121,6 +122,7 @@ export interface FirebirdKyselyDatabase {
     options?: { rowMode?: 'object' | 'array' },
   ): Promise<FbQueryResult<T>>;
   exec(sql: string, params?: QueryParams): Promise<unknown>;
+  execBatch?(sql: string, rows: QueryParams[]): Promise<unknown>;
   transaction<T>(
     fn: (tx: FirebirdKyselyTransaction) => Promise<T>,
     options?: TransactionOptions,
@@ -569,12 +571,49 @@ class FirebirdConnection implements DatabaseConnection {
   async executeQuery<R>(compiledQuery: CompiledQuery): Promise<KyselyQueryResult<R>> {
     const target = this.#tx ?? this.#db;
     const params = [...compiledQuery.parameters];
+    const multiInsert = parseMultiRowInsert(compiledQuery.sql, params);
+
     if (shouldUseExec(compiledQuery.query, compiledQuery.sql)) {
+      if (multiInsert && typeof target.execBatch === 'function') {
+        if (multiInsert.uniformSql) {
+          const res = await target.execBatch(
+            multiInsert.uniformSql,
+            multiInsert.rows.map((r) => r.params),
+          );
+          const affected = extractAffectedRows(res) ?? multiInsert.rows.length;
+          return {
+            numAffectedRows: BigInt(affected),
+            rows: [],
+          };
+        }
+        for (const row of multiInsert.rows) {
+          await target.exec(row.sql, row.params);
+        }
+        return {
+          numAffectedRows: BigInt(multiInsert.rows.length),
+          rows: [],
+        };
+      }
       const res = await target.exec(compiledQuery.sql, params);
       const affected = extractAffectedRows(res);
       return {
         ...(affected !== undefined ? { numAffectedRows: BigInt(affected) } : {}),
         rows: [],
+      };
+    }
+
+    if (multiInsert && multiInsert.hasReturning && typeof target.execBatch === 'function') {
+      const rawRows: Record<string, unknown>[] = [];
+      for (const row of multiInsert.rows) {
+        const res = await target.query<Record<string, unknown>>(row.sql, row.params, {
+          rowMode: 'object',
+        });
+        rawRows.push(...res.rows);
+      }
+      const rows = mapRows<R>(rawRows, this.#identifierCase);
+      return {
+        numAffectedRows: BigInt(rows.length),
+        rows,
       };
     }
 
@@ -897,4 +936,77 @@ function extractAffectedRows(res: unknown): number | undefined {
     return total;
   }
   return undefined;
+}
+
+const MULTI_ROW_INSERT_RE =
+  /^((?:with\b[\s\S]+?\s+)?insert\s+into\s+[\s\S]+?\)\s+(?:overriding\s+system\s+value\s+)?)(select\s+[\s\S]+?\s+from\s+rdb\$database(?:\s+union\s+all\s+select\s+[\s\S]+?\s+from\s+rdb\$database)+)(\s+returning\s+[\s\S]+)?$/i;
+
+function countPlaceholders(sqlFragment: string): number {
+  let count = 0;
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = 0; i < sqlFragment.length; i++) {
+    const ch = sqlFragment[i]!;
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+    } else if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+    } else if (ch === '?' && !inSingle && !inDouble) {
+      count++;
+    }
+  }
+  return count;
+}
+
+/** @internal */
+export interface ParsedMultiRowInsert {
+  rows: { sql: string; params: QueryParams }[];
+  uniformSql: string | undefined;
+  hasReturning: boolean;
+}
+
+/**
+ * Splits a multi-row `INSERT INTO ... SELECT ... FROM RDB$DATABASE UNION ALL ...`
+ * statement into per-row `INSERT INTO ... VALUES (...)` statements so execution
+ * against `FirebirdLite` / `FirebirdBrowser` can use `execBatch` (or per-row
+ * `INSERT ... VALUES (...) RETURNING ...`), avoiding Firebird's `-804 Data type unknown`
+ * error on untyped `?` parameters inside `SELECT ? FROM RDB$DATABASE`.
+ * @internal
+ */
+export function parseMultiRowInsert(
+  sql: string,
+  params: unknown[],
+): ParsedMultiRowInsert | undefined {
+  const m = MULTI_ROW_INSERT_RE.exec(sql.trim());
+  if (!m) return undefined;
+  const prefix = m[1]!;
+  const selectsBody = m[2]!;
+  const returningSuffix = m[3] ?? '';
+  const branches = selectsBody.split(/\s+union\s+all\s+/i);
+  if (branches.length < 2) return undefined;
+
+  const rows: { sql: string; params: QueryParams }[] = [];
+  let paramOffset = 0;
+  for (const branch of branches) {
+    const bm = /^select\s+([\s\S]+?)\s+from\s+rdb\$database$/i.exec(branch.trim());
+    if (!bm) return undefined;
+    const exprs = bm[1]!;
+    const pCount = countPlaceholders(exprs);
+    if (paramOffset + pCount > params.length) return undefined;
+    const rowParams = params.slice(paramOffset, paramOffset + pCount) as QueryParams;
+    paramOffset += pCount;
+    rows.push({
+      sql: `${prefix}values (${exprs})${returningSuffix}`,
+      params: rowParams,
+    });
+  }
+  if (paramOffset !== params.length) return undefined;
+
+  const firstSql = rows[0]!.sql;
+  const uniformSql = rows.every((r) => r.sql === firstSql) ? firstSql : undefined;
+  return {
+    rows,
+    uniformSql,
+    hasReturning: returningSuffix.length > 0,
+  };
 }

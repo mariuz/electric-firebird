@@ -1164,6 +1164,11 @@ describeIfFirebird('FirebirdLite with Kysely and Drizzle ORM', () => {
     });
     const ddb = drizzle(db, { schema: { users: usersTable } });
 
+    await ddb.insert(usersTable).values([
+      { id: 4, name: 'Dave', score: 40 },
+      { id: 5, name: 'Eve', score: 50 },
+    ]);
+
     const updated = await ddb
       .update(usersTable)
       .set({ score: 99 })
@@ -1183,7 +1188,7 @@ describeIfFirebird('FirebirdLite with Kysely and Drizzle ORM', () => {
     ]);
 
     const count = await ddb.$count(usersTable);
-    expect(count).toBe(3);
+    expect(count).toBe(5);
 
     await kdb.destroy();
   });

@@ -175,6 +175,33 @@ describe('firebird-wasm/kysely', () => {
       params: ['Two', false, 'Three', true],
     });
 
+    // When execBatch is available (as on FirebirdLite and FirebirdBrowser),
+    // multi-row INSERT routes through execBatch('insert into ... values (?, ?)', rows)
+    // to avoid Firebird's -804 Data type unknown on untyped SELECT ? FROM RDB$DATABASE.
+    const batchCalls: Array<{ sql: string; rows: QueryParams[] }> = [];
+    (fb as FirebirdKyselyDatabase).execBatch = async (sqlText, rows) => {
+      batchCalls.push({ sql: sqlText, rows });
+      return { affectedRows: rows.length };
+    };
+    const batchRes = await db
+      .insertInto('items')
+      .values([
+        { title: 'Four', done: false },
+        { title: 'Five', done: true },
+      ])
+      .executeTakeFirst();
+    expect(batchRes.numInsertedOrUpdatedRows).toBe(2n);
+    expect(batchCalls).toEqual([
+      {
+        sql: 'insert into "ITEMS" ("TITLE", "DONE") values (?, ?)',
+        rows: [
+          ['Four', false],
+          ['Five', true],
+        ],
+      },
+    ]);
+    delete (fb as FirebirdKyselyDatabase).execBatch;
+
     // INSERT ... RETURNING uses query() and maps uppercase keys back to lowercase
     fb.calls.length = 0;
     fb.nextQueryRows = [{ ID: 42, TITLE: 'Returned' }];
