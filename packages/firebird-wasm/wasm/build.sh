@@ -254,6 +254,7 @@ if [[ ! -f "${NATIVE_BUILD_DIR}/CMakeCache.txt" ]]; then
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
     -DICU_INCLUDE_DIR=/usr/include \
+    -DCMAKE_C_FLAGS="-std=gnu11 -Wno-implicit-int" \
     -DCMAKE_CXX_FLAGS="-I${FIREBIRD_SRC}/extern/re2 -I${FIREBIRD_SRC}/extern/libcds -I${FIREBIRD_SRC}/extern/boost -DFB_TZDATADIR=\\\"\\\"" \
     -Wno-dev 2>&1 || true
 

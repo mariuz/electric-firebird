@@ -63,6 +63,14 @@ API may still move between minor releases.
   - `DECFLOAT(16)` and `DECFLOAT(34)` (`SQL_DEC16 = 260`, `SQL_DEC34 = 262`)
     are decoded in the C bridge, mapped in `firebird-wasm/electric-server`, and
     accepted by `firebird-wasm/electric`.
+- **Native `IBatch` in `FirebirdLite.execBatch` (`node-firebird-drivers#178`).**
+  When `statementHandle.createBatchAsync` is available on the native client
+  (merged upstream in [`asfernandes/node-firebird-drivers#178`](https://github.com/asfernandes/node-firebird-drivers/pull/178)),
+  `FirebirdLite.execBatch` and `FirebirdTransaction.execBatch` execute batches
+  through Firebird 4.0+'s `IBatch` API (including `addBlobAsync` with
+  `TAG_BLOB_POLICY = BLOB_ID_ENGINE` so `BLOB` parameters take no per-row round
+  trips), falling back automatically to `EXECUTE BLOCK` on older drivers or
+  Firebird 3.0 servers.
 
 ### Changed
 
@@ -75,12 +83,14 @@ API may still move between minor releases.
   offset-based `SQL_TIME_TZ` and `SQL_TIMESTAMP_TZ` (`0..2878`) are decoded in
   C without `IUtil`, and `appendScaledDecimal` writes directly into the JSON
   buffer without temporary string shifts.
-- **Incremental WASM rebuilds and CI verification.** `wasm/build.sh` preserves
-  the timestamps of unchanged `autoconfig.h`, `parse.h` / `parse.cpp`, and
-  `epp-generated` outputs across native bootstrap rebuilds, and
-  `build-wasm.yml` runs an incremental rebuild check after wiping
-  `build-native-config` and `.wasm-patches-applied` and touching
-  `fb_wasm_api.cpp`.
+- **Incremental WASM rebuilds, GCC 15 host bootstrap, and CI verification.**
+  `wasm/build.sh` preserves the timestamps of unchanged `autoconfig.h`,
+  `parse.h` / `parse.cpp`, and `epp-generated` outputs across native bootstrap
+  rebuilds, passes `-DCMAKE_C_FLAGS="-std=gnu11 -Wno-implicit-int"` so
+  Firebird's `Configure.cmake` checks succeed under GCC 15 (`-std=gnu23`),
+  checks already-applied patches with `-C1`, and `build-wasm.yml` runs an
+  incremental rebuild check after wiping `build-native-config` and
+  `.wasm-patches-applied` and touching `fb_wasm_api.cpp`.
 
 ## 0.9.0 — 2026-10-19
 

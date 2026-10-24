@@ -78,8 +78,8 @@ jobs:
         with:
           path: |
             packages/firebird-wasm/wasm/build-native-config
-          key: firebird-native-config-v5.0.3-${{ hashFiles('packages/firebird-wasm/wasm/build.sh') }}
-          restore-keys: firebird-native-config-v5.0.3-
+          key: firebird-native-config-v5.0.4-${{ hashFiles('packages/firebird-wasm/wasm/build.sh') }}
+
 
       - name: Install root dependencies
         run: npm install
