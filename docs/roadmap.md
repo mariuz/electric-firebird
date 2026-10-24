@@ -1088,8 +1088,15 @@ gaps it ran into, with its numbers, in rough order of what they would buy.
       checked at 0ddf615, August 2026, the new wire driver included). So rows
       now go in `EXECUTE BLOCK`s of up to 200, their parameters declared as
       the driver binds them: three columns from 152–174 to 18–35 µs a row
-      against a local Firebird 3 server. Still possible: `IBatch` bound
-      upstream, which would also take a BLOB value's own round trips away.
+      against a local Firebird 3 server. Upstream `node-firebird-native-api`
+      merged `IBatch` bindings in
+      [asfernandes/node-firebird-drivers#178](https://github.com/asfernandes/node-firebird-drivers/pull/178)
+      (awaiting npm publish); `FirebirdTransaction.execBatch` now uses
+      `statementHandle.createBatchAsync` (including `addBlobAsync` with
+      `TAG_BLOB_POLICY = BLOB_ID_ENGINE` so BLOB parameters take no per-row
+      round trips) whenever present and supported by the server, falling back
+      to `EXECUTE BLOCK` on `node-firebird-native-api@3.3.0` or Firebird 3.
+
 - [x] **A build that survives a rebuild.** Three things stopped a clean local
       build on a stock Ubuntu machine: the native bootstrap needs the host's
       ICU headers and failed deep inside a compile without saying so; CMake

@@ -1,5 +1,7 @@
 import { blockParamType, buildBlock, placeholderOffsets } from '../batch-block';
 import type { CharacterSet } from '../batch-block';
+import { FirebirdTransaction } from '../firebird';
+import type { Attachment, Transaction } from 'node-firebird-driver';
 
 describe('placeholderOffsets', () => {
   it('finds each ? in plain SQL', () => {
@@ -95,5 +97,139 @@ describe('buildBlock', () => {
     const sql = "UPDATE t SET a = ?, note = 'why?' WHERE id = ? AND b > 0";
     const block = buildBlock(sql, placeholderOffsets(sql)!, ['INTEGER', 'INTEGER'], 1);
     expect(block).toContain("UPDATE t SET a = :p0_0, note = 'why?' WHERE id = :p0_1 AND b > 0;");
+  });
+
+  it('uses statementHandle.createBatchAsync and addBlobAsync when available (PR #178), and falls back to EXECUTE BLOCK when unsupported', async () => {
+    const addedMessages: { count: number; bytes: Uint8Array }[] = [];
+    const addedBlobs: Uint8Array[] = [];
+    let batchClosed = false;
+
+    const inMeta = {
+      getCountSync: () => 2,
+      getTypeSync: (_s: unknown, i: number) => (i === 0 ? 480 : 520), // SQL_DOUBLE (for INTEGER), SQL_BLOB
+      getSubTypeSync: () => 0,
+      getLengthSync: () => 8,
+      getScaleSync: () => 0,
+      getCharSetSync: () => 0,
+      getOffsetSync: (_s: unknown, i: number) => i * 10,
+      getNullOffsetSync: (_s: unknown, i: number) => i * 10 + 8,
+      getMessageLengthSync: () => 20,
+      getAlignedLengthSync: () => 24,
+      getBuilderSync: () => ({
+        setTypeSync: () => undefined,
+        setSubTypeSync: () => undefined,
+        setLengthSync: () => undefined,
+        setCharSetSync: () => undefined,
+        setScaleSync: () => undefined,
+        getMetadataSync: () => inMeta,
+        releaseSync: () => 0,
+      }),
+      releaseSync: () => 0,
+    };
+
+    const preparedInMeta = {
+      ...inMeta,
+      getTypeSync: (_s: unknown, i: number) => (i === 0 ? 496 : 520), // SQL_LONG, SQL_BLOB
+    };
+
+    const makeStmt = (createBatchImpl: () => Promise<unknown>) => ({
+      type: Promise.resolve(2), // INSERT
+      hasResultSet: false,
+      columnLabels: Promise.resolve([]),
+      inMetadata: inMeta,
+      outMetadata: undefined,
+      inBuffer: new Uint8Array(20),
+      dataWriter: async (_att: unknown, _tx: unknown, buf: Uint8Array, values: unknown[]) => {
+        const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+        if (values[0] === null || values[0] === undefined) {
+          dv.setInt16(8, -1, true);
+        } else {
+          dv.setFloat64(0, Number(values[0]), true);
+          dv.setInt16(8, 0, true);
+        }
+        if (values[1] === null || values[1] === undefined) {
+          dv.setInt16(18, -1, true);
+        }
+      },
+      attachment: {
+        client: {
+          statusAction: async <T>(fn: (s: unknown) => Promise<T>) => fn({}),
+        },
+      },
+      statementHandle: {
+        getInputMetadataAsync: async () => preparedInMeta,
+        getOutputMetadataAsync: async () => undefined,
+        createBatchAsync: createBatchImpl,
+      },
+      execute: jest.fn(async () => undefined),
+      dispose: jest.fn(async () => undefined),
+    });
+
+    const batchHandle = {
+      addAsync: async (_s: unknown, count: number, inBuffer: Uint8Array) => {
+        addedMessages.push({ count, bytes: new Uint8Array(inBuffer) });
+      },
+      addBlobAsync: async (
+        _s: unknown,
+        _len: number,
+        inBuffer: Uint8Array,
+        blobId: Uint8Array,
+      ) => {
+        addedBlobs.push(new Uint8Array(inBuffer));
+        blobId.set([1, 2, 3, 4, 5, 6, 7, addedBlobs.length]);
+      },
+      executeAsync: async () => ({
+        getSizeSync: () => 2,
+        getStateSync: () => 1,
+        getStatusSync: () => undefined,
+        disposeSync: () => undefined,
+      }),
+      closeAsync: async () => {
+        batchClosed = true;
+      },
+    };
+
+    const stmt1 = makeStmt(async () => batchHandle);
+    const attachment1 = {
+      prepare: jest.fn(async () => stmt1),
+    } as unknown as Attachment;
+    const tx1 = { transactionHandle: {} } as unknown as Transaction;
+
+    const fbTx1 = new FirebirdTransaction(attachment1, tx1);
+    await fbTx1.execBatch('INSERT INTO b VALUES (?, ?)', [
+      [10, new Uint8Array([0xaa, 0xbb])],
+      [20, 'hello blob'],
+    ]);
+
+    expect(addedMessages).toHaveLength(1);
+    expect(addedMessages[0]!.count).toBe(2);
+    expect(addedMessages[0]!.bytes.byteLength).toBe(48); // 2 rows * 24-byte aligned stride
+    expect(addedBlobs).toHaveLength(2);
+    expect(Array.from(addedBlobs[0]!)).toEqual([0xaa, 0xbb]);
+    expect(Buffer.from(addedBlobs[1]!).toString('utf8')).toBe('hello blob');
+    // Row 0's blobId written at offset 10..18, nullFlag=0 at 18..20
+    expect(Array.from(addedMessages[0]!.bytes.subarray(10, 18))).toEqual([1, 2, 3, 4, 5, 6, 7, 1]);
+    expect(Array.from(addedMessages[0]!.bytes.subarray(18, 20))).toEqual([0, 0]);
+    expect(batchClosed).toBe(true);
+    expect(stmt1.execute).not.toHaveBeenCalled();
+
+    // When createBatchAsync throws (e.g. against Firebird 3), falls back cleanly
+    const stmt2 = makeStmt(async () => {
+      throw new Error('feature is not supported');
+    });
+    const attachment2 = {
+      prepare: jest.fn(async () => stmt2),
+      executeQuery: jest.fn(async () => ({
+        fetch: async () => [[0, 'NONE', 1]],
+        close: async () => undefined,
+      })),
+    } as unknown as Attachment;
+    const fbTx2 = new FirebirdTransaction(attachment2, tx1);
+    await fbTx2.execBatch('INSERT INTO b VALUES (?, ?)', [
+      [1, new Uint8Array([1])],
+      [2, new Uint8Array([2])],
+    ]);
+    // Executed via EXECUTE BLOCK fallback
+    expect(attachment2.prepare).toHaveBeenCalledTimes(2);
   });
 });

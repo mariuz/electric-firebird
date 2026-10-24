@@ -659,6 +659,13 @@ export class FirebirdTransaction {
     const lease = await this.statements.acquire(this.transaction, sql);
     let failed = true;
     try {
+      if (
+        serializedRows.length > 1 &&
+        (await tryExecuteNativeBatch(lease.stmt, this.transaction, serializedRows))
+      ) {
+        failed = false;
+        return;
+      }
       const plan = serializedRows.length > 1 ? await this.blockPlan(sql, lease.stmt) : undefined;
       if (plan) {
         await this.executeInBlocks(lease.stmt, plan, serializedRows);
@@ -894,6 +901,7 @@ interface NativeMetadata {
   getAliasSync?(status: unknown, i: number): string;
   isNullableSync?(status: unknown, i: number): boolean;
   getMessageLengthSync(status: unknown): number;
+  getAlignedLengthSync?(status: unknown): number;
   getBuilderSync(status: unknown): NativeMetadataBuilder;
   releaseSync(): number;
 }
@@ -939,14 +947,62 @@ type NativeStatement = Partial<InputMessage> &
   Partial<OutputMessage> & {
     attachment?: Attachment & {
       charSetForNONE?: string;
-      client?: { statusAction?: <T>(fn: (status: unknown) => Promise<T>) => Promise<T> };
+      client?: {
+        statusAction?: <T>(fn: (status: unknown) => Promise<T>) => Promise<T>;
+        util?: {
+          getXpbBuilderSync?: (
+            status: unknown,
+            kind: number,
+            buf: Uint8Array | undefined,
+            len: number,
+          ) => NativeXpbBuilder | undefined;
+        };
+      };
     };
     internalDispose?: () => Promise<void>;
     statementHandle?: {
       getInputMetadataAsync?: (status: unknown) => Promise<NativeMetadata | undefined>;
       getOutputMetadataAsync?: (status: unknown) => Promise<NativeMetadata | undefined>;
+      createBatchAsync?: (
+        status: unknown,
+        inMetadata: NativeMetadata | undefined,
+        parLength: number,
+        par: unknown,
+      ) => Promise<NativeBatch | undefined>;
     };
   };
+
+interface NativeXpbBuilder {
+  insertIntSync(status: unknown, tag: number, value: number): void;
+  getBufferLengthSync(status: unknown): number;
+  getBufferSync(status: unknown): unknown;
+  disposeSync(): void;
+}
+
+interface NativeBatchCompletionState {
+  getSizeSync(status: unknown): number;
+  getStateSync(status: unknown, pos: number): number;
+  findErrorSync?(status: unknown, pos: number): number;
+  getStatusSync(status: unknown, to: unknown, pos: number): void;
+  disposeSync(): void;
+}
+
+interface NativeBatch {
+  addAsync(status: unknown, count: number, inBuffer: Uint8Array): Promise<void>;
+  addBlobAsync?(
+    status: unknown,
+    length: number,
+    inBuffer: Uint8Array,
+    blobId: Uint8Array,
+    parLength: number,
+    par: Uint8Array | undefined,
+  ): Promise<void>;
+  executeAsync(
+    status: unknown,
+    transaction: unknown,
+  ): Promise<NativeBatchCompletionState | undefined>;
+  closeAsync(status: unknown): Promise<void>;
+}
 
 /** A statement's parameters and output columns as prepared, and the messages made for it. */
 interface Binding {
@@ -1579,6 +1635,265 @@ async function writeBlob(stmt: Statement, transaction: Transaction, bytes: Buffe
   }
   await stream.close();
   return stream.blob;
+}
+
+const XPB_BATCH = 5;
+const BATCH_VERSION1 = 1;
+const BATCH_TAG_RECORD_COUNTS = 2;
+const BATCH_TAG_BUFFER_BYTES_SIZE = 3;
+const BATCH_TAG_BLOB_POLICY = 4;
+const BATCH_BLOB_ID_ENGINE = 1;
+const BATCH_EXECUTE_FAILED = -1;
+
+/**
+ * Execute `rows` through Firebird 4+'s native `IBatch` interface
+ * (`statementHandle.createBatchAsync`, added in
+ * `asfernandes/node-firebird-drivers#178`).
+ *
+ * Returns `true` when the batch ran via `IBatch`, or `false` when the loaded
+ * `node-firebird-native-api` build or the connected server (e.g. Firebird 3)
+ * does not support `IBatch`, allowing `execBatch` to fall back to
+ * `EXECUTE BLOCK`.
+ */
+async function tryExecuteNativeBatch(
+  stmt: Statement,
+  transaction: Transaction,
+  rows: QueryParams[],
+): Promise<boolean> {
+  const internal = stmt as unknown as NativeStatement;
+  const createBatchAsync = internal.statementHandle?.createBatchAsync;
+  const client = internal.attachment?.client;
+  const txHandle = (transaction as unknown as { transactionHandle?: unknown }).transactionHandle;
+  if (
+    typeof createBatchAsync !== 'function' ||
+    typeof client?.statusAction !== 'function' ||
+    txHandle === undefined
+  ) {
+    return false;
+  }
+  if (stmt.hasResultSet || (await outputFields(stmt)).length > 0) {
+    return false;
+  }
+  const described = await inputParams(stmt);
+  if (!described || described.length === 0) {
+    return false;
+  }
+  const paramCount = described.length;
+  for (const row of rows) {
+    if (row.length !== paramCount) return false;
+  }
+
+  const textSet = new Set<number>();
+  const blobCols: number[] = [];
+  for (let i = 0; i < paramCount; i++) {
+    const type = (described[i]?.type ?? 0) & ~1;
+    if (type === SQL_BLOB) {
+      blobCols.push(i);
+      continue;
+    }
+    if (!TEXT_TYPES.has(type)) continue;
+    let sawString = false;
+    let sawDate = false;
+    for (const row of rows) {
+      const v = row[i];
+      if (v === null || v === undefined) continue;
+      if (typeof v === 'string' || typeof v === 'bigint') {
+        sawString = true;
+      } else if (v instanceof Date || (typeof v === 'object' && v !== null && 'date' in v)) {
+        sawDate = true;
+      }
+    }
+    if (sawString && sawDate) return false;
+    if (sawString) textSet.add(i);
+  }
+
+  const textPositions = [...textSet].sort((a, b) => a - b);
+  if (!(await useMessage(stmt, textPositions))) {
+    return false;
+  }
+
+  const inMetadata = internal.inMetadata;
+  const inBuffer = internal.inBuffer;
+  const dataWriter = internal.dataWriter as
+    | ((attachment: unknown, transaction: unknown, buffer: Uint8Array, values: unknown[]) => Promise<void>)
+    | undefined;
+  if (
+    !inMetadata ||
+    !inBuffer ||
+    typeof inMetadata.getAlignedLengthSync !== 'function' ||
+    typeof dataWriter !== 'function'
+  ) {
+    return false;
+  }
+
+  const hasBlobs = blobCols.length > 0;
+  let totalBlobBytes = 0;
+  const normalizedRows: unknown[][] = new Array(rows.length);
+  const rowBlobs: (Buffer | null)[][] | undefined = hasBlobs ? new Array(rows.length) : undefined;
+
+  for (let r = 0; r < rows.length; r++) {
+    const src = rows[r]!;
+    const dst = new Array<unknown>(paramCount);
+    const blobsForRow = hasBlobs ? new Array<Buffer | null>(paramCount).fill(null) : undefined;
+    for (let i = 0; i < paramCount; i++) {
+      let v = src[i];
+      if (v === undefined || v === null) {
+        dst[i] = null;
+        continue;
+      }
+      if (v instanceof ArrayBuffer) {
+        v = Buffer.from(v);
+      } else if (v instanceof Uint8Array && !Buffer.isBuffer(v)) {
+        v = Buffer.from(v.buffer, v.byteOffset, v.byteLength);
+      } else if (typeof v === 'bigint') {
+        v = v.toString();
+      }
+      if (hasBlobs && (described[i]!.type & ~1) === SQL_BLOB) {
+        if (typeof v === 'string') {
+          const buf = Buffer.from(v, 'utf8');
+          blobsForRow![i] = buf;
+          totalBlobBytes += buf.byteLength;
+          dst[i] = null;
+          continue;
+        }
+        if (Buffer.isBuffer(v)) {
+          blobsForRow![i] = v;
+          totalBlobBytes += v.byteLength;
+          dst[i] = null;
+          continue;
+        }
+        return false;
+      }
+      if (textSet.has(i) && typeof v !== 'string') {
+        v = String(v);
+      }
+      dst[i] = v;
+    }
+    normalizedRows[r] = dst;
+    if (rowBlobs && blobsForRow) rowBlobs[r] = blobsForRow;
+  }
+
+  return client.statusAction(async (status) => {
+    const stride = inMetadata.getAlignedLengthSync!(status);
+    const msgLen = inMetadata.getMessageLengthSync(status);
+    if (stride <= 0 || msgLen <= 0) return false;
+
+    const blobOffsets = hasBlobs
+      ? blobCols.map((col) => ({
+          col,
+          offset: inMetadata.getOffsetSync(status, col),
+          nullOffset: inMetadata.getNullOffsetSync(status, col),
+        }))
+      : [];
+
+    if (hasBlobs && typeof internal.statementHandle?.createBatchAsync === 'function') {
+      // Verify addBlobAsync will be present on the batch below.
+    }
+
+    const needed = stride * rows.length + totalBlobBytes + 4096;
+    let pb: NativeXpbBuilder | undefined;
+    let parLength = 0;
+    let parBuffer: unknown;
+
+    try {
+      pb = client.util?.getXpbBuilderSync?.(status, XPB_BATCH, undefined, 0);
+      if (pb) {
+        pb.insertIntSync(status, BATCH_TAG_RECORD_COUNTS, 1);
+        if (hasBlobs) {
+          pb.insertIntSync(status, BATCH_TAG_BLOB_POLICY, BATCH_BLOB_ID_ENGINE);
+        }
+        if (needed > 16 * 1024 * 1024) {
+          pb.insertIntSync(
+            status,
+            BATCH_TAG_BUFFER_BYTES_SIZE,
+            Math.min(256 * 1024 * 1024, needed),
+          );
+        }
+        parLength = pb.getBufferLengthSync(status);
+        parBuffer = pb.getBufferSync(status);
+      } else {
+        const bytes: number[] = [BATCH_VERSION1, BATCH_TAG_RECORD_COUNTS, 4, 1, 0, 0, 0];
+        if (hasBlobs) {
+          bytes.push(BATCH_TAG_BLOB_POLICY, 4, BATCH_BLOB_ID_ENGINE, 0, 0, 0);
+        }
+        const raw = new Uint8Array(bytes);
+        parLength = raw.byteLength;
+        parBuffer = raw;
+      }
+
+      let batch: NativeBatch | undefined;
+      try {
+        batch = await createBatchAsync.call(
+          internal.statementHandle,
+          status,
+          inMetadata,
+          parLength,
+          parBuffer,
+        );
+      } catch {
+        // Unsupported by server (e.g. Firebird 3) or client library: fall back to EXECUTE BLOCK.
+        return false;
+      }
+      if (!batch) return false;
+      if (hasBlobs && typeof batch.addBlobAsync !== 'function') {
+        await batch.closeAsync(status).catch(() => undefined);
+        return false;
+      }
+
+      try {
+        const messages = new Uint8Array(stride * rows.length);
+        const blobIdBuf = hasBlobs ? new Uint8Array(8) : undefined;
+
+        for (let r = 0; r < rows.length; r++) {
+          inBuffer.fill(0);
+          await dataWriter(internal.attachment, transaction, inBuffer, normalizedRows[r]!);
+          if (hasBlobs) {
+            const blobsForRow = rowBlobs![r]!;
+            for (const { col, offset, nullOffset } of blobOffsets) {
+              const blobBytes = blobsForRow[col];
+              if (!blobBytes) continue;
+              blobIdBuf!.fill(0);
+              await batch.addBlobAsync!(
+                status,
+                blobBytes.byteLength,
+                blobBytes,
+                blobIdBuf!,
+                0,
+                undefined,
+              );
+              inBuffer[nullOffset] = 0;
+              inBuffer[nullOffset + 1] = 0;
+              inBuffer.set(blobIdBuf!, offset);
+            }
+          }
+          messages.set(inBuffer.subarray(0, msgLen), r * stride);
+        }
+
+        await batch.addAsync(status, rows.length, messages);
+        const completion = await batch.executeAsync(status, txHandle);
+        if (!completion) {
+          throw new Error('IBatch.executeAsync returned no completion state');
+        }
+        try {
+          const reported = completion.getSizeSync(status);
+          for (let i = 0; i < reported; i++) {
+            const state = completion.getStateSync(status, i);
+            if (state === BATCH_EXECUTE_FAILED) {
+              completion.getStatusSync(status, status, i);
+              throw new Error(`IBatch execution failed at row ${i}`);
+            }
+          }
+        } finally {
+          completion.disposeSync();
+        }
+      } finally {
+        await batch.closeAsync(status).catch(() => undefined);
+      }
+    } finally {
+      pb?.disposeSync();
+    }
+    return true;
+  });
 }
 
 /**
