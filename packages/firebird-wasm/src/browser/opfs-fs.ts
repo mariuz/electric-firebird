@@ -162,16 +162,21 @@ export function mountOpfs(
 ): void {
   const FS = mod.FS as unknown as EmscriptenFSInternals;
 
-  // A scratch buffer, because the WASM heap is a SharedArrayBuffer under
-  // pthreads and OPFS rejects views onto one. Grown as needed and reused, so
-  // the cost is one copy per operation rather than one allocation.
-  let scratch = new Uint8Array(65536);
+  // A scratch buffer for the threaded build, whose WASM heap is a
+  // SharedArrayBuffer that OPFS refuses views onto. Grown as needed and
+  // reused, so the cost there is one copy per operation rather than one
+  // allocation. The default build has no threads and a plain ArrayBuffer
+  // heap, which OPFS reads into and writes from directly — so there `scratch`
+  // is never allocated and no byte is copied twice.
+  let scratch: Uint8Array | null = null;
   const scratchFor = (length: number): Uint8Array => {
-    if (scratch.byteLength < length) {
-      scratch = new Uint8Array(Math.max(length, scratch.byteLength * 2));
+    if (!scratch || scratch.byteLength < length) {
+      scratch = new Uint8Array(Math.max(length, (scratch?.byteLength ?? 32768) * 2));
     }
     return scratch.subarray(0, length);
   };
+  const isShared = (view: ArrayBufferView): boolean =>
+    typeof SharedArrayBuffer !== 'undefined' && view.buffer instanceof SharedArrayBuffer;
 
   const attrs = (node: FSNode, size: number) => ({
     dev: 1,
@@ -214,6 +219,9 @@ export function mountOpfs(
       position: number,
     ): number {
       const handle = stream.node.handle!;
+      if (!isShared(buffer)) {
+        return handle.read(buffer.subarray(offset, offset + length), { at: position });
+      }
       const target = scratchFor(length);
       const read = handle.read(target, { at: position });
       if (read > 0) buffer.set(target.subarray(0, read), offset);
@@ -227,8 +235,12 @@ export function mountOpfs(
       position: number,
     ): number {
       const handle = stream.node.handle!;
+      const view = buffer.subarray(offset, offset + length);
+      if (!isShared(buffer)) {
+        return handle.write(view, { at: position });
+      }
       const source = scratchFor(length);
-      source.set(buffer.subarray(offset, offset + length));
+      source.set(view);
       return handle.write(source, { at: position });
     },
   };

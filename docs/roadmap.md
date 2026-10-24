@@ -5,7 +5,7 @@ electric-firebird's stated goal is "Firebird embedded in WASM, similar to
 that goal actually is, compares the API surface against PGlite feature by
 feature, and proposes a staged roadmap.
 
-Last reviewed: 2026-10-18.
+Last reviewed: 2026-10-24.
 
 ---
 
@@ -54,25 +54,21 @@ not:
   registered with the plugin manager, an `IProvider` resolved.
 - ✅ **The metadata layer is real code, not stubs.**  `build.sh` builds
   `gpre_boot` and preprocesses all 14 `.epp` sources under `src/jrd` and
-  `src/dsql`; `fb_wasm_stubs.cpp` shrank from 1934 to ~470 lines.
-- ❌ **`_fb_create_database()` traps.**  The call aborts with WASM's
-  `function signature mismatch` — an indirect call whose signature does not
-  match its function-table entry.  Native builds tolerate function-pointer
-  casts that WASM rejects, so this is the expected next class of problem.
-
-So: the engine is built and starts; it does not execute SQL yet.  M1's
-acceptance test — `wasm.spec.ts` completing a create → insert → select — now
-fails on a concrete, locatable defect rather than on absence.
+  `src/dsql`; `fb_wasm_stubs.cpp` shrank from 1934 to 172 lines.
+- ✅ **`_fb_create_database()` and full SQL execution work.**  Previously
+  trapped with WASM's `function signature mismatch` (fixed below);
+  `wasm.spec.ts` and `browser-engine.spec.ts` now drive full create → insert →
+  select round-trips against the real engine.
 
 ### Also found during this review
 
 | # | Issue | Status |
 |---|-------|--------|
-| 1 | `FirebirdBrowser.query(sql, params)` accepted `params` and **silently discarded them**, so the same code returned different results on Node and in the browser. | **Fixed** — it now throws until the C API can bind parameters. Refusing is the only honest option while the capability is missing. |
+| 1 | `FirebirdBrowser.query(sql, params)` accepted `params` and **silently discarded them**, so the same code returned different results on Node and in the browser. | **Fixed** — parameters now bind through `fb_query_params` / `fb_execute_params` against the statement's declared metadata. |
 | 2 | `FirebirdBrowserTransaction.exec/query` passed `dbHandle`, never `txHandle`, so statements did not run in the transaction they appeared to belong to and `rollback()` could not undo them. | **Fixed** — `fb_execute`/`fb_query` take a transaction handle and the TS layer threads it through. Covered by a test. |
 | 3 | `persist()` rewrote the **whole** database, one IndexedDB transaction per page. | **Fixed.** One transaction for the whole import, and only changed pages are written. An interrupted persist now rolls back instead of leaving a half-written database. |
-| 4 | Two tabs on the same origin both open `firebird_<name>` and both persist whole images. | **Fixed** — a Web Lock per database refuses the second tab instead of letting it overwrite the first. Sharing one engine between tabs remains M4. |
-| 5 | JSON is the result ABI. | Improved, still lossy. Values are now decoded by real type: BLOBs read (text as string, binary as base64), `NUMERIC`/`DECFLOAT`/`INT128` as exact decimal strings, `BIGINT` as a string once it exceeds `Number.MAX_SAFE_INTEGER`, dates as ISO-8601. `FieldInfo` still carries only `name` — a typed ABI is M2. |
+| 4 | Two tabs on the same origin both open `firebird_<name>` and both persist whole images. | **Fixed** — a Web Lock per database refuses the second tab (`multiTab: 'exclusive'`) or shares one leader engine over `BroadcastChannel` (`multiTab: 'shared'`). |
+| 5 | JSON is the result ABI. | **Fixed.** Values are decoded by real type: BLOBs read (text as string, binary as base64 or `Uint8Array` over the side channel with `types: { binary: true }`), `NUMERIC`/`DECFLOAT`/`INT128` as exact decimal strings, `BIGINT` as a string once it exceeds `Number.MAX_SAFE_INTEGER`, dates as ISO-8601, and `FieldInfo` carries `name`, `type`, `typeName`, `subType`, `scale`, `length`, and `nullable`. |
 | 6 | `loadFirebirdWasm()` caches one module in a module-level variable with no way to dispose it. | **Fixed** in 0.9.0 — `disposeFirebirdWasm()`, and the last `close()` of a transport's databases disposes the module. |
 | 7 | Jest config sets `testPathIgnorePatterns: ["/src/browser/"]`, and there were no browser tests. | **Fixed** — 30 Playwright tests, see §5. |
 | 8 | `e2e` resolved WASM artifact paths one directory too high (`../../../packages/...` from `e2e/server`). | **Fixed.** The WASM suite would have skipped and the server 404'd *even after a successful build*. |
@@ -225,10 +221,13 @@ this and are already in place:
 implementations:
 
 - `DirectTransport` calls the WASM exports in the current thread.  Node uses
-  it, the Worker uses it internally, and the stub-ABI tests use it.
+  it, the Worker uses it internally, a browser page can use it directly on the
+  default single-threaded build (`firebird-embedded-st`), and the stub-ABI
+  tests use it.
 - `WorkerTransport` forwards over `postMessage` to a Worker built from
-  `browser/worker-entry`.  Browsers must use it, so `FirebirdBrowser` takes a
-  `worker` option.
+  `browser/worker-entry`.  Required for the threaded build (`threads: true`,
+  which blocks on mutexes) and for `opfs://` databases (`FileSystemSyncAccessHandle`
+  is Worker-only), and recommended whenever keeping the UI thread free matters.
 
 The Worker owns Emscripten's filesystem, which is why filesystem access is part
 of the transport rather than something the caller does — persistence copies the
@@ -295,9 +294,12 @@ written; what remains:
 - ~~Two tabs cannot *share* a database.~~ Done: `multiTab: 'shared'` elects one
   tab to run the engine and serves the rest over a `BroadcastChannel`. The
   default is still `'exclusive'`, so sharing is opt-in.
-- A typed *binary* result encoding, so exact numerics need not travel as
-  strings at all. (Parameters already go the other way in binary where it is
-  exact; see M2.)
+- ~~A typed *binary* result encoding, so exact numerics need not travel as
+  strings at all.~~ Done without replacing the JSON wire format (see M2 and
+  [plans/typed-results.md](./plans/typed-results.md)): generated row
+  constructors, opt-in `types:` conversions, and a binary side-channel for
+  BLOBs (`types: { binary: true }`). (Parameters already go the other way in
+  binary where it is exact; see M2.)
 - ~~A build without `SharedArrayBuffer`.~~ Built: `firebird-embedded-st`
   runs with no COOP/COEP headers, the demo and `firebird-quake2` run it on
   GitHub Pages, 0.8.0 ships it beside the threaded build, and it is now the
@@ -578,7 +580,7 @@ Legend: ✅ shipped · 🟡 partial · ❌ missing · n/a not applicable
 | In-memory / ephemeral database | ✅ `memory://` | ✅ | `new FirebirdBrowser('memory://')` — no IndexedDB store is opened, no lock is taken, `persist()` is a no-op, and the file is discarded on `close()`. The engine already ran from memory; what this removes is the durability copy |
 | Node filesystem | ✅ `file://` | ✅ | Via the native driver, not WASM |
 | IndexedDB | ✅ `idb://` | ✅ | One transaction per persist, only changed pages written |
-| OPFS | — | ✅ | `opfs://name`. The engine's own reads and writes land in an OPFS file through a custom Emscripten filesystem backed by sync access handles, so there is no image copy and no persist step at all |
+| OPFS | — | ✅ | `opfs://name`. The engine's own reads and writes land in an OPFS file through a custom Emscripten filesystem backed by sync access handles, so there is no image copy and no persist step at all; on the default single-threaded build (`firebird-embedded-st`), views onto the WASM `ArrayBuffer` heap are passed directly with zero scratch-buffer copy |
 | Incremental / dirty-page writes | ✅ | ✅ | Pages compared against what is stored |
 | Durability tuning | ✅ `relaxedDurability` | ✅ | `autoPersist` + `autoPersistDebounceMs` |
 | `dumpDataDir()` on the DB object | ✅ | ✅ | Returns the live image as a `Uint8Array` — read from the engine's filesystem, so unpersisted writes are included and a `memory://` database can be dumped at all |
@@ -589,7 +591,7 @@ Legend: ✅ shipped · 🟡 partial · ❌ missing · n/a not applicable
 | Capability | PGlite | electric-firebird | Notes |
 |---|---|---|---|
 | Multi-tab sharing (worker + leader election) | ✅ `PGliteWorker` | ✅ | `multiTab: 'shared'` elects one tab over the existing Web Lock and proxies the rest to it over `BroadcastChannel`. The default `'exclusive'` refuses the second tab rather than letting it overwrite the first, so neither mode corrupts anything |
-| Web Worker offloading | ✅ | ✅ | Required rather than optional: the build uses pthreads and Firebird blocks on mutexes while opening a database, so an engine on the main thread deadlocks the page. `WorkerTransport` forwards to `serveEngine` |
+| Web Worker offloading | ✅ | ✅ | `WorkerTransport` forwards to `serveEngine`. Optional on the default single-threaded build (`firebird-embedded-st`), which runs on the page thread or in a Worker; required for `opfs://` (sync access handles are Worker-only) and for the threaded build (`threads: true`, which blocks on mutexes) |
 | Live / reactive queries | ✅ `live` extension | ✅ | `db.live(sql, { events }, onChange)` re-runs the statement when a named event fires. Event names are the caller's to give: nothing in Firebird connects a posted event to the tables a query reads |
 | `listen()` / `notify()` | ✅ | ✅ | `db.listen(names, cb)` and `db.notify(name)`, over the `fb_events_*` C API. Counts rather than individual events: two posts in quick succession arrive as one call with a count of 2. Delivery is after the posting transaction commits |
 | Sync with a server | ✅ (ElectricSQL) | ✅ | `firebird-wasm/electric`'s `syncShapeToTable` and `syncShapesToTables` follow Electric shapes into tables, from Postgres through Electric or from a Firebird server through `firebird-wasm/electric-server`. Writes go back through `createWriteQueue`: applied locally at once, sent to the app's API, kept over the sync until they come back |
@@ -875,8 +877,6 @@ be built:
 
 ### M2 — A correct API surface
 
-*Complete except the typed wire format.*
-
 - [x] `fb_execute_params` / `fb_query_params`. Bound through the statement's
       *declared* metadata plus `IUtil::convert`, not `IMetadataBuilder` — the
       builder approach failed with a bare "internal error" and was abandoned.
@@ -901,31 +901,28 @@ be built:
       the Node one prepares once and loops.
 - [x] Thread `txHandle` through `fb_execute`/`fb_query`.
 - [x] Add an explicit `tx.rollback()`. Browser in `4380ce7`, Node in `b6accb4`.
-- [ ] Replace the JSON ABI with a typed encoding. **Half done, and the other
-      half should probably not be this.** `FieldInfo` carries `type`,
+- [x] Replace the JSON ABI with a typed encoding. `FieldInfo` carries `type`,
       `typeName`, `subType`, `scale`, `length` and `nullable`, so a caller can
       tell an exact `NUMERIC` from a `VARCHAR` of digits. Values still travel
-      as decimal strings, ISO-8601 and base64.
+      as decimal strings, ISO-8601 and base64 by default.
 
       Measured before planning the rest, and the premise did not survive:
       `JSON.parse` is **8 ms of a 45 ms decode** on 10,000 rows. The dominant
       cost is **33 ms building row objects**, which a binary format would not
       change — and which a generated constructor cuts by 12× with no ABI change
       at all. See [plans/typed-results.md](./plans/typed-results.md) for the
-      numbers and what to do instead: fast row construction, opt-in typed
-      values, and a binary path for BLOBs only where base64 actually costs
-      something. **Steps 1 and 2 are done**: row construction is 5.5x faster on
-      large results and 17x on repeated small ones, and `types:` converts
-      `BIGINT`, binary `BLOB` and `DATE`/`TIMESTAMP` on request. Only the
-      binary BLOB side-channel remains, and only if a workload wants it.
+      numbers and what was done instead: fast row construction (5.5× faster on
+      large results and 17× on repeated small ones), opt-in typed values
+      (`types:` converts `BIGINT`, binary `BLOB` and `DATE`/`TIMESTAMP` on
+      request), and a binary side-channel for BLOBs (`types: { binary: true }`,
+      6.3× faster on a blob-heavy result set and transferred rather than cloned
+      across a Worker).
 - [x] `exec()` accepts multi-statement scripts and returns one result per
       statement. Splitting respects strings, quoted identifiers, comments and
       `SET TERM`.
 - [x] Populate `affectedRows` on the browser path.
 
 ### M3 — Persistence you can trust
-
-*Complete except two conveniences.*
 
 - [x] Dirty-page tracking: only pages whose contents changed are written.
 - [x] An interrupted persist cannot corrupt the database. Achieved with a
@@ -957,11 +954,15 @@ be built:
       filesystem *under* it: Firebird's `read`/`write` reach JavaScript through
       Emscripten's FS, which was measured before any of it was designed — 1,678
       writes and 14.1 MB for a create-and-insert. Two things the sketch did not
-      anticipate: the WASM heap is a `SharedArrayBuffer` under pthreads and OPFS
-      rejects views onto one, so every I/O copies through a scratch buffer; and
-      a sync access handle creates its file on open, so "does this database
-      exist" has to mean *has bytes* or the engine's `O_CREAT | O_EXCL` fails
-      with EEXIST on a database that was never written.
+      anticipate: under pthreads (`threads: true`) the WASM heap is a
+      `SharedArrayBuffer` and OPFS rejects views onto one, so those calls copy
+      through a reusable scratch buffer, whereas on the default single-threaded
+      build (`firebird-embedded-st`) the heap is a plain `ArrayBuffer` and
+      `mountOpfs` passes the WASM heap subarray directly to
+      `FileSystemSyncAccessHandle.read`/`write` with zero intermediate copy and
+      no scratch allocation; and a sync access handle creates its file on open,
+      so "does this database exist" has to mean *has bytes* or the engine's
+      `O_CREAT | O_EXCL` fails with EEXIST on a database that was never written.
 - [x] Publish the prebuilt artifact to npm. Shipped in `firebird-wasm@0.1.0`.
 - [x] A size budget and a default `locateFile` for CDN use. Each `.wasm` is
       8.7–8.8 MB raw, 2.9 MB gzipped and 2.05 MB with brotli;

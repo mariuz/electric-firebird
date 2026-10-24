@@ -66,11 +66,12 @@ Two other things lean on threads without starting one:
   in the browser. Without threads there is nothing to wait for, and the engine
   could run on the main thread like sql.js does, synchronously; the Worker
   would become a choice rather than a requirement.
-- **Memory.** The WASM heap is a `SharedArrayBuffer`, and OPFS sync access
-  handles refuse views onto one, so every page read and write through the
-  OPFS backend copies through a scratch buffer (noted under M4 in the
-  roadmap). A plain `ArrayBuffer` heap would let those calls take the heap
-  view directly.
+- **Memory.** Under pthreads (`threads: true`) the WASM heap is a
+  `SharedArrayBuffer`, and OPFS sync access handles refuse views onto one, so
+  every page read and write through the OPFS backend copies through a scratch
+  buffer (noted under M4 in the roadmap). With a plain `ArrayBuffer` heap (the
+  default single-threaded build), `mountOpfs` hands those calls the WASM heap
+  view directly, with no scratch buffer and no extra copy.
 
 ## Step 1, measured
 

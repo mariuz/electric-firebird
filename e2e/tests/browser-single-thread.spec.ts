@@ -118,21 +118,31 @@ test.describe('the build without threads, without cross-origin isolation', () =>
     expect(rows).toEqual([{ V: 'kept' }]);
   });
 
-  test('runs in a Worker', async ({ page }) => {
+  test('runs in a Worker, including an opfs:// database directly from the plain ArrayBuffer heap', async ({ page }) => {
     await openHarness(page, '/browser-harness');
 
-    const rows = await page.evaluate(async () => {
-      const db = new window.FB.FirebirdBrowser('memory://st-worker', {
+    const result = await page.evaluate(async () => {
+      const root = await navigator.storage.getDirectory();
+      const dir = await root.getDirectoryHandle('firebird', { create: true });
+      await dir.removeEntry('st-opfs.fdb').catch(() => undefined);
+
+      const db = new window.FB.FirebirdBrowser('opfs://st-opfs', {
         worker: new Worker('/no-isolation/firebird-engine-worker-st.js'),
       });
       await db.exec('CREATE TABLE t (id INTEGER)');
       await db.exec('INSERT INTO t VALUES (42)');
-      const res = await db.query('SELECT id FROM t');
+      const first = (await db.query('SELECT id FROM t')).rows;
       await db.close();
-      return res.rows;
+
+      const reopened = new window.FB.FirebirdBrowser('opfs://st-opfs', {
+        worker: new Worker('/no-isolation/firebird-engine-worker-st.js'),
+      });
+      const second = (await reopened.query('SELECT id FROM t')).rows;
+      await reopened.close();
+      return { first, second };
     });
 
-    expect(rows).toEqual([{ ID: 42 }]);
+    expect(result).toEqual({ first: [{ ID: 42 }], second: [{ ID: 42 }] });
   });
 
   test('refuses the threaded build with a message, instead of hanging', async ({ page }) => {
