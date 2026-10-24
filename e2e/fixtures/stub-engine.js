@@ -76,6 +76,12 @@
     affectedRows: 0,
     /** Return code of `_fb_execute_batch` (non-zero = failure). */
     batchRc: 0,
+    /** When true, `_fb_cursor_open` returns 0. */
+    cursorOpenReturnsNull: false,
+    /** When true, `_fb_cursor_fetch` returns 0. */
+    cursorFetchReturnsNull: false,
+    /** Return code of `_fb_cursor_close` (non-zero = failure). */
+    cursorCloseRc: 0,
     /** The binary forms the last parameter buffer carried: [{ index, kind, value }]. */
     lastBinaryParams: [],
 
@@ -310,6 +316,8 @@
     let lastBlobSize = 0;
     let nextDbHandle = 1000;
     let nextTxHandle = 5000;
+    let nextCursorHandle = 9000;
+    const cursors = new Map(); // cursorHandle -> { columns, rows, offset }
     let initialised = false;
 
     /**
@@ -491,6 +499,62 @@
         return ptr;
       },
 
+      _fb_cursor_open(handle, txHandle, sqlPtr, paramsPtr, paramsLength) {
+        const sql = UTF8ToString(sqlPtr);
+        const params = decodeParams(paramsPtr, paramsLength);
+        stub.calls.push({
+          fn: '_fb_cursor_open',
+          args: [handle, txHandle, sql, params],
+        });
+        if (stub.cursorOpenReturnsNull || stub.queryReturnsNull) return 0;
+        const described = (stub.queryResult.columns ?? []).map((c) =>
+          typeof c === 'string'
+            ? {
+                name: c,
+                type: 448,
+                subType: 0,
+                scale: 0,
+                length: 32,
+                nullable: true,
+              }
+            : c,
+        );
+        const cursorHandle = nextCursorHandle++;
+        cursors.set(cursorHandle, {
+          columns: described,
+          rows: [...(stub.queryResult.rows ?? [])],
+          offset: 0,
+        });
+        return cursorHandle;
+      },
+
+      _fb_cursor_fetch(cursorHandle, maxRows, flags) {
+        stub.calls.push({
+          fn: '_fb_cursor_fetch',
+          args: [cursorHandle, maxRows, flags],
+        });
+        if (stub.cursorFetchReturnsNull) return 0;
+        const entry = cursors.get(cursorHandle);
+        if (!entry) return 0;
+        const batchRows = entry.rows.slice(entry.offset, entry.offset + maxRows);
+        entry.offset += batchRows.length;
+        publishBlobs(flags);
+        const ptr = heapString(
+          JSON.stringify({ columns: entry.columns, rows: batchRows }),
+        );
+        liveResults.add(ptr);
+        return ptr;
+      },
+
+      _fb_cursor_close(cursorHandle) {
+        stub.calls.push({
+          fn: '_fb_cursor_close',
+          args: [cursorHandle],
+        });
+        cursors.delete(cursorHandle);
+        return stub.cursorCloseRc;
+      },
+
       _fb_last_error() {
         return heapString(stub.lastError);
       },
@@ -520,6 +584,7 @@
       doubleFrees,
       initialised,
       openAttachments: attachments.size,
+      openCursors: cursors.size,
     });
     stub.fileBytes = (path) => Array.from(files.get(path) ?? []);
     stub.fileSize = (path) => files.get(path)?.byteLength ?? 0;

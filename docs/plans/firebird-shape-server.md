@@ -90,13 +90,13 @@ reinstalling the capture, which forgets the log, sends every client back to a
 snapshot. Only the tables the server was given are served.
 
 Types and their text, in Postgres's names so the client maps them as it maps
-Postgres: `SMALLINT` int2, `INTEGER` int4, `BIGINT` int8, `NUMERIC`/`DECIMAL`
-and `INT128` numeric (rendered by Firebird, exact), `FLOAT` float4, `DOUBLE
-PRECISION` float8 (the shortest text that reads back as the same double),
-`BOOLEAN` bool, `CHAR` bpchar, `VARCHAR` varchar, text `BLOB` text, `DATE`,
-`TIME` and `TIMESTAMP` (Firebird's text), the `WITH TIME ZONE` types in UTC,
-a binary `BLOB`, `BINARY` and `VARBINARY` bytea (Postgres's `\x` hex).
-`DECFLOAT` is reported as a type the client refuses by name.
+Postgres: `SMALLINT` int2, `INTEGER` int4, `BIGINT` int8, `NUMERIC`/`DECIMAL`,
+`INT128` and `DECFLOAT(16)`/`DECFLOAT(34)` numeric (rendered by Firebird,
+exact), `FLOAT` float4, `DOUBLE PRECISION` float8 (the shortest text that
+reads back as the same double), `BOOLEAN` bool, `CHAR` bpchar, `VARCHAR`
+varchar, text `BLOB` text, `DATE`, `TIME` and `TIMESTAMP` (Firebird's text),
+the `WITH TIME ZONE` types in UTC, a binary `BLOB`, `BINARY` and `VARBINARY`
+bytea (Postgres's `\x` hex).
 
 ## Since the prototype
 
@@ -131,9 +131,18 @@ a binary `BLOB`, `BINARY` and `VARBINARY` bytea (Postgres's `\x` hex).
   Without it, two servers numbering at once failed on each other's rows, or
   could commit a higher number before a lower one, and a client that had
   seen the higher would never be sent the lower.
-
-Still out: writes from the browser back to the server (see the write path in
-[electric-sync.md](./electric-sync.md)).
+- **Batched changed-key lookups.** When reading changes after an offset,
+  non-delete keys are fetched in batches of up to 200 keys per `SELECT`
+  (`WHERE pk IN (?, …)` for single-column keys, or disjuncts for composite
+  keys) instead of one round-trip per changed row.
+- **`replica=full`.** When a client requests `replica=full`, update and
+  delete entries include `old_value`, and the shape handle encodes the
+  replica mode so `default` and `full` shapes stay distinct.
+- **Write companion (`server.applyWrite(write)`).** Applies a client write
+  (`insert`, `update`, `delete`) from `createWriteQueue` against a served
+  table inside a transaction, validating table and column names against the
+  loaded catalog and returning `{ txid }` (`CURRENT_TRANSACTION`) for
+  client-side write confirmation.
 
 ## Tests
 

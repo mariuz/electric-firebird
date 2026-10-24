@@ -32,6 +32,7 @@ import type { FirebirdColumn, TablePlan } from './catalog';
 import { CHANGES, CHANGE_EVENT, KEY_COLUMNS, META, installCapture, pruneLog, stampCommitted } from './capture';
 import { WhereError, translateWhere } from './where';
 import type { FirebirdWhere } from './where';
+import { WriteRejected } from '../electric/writes';
 
 export { triggerName, tableTrigger } from './capture';
 export { translateWhere, WhereError } from './where';
@@ -83,12 +84,30 @@ export interface ShapeServer {
    */
   readonly events: boolean;
   /**
+   * Apply one client write (`insert`, `update` or `delete`) to its served
+   * table in a serialized transaction, wake any waiting live requests, and
+   * return the committing Firebird transaction id (`{ txid }`) as
+   * `createWriteQueue`'s `send` expects.
+   *
+   * Throws `WriteRejected` when the table or a column is not served, or a
+   * key column is missing.
+   */
+  applyWrite(write: ServerWrite): Promise<{ txid: number }>;
+  /**
    * Drop what the log numbered before `before` (default: now less
    * `retainLogMs`), and return the highest number dropped, or 0.
    */
   prune(before?: Date): Promise<number>;
   /** Stop answering and close the connection. */
   close(): Promise<void>;
+}
+
+/** A write from a client (such as `createWriteQueue`'s `LocalWrite`), to apply at the source. */
+export interface ServerWrite {
+  table: string;
+  operation: 'insert' | 'update' | 'delete';
+  key: Record<string, unknown>;
+  value?: Record<string, unknown>;
 }
 
 type Message = Record<string, unknown>;
@@ -238,20 +257,66 @@ export async function createShapeServer(options: ShapeServerOptions): Promise<Sh
       }
       await rs.close();
 
-      // A row that no longer matches the shape's where has left it: a delete.
-      const where = table.key.map((k) => `${quote(k)} = ?`).join(' AND ') + (shape.where ? ` AND (${shape.where.sql})` : '');
-      const select = `SELECT ${shape.columns.map((c) => c.select).join(', ')} FROM ${quote(table.name)} WHERE ${where}`;
+      // Fetch current rows for all non-delete changes in batches of up to 200
+      // keys per SELECT rather than one round-trip per changed key.  A row that
+      // was deleted since or no longer matches the shape's where is absent from
+      // the result and emitted as a delete.
+      const nonDeletes = [...last.values()].filter((entry) => entry.op !== 'D');
+      const foundByKey = new Map<string, Message>();
+      const selectCols = shape.columns.map((c) => c.select).join(', ');
+      const quotedKeys = table.key.map(quote);
+      const batchSize = 200;
+      for (let start = 0; start < nonDeletes.length; start += batchSize) {
+        const slice = nonDeletes.slice(start, start + batchSize);
+        let keyPredicate: string;
+        const keyParams: unknown[] = [];
+        if (quotedKeys.length === 1) {
+          keyPredicate =
+            slice.length === 1
+              ? `${quotedKeys[0]} = ?`
+              : `${quotedKeys[0]} IN (${slice.map(() => '?').join(', ')})`;
+          for (const item of slice) keyParams.push(item.key[0]);
+        } else {
+          const disjuncts = slice.map(
+            () => `(${quotedKeys.map((k) => `${k} = ?`).join(' AND ')})`,
+          );
+          keyPredicate = slice.length === 1 ? disjuncts[0]! : `(${disjuncts.join(' OR ')})`;
+          for (const item of slice) keyParams.push(...item.key);
+        }
+        const whereClause = shape.where
+          ? `(${keyPredicate}) AND (${shape.where.sql})`
+          : keyPredicate;
+        const found = await attachment.executeQuery(
+          tx,
+          `SELECT ${selectCols} FROM ${quote(table.name)} WHERE ${whereClause}`,
+          shape.where ? [...keyParams, ...shape.where.params] : keyParams,
+        );
+        const rows = await found.fetch();
+        await found.close();
+        for (const row of rows) {
+          const msg = await change('insert', table, shape.columns, row, tx);
+          foundByKey.set(String(msg['key']), msg);
+        }
+      }
+
       const messages: Message[] = [];
       for (const { op, key, txids } of last.values()) {
-        let current: unknown[] | null = null;
-        if (op !== 'D') {
-          const found = await attachment.executeQuery(tx, select, [...key, ...(shape.where?.params ?? [])]);
-          current = (await found.fetch({ fetchSize: 1 }))[0] ?? null;
-          await found.close();
+        const delMsg = deletion(table, key);
+        const matched = op !== 'D' ? foundByKey.get(String(delMsg['key'])) : undefined;
+        let message: Message;
+        if (matched) {
+          if (shape.replica === 'full' && op === 'U' && !shape.where) {
+            message = {
+              ...matched,
+              old_value: {},
+              headers: { ...(matched['headers'] as Record<string, unknown>), operation: 'update' },
+            };
+          } else {
+            message = matched;
+          }
+        } else {
+          message = delMsg;
         }
-        const message = current
-          ? await change('insert', table, shape.columns, current, tx)
-          : deletion(table, key);
         (message['headers'] as Record<string, unknown>)['txids'] = [...txids].map(Number);
         messages.push(message);
       }
@@ -414,6 +479,92 @@ export async function createShapeServer(options: ShapeServerOptions): Promise<Sh
     respond(res, 200, [...result.messages, upToDate(result.seen)], headers);
   };
 
+  const applyWrite = async (write: ServerWrite): Promise<{ txid: number }> => {
+    if (closed) throw new HttpError(503, 'The shape server is closing');
+    const table = tables.get(relationName(write.table));
+    if (!table) throw new WriteRejected(`Table ${write.table} is not served`);
+    const byName = new Map<string, string>();
+    for (const c of table.columns) {
+      byName.set(c.shapeName, c.name);
+      byName.set(c.name, c.name);
+    }
+    const resolveCol = (givenCol: string): string => {
+      const fb = byName.get(givenCol);
+      if (!fb) throw new WriteRejected(`Column ${givenCol} is not in table ${table.name}`);
+      return fb;
+    };
+    const coerceParam = (v: unknown): unknown => {
+      if (v instanceof ArrayBuffer) return Buffer.from(v);
+      if (v instanceof Uint8Array && !Buffer.isBuffer(v)) {
+        return Buffer.from(v.buffer, v.byteOffset, v.byteLength);
+      }
+      return v ?? null;
+    };
+
+    const keySource = write.operation === 'insert' ? { ...(write.value ?? {}), ...write.key } : write.key;
+    const keyEntries = table.key.map((k) => {
+      const plan = table.columns.find((c) => c.name === k)!;
+      const val =
+        plan.shapeName in keySource
+          ? keySource[plan.shapeName]
+          : k in keySource
+            ? keySource[k]
+            : undefined;
+      if (val === undefined || val === null) {
+        throw new WriteRejected(`Write to ${table.name} is missing primary key column ${plan.shapeName}`);
+      }
+      return [k, coerceParam(val)] as const;
+    });
+
+    const valueObj = write.value ?? {};
+    const valueEntries = Object.entries(valueObj).map(([k, v]) => [resolveCol(k), coerceParam(v)] as const);
+
+    const txid = await serialized(attachment, async () => {
+      const tx = await attachment.startTransaction({ isolation: TransactionIsolation.READ_COMMITTED });
+      try {
+        const whereSql = keyEntries.map(([k]) => `${quote(k)} = ?`).join(' AND ');
+        const whereParams = keyEntries.map(([, v]) => v);
+        if (write.operation === 'delete') {
+          await attachment.execute(tx, `DELETE FROM ${quote(table.name)} WHERE ${whereSql}`, whereParams);
+        } else if (write.operation === 'insert') {
+          const merged = new Map<string, unknown>(keyEntries);
+          for (const [k, v] of valueEntries) merged.set(k, v);
+          const cols = [...merged.keys()];
+          const vals = [...merged.values()];
+          await attachment.execute(
+            tx,
+            `UPDATE OR INSERT INTO ${quote(table.name)} (${cols.map(quote).join(', ')}) ` +
+              `VALUES (${cols.map(() => '?').join(', ')}) ` +
+              `MATCHING (${table.key.map(quote).join(', ')})`,
+            vals,
+          );
+        } else if (write.operation === 'update') {
+          const nonKey = valueEntries.filter(([k]) => !table.key.includes(k));
+          if (nonKey.length > 0) {
+            await attachment.execute(
+              tx,
+              `UPDATE ${quote(table.name)} SET ${nonKey.map(([k]) => `${quote(k)} = ?`).join(', ')} WHERE ${whereSql}`,
+              [...nonKey.map(([, v]) => v), ...whereParams],
+            );
+          }
+        } else {
+          throw new WriteRejected(`Unsupported write operation: ${String(write.operation)}`);
+        }
+        const rs = await attachment.executeQuery(tx, 'SELECT CURRENT_TRANSACTION FROM RDB$DATABASE');
+        const rows = await rs.fetch();
+        await rs.close();
+        const id = Number(rows[0]?.[0] ?? 0);
+        await tx.commit();
+        return id;
+      } catch (err) {
+        await tx.rollback().catch(() => undefined);
+        throw err;
+      }
+    });
+    signal();
+    return { txid };
+  };
+
   const prune = async (before?: Date): Promise<number> => {
     if (closed) return 0;
     return serialized(attachment, () => pruneLog(attachment, before ?? new Date(Date.now() - (retainLogMs ?? 0))));
@@ -437,6 +588,7 @@ export async function createShapeServer(options: ShapeServerOptions): Promise<Sh
         else res.end();
       });
     },
+    applyWrite,
     prune,
     close: async () => {
       if (closed) return;
@@ -464,6 +616,7 @@ interface Shape {
   columns: TablePlan['columns'];
   schema: Record<string, unknown>;
   where: FirebirdWhere | undefined;
+  replica: 'default' | 'full';
   handle: string;
 }
 
@@ -489,12 +642,18 @@ function shapeOfRequest(params: URLSearchParams, tables: ReadonlyMap<string, Tab
     const names = new Map(table.columns.map((c) => [c.shapeName, quote(c.name)]));
     where = translateWhere(whereText, names, values);
   }
+  const replicaParam = params.get('replica');
+  if (replicaParam !== null && replicaParam !== 'default' && replicaParam !== 'full') {
+    throw new HttpError(400, `replica ${replicaParam} is not supported (expected default or full)`);
+  }
+  const replica: 'default' | 'full' = replicaParam === 'full' ? 'full' : 'default';
+
   // Each shape of a table its own handle: the table alone, as before, when
   // the shape is the whole table.
-  const definition = whereText || columnsParam
-    ? `${table.name}\u0000${columns.map((c) => c.name).join(',')}\u0000${whereText ?? ''}\u0000${JSON.stringify([...values].sort())}`
+  const definition = whereText || columnsParam || replica === 'full'
+    ? `${table.name}\u0000${columns.map((c) => c.name).join(',')}\u0000${whereText ?? ''}\u0000${JSON.stringify([...values].sort())}${replica === 'full' ? '\u0000full' : ''}`
     : table.name;
-  return { table, columns, schema, where, handle: `${epoch}-${hashName(definition)}` };
+  return { table, columns, schema, where, replica, handle: `${epoch}-${hashName(definition)}` };
 }
 
 /** `(k1, k2, …) > (v1, v2, …)`, as Firebird 3 can write it. */

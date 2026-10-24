@@ -9,6 +9,7 @@
  */
 
 import { syncShapeToTable, syncShapesToTables, tableFromSchema, toFirebird, firebirdColumn, firebirdName, checkSchema } from '../electric';
+import { planColumn } from '../electric-server/catalog';
 import type { ElectricDatabase, ElectricSchema, ElectricTransaction } from '../electric';
 import type { FirebirdBrowser } from '../browser/firebird-browser';
 
@@ -182,6 +183,35 @@ describe('syncShapeToTable', () => {
     ]);
   });
 
+  it('applies replica=full updates: upserts full rows and deletes old keys on key changes', async () => {
+    const db = new FakeDb();
+    const { stream } = await start(db);
+    await stream.deliver([insert({ id: '1', title: 'a', done: 'true' }), upToDate], '1_0', SCHEMA);
+    await stream.deliver(
+      [
+        {
+          headers: { operation: 'update' },
+          key: '1',
+          value: { id: '1', title: 'updated', done: 'false' },
+          old_value: { title: 'a', done: 'true' },
+        },
+        {
+          headers: { operation: 'update' },
+          key: '2',
+          value: { id: '2', title: 'rekeyed', done: 'true' },
+          old_value: { id: '1' },
+        },
+        upToDate,
+      ],
+      '2_0',
+    );
+    expect(db.lastData()).toEqual([
+      'UPDATE OR INSERT INTO "ITEMS" ("ID", "TITLE", "DONE") VALUES (?, ?, ?) MATCHING ("ID") [1,"updated",false]',
+      'DELETE FROM "ITEMS" WHERE "ID" = ? [1]',
+      'UPDATE OR INSERT INTO "ITEMS" ("ID", "TITLE", "DONE") VALUES (?, ?, ?) MATCHING ("ID") [2,"rekeyed",true]',
+    ]);
+  });
+
   it('resumes from the stored position, and does not empty the table', async () => {
     const db = new FakeDb();
     const first = await start(db);
@@ -349,6 +379,8 @@ describe('values', () => {
     expect(toFirebird('42', 'c', col('int4'))).toBe(42);
     expect(toFirebird('9007199254740993', 'c', col('int8'))).toBe('9007199254740993');
     expect(toFirebird('12.50', 'c', col('numeric'))).toBe('12.50');
+    expect(toFirebird('1.25E+20', 'c', col('numeric'))).toBe('1.25E+20');
+    expect(toFirebird('-1e-30', 'c', col('decfloat'))).toBe('-1e-30');
     expect(toFirebird('0.1', 'c', col('float8'))).toBe(0.1);
     expect(toFirebird('true', 'c', col('bool'))).toBe(true);
     expect(toFirebird('f', 'c', col('bool'))).toBe(false);
@@ -382,8 +414,27 @@ describe('values', () => {
   });
 
   it('accepts every mapped type, and refuses the rest by name', () => {
-    expect(() => checkSchema({ a: col('int4'), b: col('text', { dims: 2 }), c: col('uuid') })).not.toThrow();
+    expect(() =>
+      checkSchema({ a: col('int4'), b: col('text', { dims: 2 }), c: col('uuid'), d: col('decfloat') }),
+    ).not.toThrow();
     expect(() => checkSchema({ m: col('money') })).toThrow(/m \(money\)/);
+    expect(
+      planColumn({
+        name: 'DF',
+        type: 25,
+        subType: 0,
+        scale: 0,
+        precision: 34,
+        charLength: 16,
+        notNull: false,
+      }),
+    ).toEqual({
+      name: 'DF',
+      shapeName: 'df',
+      select: 'CAST("DF" AS VARCHAR(64))',
+      render: 'text',
+      schema: { type: 'numeric' },
+    });
   });
 
   it('writes a CREATE TABLE for a schema, to review', () => {

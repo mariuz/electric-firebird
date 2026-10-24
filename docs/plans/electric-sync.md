@@ -127,7 +127,7 @@ booleans and JSON; the rest is a mapping this package owns:
 | Postgres (`electric-schema` type) | Firebird column | Value |
 |---|---|---|
 | `int2`, `int4`, `int8` | `SMALLINT`, `INTEGER`, `BIGINT` | number / bigint |
-| `numeric(p,s)` | `NUMERIC(p,s)` (to 38 digits: `INT128` underneath) | the string, exact |
+| `numeric(p,s)`, `decfloat` | `NUMERIC(p,s)` (to 38 digits: `INT128` underneath), `DECFLOAT(16)` / `DECFLOAT(34)` | the string (including scientific notation), exact |
 | `float4`, `float8` | `FLOAT`, `DOUBLE PRECISION` | number |
 | `bool` | `BOOLEAN` | boolean |
 | `text`, `varchar(n)`, `bpchar(n)` | `VARCHAR(n)`, or `BLOB SUB_TYPE TEXT` for unbounded text | string |
@@ -213,8 +213,10 @@ A prototype that proves the read path end to end:
    Firebird SQL in `<firebird-repl>` (#39).
 
 Out of the first step, and since built: several shapes in one transaction
-(`syncShapesToTables`, as PGlite names it). Still out: writes, `replica=full`, subset
-snapshots, and the Node side beyond what the tests need.
+(`syncShapesToTables`, as PGlite names it), optimistic local writes
+(`createWriteQueue`) and the server-side `server.applyWrite(write)` companion,
+and `replica=full` support on both the shape server and client sync. Still out:
+subset snapshots, and the Node side beyond what the tests need.
 
 ## Questions to decide first
 

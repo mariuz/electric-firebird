@@ -401,7 +401,12 @@ async function syncShapes(
       if (stopped || state.stream !== stream) return;
       for (const message of messages) {
         if (isChangeMessage(message)) {
-          state.pending.push({ kind: message.headers.operation, value: message.value as Record<string, unknown> });
+          const oldValue = (message as { old_value?: Record<string, unknown> }).old_value;
+          state.pending.push({
+            kind: message.headers.operation,
+            value: message.value as Record<string, unknown>,
+            ...(oldValue !== undefined ? { oldValue } : {}),
+          });
           state.dirty = true;
           const txids = (message.headers as { txids?: Array<number | string> }).txids;
           if (txids) for (const t of txids) state.txids.add(String(t));

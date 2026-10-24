@@ -559,8 +559,9 @@ Legend: ✅ shipped · 🟡 partial · ❌ missing · n/a not applicable
 | Template-literal `` sql`…` `` tag | ✅ | ✅ | Values bind as `?` parameters; fragments nest. `sql.identifier()` quotes names, `sql.join()` expands `IN` lists, `sql.unsafe()` is the named escape hatch |
 | `exec(sql)` multi-statement script → array of results | ✅ | ✅ | Splitting respects strings, identifiers, comments and `SET TERM` |
 | `rowMode: 'object' \| 'array'` | ✅ | ✅ | Per query, on both backends. Names stay in `fields`. Worth it less for speed (1.1× on 10k rows, since the generated constructor already made object building cheap) than for `SELECT a.ID, b.ID`, which object mode can only half-represent |
-| Custom `parsers` / `serializers` | ✅ | 🟡 | `types: { parsers, serializers }` on the browser backend. Parsers key on the Firebird type code and replace the built-in conversion; serializers are a list, because an outgoing parameter has no declared type to key on. Not on the Node backend, whose driver reports no type codes |
-| `describeQuery()` | ✅ | ✅ | Prepares and drops the statement, executing nothing. WASM reports parameter *and* column types plus the statement kind; Node reports column names and the kind, and `params` is `undefined` there because the native driver exposes no input metadata |
+| `queryStream(sql, params, options)` | — | ✅ | Async-iterable cursor batching (`batchSize` default 500) on both backends and inside transactions; breaking out of `for await` closes the cursor and finishes the transaction immediately |
+| Custom `parsers` / `serializers` | ✅ | ✅ | `types: { bigint, dates, binary, parsers, serializers }` on both backends (`FirebirdBrowser` and `FirebirdLite`). Parsers key on the Firebird type code and replace the built-in conversion; serializers are a list, because an outgoing parameter has no declared type to key on |
+| `describeQuery()` | ✅ | ✅ | Prepares and drops the statement, executing nothing. Both backends report full output column metadata (`FieldInfo`) and the statement kind; WASM also reports `params`, whereas `params` is `undefined` on Node |
 | Typed field metadata (`dataTypeID`) | ✅ | ✅ | `FieldInfo` carries type, typeName, subType, scale, length, nullable |
 | Affected-row count | ✅ | ✅ | `exec()` returns `{ affectedRows }` |
 | Binary / BLOB values | ✅ | ✅ | Text BLOBs as strings, read and written (a string parameter into a BLOB column is written as a blob); binary as base64 by default, or `Uint8Array` with `types: { binary: true }`, which carries the bytes beside the JSON rather than through it — 6.3× faster to decode on a blob-heavy result set, and transferred rather than cloned across a Worker |
@@ -604,7 +605,7 @@ Legend: ✅ shipped · 🟡 partial · ❌ missing · n/a not applicable
 | CDN distribution | ✅ | ✅ | `cdnArtifacts()` gives the jsDelivr/unpkg URLs and their `locateFile`; both builds tested from another origin |
 | Bundler guides (Vite/webpack) | ✅ | ✅ | Vite, webpack, esbuild and Next.js in [integration.md](./integration.md); `examples/vite` and `examples/webpack` are built and run in CI |
 | Framework hooks (React/Vue) | ✅ | ✅ | `firebird-wasm/react` and `firebird-wasm/vue`: a provider, `useQuery` and `useLiveQuery` |
-| ORM / query-builder support | ✅ | ❌ | |
+| ORM / query-builder support | ✅ | ✅ | `firebird-wasm/kysely` (`FirebirdDialect`, `createKysely`) and `firebird-wasm/drizzle` (`drizzle`, `firebirdTable`) run against both `FirebirdBrowser` and `FirebirdLite`, with `?` parameter binding, `OFFSET ? ROWS FETCH NEXT ? ROWS ONLY`, multi-row `INSERT … SELECT … FROM RDB$DATABASE UNION ALL …`, `UPDATE OR INSERT … MATCHING`, `RETURNING`, transactions + savepoints, cursor streaming, and system-table introspection |
 | Extensions / plugin API | ✅ | n/a | Firebird UDRs are a different model; not a near-term goal |
 | REPL component | ✅ | ✅ | `<firebird-repl>` in `firebird-wasm/repl`, a custom element that works in plain pages, React and Vue |
 
@@ -813,7 +814,8 @@ be built:
 6. ~~**Sync is one-way.**~~ Fixed: `createWriteQueue` applies a write
    locally at once, sends it to the app's API, and keeps it over the sync
    until its transaction comes back.
-7. Everything in §2 marked ❌ — real gaps, but none of them mislead a user.
+7. ~~**Everything in §2 marked ❌.**~~ Closed: `firebird-wasm/kysely` and
+   `firebird-wasm/drizzle` close the last `❌` in §2.
 
 ---
 
@@ -1070,12 +1072,15 @@ gaps it ran into, with its numbers, in rough order of what they would buy.
 - [x] **The cost per value in C.** A value written cost 0.75–1.9 µs above
       the engine's own fetch, against 0.1 µs to decode it in JS; a timestamp
       went through two `IUtil` calls, `snprintf`, a temporary string and an
-      escaping pass. The bridge now decodes dates and times with the engine's
-      own arithmetic and writes digits with `std::to_chars`: timestamps
-      1.9 → 0.7 µs, dates 1.1 → 0.55, doubles 0.95 → 0.65, integers and
-      NUMERICs 0.75–0.85 → 0.55, BOOLEAN (untouched) 0.5 either way. What is
-      left, ~0.5 µs a value of any type, is the per-value loop itself; FLOAT
-      and the time-zone types still use the old path.
+      escaping pass. The bridge now decodes dates, times, and offset-based
+      `TIME WITH TIME ZONE` / `TIMESTAMP WITH TIME ZONE` values (`0..2878`)
+      with the engine's own arithmetic and writes digits with `std::to_chars`
+      (`FLOAT` and `DOUBLE PRECISION` included, and `appendScaledDecimal`
+      writing directly into the output buffer without temporary string shifts):
+      timestamps 1.9 → 0.7 µs, dates 1.1 → 0.55, doubles/floats 0.95 → 0.65,
+      integers and NUMERICs 0.75–0.85 → 0.55, BOOLEAN (untouched) 0.5 either
+      way. What is left, ~0.5 µs a value of any type, is the per-value loop
+      itself.
 - [x] **`execBatch` on the Node backend.** It prepared once and looped, one
       execute and one round trip per row; the browser's runs as one `IBatch`
       request. The Node driver binds no `IBatch`: not node-firebird-native-api
@@ -1093,7 +1098,11 @@ gaps it ran into, with its numbers, in rough order of what they would buy.
       native `gpre_boot` against the source tree's 32-bit-edited
       `autoconfig.h` (git-ignored, so it survives a cleaned submodule). Fixed
       in #17; CI only ever builds once, from a fresh checkout, which is why
-      none of these showed there. Still open: a CI job that builds twice.
+      none of these showed there. `build-wasm.yml` now runs an incremental
+      rebuild step after wiping `build-native-config` and `.wasm-patches-applied`
+      and touching `fb_wasm_api.cpp`, and `build.sh` preserves the timestamps
+      of unchanged `autoconfig.h`, `parse.h` / `parse.cpp`, and `epp-generated`
+      outputs so the second pass only recompiles the touched translation unit.
 - [x] **The linter runs.** `npm run lint` had a script and its dependencies
       but no configuration, so it never ran. Fixed in #15, with a CI step.
 - [x] **No `SharedArrayBuffer` requirement.** Every static-hosted consumer
@@ -1124,6 +1133,16 @@ gaps it ran into, with its numbers, in rough order of what they would buy.
       round, 50 000-row inserts, deletes and updates, and the scan that meets
       a deleted table's garbage all cost the same within noise, and so does a
       `firebird-quake2` tic (4.9–5.6 ms idle, 10.5–12 walking, either way).
+- [x] **Cursor / streaming query API (`queryStream()`).** `query()`
+      materialises the entire result set into memory at once. `queryStream()`
+      (on `FirebirdBrowser`, `FirebirdBrowserTransaction`, `FirebirdLite`, and
+      `FirebirdTransaction`) returns an async iterable yielding
+      `QueryResult<T>` batches of `batchSize` rows (default 500) over an open
+      cursor (`fb_cursor_open` / `fb_cursor_fetch` / `fb_cursor_close` in the
+      WASM C bridge, `ResultSet.fetch({ fetchSize })` on Node). Breaking out
+      of `for await` early closes the cursor, releases the statement, and
+      finishes the transaction immediately without fetching the rest of the
+      table.
 
 ### M5 — Ecosystem
 
@@ -1139,18 +1158,29 @@ gaps it ran into, with its numbers, in rough order of what they would buy.
       [plans/electric-sync.md](./plans/electric-sync.md). **The read path
       is in:** `firebird-wasm/electric`'s `syncShapeToTable`, tested in
       Chromium against a real Postgres and Electric in CI (types, live
-      changes, resume after a reload, must-refetch). A demo:
+      changes, resume after a reload, must-refetch, `replica=full`). A demo:
       [`examples/electric`](../examples/electric) syncs from both kinds of
       source into one page, tested against real containers in CI. `bytea`
       maps to a binary BLOB, which the engine now binds bytes into;
       `syncShapesToTables` applies several shapes in one transaction; and
       `createWriteQueue` is the write path: local writes at once, sent to
-      the app's API, kept over the sync until their transaction comes back.
+      the app's API (with `server.applyWrite(write)` on `ShapeServer` as the
+      server-side companion), kept over the sync until their transaction comes
+      back.
       **A Firebird server as the source** works the same way through
       `firebird-wasm/electric-server` (Electric reads only Postgres), with
-      `where`, paged snapshots, a pruned log, event wake-ups and several
-      servers per database: see
+      `where`, paged snapshots, batched changed-key lookups, `replica=full`,
+      `DECFLOAT` support, `applyWrite`, a pruned log, event wake-ups and
+      several servers per database: see
       [plans/firebird-shape-server.md](./plans/firebird-shape-server.md).
+- [x] ORM / query-builder dialects: `firebird-wasm/kysely` (`FirebirdDialect`,
+      `createKysely`) and `firebird-wasm/drizzle` (`drizzle`, `firebirdTable`)
+      run against both `FirebirdBrowser` and `FirebirdLite`. Both compile `?`
+      positional placeholders, `OFFSET ? ROWS FETCH NEXT ? ROWS ONLY`
+      pagination, multi-row `INSERT INTO … SELECT … FROM RDB$DATABASE UNION ALL …`,
+      `UPDATE OR INSERT INTO … MATCHING (…)` upserts, `INSERT`/`UPDATE`/`DELETE … RETURNING`,
+      Firebird transaction isolation levels + savepoints, cursor streaming via
+      `queryStream`, and bijective lowercase/uppercase identifier mapping.
 - [ ] A Firebird version build matrix. The submodule tracks `master` and the
       shipped engine reports `ENGINE_VERSION 6.0.0`, so the recurring "Firebird
       4 & 5 support" line was always mis-stated: what is missing is *testing

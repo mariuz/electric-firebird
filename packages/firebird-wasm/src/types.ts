@@ -2,6 +2,8 @@
  * TypeScript types for FirebirdLite
  */
 
+import type { TypeOptions } from './browser/value-types';
+
 /**
  * Options for creating a FirebirdLite instance.
  */
@@ -41,6 +43,15 @@ export interface FirebirdLiteOptions {
    * @default 0
    */
   statementCache?: number;
+  /**
+   * Opt-in conversions from the wire types (`string` for exact numbers and
+   * dates, base64 for binary BLOBs) to `bigint`, `Date` and `Uint8Array`,
+   * plus custom `parsers` and `serializers`.
+   *
+   * Everything defaults to off. See {@link TypeOptions} for what each
+   * conversion trades away.
+   */
+  types?: TypeOptions;
 }
 
 /**
@@ -58,8 +69,8 @@ export interface QueryResult<T = Row> {
 /**
  * Information about a result set column.
  *
- * Everything beyond `name` is optional because the Node.js native driver does
- * not expose it; the WASM backend fills it in.
+ * Populated from Firebird's prepared output metadata on both the WASM and
+ * Node.js backends.
  */
 export interface FieldInfo {
   /** Column name (alias if provided, otherwise the field name). */
@@ -179,6 +190,18 @@ export interface QueryOptions extends TransactionOptions {
 export type ArrayRow = unknown[];
 
 /**
+ * Options accepted by `queryStream()`.
+ */
+export interface QueryStreamOptions extends QueryOptions {
+  /**
+   * Maximum number of rows fetched per cursor batch.
+   *
+   * @default 500
+   */
+  batchSize?: number;
+}
+
+/**
  * What a statement is, from Firebird's `isc_info_sql_stmt_*` codes.
  *
  * `'UNKNOWN'` covers a code this library does not name rather than a failure
@@ -213,7 +236,7 @@ export interface QueryDescription {
    * One entry per `?`, in order.
    *
    * `undefined` where the backend cannot report them — the Node driver
-   * exposes no input metadata, and an empty array there would claim the
+   * exposes no public input metadata, and an empty array there would claim the
    * statement takes no parameters.
    */
   params?: FieldInfo[];

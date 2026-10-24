@@ -1,4 +1,6 @@
+import * as os from 'os';
 import {
+  Blob as FbBlob,
   TransactionIsolation,
 } from 'node-firebird-driver';
 import type {
@@ -14,6 +16,7 @@ import type {
   QueryDescription,
   QueryResult,
   QueryOptions,
+  QueryStreamOptions,
   Row,
   QueryParams,
   RowMode,
@@ -21,12 +24,17 @@ import type {
   FieldInfo,
 } from './types';
 import { statementKind } from './statement-types';
-import { toStatement, resolveQueryCall } from './sql-tag';
+import { firebirdTypeName } from './browser/field-types';
+import { applyTypes, applySerializers } from './browser/value-types';
+import type { TypeOptions } from './browser/value-types';
+import { toStatement, resolveQueryCall, resolveBatchSize } from './sql-tag';
 import { blockParamType, buildBlock, placeholderOffsets } from './batch-block';
 import type { CharacterSet, ParamDescriptor } from './batch-block';
-import type { SqlFragment } from './sql-tag';
+import type { SqlFragment, Statement as ParsedStatement } from './sql-tag';
 
 type NativeDriver = typeof import('node-firebird-driver-native');
+
+const littleEndian = os.endianness() === 'LE';
 
 /** `isc_info_sql_stmt_select`: the statement type the shared read transaction runs. */
 const STMT_SELECT = 1;
@@ -58,6 +66,8 @@ function loadNativeDriver(): NativeDriver {
 
 /** `QueryOptions` with the array mode pinned, for the overloads below. */
 type ArrayModeOptions = QueryOptions & { rowMode: 'array' };
+/** `QueryStreamOptions` with the array mode pinned, for the overloads below. */
+type ArrayStreamOptions = QueryStreamOptions & { rowMode: 'array' };
 
 /**
  * FirebirdLite – a PGlite-style wrapper around Firebird Embedded.
@@ -90,6 +100,7 @@ export class FirebirdLite {
   private readonly statementCacheSize: number;
   /** Statements kept prepared by their SQL text, once connected (`statementCache`). */
   private statements: StatementCache | null = null;
+  private readonly types: TypeOptions | undefined;
 
   constructor(dbPath: string, options: FirebirdLiteOptions = {}) {
     this.dbPath = dbPath;
@@ -105,6 +116,11 @@ export class FirebirdLite {
       throw new RangeError('statementCache is a whole number of statements, 0 or more');
     }
     this.statementCacheSize = size;
+    this.types = options.types;
+  }
+
+  private serialize(params: QueryParams): QueryParams {
+    return applySerializers(params, this.types?.serializers);
   }
 
   /**
@@ -216,26 +232,26 @@ export class FirebirdLite {
     }
     await this.endReadTransaction();
 
+    const serializedParams = this.serialize(statement.params);
     const txOptions = buildTransactionOptions(options);
     const transaction = await attachment.startTransaction(txOptions);
 
+    let rows: T[];
+    let fields: FieldInfo[];
     try {
       const lease = await this.statements!.acquire(transaction, statement.sql);
       const stmt = lease.stmt;
 
-      let rows: T[];
-      let fields: FieldInfo[];
       // Released in `finally`, not after the fetch: a statement that throws on
       // execute — a lock conflict, an overflow, a wrong parameter count — would
       // otherwise leak its handle, and the retry loop such failures are usually
       // wrapped in leaks one per attempt until the attachment refuses more.
       let failed = true;
       try {
-        const columnLabels = await stmt.columnLabels;
-        fields = columnLabels.map((label) => ({ name: label }));
+        fields = await outputFields(stmt);
 
         rows = shapeRows<T>(
-          await fetchRows(stmt, transaction, statement.params, fields.length),
+          await fetchRows(stmt, transaction, serializedParams, fields, this.types),
           fields,
           rowMode,
         );
@@ -247,10 +263,125 @@ export class FirebirdLite {
       // After the statement is disposed, as before — the commit is the last
       // thing that happens on the success path.
       await transaction.commit();
-      return { rows, fields };
     } catch (err) {
       await transaction.rollback().catch(() => undefined);
       throw err;
+    }
+
+    return applyTypes({ rows, fields }, this.types, rowMode);
+  }
+
+  /**
+   * Stream a SQL query's result set in batches of `batchSize` rows (default 500).
+   *
+   * Yields one `QueryResult<T>` batch per cursor fetch instead of materialising
+   * the entire result set into memory at once.  Breaking out of the `for await`
+   * loop early closes the cursor and finishes the transaction immediately.
+   */
+  queryStream(
+    sql: SqlFragment,
+    options: ArrayStreamOptions,
+  ): AsyncIterableIterator<QueryResult<ArrayRow>>;
+  queryStream(
+    sql: string | SqlFragment,
+    params: QueryParams | undefined,
+    options: ArrayStreamOptions,
+  ): AsyncIterableIterator<QueryResult<ArrayRow>>;
+  queryStream<T extends Row = Row>(
+    sql: SqlFragment,
+    options?: QueryStreamOptions,
+  ): AsyncIterableIterator<QueryResult<T>>;
+  queryStream<T extends Row = Row>(
+    sql: string,
+    params?: QueryParams,
+    options?: QueryStreamOptions,
+  ): AsyncIterableIterator<QueryResult<T>>;
+  queryStream<T extends Row = Row>(
+    sql: string | SqlFragment,
+    params?: QueryParams,
+    options?: QueryStreamOptions,
+  ): AsyncIterableIterator<QueryResult<T>>;
+  queryStream<T = Row>(
+    sql: string | SqlFragment,
+    paramsOrOptions: QueryParams | QueryStreamOptions = [],
+    maybeOptions: QueryStreamOptions = {},
+  ): AsyncIterableIterator<QueryResult<T>> {
+    const { statement, options } = resolveQueryCall<QueryStreamOptions>(
+      sql,
+      paramsOrOptions,
+      maybeOptions,
+    );
+    const batchSize = resolveBatchSize(options.batchSize);
+    return this.streamQuery<T>(statement, options, batchSize);
+  }
+
+  private async *streamQuery<T>(
+    statement: ParsedStatement,
+    options: QueryStreamOptions,
+    batchSize: number,
+  ): AsyncIterableIterator<QueryResult<T>> {
+    await this.ensureReady();
+    const rowMode: RowMode = options.rowMode ?? 'object';
+    const attachment = this.attachment!;
+    await this.endReadTransaction();
+
+    const serializedParams = this.serialize(statement.params);
+    const txOptions = buildTransactionOptions(options);
+    const transaction = await attachment.startTransaction(txOptions);
+
+    let engineFailed = false;
+    let lease: StatementLease | undefined;
+    let txFinished = false;
+
+    try {
+      try {
+        lease = await this.statements!.acquire(transaction, statement.sql);
+      } catch (err) {
+        engineFailed = true;
+        throw err;
+      }
+      const stmt = lease.stmt;
+
+      let fields: FieldInfo[];
+      try {
+        fields = await outputFields(stmt);
+      } catch (err) {
+        engineFailed = true;
+        throw err;
+      }
+
+      yield* streamRows<T>(
+        stmt,
+        transaction,
+        serializedParams,
+        fields,
+        rowMode,
+        batchSize,
+        this.types,
+        () => {
+          engineFailed = true;
+        },
+      );
+
+      const toRelease = lease;
+      lease = undefined;
+      await toRelease.release(false);
+
+      txFinished = true;
+      await transaction.commit();
+    } finally {
+      if (lease) {
+        await lease.release(engineFailed);
+      }
+      if (!txFinished) {
+        if (engineFailed) {
+          await transaction.rollback().catch(() => undefined);
+        } else {
+          await transaction
+            .commit()
+            .catch(() => transaction.rollback().catch(() => undefined));
+        }
+      }
     }
   }
 
@@ -268,6 +399,7 @@ export class FirebirdLite {
     params: QueryParams,
     rowMode: RowMode,
   ): Promise<QueryResult<T> | undefined> {
+    const serializedParams = this.serialize(params);
     const attachment = this.attachment!;
     this.readTransaction ??= await attachment.startTransaction({
       isolation: TransactionIsolation.READ_COMMITTED,
@@ -286,16 +418,15 @@ export class FirebirdLite {
     const stmt = lease.stmt;
     // A writing SELECT stays kept: only the transaction was wrong for it.
     let failed = false;
+    let fields: FieldInfo[];
+    let rawRows: unknown[][];
     try {
       if ((await stmt.type) !== STMT_SELECT) {
         this.remember(sql);
         return undefined;
       }
-      const fields: FieldInfo[] = (await stmt.columnLabels).map((label) => ({
-        name: label,
-      }));
-      const rawRows = await fetchRows(stmt, transaction, params, fields.length);
-      return { rows: shapeRows<T>(rawRows, fields, rowMode), fields };
+      fields = await outputFields(stmt);
+      rawRows = await fetchRows(stmt, transaction, serializedParams, fields, this.types);
     } catch (err) {
       // The native driver's errors carry only the message text.
       if (/attempted update during read-only transaction/.test(String((err as Error)?.message))) {
@@ -308,6 +439,7 @@ export class FirebirdLite {
     } finally {
       await lease.release(failed);
     }
+    return applyTypes({ rows: shapeRows<T>(rawRows, fields, rowMode), fields }, this.types, rowMode);
   }
 
   private remember(sql: string): void {
@@ -335,19 +467,16 @@ export class FirebirdLite {
    *
    * ```ts
    * const shape = await db.describeQuery('SELECT id, name FROM items WHERE id = ?');
-   * // shape.fields        → [{ name: 'ID' }, { name: 'NAME' }]
+   * // shape.fields        → [{ name: 'ID', type: 496, typeName: 'INTEGER', ... }, ...]
    * // shape.statementType → 'SELECT'
    * ```
    *
    * The statement is prepared and disposed, so nothing runs: describing an
    * `INSERT` inserts nothing.
    *
-   * **`params` is `undefined` here.** The native driver exposes no input
-   * metadata — `Statement` offers `columnLabels`, `hasResultSet` and `type`
-   * and nothing about `?` placeholders — and an empty array would claim the
-   * statement takes none. `fields` carries names only, for the same reason
-   * `FieldInfo` does everywhere on this backend. The WASM backend reports both
-   * in full.
+   * **`params` is `undefined` here.** The native driver exposes no public input
+   * metadata, and an empty array would claim the statement takes none. `fields`
+   * carries the full {@link FieldInfo} from the prepared output metadata.
    */
   async describeQuery(sql: string | SqlFragment): Promise<QueryDescription> {
     await this.ensureReady();
@@ -358,12 +487,12 @@ export class FirebirdLite {
     try {
       const stmt = await attachment.prepare(transaction, text);
       try {
-        const columnLabels = await stmt.columnLabels;
+        const fields = await outputFields(stmt);
         const type = await stmt.type;
 
         return {
           params: undefined,
-          fields: columnLabels.map((label) => ({ name: label })),
+          fields,
           statementType: statementKind(type),
           hasResultSet: stmt.hasResultSet,
         };
@@ -400,6 +529,7 @@ export class FirebirdLite {
       transaction,
       () => this.endReadTransaction(),
       this.statements ?? undefined,
+      this.types,
     );
 
     let result: T;
@@ -456,7 +586,12 @@ export class FirebirdTransaction {
     private readonly transaction: Transaction,
     private readonly beforeStatement: () => Promise<void> = async () => undefined,
     private readonly statements: StatementCache = new StatementCache(attachment, 0),
+    private readonly types?: TypeOptions,
   ) {}
+
+  private serialize(params: QueryParams): QueryParams {
+    return applySerializers(params, this.types?.serializers);
+  }
 
   /** Whether this transaction has already been rolled back. */
   get isFinished(): boolean {
@@ -489,14 +624,15 @@ export class FirebirdTransaction {
     this.assertUsable();
     await this.beforeStatement();
     const statement = toStatement(sql, params);
+    const serialized = this.serialize(statement.params);
     // With the cache off, a statement without parameters runs as it always
     // did. With it on, every statement goes through the cache, which is also
     // what sees DDL coming and empties itself first.
-    if (statement.params.length > 0 || this.statements.enabled) {
+    if (serialized.length > 0 || this.statements.enabled) {
       const lease = await this.statements.acquire(this.transaction, statement.sql);
       let failed = true;
       try {
-        await lease.stmt.execute(this.transaction, await bindParams(lease.stmt, this.transaction, statement.params));
+        await lease.stmt.execute(this.transaction, await bindParams(lease.stmt, this.transaction, serialized));
         failed = false;
       } finally {
         await lease.release(failed);
@@ -517,14 +653,17 @@ export class FirebirdTransaction {
       throw new TypeError('execBatch takes an array of parameter rows');
     }
     if (rows.length === 0) return;
+    const serializedRows = this.types?.serializers?.length
+      ? rows.map((row) => this.serialize(row))
+      : rows;
     const lease = await this.statements.acquire(this.transaction, sql);
     let failed = true;
     try {
-      const plan = rows.length > 1 ? await this.blockPlan(sql, lease.stmt) : undefined;
+      const plan = serializedRows.length > 1 ? await this.blockPlan(sql, lease.stmt) : undefined;
       if (plan) {
-        await this.executeInBlocks(lease.stmt, plan, rows);
+        await this.executeInBlocks(lease.stmt, plan, serializedRows);
       } else {
-        for (const row of rows) {
+        for (const row of serializedRows) {
           await lease.stmt.execute(this.transaction, await bindParams(lease.stmt, this.transaction, row));
         }
       }
@@ -546,7 +685,7 @@ export class FirebirdTransaction {
     const type = await stmt.type;
     // INSERT, UPDATE, DELETE, EXECUTE PROCEDURE; nothing with a result.
     if (![2, 3, 4, 8].includes(type) || stmt.hasResultSet) return undefined;
-    if ((await stmt.columnLabels).length > 0) return undefined;
+    if ((await outputFields(stmt)).length > 0) return undefined;
 
     const params = await inputParams(stmt);
     const offsets = placeholderOffsets(sql);
@@ -631,6 +770,7 @@ export class FirebirdTransaction {
     this.assertUsable();
     await this.beforeStatement();
     const statement = toStatement(sql, params);
+    const serialized = this.serialize(statement.params);
     const rowMode = options.rowMode ?? 'object';
 
     const lease = await this.statements.acquire(this.transaction, statement.sql);
@@ -639,17 +779,93 @@ export class FirebirdTransaction {
     // throws must still be released. More so here, because a transaction
     // callback that catches its own errors goes on using the same attachment.
     let failed = true;
+    let fields: FieldInfo[];
+    let rawRows: unknown[][];
     try {
-      const columnLabels = await stmt.columnLabels;
-      const fields: FieldInfo[] = columnLabels.map((label) => ({
-        name: label,
-      }));
-
-      const rawRows = await fetchRows(stmt, this.transaction, statement.params, fields.length);
+      fields = await outputFields(stmt);
+      rawRows = await fetchRows(stmt, this.transaction, serialized, fields, this.types);
       failed = false;
-      return { rows: shapeRows<T>(rawRows, fields, rowMode), fields };
     } finally {
       await lease.release(failed);
+    }
+    return applyTypes({ rows: shapeRows<T>(rawRows, fields, rowMode), fields }, this.types, rowMode);
+  }
+
+  /**
+   * Stream a SELECT statement inside this transaction in batches of `batchSize` rows.
+   */
+  queryStream(
+    sql: SqlFragment,
+    options: { rowMode: 'array'; batchSize?: number },
+  ): AsyncIterableIterator<QueryResult<ArrayRow>>;
+  queryStream(
+    sql: string | SqlFragment,
+    params: QueryParams | undefined,
+    options: { rowMode: 'array'; batchSize?: number },
+  ): AsyncIterableIterator<QueryResult<ArrayRow>>;
+  queryStream<T extends Row = Row>(
+    sql: SqlFragment,
+    options?: { rowMode?: RowMode; batchSize?: number },
+  ): AsyncIterableIterator<QueryResult<T>>;
+  queryStream<T extends Row = Row>(
+    sql: string | SqlFragment,
+    params?: QueryParams,
+    options?: { rowMode?: RowMode; batchSize?: number },
+  ): AsyncIterableIterator<QueryResult<T>>;
+  queryStream<T = Row>(
+    sql: string | SqlFragment,
+    paramsOrOptions: QueryParams | { rowMode?: RowMode; batchSize?: number } = [],
+    maybeOptions: { rowMode?: RowMode; batchSize?: number } = {},
+  ): AsyncIterableIterator<QueryResult<T>> {
+    this.assertUsable();
+    const { statement, options } = resolveQueryCall<{
+      rowMode?: RowMode;
+      batchSize?: number;
+    }>(sql, paramsOrOptions, maybeOptions);
+    const batchSize = resolveBatchSize(options.batchSize);
+    return this.streamQuery<T>(
+      statement,
+      options.rowMode ?? 'object',
+      batchSize,
+    );
+  }
+
+  private async *streamQuery<T>(
+    statement: ParsedStatement,
+    rowMode: RowMode,
+    batchSize: number,
+  ): AsyncIterableIterator<QueryResult<T>> {
+    this.assertUsable();
+    await this.beforeStatement();
+
+    const serialized = this.serialize(statement.params);
+    let engineFailed = false;
+    const lease = await this.statements.acquire(this.transaction, statement.sql);
+    const stmt = lease.stmt;
+
+    try {
+      let fields: FieldInfo[];
+      try {
+        fields = await outputFields(stmt);
+      } catch (err) {
+        engineFailed = true;
+        throw err;
+      }
+
+      yield* streamRows<T>(
+        stmt,
+        this.transaction,
+        serialized,
+        fields,
+        rowMode,
+        batchSize,
+        this.types,
+        () => {
+          engineFailed = true;
+        },
+      );
+    } finally {
+      await lease.release(engineFailed);
     }
   }
 }
@@ -662,9 +878,9 @@ export class FirebirdTransaction {
  * one of the engine's 256 contexts per row, so 200 leaves room. */
 const BLOCK_ROWS = 200;
 
-// The driver's statement internals this file reads and, for text, rewrites.
-// Not public API: each use checks they are there and falls back to the
-// driver's own behaviour when they are not.
+// The driver's statement internals this file reads and, for text/exact types,
+// rewrites. Not public API: each use checks they are there and falls back to
+// the driver's own behaviour when they are not.
 
 interface NativeMetadata {
   getCountSync(status: unknown): number;
@@ -673,6 +889,10 @@ interface NativeMetadata {
   getLengthSync(status: unknown, i: number): number;
   getScaleSync(status: unknown, i: number): number;
   getCharSetSync(status: unknown, i: number): number;
+  getOffsetSync(status: unknown, i: number): number;
+  getNullOffsetSync(status: unknown, i: number): number;
+  getAliasSync?(status: unknown, i: number): string;
+  isNullableSync?(status: unknown, i: number): boolean;
   getMessageLengthSync(status: unknown): number;
   getBuilderSync(status: unknown): NativeMetadataBuilder;
   releaseSync(): number;
@@ -695,23 +915,55 @@ interface InputMessage {
   dataWriter: unknown;
 }
 
-type NativeStatement = Partial<InputMessage> & {
-  attachment?: Attachment & {
-    client?: { statusAction?: <T>(fn: (status: unknown) => Promise<T>) => Promise<T> };
-  };
-  internalDispose?: () => Promise<void>;
-  statementHandle?: { getInputMetadataAsync?: (status: unknown) => Promise<NativeMetadata | undefined> };
-};
+/** What the driver decodes a statement's output row with: the message and its reader. */
+interface OutputMessage {
+  outMetadata: NativeMetadata | undefined;
+  outBuffer: Uint8Array | undefined;
+  dataReader: unknown;
+}
 
-/** A statement's parameters as prepared, and the input messages made for text. */
+interface OutputDescriptor {
+  msgType: number;
+  preparedType: number;
+  subType: number;
+  scale: number;
+  length: number;
+  preparedLength: number;
+  charSet: number;
+  preparedCharSet: number;
+  offset: number;
+  nullOffset: number;
+}
+
+type NativeStatement = Partial<InputMessage> &
+  Partial<OutputMessage> & {
+    attachment?: Attachment & {
+      charSetForNONE?: string;
+      client?: { statusAction?: <T>(fn: (status: unknown) => Promise<T>) => Promise<T> };
+    };
+    internalDispose?: () => Promise<void>;
+    statementHandle?: {
+      getInputMetadataAsync?: (status: unknown) => Promise<NativeMetadata | undefined>;
+      getOutputMetadataAsync?: (status: unknown) => Promise<NativeMetadata | undefined>;
+    };
+  };
+
+/** A statement's parameters and output columns as prepared, and the messages made for it. */
 interface Binding {
   params: ParamDescriptor[] | undefined;
-  /** The driver's own message, kept while another is in place. */
+  fields?: FieldInfo[];
+  outDescriptors?: OutputDescriptor[];
+  /** The driver's own input message, kept while another is in place. */
   original?: InputMessage;
-  /** Messages by the positions they take as text: `"1,3"`. */
+  /** The driver's own output message, kept while customOut is in place. */
+  originalOut?: OutputMessage;
+  /** Custom output metadata that avoids the driver's lossy SQL_DOUBLE rewrite. */
+  customOut?: NativeMetadata;
+  /** Input messages by the positions they take as text: `"1,3"`. */
   variants: Map<string, InputMessage>;
-  /** The positions of the message in place; `''` is the driver's own. */
+  /** The positions of the input message in place; `''` is the driver's own. */
   current: string;
+  disposeHooked?: boolean;
 }
 
 const bindings = new WeakMap<Statement, Binding>();
@@ -722,9 +974,38 @@ async function bindingOf(stmt: Statement): Promise<Binding> {
     // Read before anything here rewrites the message; a statement is used
     // by one call at a time, so nothing else reads it meanwhile.
     binding = { params: await readInputParams(stmt), variants: new Map(), current: '' };
+    await setupOutput(stmt, binding);
     bindings.set(stmt, binding);
   }
   return binding;
+}
+
+/**
+ * Return a fresh copy of `stmt`'s output column metadata (`FieldInfo[]`).
+ *
+ * When the native driver's prepared output metadata is available, each entry
+ * carries `type`, `typeName`, `subType`, `scale`, `length` and `nullable`,
+ * matching `FirebirdBrowser`. Falls back to `stmt.fields` (for unit test stubs)
+ * or `stmt.columnLabels` (names only).
+ */
+async function outputFields(stmt: Statement): Promise<FieldInfo[]> {
+  const binding = await bindingOf(stmt);
+  if (binding.fields) {
+    return binding.fields.map((f) => ({ ...f }));
+  }
+  const mockFields = (stmt as unknown as { fields?: FieldInfo[] }).fields;
+  if (Array.isArray(mockFields)) {
+    binding.fields = mockFields.map((f) => ({
+      ...f,
+      ...(f.type !== undefined && f.typeName === undefined
+        ? { typeName: firebirdTypeName(f.type, f.scale ?? 0) }
+        : {}),
+    }));
+    return binding.fields.map((f) => ({ ...f }));
+  }
+  const columnLabels = await stmt.columnLabels;
+  binding.fields = columnLabels.map((label) => ({ name: label }));
+  return binding.fields.map((f) => ({ ...f }));
 }
 
 /**
@@ -779,25 +1060,442 @@ async function readInputParams(stmt: Statement): Promise<ParamDescriptor[] | und
   }
 }
 
-/** `SQL_BLOB`, without the nullable bit. */
-const SQL_BLOB = 520;
-/** `SQL_DOUBLE`: what the driver binds every integer and NUMERIC as. */
-const SQL_DOUBLE = 480;
-/** SMALLINT, INTEGER, BIGINT, and NUMERIC / DECIMAL kept in them. */
-const INTEGER_TYPES: ReadonlySet<number> = new Set([500, 496, 580]);
-/** `SQL_VARYING`. */
+// Firebird SQL type codes (without the nullable low bit).
+const SQL_TEXT = 452;
 const SQL_VARYING = 448;
-/** Character set id of UTF8. */
+const SQL_SHORT = 500;
+const SQL_LONG = 496;
+const SQL_FLOAT = 482;
+const SQL_DOUBLE = 480;
+const SQL_D_FLOAT = 530;
+const SQL_TIMESTAMP = 510;
+const SQL_BLOB = 520;
+const SQL_TYPE_TIME = 560;
+const SQL_TYPE_DATE = 570;
+const SQL_INT64 = 580;
+const SQL_TIMESTAMP_TZ = 32754;
+const SQL_TIME_TZ = 32756;
+const SQL_INT128 = 32752;
+const SQL_DEC16 = 32760;
+const SQL_DEC34 = 32762;
+const SQL_BOOLEAN = 32764;
+const SQL_NULL = 32766;
+
+/** SMALLINT, INTEGER, BIGINT, and NUMERIC / DECIMAL kept in them. */
+const INTEGER_TYPES: ReadonlySet<number> = new Set([SQL_SHORT, SQL_LONG, SQL_INT64]);
+/** Character set ids from Firebird's `RDB$CHARACTER_SETS`. */
+const CHARSET_OCTETS = 1;
+const CS_UNICODE_FSS = 3;
 const CS_UTF8 = 4;
+/** `Number.MAX_SAFE_INTEGER` as a `bigint`: beyond this, IEEE-754 doubles round. */
+const SAFE_INT64 = 9007199254740991n;
+/**
+ * Firebird 4+ output types whose binary format needs `IUtil` (`IInt128`,
+ * `IDecFloat16`/`34`, `decodeTimeTz`/`decodeTimeStampTz`): coerced in the
+ * output message to `SQL_VARYING` so Firebird formats them directly.
+ */
+const COERCE_TO_VARYING: ReadonlySet<number> = new Set([
+  SQL_INT128,
+  SQL_DEC16,
+  SQL_DEC34,
+  SQL_TIME_TZ,
+  SQL_TIMESTAMP_TZ,
+]);
 /**
  * DATE, TIME, TIMESTAMP, and TIME / TIMESTAMP WITH TIME ZONE in both forms
  * (the driver rewrites the zoned ones to their `_EX` forms).
  */
 const DATE_TIME_TYPES: ReadonlySet<number> = new Set([570, 560, 510, 32756, 32754, 32750, 32748]);
 /** The types a string is sent to as text, for Firebird to convert. */
-const TEXT_TYPES: ReadonlySet<number> = new Set([...DATE_TIME_TYPES, ...INTEGER_TYPES]);
+const TEXT_TYPES: ReadonlySet<number> = new Set([
+  ...DATE_TIME_TYPES,
+  ...INTEGER_TYPES,
+  SQL_INT128,
+  SQL_DEC16,
+  SQL_DEC34,
+  SQL_BOOLEAN,
+]);
 /** Bytes a value takes as text: a timestamp with the longest zone name fits twice. */
 const TEXT_LENGTH = 128;
+
+/**
+ * Replace the driver's `outMetadata` and `dataReader` on `stmt` with ones built
+ * from Firebird's prepared output metadata.
+ *
+ * `node-firebird-driver-native`'s `fixMetadata` rewrites `SMALLINT`, `INTEGER`,
+ * `BIGINT`, `FLOAT`, `NUMERIC` and `DECIMAL` to `SQL_DOUBLE` (losing precision
+ * on `BIGINT` past 2^53 and turning exact `NUMERIC`/`DECIMAL` values into
+ * floats), decodes `DATE`/`TIME`/`TIMESTAMP` into local-timezone `Date`
+ * objects (truncating 100 µs fractions), and returns raw `Blob` handles that
+ * expire when `query()` commits its transaction. Keeping the prepared types and
+ * decoding them with the same rules as `fb_wasm_api.cpp` gives Node and
+ * browser queries identical wire values and `FieldInfo` metadata.
+ */
+async function setupOutput(stmt: Statement, binding: Binding): Promise<void> {
+  const internal = stmt as unknown as NativeStatement;
+  const client = internal.attachment?.client;
+  if (
+    typeof internal.statementHandle?.getOutputMetadataAsync !== 'function' ||
+    typeof client?.statusAction !== 'function'
+  ) {
+    return;
+  }
+  if (!internal.outMetadata) {
+    binding.fields = [];
+    return;
+  }
+  try {
+    await client.statusAction(async (status) => {
+      const prepared = await internal.statementHandle!.getOutputMetadataAsync!(status);
+      if (!prepared) {
+        binding.fields = [];
+        return;
+      }
+      try {
+        const count = prepared.getCountSync(status);
+        if (count === 0) {
+          binding.fields = [];
+          return;
+        }
+        const fields: FieldInfo[] = [];
+        const builder = prepared.getBuilderSync(status);
+        let outMetadata: NativeMetadata;
+        try {
+          for (let i = 0; i < count; i++) {
+            const rawType = prepared.getTypeSync(status, i);
+            const type = rawType & ~1;
+            const subType = prepared.getSubTypeSync(status, i);
+            const scale = prepared.getScaleSync(status, i);
+            const length = prepared.getLengthSync(status, i);
+            const nullable =
+              typeof prepared.isNullableSync === 'function'
+                ? Boolean(prepared.isNullableSync(status, i))
+                : (rawType & 1) !== 0;
+            const name =
+              typeof prepared.getAliasSync === 'function'
+                ? prepared.getAliasSync(status, i)
+                : '';
+
+            fields.push({
+              name,
+              type,
+              typeName: firebirdTypeName(type, scale),
+              subType,
+              scale,
+              length,
+              nullable,
+            });
+
+            if (COERCE_TO_VARYING.has(type)) {
+              builder.setTypeSync(status, i, SQL_VARYING);
+              builder.setSubTypeSync(status, i, 0);
+              builder.setLengthSync(status, i, 64);
+              builder.setCharSetSync(status, i, CS_UTF8);
+              builder.setScaleSync(status, i, 0);
+            } else if (type === SQL_D_FLOAT) {
+              builder.setTypeSync(status, i, SQL_DOUBLE);
+              builder.setLengthSync(status, i, 8);
+              builder.setScaleSync(status, i, 0);
+            }
+          }
+          outMetadata = builder.getMetadataSync(status);
+        } finally {
+          builder.releaseSync();
+        }
+
+        const descriptors: OutputDescriptor[] = [];
+        for (let i = 0; i < count; i++) {
+          descriptors.push({
+            msgType: outMetadata.getTypeSync(status, i) & ~1,
+            preparedType: fields[i]!.type!,
+            subType: fields[i]!.subType ?? 0,
+            scale: fields[i]!.scale ?? 0,
+            length: outMetadata.getLengthSync(status, i),
+            preparedLength: fields[i]!.length ?? 0,
+            charSet: outMetadata.getCharSetSync(status, i),
+            preparedCharSet: prepared.getCharSetSync(status, i),
+            offset: outMetadata.getOffsetSync(status, i),
+            nullOffset: outMetadata.getNullOffsetSync(status, i),
+          });
+        }
+
+        binding.fields = fields;
+        binding.outDescriptors = descriptors;
+        binding.originalOut = {
+          outMetadata: internal.outMetadata,
+          outBuffer: internal.outBuffer,
+          dataReader: internal.dataReader,
+        };
+        binding.customOut = outMetadata;
+        hookDispose(internal, binding);
+
+        internal.outMetadata = outMetadata;
+        internal.outBuffer = new Uint8Array(outMetadata.getMessageLengthSync(status));
+        internal.dataReader = createOutputDataReader(descriptors);
+      } finally {
+        prepared.releaseSync();
+      }
+    });
+  } catch {
+    // Fall back to the driver's own output metadata if internals differ.
+  }
+}
+
+function createOutputDataReader(
+  descriptors: OutputDescriptor[],
+): (attachment: unknown, transaction: unknown, buffer: Uint8Array) => Promise<unknown[]> {
+  return async (attachment, _transaction, buffer) => {
+    const dataView = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+    const row = new Array<unknown>(descriptors.length);
+    for (let i = 0; i < descriptors.length; i++) {
+      const d = descriptors[i]!;
+      if (dataView.getInt16(d.nullOffset, littleEndian) === -1) {
+        row[i] = null;
+      } else {
+        row[i] = readColumnValue(d, attachment, buffer, dataView);
+      }
+    }
+    return row;
+  };
+}
+
+function readColumnValue(
+  d: OutputDescriptor,
+  attachment: unknown,
+  buffer: Uint8Array,
+  dataView: DataView,
+): unknown {
+  switch (d.msgType) {
+    case SQL_TEXT: {
+      const raw = buffer.subarray(d.offset, d.offset + d.length);
+      if ((d.preparedCharSet & 0xff) === CHARSET_OCTETS) {
+        return Buffer.from(raw);
+      }
+      const byteLen = charTextLength(raw, d.length, d.preparedCharSet);
+      return decodeText(raw.subarray(0, byteLen), d.preparedCharSet, attachment);
+    }
+
+    case SQL_VARYING: {
+      const varLength = dataView.getUint16(d.offset, littleEndian);
+      const raw = buffer.subarray(d.offset + 2, d.offset + 2 + varLength);
+      if ((d.preparedCharSet & 0xff) === CHARSET_OCTETS) {
+        return Buffer.from(raw);
+      }
+      const text = decodeText(raw, d.charSet, attachment);
+      if (d.preparedType === SQL_TIMESTAMP_TZ) {
+        return text.replace(/^(\d{4}-\d{2}-\d{2}) /, '$1T');
+      }
+      return text;
+    }
+
+    case SQL_SHORT: {
+      const val = dataView.getInt16(d.offset, littleEndian);
+      return d.scale !== 0 ? formatScaledDecimal(BigInt(val), d.scale) : val;
+    }
+
+    case SQL_LONG: {
+      const val = dataView.getInt32(d.offset, littleEndian);
+      return d.scale !== 0 ? formatScaledDecimal(BigInt(val), d.scale) : val;
+    }
+
+    case SQL_INT64: {
+      const val = dataView.getBigInt64(d.offset, littleEndian);
+      if (d.scale !== 0) return formatScaledDecimal(val, d.scale);
+      return val >= -SAFE_INT64 && val <= SAFE_INT64 ? Number(val) : val.toString();
+    }
+
+    case SQL_FLOAT: {
+      const val = dataView.getFloat32(d.offset, littleEndian);
+      return Number.isFinite(val) ? Number(val.toPrecision(9)) : null;
+    }
+
+    case SQL_DOUBLE: {
+      const val = dataView.getFloat64(d.offset, littleEndian);
+      return Number.isFinite(val) ? val : null;
+    }
+
+    case SQL_BOOLEAN:
+      return dataView.getInt8(d.offset) !== 0;
+
+    case SQL_TYPE_DATE:
+      return formatDate(dataView.getInt32(d.offset, littleEndian));
+
+    case SQL_TYPE_TIME:
+      return formatTime(dataView.getUint32(d.offset, littleEndian));
+
+    case SQL_TIMESTAMP:
+      return `${formatDate(dataView.getInt32(d.offset, littleEndian))}T${formatTime(
+        dataView.getUint32(d.offset + 4, littleEndian),
+      )}`;
+
+    case SQL_BLOB:
+      return new FbBlob(attachment as Attachment, buffer.slice(d.offset, d.offset + 8));
+
+    case SQL_NULL:
+    default:
+      return null;
+  }
+}
+
+/**
+ * How many bytes of a `CHAR(n)` buffer represent its `n` characters.
+ * Mirrors `charTextLength` in `fb_wasm_api.cpp`.
+ */
+function charTextLength(data: Uint8Array, length: number, charSet: number): number {
+  const cs = charSet & 0xff;
+  const bytesPerChar = cs === CS_UTF8 ? 4 : cs === CS_UNICODE_FSS ? 3 : 1;
+  if (bytesPerChar === 1) return length;
+
+  const chars = Math.floor(length / bytesPerChar);
+  let pos = 0;
+  for (let n = 0; n < chars && pos < length; n++) {
+    const c = data[pos]!;
+    pos += c < 0x80 ? 1 : (c >> 5) === 0x6 ? 2 : (c >> 4) === 0xe ? 3 : (c >> 3) === 0x1e ? 4 : 1;
+  }
+  return pos < length ? pos : length;
+}
+
+function decodeText(bytes: Uint8Array, charSet: number, attachment: unknown): string {
+  const buf = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if ((charSet & 0xff) === 0) {
+    const noneCharset = (attachment as { charSetForNONE?: string } | undefined)?.charSetForNONE;
+    if (noneCharset && noneCharset.toLowerCase() !== 'utf8' && noneCharset.toLowerCase() !== 'utf-8') {
+      try {
+        return new TextDecoder(noneCharset).decode(bytes);
+      } catch {
+        // fall through to utf8
+      }
+    }
+  }
+  return buf.toString('utf8');
+}
+
+/** Firebird `ISC_DATE` (days since 1858-11-17) to `'YYYY-MM-DD'`. */
+function formatDate(iscDate: number): string {
+  let nday = (iscDate + 2400001 - 1721119) | 0;
+  const century = ((4 * nday - 1) / 146097) | 0;
+  nday = (4 * nday - 1 - 146097 * century) | 0;
+  let d = (nday / 4) | 0;
+
+  nday = ((4 * d + 3) / 1461) | 0;
+  d = (4 * d + 3 - 1461 * nday) | 0;
+  d = ((d + 4) / 4) | 0;
+
+  let m = ((5 * d - 3) / 153) | 0;
+  d = (5 * d - 3 - 153 * m) | 0;
+  d = ((d + 5) / 5) | 0;
+
+  let y = (100 * century + nday) | 0;
+  if (m < 10) {
+    m += 3;
+  } else {
+    m -= 9;
+    y += 1;
+  }
+  return `${String(y).padStart(4, '0')}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+}
+
+/** Firebird `ISC_TIME` (1/10000 s since midnight) to `'HH:MM:SS.ffff'`. */
+function formatTime(iscTime: number): string {
+  const hours = Math.floor(iscTime / 36_000_000);
+  let rem = iscTime % 36_000_000;
+  const minutes = Math.floor(rem / 600_000);
+  rem %= 600_000;
+  const seconds = Math.floor(rem / 10_000);
+  const fractions = rem % 10_000;
+  return (
+    `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:` +
+    `${String(seconds).padStart(2, '0')}.${String(fractions).padStart(4, '0')}`
+  );
+}
+
+/** Scaled integer (`NUMERIC` / `DECIMAL`) to exact decimal string. */
+function formatScaledDecimal(value: bigint, scale: number): string {
+  if (scale >= 0) {
+    return value === 0n ? '0' : `${value}${'0'.repeat(scale)}`;
+  }
+  const negative = value < 0n;
+  const digits = (negative ? -value : value).toString();
+  const decimals = -scale;
+  const padded = digits.length <= decimals ? digits.padStart(decimals + 1, '0') : digits;
+  const dot = padded.length - decimals;
+  return `${negative ? '-' : ''}${padded.slice(0, dot)}.${padded.slice(dot)}`;
+}
+
+/**
+ * Resolve `SQL_BLOB` handles and `OCTETS` byte buffers in `rawRows` after a
+ * fetch call completes (when no pipelined `fetchNextAsync` call is in flight
+ * on the attachment).
+ */
+async function resolveOutputRows(
+  stmt: Statement,
+  transaction: Transaction,
+  fields: FieldInfo[],
+  rawRows: unknown[][],
+  types: TypeOptions | undefined,
+): Promise<void> {
+  if (rawRows.length === 0) return;
+
+  const binaryBlobs = types?.binary === true;
+  const attachment = (stmt as unknown as NativeStatement).attachment;
+  const outDescriptors = bindings.get(stmt)?.outDescriptors;
+
+  for (const row of rawRows) {
+    for (let i = 0; i < row.length; i++) {
+      const cell = row[i];
+      if (cell === null || cell === undefined) continue;
+
+      const field = fields[i];
+      const type = (field?.type ?? 0) & ~1;
+
+      if (
+        cell instanceof FbBlob ||
+        (type === SQL_BLOB &&
+          typeof cell === 'object' &&
+          !(cell instanceof Uint8Array) &&
+          'id' in (cell as Record<string, unknown>))
+      ) {
+        if (typeof attachment?.openBlob !== 'function') continue;
+        const bytes = await readBlobBytes(attachment, transaction, cell as FbBlob);
+        if (field?.subType === 1) {
+          const charSet = outDescriptors?.[i]?.preparedCharSet ?? CS_UTF8;
+          row[i] = decodeText(bytes, charSet, attachment);
+        } else {
+          row[i] = binaryBlobs ? new Uint8Array(bytes) : bytes.toString('base64');
+        }
+      } else if (Buffer.isBuffer(cell) || cell instanceof Uint8Array) {
+        const buf = Buffer.isBuffer(cell)
+          ? cell
+          : Buffer.from(cell.buffer, cell.byteOffset, cell.byteLength);
+        if (type === SQL_BLOB && field?.subType === 1) {
+          row[i] = buf.toString('utf8');
+        } else {
+          row[i] = binaryBlobs ? new Uint8Array(buf) : buf.toString('base64');
+        }
+      }
+    }
+  }
+}
+
+async function readBlobBytes(
+  attachment: Attachment,
+  transaction: Transaction,
+  blob: FbBlob,
+): Promise<Buffer> {
+  const stream = await attachment.openBlob(transaction, blob);
+  try {
+    const chunks: Buffer[] = [];
+    for (;;) {
+      const buffer = Buffer.alloc(64 * 1024);
+      const n = await stream.read(buffer);
+      if (n < 0) break;
+      if (n > 0) chunks.push(buffer.subarray(0, n));
+    }
+    return Buffer.concat(chunks);
+  } finally {
+    await stream.close().catch(() => undefined);
+  }
+}
 
 /**
  * The parameters as the driver will take them, the statement made ready to
@@ -824,12 +1522,12 @@ const TEXT_LENGTH = 128;
  * so the same call now means the same there and here, to the last digit.
  * A `Date` still goes the driver's way.
  *
- * So does a string bound to a SMALLINT, INTEGER, BIGINT or NUMERIC parameter:
- * the driver binds those as doubles, and `'9007199254740993'` arrived as
- * 9007199254740992, `'0.1'` in a NUMERIC(18,17) as 0.10000000000000001.
- * A JS number still goes as a double (it is one); a string to a DOUBLE
- * PRECISION or FLOAT parameter is still converted by JS, which rounds
- * correctly.
+ * So does a string or `bigint` bound to a SMALLINT, INTEGER, BIGINT or
+ * NUMERIC parameter: the driver binds those as doubles, and
+ * `'9007199254740993'` arrived as 9007199254740992, `'0.1'` in a
+ * NUMERIC(18,17) as 0.10000000000000001. A JS number still goes as a double
+ * (it is one); a string to a DOUBLE PRECISION or FLOAT parameter is still
+ * converted by JS, which rounds correctly.
  */
 async function bindParams(stmt: Statement, transaction: Transaction, given: QueryParams): Promise<QueryParams> {
   // Bytes as the driver takes them: a Buffer (the browser engine takes a
@@ -840,7 +1538,10 @@ async function bindParams(stmt: Statement, transaction: Transaction, given: Quer
       : p instanceof Uint8Array && !Buffer.isBuffer(p) ? Buffer.from(p.buffer, p.byteOffset, p.byteLength) : p)
     : given;
   const binding = bindings.get(stmt);
-  if (!params.some((p) => typeof p === 'string' || Buffer.isBuffer(p)) && (!binding || binding.current === '')) {
+  if (
+    !params.some((p) => typeof p === 'string' || typeof p === 'bigint' || Buffer.isBuffer(p)) &&
+    (!binding || binding.current === '')
+  ) {
     return params;
   }
   const described = (binding ?? (await bindingOf(stmt))).params;
@@ -849,7 +1550,11 @@ async function bindParams(stmt: Statement, transaction: Transaction, given: Quer
   const text: number[] = [];
   const bound: unknown[] = [...params];
   for (let i = 0; i < bound.length; i++) {
-    const p = bound[i];
+    let p = bound[i];
+    if (typeof p === 'bigint') {
+      p = p.toString();
+      bound[i] = p;
+    }
     const type = (described[i]?.type ?? 0) & ~1;
     if (type === SQL_BLOB && (typeof p === 'string' || Buffer.isBuffer(p))) {
       bound[i] = await writeBlob(stmt, transaction, typeof p === 'string' ? Buffer.from(p, 'utf8') : p);
@@ -904,7 +1609,7 @@ async function useMessage(stmt: Statement, positions: number[]): Promise<boolean
         inBuffer: internal.inBuffer!,
         dataWriter: internal.dataWriter,
       };
-      releaseMessagesOnDispose(internal, binding);
+      hookDispose(internal, binding);
     }
     binding.variants.set(key, made);
     message = made;
@@ -965,12 +1670,15 @@ async function makeTextMessage(
 }
 
 /**
- * Hand the driver back its own message when the statement is disposed, for
- * it to release as it always does, and release the ones made here.
+ * Hand the driver back its own input/output messages when the statement is
+ * disposed, for it to release as it always does, and release the ones made
+ * here.
  */
-function releaseMessagesOnDispose(internal: NativeStatement, binding: Binding): void {
+function hookDispose(internal: NativeStatement, binding: Binding): void {
+  if (binding.disposeHooked) return;
   const dispose = internal.internalDispose;
   if (typeof dispose !== 'function') return;
+  binding.disposeHooked = true;
   internal.internalDispose = async function (this: NativeStatement) {
     if (binding.original) {
       internal.inMetadata = binding.original.inMetadata;
@@ -980,6 +1688,15 @@ function releaseMessagesOnDispose(internal: NativeStatement, binding: Binding): 
     for (const message of binding.variants.values()) message.inMetadata.releaseSync();
     binding.variants.clear();
     binding.current = '';
+    if (binding.customOut) {
+      if (binding.originalOut) {
+        internal.outMetadata = binding.originalOut.outMetadata;
+        internal.outBuffer = binding.originalOut.outBuffer;
+        internal.dataReader = binding.originalOut.dataReader;
+      }
+      binding.customOut.releaseSync();
+      binding.customOut = undefined;
+    }
     return dispose.call(this);
   };
 }
@@ -1138,23 +1855,112 @@ async function fetchRows(
   stmt: Statement,
   transaction: Transaction,
   params: QueryParams,
-  columnCount: number,
+  fields: FieldInfo[],
+  types?: TypeOptions,
 ): Promise<unknown[][]> {
   params = await bindParams(stmt, transaction, params);
+  let rawRows: unknown[][];
   if (stmt.hasResultSet) {
     const resultSet = await stmt.executeQuery(transaction, params);
     // A failing fetch must still close.
     try {
-      return await resultSet.fetch();
+      rawRows = await resultSet.fetch();
     } finally {
       await resultSet.close().catch(() => undefined);
     }
+  } else if (fields.length > 0) {
+    rawRows = [await stmt.executeSingleton(transaction, params)];
+  } else {
+    await stmt.execute(transaction, params);
+    return [];
   }
-  if (columnCount > 0) {
-    return [await stmt.executeSingleton(transaction, params)];
+  await resolveOutputRows(stmt, transaction, fields, rawRows, types);
+  return rawRows;
+}
+
+/**
+ * Stream a prepared statement's result set in batches of up to `batchSize` rows.
+ */
+async function* streamRows<T>(
+  stmt: Statement,
+  transaction: Transaction,
+  params: QueryParams,
+  fields: FieldInfo[],
+  rowMode: RowMode,
+  batchSize: number,
+  types: TypeOptions | undefined,
+  onEngineError: () => void,
+): AsyncIterableIterator<QueryResult<T>> {
+  let boundParams: QueryParams;
+  try {
+    boundParams = await bindParams(stmt, transaction, params);
+  } catch (err) {
+    onEngineError();
+    throw err;
   }
-  await stmt.execute(transaction, params);
-  return [];
+
+  if (stmt.hasResultSet) {
+    let resultSet;
+    try {
+      resultSet = await stmt.executeQuery(transaction, boundParams);
+    } catch (err) {
+      onEngineError();
+      throw err;
+    }
+    try {
+      while (true) {
+        let rawRows: unknown[][];
+        try {
+          rawRows = await resultSet.fetch({ fetchSize: batchSize });
+          await resolveOutputRows(stmt, transaction, fields, rawRows, types);
+        } catch (err) {
+          onEngineError();
+          throw err;
+        }
+        if (rawRows.length === 0) break;
+        const batchFields = fields.map((f) => ({ ...f }));
+        yield applyTypes(
+          {
+            rows: shapeRows<T>(rawRows, batchFields, rowMode),
+            fields: batchFields,
+          },
+          types,
+          rowMode,
+        );
+      }
+    } finally {
+      await resultSet.close().catch(() => undefined);
+    }
+    return;
+  }
+
+  if (fields.length > 0) {
+    let rawRows: unknown[][];
+    try {
+      rawRows = [await stmt.executeSingleton(transaction, boundParams)];
+      await resolveOutputRows(stmt, transaction, fields, rawRows, types);
+    } catch (err) {
+      onEngineError();
+      throw err;
+    }
+    const batchFields = fields.map((f) => ({ ...f }));
+    yield applyTypes(
+      {
+        rows: shapeRows<T>(rawRows, batchFields, rowMode),
+        fields: batchFields,
+      },
+      types,
+      rowMode,
+    );
+    return;
+  }
+
+  try {
+    await stmt.execute(transaction, boundParams);
+  } catch (err) {
+    onEngineError();
+    throw err;
+  }
 }
 
 /**

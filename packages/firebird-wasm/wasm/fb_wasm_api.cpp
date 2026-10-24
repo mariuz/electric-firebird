@@ -156,6 +156,7 @@ struct CachedStatement
 	IStatement* statement = nullptr;
 	unsigned type = 0;
 	std::shared_ptr<OutputShape> shape;     // filled by the first query that runs it
+	bool busy = false;                      // in use by an open cursor or running query
 };
 
 /** An attached database, and the statements kept prepared for it, most recently used first. */
@@ -179,11 +180,31 @@ struct TxEntry
 	int db_handle = 0;
 };
 
+/** An open streaming cursor (fb_cursor_open / fb_cursor_fetch / fb_cursor_close). */
+struct CursorEntry
+{
+	int db_handle = 0;
+	int tx_handle = 0;
+	IAttachment* attachment = nullptr;
+	ITransaction* transaction = nullptr;
+	bool ownTransaction = false;
+	IStatement* statement = nullptr;
+	bool cached = false;
+	std::shared_ptr<OutputShape> shape;
+	IResultSet* cursor = nullptr;
+	std::vector<unsigned char> singleRowBuffer;
+	bool singleRowPending = false;
+	bool eof = false;
+	bool failed = false;
+};
+
 std::map<int, DbEntry> g_databases;
 std::map<int, TxEntry> g_transactions;
+std::map<int, CursorEntry> g_cursors;
 
 int g_nextDbHandle = 1;
 int g_nextTxHandle = 1;
+int g_nextCursorHandle = 1;
 
 std::string g_lastError;
 /** The last error said "attempted update during read-only transaction". */
@@ -451,7 +472,19 @@ DbEntry* lookupEntry(int handle)
 void flushStatements(DbEntry& entry)
 {
 	for (auto& c : entry.statements)
-		freeStatement(c.statement);
+	{
+		bool inUseByCursor = false;
+		for (auto& kv : g_cursors)
+		{
+			if (kv.second.statement == c.statement)
+			{
+				kv.second.cached = false;
+				inUseByCursor = true;
+			}
+		}
+		if (!inUseByCursor)
+			freeStatement(c.statement);
+	}
 	entry.statements.clear();
 }
 
@@ -592,9 +625,10 @@ IStatement* acquireStatement(int db_handle, IAttachment* attachment, ITransactio
 	{
 		for (auto it = entry->statements.begin(); it != entry->statements.end(); ++it)
 		{
-			if (it->sql == sql)
+			if (!it->busy && it->sql == sql)
 			{
 				entry->statements.splice(entry->statements.begin(), entry->statements, it);
+				entry->statements.front().busy = true;
 				cached = true;
 				if (typeOut)
 					*typeOut = entry->statements.front().type;
@@ -620,12 +654,24 @@ IStatement* acquireStatement(int db_handle, IAttachment* attachment, ITransactio
 
 	if (entry && g_statementCacheSize && cacheableType(type))
 	{
-		entry->statements.push_front(CachedStatement{sql, statement, type});
+		entry->statements.push_front(CachedStatement{sql, statement, type, nullptr, true});
 		cached = true;
 		while (entry->statements.size() > g_statementCacheSize)
 		{
-			freeStatement(entry->statements.back().statement);
-			entry->statements.pop_back();
+			auto victim = entry->statements.end();
+			for (auto it = entry->statements.end(); it != entry->statements.begin(); )
+			{
+				--it;
+				if (!it->busy)
+				{
+					victim = it;
+					break;
+				}
+			}
+			if (victim == entry->statements.end())
+				break;
+			freeStatement(victim->statement);
+			entry->statements.erase(victim);
 		}
 	}
 
@@ -642,20 +688,69 @@ void releaseStatement(int db_handle, IStatement* statement, bool cached, bool fa
 		freeStatement(statement);
 		return;
 	}
-	if (!failed)
-		return;
 	DbEntry* entry = lookupEntry(db_handle);
 	if (!entry)
+	{
+		freeStatement(statement);
 		return;
+	}
 	for (auto it = entry->statements.begin(); it != entry->statements.end(); ++it)
 	{
 		if (it->statement == statement)
 		{
-			freeStatement(statement);
-			entry->statements.erase(it);
+			if (failed)
+			{
+				freeStatement(statement);
+				entry->statements.erase(it);
+			}
+			else
+			{
+				it->busy = false;
+			}
 			return;
 		}
 	}
+	freeStatement(statement);
+}
+
+/** Close an open CursorEntry, releasing its IResultSet, statement, and self-owned transaction. */
+bool closeCursorEntry(CursorEntry& entry, bool commitOwnTx)
+{
+	if (entry.cursor)
+	{
+		Status s;
+		entry.cursor->close(s.ptr());
+		entry.cursor->release();
+		entry.cursor = nullptr;
+	}
+
+	releaseStatement(entry.db_handle, entry.statement, entry.cached, entry.failed);
+	entry.statement = nullptr;
+
+	if (entry.ownTransaction && entry.transaction)
+	{
+		ITransaction* tx = entry.transaction;
+		entry.transaction = nullptr;
+		if (commitOwnTx && !entry.failed)
+		{
+			Status commitStatus;
+			tx->commit(commitStatus.ptr());
+			if (commitStatus.failed())
+			{
+				setErrorFromStatus("fb_cursor_close: commit failed", commitStatus.ptr());
+				Status rollbackStatus;
+				tx->rollback(rollbackStatus.ptr());
+				return false;
+			}
+		}
+		else
+		{
+			Status rollbackStatus;
+			tx->rollback(rollbackStatus.ptr());
+		}
+	}
+
+	return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -828,19 +923,47 @@ void appendScaledDecimal(ISC_INT64 value, int scale, std::string& out)
 		? (~static_cast<unsigned long long>(value) + 1ULL)
 		: static_cast<unsigned long long>(value);
 
-	char digits[32];
-	const auto written = std::to_chars(digits, digits + sizeof(digits), magnitude);
-	std::string text(digits, written.ptr);
-
-	const size_t decimals = static_cast<size_t>(-scale);
-	if (text.size() <= decimals)
-		text.insert(0, decimals - text.size() + 1, '0');
-
-	text.insert(text.size() - decimals, ".");
-
 	if (negative)
 		out += '-';
-	out += text;
+
+	char digits[32];
+	const auto written = std::to_chars(digits, digits + sizeof(digits), magnitude);
+	const size_t len = static_cast<size_t>(written.ptr - digits);
+	const size_t decimals = static_cast<size_t>(-scale);
+	if (len <= decimals)
+	{
+		out += "0.";
+		out.append(decimals - len, '0');
+		out.append(digits, len);
+	}
+	else
+	{
+		const size_t whole = len - decimals;
+		out.append(digits, whole);
+		out += '.';
+		out.append(digits + whole, decimals);
+	}
+}
+
+/**
+ * Firebird's offset time-zone encoding (TimeZoneUtil::ONE_DAY = 24 * 60 - 1):
+ * zone ids 0..2878 encode a signed displacement of (zone - 1439) minutes from
+ * UTC.  Named zones sit at the top of ISC_USHORT (65535 = GMT downwards).
+ */
+constexpr unsigned TZ_ONE_DAY = 24 * 60 - 1;
+constexpr unsigned TZ_MAX_OFFSET_ID = TZ_ONE_DAY * 2;
+constexpr int TICKS_PER_MINUTE = 60 * ISC_TIME_SECONDS_PRECISION;
+constexpr int TICKS_PER_DAY = 24 * 3600 * ISC_TIME_SECONDS_PRECISION;
+
+void appendOffsetText(int displacementMinutes, std::string& out)
+{
+	out += ' ';
+	out += displacementMinutes < 0 ? '-' : '+';
+	const unsigned absMinutes = static_cast<unsigned>(
+		displacementMinutes < 0 ? -displacementMinutes : displacementMinutes);
+	appendPadded(absMinutes / 60, 2, out);
+	out += ':';
+	appendPadded(absMinutes % 60, 2, out);
 }
 
 /** JSON numbers are IEEE-754 doubles; beyond 2^53 integers stop being exact. */
@@ -1070,7 +1193,11 @@ void appendValue(IAttachment* attachment, ITransaction* transaction,
 			if (status.failed() || !buf[0])
 				out += "null";
 			else
-				jsonEscape(buf, strlen(buf), out);
+			{
+				out += '"';
+				out.append(buf, strlen(buf));
+				out += '"';
+			}
 			break;
 		}
 
@@ -1082,9 +1209,11 @@ void appendValue(IAttachment* attachment, ITransaction* transaction,
 				out += "null"; // JSON has no Infinity/NaN
 			else
 			{
-				char buf[32];
-				snprintf(buf, sizeof(buf), "%.9g", static_cast<double>(value));
-				out += buf;
+				// The shortest text that reads back as this very float, written
+				// straight into the result without snprintf.
+				char buf[24];
+				const auto r = std::to_chars(buf, buf + sizeof(buf), value);
+				out.append(buf, r.ptr);
 			}
 			break;
 		}
@@ -1118,7 +1247,11 @@ void appendValue(IAttachment* attachment, ITransaction* transaction,
 			if (status.failed() || !buf[0])
 				out += "null";
 			else
-				jsonEscape(buf, strlen(buf), out);
+			{
+				out += '"';
+				out.append(buf, strlen(buf));
+				out += '"';
+			}
 			break;
 		}
 
@@ -1133,7 +1266,11 @@ void appendValue(IAttachment* attachment, ITransaction* transaction,
 			if (status.failed() || !buf[0])
 				out += "null";
 			else
-				jsonEscape(buf, strlen(buf), out);
+			{
+				out += '"';
+				out.append(buf, strlen(buf));
+				out += '"';
+			}
 			break;
 		}
 
@@ -1183,42 +1320,83 @@ void appendValue(IAttachment* attachment, ITransaction* transaction,
 
 		case SQL_TIME_TZ:
 		{
-			Status status;
 			ISC_TIME_TZ value;
 			memcpy(&value, data, sizeof(value));
 			unsigned hours = 0, minutes = 0, seconds = 0, fractions = 0;
+			if (value.time_zone <= TZ_MAX_OFFSET_ID)
+			{
+				const int displacement = static_cast<int>(value.time_zone) - static_cast<int>(TZ_ONE_DAY);
+				int localTicks = static_cast<int>(value.utc_time) + displacement * TICKS_PER_MINUTE;
+				if (localTicks < 0)
+					localTicks += TICKS_PER_DAY;
+				else if (localTicks >= TICKS_PER_DAY)
+					localTicks -= TICKS_PER_DAY;
+				decodeTimeOfDay(static_cast<ISC_TIME>(localTicks), hours, minutes, seconds, fractions);
+				out += '"';
+				appendTimeText(hours, minutes, seconds, fractions, out);
+				appendOffsetText(displacement, out);
+				out += '"';
+				break;
+			}
+			Status status;
 			char zone[64] = {0};
 			g_util->decodeTimeTz(status.ptr(), &value, &hours, &minutes, &seconds,
 				&fractions, sizeof(zone), zone);
 			if (status.failed())
 				{ out += "null"; break; }
-			std::string text;
-			appendTimeText(hours, minutes, seconds, fractions, text);
-			text += ' ';
-			text += zone;
-			jsonEscape(text, out);
+			out += '"';
+			appendTimeText(hours, minutes, seconds, fractions, out);
+			out += ' ';
+			out += zone;
+			out += '"';
 			break;
 		}
 
 		case SQL_TIMESTAMP_TZ:
 		{
-			Status status;
 			ISC_TIMESTAMP_TZ value;
 			memcpy(&value, data, sizeof(value));
 			unsigned year = 0, month = 0, day = 0;
 			unsigned hours = 0, minutes = 0, seconds = 0, fractions = 0;
+			if (value.time_zone <= TZ_MAX_OFFSET_ID)
+			{
+				const int displacement = static_cast<int>(value.time_zone) - static_cast<int>(TZ_ONE_DAY);
+				ISC_DATE localDate = value.utc_timestamp.timestamp_date;
+				int localTicks = static_cast<int>(value.utc_timestamp.timestamp_time)
+					+ displacement * TICKS_PER_MINUTE;
+				if (localTicks < 0)
+				{
+					localTicks += TICKS_PER_DAY;
+					--localDate;
+				}
+				else if (localTicks >= TICKS_PER_DAY)
+				{
+					localTicks -= TICKS_PER_DAY;
+					++localDate;
+				}
+				decodeDay(localDate, year, month, day);
+				decodeTimeOfDay(static_cast<ISC_TIME>(localTicks), hours, minutes, seconds, fractions);
+				out += '"';
+				appendDateText(year, month, day, out);
+				out += 'T';
+				appendTimeText(hours, minutes, seconds, fractions, out);
+				appendOffsetText(displacement, out);
+				out += '"';
+				break;
+			}
+			Status status;
 			char zone[64] = {0};
 			g_util->decodeTimeStampTz(status.ptr(), &value, &year, &month, &day,
 				&hours, &minutes, &seconds, &fractions, sizeof(zone), zone);
 			if (status.failed())
 				{ out += "null"; break; }
-			std::string text;
-			appendDateText(year, month, day, text);
-			text += 'T';
-			appendTimeText(hours, minutes, seconds, fractions, text);
-			text += ' ';
-			text += zone;
-			jsonEscape(text, out);
+			out += '"';
+			appendDateText(year, month, day, out);
+			out += 'T';
+			appendTimeText(hours, minutes, seconds, fractions, out);
+			out += ' ';
+			out += zone;
+			out += '"';
 			break;
 		}
 
@@ -2527,6 +2705,19 @@ int fb_detach_database(int db_handle)
 		return 1;
 	}
 
+	// Close any streaming cursors still open on this database before rolling
+	// back transactions or freeing statements.
+	for (auto cur = g_cursors.begin(); cur != g_cursors.end(); )
+	{
+		if (cur->second.db_handle != db_handle)
+		{
+			++cur;
+			continue;
+		}
+		closeCursorEntry(cur->second, false);
+		cur = g_cursors.erase(cur);
+	}
+
 	// Transactions outlive the JS objects that started them; leaving one open
 	// would keep the attachment alive and the database file locked.  Only this
 	// database's: every transaction used to go, so closing one database rolled
@@ -3353,6 +3544,17 @@ int fb_commit(int tx_handle)
 		return 1;
 	}
 
+	for (auto cur = g_cursors.begin(); cur != g_cursors.end(); )
+	{
+		if (cur->second.tx_handle != tx_handle)
+		{
+			++cur;
+			continue;
+		}
+		closeCursorEntry(cur->second, false);
+		cur = g_cursors.erase(cur);
+	}
+
 	Status status;
 	ITransaction* transaction = it->second.transaction;
 	transaction->commit(status.ptr());
@@ -3385,6 +3587,17 @@ int fb_rollback(int tx_handle)
 	{
 		setError("fb_rollback: unknown transaction handle");
 		return 1;
+	}
+
+	for (auto cur = g_cursors.begin(); cur != g_cursors.end(); )
+	{
+		if (cur->second.tx_handle != tx_handle)
+		{
+			++cur;
+			continue;
+		}
+		closeCursorEntry(cur->second, false);
+		cur = g_cursors.erase(cur);
 	}
 
 	Status status;
@@ -3928,6 +4141,301 @@ const char* fb_query_params(int db_handle, int tx_handle, const char* sql,
 	cleanup(true);
 	publishBlobs(sink);
 	return allocCString(json);
+}
+
+/**
+ * Open a streaming cursor for `sql` (with optional packed `params`).
+ *
+ * Returns a cursor handle (>0) on success, or 0 on failure (see fb_last_error()).
+ * With `tx_handle` of 0 the cursor starts its own transaction, which is
+ * committed when `fb_cursor_close()` is called (or rolled back if a fetch
+ * failed).  A dedicated transaction rather than the database's shared read
+ * transaction is used so that writes or DDL run by the caller between batches
+ * cannot end the cursor's transaction mid-stream.
+ */
+FB_WASM_EXPORT
+int fb_cursor_open(int db_handle, int tx_handle, const char* sql,
+	const unsigned char* params, int params_length)
+{
+	clearError();
+
+	IAttachment* attachment = lookupAttachment(db_handle);
+	if (!attachment)
+	{
+		setError("fb_cursor_open: unknown database handle");
+		return 0;
+	}
+
+	std::vector<ParamValue> values;
+	if (!parseParams(params, static_cast<unsigned>(params_length < 0 ? 0 : params_length),
+			values))
+	{
+		setError("fb_cursor_open: malformed parameter buffer");
+		return 0;
+	}
+
+	ITransaction* transaction = nullptr;
+	bool ownTransaction = false;
+
+	if (tx_handle)
+	{
+		transaction = lookupTransaction(tx_handle);
+		if (!transaction)
+		{
+			setError("fb_cursor_open: unknown transaction handle");
+			return 0;
+		}
+	}
+	else
+	{
+		Status status;
+		transaction = attachment->startTransaction(status.ptr(), 0, nullptr);
+		if (status.failed() || !transaction)
+		{
+			setErrorFromStatus("fb_cursor_open: could not start transaction", status.ptr());
+			return 0;
+		}
+		ownTransaction = true;
+	}
+
+	IResultSet* cursor = nullptr;
+	IStatement* statement = nullptr;
+	bool cached = false;
+
+	auto cleanupOnError = [&]()
+	{
+		if (cursor)
+		{
+			Status s;
+			cursor->close(s.ptr());
+			cursor->release();
+		}
+		releaseStatement(db_handle, statement, cached, true);
+		if (ownTransaction && transaction)
+		{
+			Status s;
+			transaction->rollback(s.ptr());
+		}
+	};
+
+	Status status;
+	unsigned type = 0;
+	statement = acquireStatement(db_handle, attachment, transaction, sql, status, cached, &type);
+	if (status.failed() || !statement)
+	{
+		setErrorFromStatus("fb_cursor_open: prepare failed", status.ptr());
+		cleanupOnError();
+		return 0;
+	}
+
+	InputMessage input;
+	IMessageMetadata* inMeta = nullptr;
+	void* inBuffer = nullptr;
+	if (params && params_length > 0)
+	{
+		input.writeBlobsTo(attachment, transaction);
+		if (!input.build(statement, values))
+		{
+			cleanupOnError();
+			return 0;
+		}
+		inMeta = input.meta();
+		inBuffer = input.data();
+	}
+
+	const std::shared_ptr<OutputShape> shape = outputShape(db_handle, statement, cached, "fb_cursor_open");
+	if (!shape)
+	{
+		cleanupOnError();
+		return 0;
+	}
+
+	CursorEntry entry;
+	entry.db_handle = db_handle;
+	entry.tx_handle = tx_handle;
+	entry.attachment = attachment;
+	entry.transaction = transaction;
+	entry.ownTransaction = ownTransaction;
+	entry.statement = statement;
+	entry.cached = cached;
+	entry.shape = shape;
+
+	if (!shape->columnCount)
+	{
+		statement->execute(status.ptr(), transaction, inMeta, inBuffer, nullptr, nullptr);
+		if (status.failed())
+		{
+			setErrorFromStatus("fb_cursor_open: could not execute statement", status.ptr());
+			cleanupOnError();
+			return 0;
+		}
+
+		Status affectedStatus;
+		const ISC_UINT64 affected = statement->getAffectedRecords(affectedStatus.ptr());
+		g_lastAffectedRows = affectedStatus.failed()
+			? 0
+			: static_cast<ISC_INT64>(affected);
+		entry.eof = true;
+	}
+	else if (!shape->hasCursor)
+	{
+		entry.singleRowBuffer.resize(shape->messageLength);
+		statement->execute(status.ptr(), transaction, inMeta, inBuffer,
+			shape->metadata, entry.singleRowBuffer.data());
+		if (status.failed())
+		{
+			setErrorFromStatus("fb_cursor_open: could not execute statement", status.ptr());
+			cleanupOnError();
+			return 0;
+		}
+		entry.singleRowPending = true;
+	}
+	else
+	{
+		cursor = statement->openCursor(status.ptr(), transaction, inMeta, inBuffer,
+			shape->metadata, 0);
+		if (status.failed() || !cursor)
+		{
+			setErrorFromStatus("fb_cursor_open: could not open cursor", status.ptr());
+			cleanupOnError();
+			return 0;
+		}
+		entry.cursor = cursor;
+	}
+
+	const int handle = g_nextCursorHandle++;
+	g_cursors[handle] = std::move(entry);
+	return handle;
+}
+
+/**
+ * Fetch up to `max_rows` rows from an open cursor and return a JSON-encoded
+ * batch (`{"columns":[...],"rows":[...]}` or `{"shape":N,"rows":[...]}`), or
+ * nullptr on failure.  When the cursor is exhausted, `rows` is `[]`.
+ * Release the returned string with `fb_free_result()`.
+ */
+FB_WASM_EXPORT
+const char* fb_cursor_fetch(int cursor_handle, int max_rows, int flags)
+{
+	clearError();
+
+	const auto it = g_cursors.find(cursor_handle);
+	if (it == g_cursors.end())
+	{
+		setError("fb_cursor_fetch: unknown cursor handle");
+		return nullptr;
+	}
+
+	if (max_rows <= 0)
+	{
+		setError("fb_cursor_fetch: max_rows must be positive");
+		return nullptr;
+	}
+
+	CursorEntry& entry = it->second;
+	const OutputShape& shape = *entry.shape;
+	const unsigned columnCount = shape.columnCount;
+	const bool shapeIds = (flags & FB_QUERY_SHAPE_IDS) != 0;
+
+	BlobSink sink;
+	sink.enabled = (flags & FB_QUERY_BINARY_BLOBS) != 0;
+
+	std::string json = shapeIds && shape.id ? shape.idHeader : shape.header;
+	bool firstRow = true;
+
+	const auto appendRowFromBuffer = [&](const unsigned char* buf)
+	{
+		if (!firstRow)
+			json += ',';
+		firstRow = false;
+
+		json += '[';
+		for (unsigned i = 0; i < columnCount; i++)
+		{
+			if (i)
+				json += ',';
+
+			short nullFlag = 0;
+			memcpy(&nullFlag, buf + shape.nullOffsets[i], sizeof(nullFlag));
+
+			if (nullFlag == -1)
+				json += "null";
+			else
+			{
+				appendValue(entry.attachment, entry.transaction,
+					shape.types[i], shape.subTypes[i],
+					shape.scales[i], shape.lengths[i], shape.charSets[i],
+					buf + shape.offsets[i],
+					json, &sink);
+			}
+		}
+		json += ']';
+	};
+
+	if (!entry.eof && columnCount > 0)
+	{
+		if (entry.singleRowPending)
+		{
+			entry.singleRowPending = false;
+			entry.eof = true;
+			appendRowFromBuffer(entry.singleRowBuffer.data());
+		}
+		else if (entry.cursor)
+		{
+			std::vector<unsigned char> buffer(shape.messageLength);
+			for (int fetched = 0; fetched < max_rows; ++fetched)
+			{
+				Status status;
+				const int rc = entry.cursor->fetchNext(status.ptr(), buffer.data());
+				if (status.failed())
+				{
+					entry.failed = true;
+					setErrorFromStatus("fb_cursor_fetch: fetch failed", status.ptr());
+					return nullptr;
+				}
+				if (rc != IStatus::RESULT_OK)
+				{
+					entry.eof = true;
+					break;
+				}
+				appendRowFromBuffer(buffer.data());
+			}
+		}
+		else
+		{
+			entry.eof = true;
+		}
+	}
+	else
+	{
+		entry.eof = true;
+	}
+
+	json += "]}";
+	publishBlobs(sink);
+	return allocCString(json);
+}
+
+/**
+ * Close an open cursor, release its statement, and commit (or roll back on
+ * fetch failure) any transaction that `fb_cursor_open` started for itself.
+ * Returns 0 on success, non-zero on failure.
+ */
+FB_WASM_EXPORT
+int fb_cursor_close(int cursor_handle)
+{
+	clearError();
+
+	const auto it = g_cursors.find(cursor_handle);
+	if (it == g_cursors.end())
+	{
+		setError("fb_cursor_close: unknown cursor handle");
+		return 1;
+	}
+
+	const bool ok = closeCursorEntry(it->second, true);
+	g_cursors.erase(it);
+	return ok ? 0 : 2;
 }
 
 } /* extern "C" */

@@ -20,6 +20,9 @@ export { FirebirdLite, FirebirdTransaction } from './firebird';
 
 export { sql, SqlFragment, RawSql, isSqlFragment, toStatement } from './sql-tag';
 export { statementKind } from './statement-types';
+export { firebirdTypeName } from './browser/field-types';
+export { applyTypes, applySerializers, hasTypeOptions } from './browser/value-types';
+export type { TypeOptions, Parser, Serializer } from './browser/value-types';
 export type { SqlTag, Statement } from './sql-tag';
 
 export type {
@@ -28,7 +31,9 @@ export type {
   QueryParams,
   Row,
   FieldInfo,
+  FirebirdTypeName,
   QueryOptions,
+  QueryStreamOptions,
   QueryDescription,
   StatementKind,
   RowMode,

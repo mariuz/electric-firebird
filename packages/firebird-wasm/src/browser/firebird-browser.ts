@@ -34,13 +34,14 @@ import type { TypeOptions } from './value-types';
 import { acquireDatabaseLock } from './db-lock';
 import { SharedEngineTransport } from './shared-transport';
 import type { DatabaseLock } from './db-lock';
-import { toStatement, resolveQueryCall } from '../sql-tag';
-import type { SqlFragment } from '../sql-tag';
+import { toStatement, resolveQueryCall, resolveBatchSize } from '../sql-tag';
+import type { SqlFragment, Statement } from '../sql-tag';
 import type {
   ArrayRow,
   QueryResult,
   QueryDescription,
   QueryOptions,
+  QueryStreamOptions,
   Row,
   QueryParams,
   RowMode,
@@ -49,6 +50,8 @@ import type {
 
 /** `QueryOptions` with the array mode pinned, for the overloads below. */
 type ArrayModeOptions = QueryOptions & { rowMode: 'array' };
+/** `QueryStreamOptions` with the array mode pinned, for the overloads below. */
+type ArrayStreamOptions = QueryStreamOptions & { rowMode: 'array' };
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -654,6 +657,158 @@ export class FirebirdBrowser {
       // from the query leaves anything to roll back.
       await this.engine.rollback(txHandle).catch(() => undefined);
       throw err;
+    }
+  }
+
+  /**
+   * Stream a SQL query's result set in batches of `batchSize` rows (default 500).
+   *
+   * Yields one `QueryResult<T>` batch per cursor fetch instead of materialising
+   * the entire result set into memory at once.  Breaking out of the `for await`
+   * loop early closes the cursor and finishes the transaction immediately.
+   *
+   * ```ts
+   * for await (const batch of db.queryStream('SELECT * FROM items', [], { batchSize: 100 })) {
+   *   for (const row of batch.rows) {
+   *     // process row
+   *   }
+   * }
+   * ```
+   */
+  queryStream(
+    sql: SqlFragment,
+    options: ArrayStreamOptions,
+  ): AsyncIterableIterator<QueryResult<ArrayRow>>;
+  queryStream(
+    sql: string | SqlFragment,
+    params: QueryParams | undefined,
+    options: ArrayStreamOptions,
+  ): AsyncIterableIterator<QueryResult<ArrayRow>>;
+  queryStream<T extends Row = Row>(
+    sql: SqlFragment,
+    options?: QueryStreamOptions,
+  ): AsyncIterableIterator<QueryResult<T>>;
+  queryStream<T extends Row = Row>(
+    sql: string,
+    params?: QueryParams,
+    options?: QueryStreamOptions,
+  ): AsyncIterableIterator<QueryResult<T>>;
+  queryStream<T extends Row = Row>(
+    sql: string | SqlFragment,
+    params?: QueryParams,
+    options?: QueryStreamOptions,
+  ): AsyncIterableIterator<QueryResult<T>>;
+  queryStream<T = Row>(
+    sql: string | SqlFragment,
+    paramsOrOptions: QueryParams | QueryStreamOptions = [],
+    maybeOptions: QueryStreamOptions = {},
+  ): AsyncIterableIterator<QueryResult<T>> {
+    const { statement, options } = resolveQueryCall<QueryStreamOptions>(
+      sql,
+      paramsOrOptions,
+      maybeOptions,
+    );
+    const batchSize = resolveBatchSize(options.batchSize);
+    return this.streamQuery<T>(statement, options, batchSize);
+  }
+
+  private async *streamQuery<T>(
+    statement: Statement,
+    options: QueryStreamOptions,
+    batchSize: number,
+  ): AsyncIterableIterator<QueryResult<T>> {
+    await this.ensureReady();
+
+    const rowMode = options.rowMode ?? 'object';
+    const binaryBlobs = this.options.types?.binary === true;
+    const serializedParams = this.serialize(statement.params);
+
+    if (
+      typeof this.engine.cursorOpen !== 'function' ||
+      typeof this.engine.cursorFetch !== 'function' ||
+      typeof this.engine.cursorClose !== 'function'
+    ) {
+      const full = (await this.query(
+        statement.sql,
+        statement.params,
+        options,
+      )) as QueryResult<T>;
+      for (let i = 0; i < full.rows.length; i += batchSize) {
+        yield {
+          rows: full.rows.slice(i, i + batchSize),
+          fields: full.fields.map((f) => ({ ...f })),
+        };
+      }
+      return;
+    }
+
+    let txHandle: EngineHandle = 0;
+    let ownsTxHandle = false;
+    let cursorHandle: EngineHandle = 0;
+    let engineFailed = false;
+
+    try {
+      if (hasTransactionOptions(options)) {
+        txHandle = await this.engine.startTransaction(this.dbHandle, options);
+        ownsTxHandle = true;
+      }
+
+      try {
+        cursorHandle = await this.engine.cursorOpen(
+          this.dbHandle,
+          txHandle,
+          statement.sql,
+          serializedParams,
+        );
+      } catch (err) {
+        engineFailed = true;
+        throw err;
+      }
+
+      while (true) {
+        let batch: QueryResult<T>;
+        try {
+          batch = await this.engine.cursorFetch<T>(
+            cursorHandle,
+            batchSize,
+            rowMode,
+            binaryBlobs,
+          );
+        } catch (err) {
+          engineFailed = true;
+          throw err;
+        }
+
+        if (batch.rows.length === 0) {
+          break;
+        }
+
+        yield applyTypes(batch, this.options.types, rowMode);
+      }
+
+      const toClose = cursorHandle;
+      cursorHandle = 0;
+      await this.engine.cursorClose(toClose);
+
+      if (ownsTxHandle && txHandle !== 0) {
+        const toCommit = txHandle;
+        txHandle = 0;
+        ownsTxHandle = false;
+        await this.engine.commit(toCommit);
+      }
+    } finally {
+      if (cursorHandle !== 0) {
+        await this.engine.cursorClose(cursorHandle).catch(() => undefined);
+      }
+      if (ownsTxHandle && txHandle !== 0) {
+        if (engineFailed) {
+          await this.engine.rollback(txHandle).catch(() => undefined);
+        } else {
+          await this.engine
+            .commit(txHandle)
+            .catch(() => this.engine.rollback(txHandle).catch(() => undefined));
+        }
+      }
     }
   }
 
@@ -1397,5 +1552,101 @@ export class FirebirdBrowserTransaction {
       this.types,
       rowMode,
     );
+  }
+
+  /** Stream a SELECT inside this transaction in batches of `batchSize` rows. */
+  queryStream(
+    sql: SqlFragment,
+    options: { rowMode: 'array'; batchSize?: number },
+  ): AsyncIterableIterator<QueryResult<ArrayRow>>;
+  queryStream(
+    sql: string | SqlFragment,
+    params: QueryParams | undefined,
+    options: { rowMode: 'array'; batchSize?: number },
+  ): AsyncIterableIterator<QueryResult<ArrayRow>>;
+  queryStream<T extends Row = Row>(
+    sql: SqlFragment,
+    options?: { rowMode?: RowMode; batchSize?: number },
+  ): AsyncIterableIterator<QueryResult<T>>;
+  queryStream<T extends Row = Row>(
+    sql: string | SqlFragment,
+    params?: QueryParams,
+    options?: { rowMode?: RowMode; batchSize?: number },
+  ): AsyncIterableIterator<QueryResult<T>>;
+  queryStream<T = Row>(
+    sql: string | SqlFragment,
+    paramsOrOptions: QueryParams | { rowMode?: RowMode; batchSize?: number } = [],
+    maybeOptions: { rowMode?: RowMode; batchSize?: number } = {},
+  ): AsyncIterableIterator<QueryResult<T>> {
+    this.assertUsable();
+    const { statement, options } = resolveQueryCall<{
+      rowMode?: RowMode;
+      batchSize?: number;
+    }>(sql, paramsOrOptions, maybeOptions);
+    const batchSize = resolveBatchSize(options.batchSize);
+    return this.streamQuery<T>(
+      statement,
+      options.rowMode ?? 'object',
+      batchSize,
+    );
+  }
+
+  private async *streamQuery<T>(
+    statement: Statement,
+    rowMode: RowMode,
+    batchSize: number,
+  ): AsyncIterableIterator<QueryResult<T>> {
+    this.assertUsable();
+
+    if (
+      typeof this.engine.cursorOpen !== 'function' ||
+      typeof this.engine.cursorFetch !== 'function' ||
+      typeof this.engine.cursorClose !== 'function'
+    ) {
+      const full = (await this.query(statement.sql, statement.params, {
+        rowMode,
+      })) as QueryResult<T>;
+      for (let i = 0; i < full.rows.length; i += batchSize) {
+        yield {
+          rows: full.rows.slice(i, i + batchSize),
+          fields: full.fields.map((f) => ({ ...f })),
+        };
+      }
+      return;
+    }
+
+    const binaryBlobs = this.types?.binary === true;
+    let cursorHandle = await this.engine.cursorOpen(
+      this.dbHandle,
+      this.txHandle,
+      statement.sql,
+      applySerializers(statement.params, this.types?.serializers),
+    );
+
+    try {
+      while (true) {
+        this.assertUsable();
+        const batch = await this.engine.cursorFetch<T>(
+          cursorHandle,
+          batchSize,
+          rowMode,
+          binaryBlobs,
+        );
+        if (batch.rows.length === 0) {
+          break;
+        }
+        yield applyTypes(batch, this.types, rowMode);
+      }
+
+      const toClose = cursorHandle;
+      cursorHandle = 0;
+      if (!this.finished) {
+        await this.engine.cursorClose(toClose);
+      }
+    } finally {
+      if (cursorHandle !== 0) {
+        await this.engine.cursorClose(cursorHandle).catch(() => undefined);
+      }
+    }
   }
 }

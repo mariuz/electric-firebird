@@ -110,7 +110,7 @@ describeIfFirebird('createShapeServer against a Firebird server', () => {
     const version = await source.query<{ V: string }>(
       "SELECT rdb$get_context('SYSTEM', 'ENGINE_VERSION') AS v FROM rdb$database");
     major = Number(version.rows[0]!.V.split('.')[0]);
-    const zoned = major >= 4 ? ', tstz TIMESTAMP WITH TIME ZONE, huge INT128' : '';
+    const zoned = major >= 4 ? ', tstz TIMESTAMP WITH TIME ZONE, huge INT128, df DECFLOAT(34)' : '';
     await source.exec(
       'CREATE TABLE items (id INTEGER NOT NULL PRIMARY KEY, small SMALLINT, big BIGINT, price NUMERIC(10,2), ' +
         'ratio DOUBLE PRECISION, title VARCHAR(40), code CHAR(3), done BOOLEAN, note BLOB SUB_TYPE TEXT, ' +
@@ -122,7 +122,7 @@ describeIfFirebird('createShapeServer against a Firebird server', () => {
         "'13:45:01.5', '2024-05-01 12:00:00.1234', x'00ff800a', x'ff0080')");
     if (major >= 4) {
       await source.exec(
-        "UPDATE items SET tstz = TIMESTAMP '2024-05-01 12:00:00 +02:00', huge = 170141183460469231731687303715884105727 WHERE id = 1");
+        "UPDATE items SET tstz = TIMESTAMP '2024-05-01 12:00:00 +02:00', huge = 170141183460469231731687303715884105727, df = 1.25E+20 WHERE id = 1");
     }
     await source.exec("INSERT INTO pairs VALUES (1, 'x', 'one-x')");
     await source.exec(`CREATE TABLE dated ${DATED}`);
@@ -169,7 +169,7 @@ describeIfFirebird('createShapeServer against a Firebird server', () => {
       raw: { type: 'bytea' },
       bin: { type: 'bytea' },
     });
-    if (major >= 4) expect(schema).toMatchObject({ tstz: { type: 'timestamptz' }, huge: { type: 'numeric' } });
+    if (major >= 4) expect(schema).toMatchObject({ tstz: { type: 'timestamptz' }, huge: { type: 'numeric' }, df: { type: 'numeric' } });
   });
 
   it('serves the snapshot as the exact text the client converts', async () => {
@@ -187,6 +187,7 @@ describeIfFirebird('createShapeServer against a Firebird server', () => {
       expect(rows[0]).toMatchObject({
         tstz: '2024-05-01 10:00:00.0000+00',
         huge: '170141183460469231731687303715884105727',
+        df: '1.25E+20',
       });
     }
   });
@@ -461,19 +462,7 @@ describeIfFirebird('createShapeServer against a Firebird server', () => {
           if (!online) throw new Error('offline');
           if (w.value['title'] === 'refused') throw new WriteRejected('the server says no');
           sent.push(w);
-          return source.transaction(async (tx) => {
-            if (w.operation === 'insert') {
-              await tx.exec('UPDATE OR INSERT INTO todos (id, title, done) VALUES (?, ?, ?) MATCHING (id)',
-                [w.key['id'], w.value['title'] ?? null, w.value['done'] ?? null]);
-            } else if (w.operation === 'update') {
-              await tx.exec('UPDATE todos SET title = COALESCE(?, title), done = COALESCE(?, done) WHERE id = ?',
-                [w.value['title'] ?? null, w.value['done'] ?? null, w.key['id']]);
-            } else {
-              await tx.exec('DELETE FROM todos WHERE id = ?', [w.key['id']]);
-            }
-            const { rows } = await tx.query<{ T: number }>('SELECT CURRENT_TRANSACTION AS t FROM rdb$database');
-            return { txid: rows[0]!.T };
-          });
+          return served.server.applyWrite(w);
         },
       });
       const sync = await syncShapeToTable(db, {
@@ -616,6 +605,207 @@ describeIfFirebird('createShapeServer against a Firebird server', () => {
     } finally {
       await reader?.close();
       await target.close();
+    }
+  });
+});
+
+describe('createShapeServer fast paths & protocol (mocked driver)', () => {
+  it('batches changed-key lookups in changesAfter, supports replica=full, and applies writes via applyWrite', async () => {
+    const executedQueries: Array<{ sql: string; params?: unknown[] }> = [];
+    const executedStmts: Array<{ sql: string; params?: unknown[] }> = [];
+    let currentChanges: unknown[][] = [];
+    let currentRowsByKey = new Map<number, unknown[]>();
+    let currentPairs: unknown[][] = [];
+
+    const mockAttachment = {
+      startTransaction: jest.fn(async () => ({
+        commit: jest.fn(async () => undefined),
+        rollback: jest.fn(async () => undefined),
+      })),
+      execute: jest.fn(async (_tx: unknown, sql: string, params?: unknown[]) => {
+        executedStmts.push({ sql, params });
+      }),
+      executeQuery: jest.fn(async (_tx: unknown, sql: string, params?: unknown[]) => {
+        executedQueries.push({ sql, params });
+        let rows: unknown[][] = [];
+        if (sql.includes('FROM RDB$RELATION_FIELDS') && params?.[0] === 'ITEMS') {
+          rows = [
+            ['ID', 8, 0, 0, 0, 4, 1, 0],
+            ['TITLE', 37, 0, 0, 0, 40, 0, 0],
+          ];
+        } else if (sql.includes('FROM RDB$RELATION_CONSTRAINTS') && params?.[0] === 'ITEMS') {
+          rows = [['ID']];
+        } else if (sql.includes('FROM RDB$RELATION_FIELDS') && params?.[0] === 'PAIRS') {
+          rows = [
+            ['A', 8, 0, 0, 0, 4, 1, 0],
+            ['B', 37, 0, 0, 0, 10, 1, 0],
+            ['V', 37, 0, 0, 0, 20, 0, 0],
+          ];
+        } else if (sql.includes('FROM RDB$RELATION_CONSTRAINTS') && params?.[0] === 'PAIRS') {
+          rows = [['A'], ['B']];
+        } else if (sql.includes('SELECT FIRST 1 EPOCH FROM ELECTRIC_META')) {
+          rows = [['ep1']];
+        } else if (sql.includes('SELECT FIRST 1 1 FROM ELECTRIC_CHANGES WHERE COMMIT_SEQ IS NULL')) {
+          rows = [];
+        } else if (sql.includes('SELECT (SELECT MAX(COMMIT_SEQ) FROM ELECTRIC_CHANGES), MAX(PRUNED_THROUGH) FROM ELECTRIC_META')) {
+          rows = [[10, 0]];
+        } else if (sql.includes('FROM ELECTRIC_CHANGES WHERE TABLE_NAME = ?')) {
+          rows = currentChanges;
+        } else if (sql.startsWith('SELECT "ID", "TITLE" FROM "ITEMS" WHERE ')) {
+          rows = (params ?? [])
+            .map((k) => currentRowsByKey.get(Number(k)))
+            .filter((r): r is unknown[] => r !== undefined);
+        } else if (sql.startsWith('SELECT "A", "B", "V" FROM "PAIRS" WHERE ')) {
+          rows = currentPairs;
+        } else if (sql.includes('SELECT CURRENT_TRANSACTION FROM RDB$DATABASE')) {
+          rows = [[777]];
+        }
+        return {
+          fetch: jest.fn(async () => rows),
+          close: jest.fn(async () => undefined),
+        };
+      }),
+      queueEvents: jest.fn(async () => ({ cancel: jest.fn(async () => undefined) })),
+      disconnect: jest.fn(async () => undefined),
+    };
+
+    const mockClient = {
+      connect: jest.fn(async () => mockAttachment),
+      dispose: jest.fn(async () => undefined),
+    };
+
+    let srv: ShapeServer | undefined;
+    let httpSrv: http.Server | undefined;
+    try {
+      jest.resetModules();
+      jest.doMock('node-firebird-driver-native', () => ({
+        createNativeClient: () => mockClient,
+        getDefaultLibraryFilename: () => 'mock.dll',
+      }));
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { createShapeServer: createMockedServer } = require('../electric-server') as typeof import('../electric-server');
+      srv = await createMockedServer({
+        database: 'localhost:/tmp/mock.fdb',
+        tables: ['items', 'pairs'],
+        install: false,
+        events: false,
+        retainLogMs: null,
+      });
+      httpSrv = http.createServer(srv.handler);
+      await new Promise<void>((r) => httpSrv!.listen(0, '127.0.0.1', r));
+      const base = `http://127.0.0.1:${(httpSrv.address() as AddressInfo).port}/v1/shape`;
+
+      // 1. Batched changesAfter: 205 updated keys -> 2 batched SELECT ... WHERE "ID" IN (...) queries
+      currentChanges = [];
+      currentRowsByKey = new Map();
+      for (let i = 1; i <= 205; i++) {
+        currentChanges.push(['U', 50 + i, String(i), null, null, null]);
+        currentRowsByKey.set(i, [i, `item-${i}`]);
+      }
+      executedQueries.length = 0;
+
+      const defaultSnap = await fetch(`${base}?table=items&offset=-1`);
+      const defaultHandle = defaultSnap.headers.get('electric-handle')!;
+      const fullSnap = await fetch(`${base}?table=items&offset=-1&replica=full`);
+      const fullHandle = fullSnap.headers.get('electric-handle')!;
+      expect(fullHandle).not.toBe(defaultHandle);
+
+      const badReplica = await fetch(`${base}?table=items&offset=-1&replica=bogus`);
+      expect(badReplica.status).toBe(400);
+
+      executedQueries.length = 0;
+      const deltaRes = await fetch(`${base}?table=items&offset=0_0&handle=${fullHandle}&replica=full`);
+      expect(deltaRes.status).toBe(200);
+      const deltaBody = (await deltaRes.json()) as Array<Record<string, unknown>>;
+      // 205 change messages + 1 up-to-date control message
+      expect(deltaBody).toHaveLength(206);
+      expect(deltaBody[0]).toMatchObject({
+        key: '"ITEMS"/"1"',
+        value: { id: '1', title: 'item-1' },
+        old_value: {},
+        headers: { operation: 'update', txids: [51] },
+      });
+
+      const itemSelects = executedQueries.filter((q) =>
+        q.sql.startsWith('SELECT "ID", "TITLE" FROM "ITEMS" WHERE "ID" IN ('),
+      );
+      expect(itemSelects).toHaveLength(2);
+      expect(itemSelects[0]!.params).toHaveLength(200);
+      expect(itemSelects[1]!.params).toHaveLength(5);
+
+      // 2. Composite keys batching in changesAfter
+      currentChanges = [
+        ['I', 91, '1', 'x', null, null],
+        ['U', 92, '2', 'y', null, null],
+      ];
+      currentPairs = [
+        [1, 'x', 'val-1'],
+        [2, 'y', 'val-2'],
+      ];
+      const pairsSnap = await fetch(`${base}?table=pairs&offset=-1`);
+      const pairsHandle = pairsSnap.headers.get('electric-handle')!;
+      executedQueries.length = 0;
+      const pairsDelta = await fetch(`${base}?table=pairs&offset=0_0&handle=${pairsHandle}`);
+      expect(pairsDelta.status).toBe(200);
+      const pairSelects = executedQueries.filter((q) =>
+        q.sql.startsWith('SELECT "A", "B", "V" FROM "PAIRS" WHERE '),
+      );
+      expect(pairSelects).toHaveLength(1);
+      expect(pairSelects[0]!.sql).toContain('(("A" = ? AND "B" = ?) OR ("A" = ? AND "B" = ?))');
+      expect(pairSelects[0]!.params).toEqual(['1', 'x', '2', 'y']);
+
+      // 3. server.applyWrite for insert, update, delete + validation errors
+      executedStmts.length = 0;
+      const ins = await srv.applyWrite({
+        table: 'items',
+        operation: 'insert',
+        key: { id: 10 },
+        value: { title: 'hello' },
+      });
+      expect(ins).toEqual({ txid: 777 });
+      expect(executedStmts[0]).toEqual({
+        sql: 'UPDATE OR INSERT INTO "ITEMS" ("ID", "TITLE") VALUES (?, ?) MATCHING ("ID")',
+        params: [10, 'hello'],
+      });
+
+      executedStmts.length = 0;
+      await srv.applyWrite({
+        table: 'items',
+        operation: 'update',
+        key: { id: 10 },
+        value: { title: 'updated' },
+      });
+      expect(executedStmts[0]).toEqual({
+        sql: 'UPDATE "ITEMS" SET "TITLE" = ? WHERE "ID" = ?',
+        params: ['updated', 10],
+      });
+
+      executedStmts.length = 0;
+      await srv.applyWrite({
+        table: 'items',
+        operation: 'delete',
+        key: { id: 10 },
+      });
+      expect(executedStmts[0]).toEqual({
+        sql: 'DELETE FROM "ITEMS" WHERE "ID" = ?',
+        params: [10],
+      });
+
+      await expect(
+        srv.applyWrite({ table: 'unknown', operation: 'delete', key: { id: 1 } }),
+      ).rejects.toThrow(/Table unknown is not served/);
+      await expect(
+        srv.applyWrite({ table: 'items', operation: 'update', key: { id: 1 }, value: { nope: 1 } }),
+      ).rejects.toThrow(/Column nope is not in table ITEMS/);
+      await expect(
+        srv.applyWrite({ table: 'items', operation: 'delete', key: {} }),
+      ).rejects.toThrow(/missing primary key column id/);
+    } finally {
+      jest.dontMock('node-firebird-driver-native');
+      jest.resetModules();
+      httpSrv?.closeAllConnections();
+      if (httpSrv) await new Promise((r) => httpSrv!.close(r));
+      await srv?.close();
     }
   });
 });

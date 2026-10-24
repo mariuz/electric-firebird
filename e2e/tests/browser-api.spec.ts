@@ -2642,4 +2642,68 @@ test.describe('FirebirdBrowser', () => {
     // Three statements from session 1, plus one more in session 2.
     expect(second.statements).toBe(4);
   });
+
+  test('streams rows in batches with queryStream() and closes cursor on early break', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      window.__stub.queryResult = {
+        columns: ['ID', 'NAME'],
+        rows: [
+          [1, 'a'],
+          [2, 'b'],
+          [3, 'c'],
+          [4, 'd'],
+          [5, 'e'],
+        ],
+      };
+
+      const db = new window.FB.FirebirdBrowser('memory://stream-api', {
+        autoPersist: false,
+      });
+
+      const fullBatches: Array<Array<{ ID: number; NAME: string }>> = [];
+      for await (const batch of db.queryStream<{ ID: number; NAME: string }>(
+        'SELECT id, name FROM items WHERE id >= ?',
+        [1],
+        { batchSize: 2 },
+      )) {
+        fullBatches.push(batch.rows);
+      }
+
+      const breakRows: Array<unknown[]> = [];
+      for await (const batch of db.queryStream(
+        window.FB.sql`SELECT id, name FROM items WHERE id >= ${1}`,
+        { rowMode: 'array', batchSize: 2 },
+      )) {
+        breakRows.push(...batch.rows);
+        break;
+      }
+
+      const stats = window.__stub.stats();
+      const closeCalls = window.__stub.countCalls('_fb_cursor_close');
+      await db.close();
+
+      return { fullBatches, breakRows, stats, closeCalls };
+    });
+
+    expect(result.fullBatches).toEqual([
+      [
+        { ID: 1, NAME: 'a' },
+        { ID: 2, NAME: 'b' },
+      ],
+      [
+        { ID: 3, NAME: 'c' },
+        { ID: 4, NAME: 'd' },
+      ],
+      [{ ID: 5, NAME: 'e' }],
+    ]);
+    expect(result.breakRows).toEqual([
+      [1, 'a'],
+      [2, 'b'],
+    ]);
+    expect(result.closeCalls).toBe(2);
+    expect(result.stats.openCursors).toBe(0);
+    expect(result.stats.liveResults).toBe(0);
+  });
 });

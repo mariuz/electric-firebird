@@ -19,7 +19,11 @@ export interface ElectricTransaction {
 
 /** An operation, or the reset a `must-refetch` asks for, in log order. */
 export type LogEntry =
-  | { kind: 'insert' | 'update' | 'delete'; value: Record<string, unknown> }
+  | {
+      kind: 'insert' | 'update' | 'delete';
+      value: Record<string, unknown>;
+      oldValue?: Record<string, unknown>;
+    }
   | { kind: 'reset' };
 
 /** Where the rows go. */
@@ -74,17 +78,41 @@ export async function applyEntries(
     else await tx.execBatch(sql, rows);
   };
 
+  const schemaColumns = Object.keys(target.schema);
+  const queueUpsert = async (value: Record<string, unknown>) => {
+    const columns = Object.keys(value);
+    const row = columns.map((c) => convert(target, c, value[c]));
+    if (pending && sameColumns(pending.columns, columns)) {
+      pending.rows.push(row);
+    } else {
+      await flush();
+      pending = { columns, rows: [row] };
+    }
+  };
+
   for (const entry of entries) {
     if (entry.kind === 'insert') {
-      const columns = Object.keys(entry.value);
-      const row = columns.map((c) => convert(target, c, entry.value[c]));
-      if (pending && sameColumns(pending.columns, columns)) {
-        pending.rows.push(row);
-      } else {
-        await flush();
-        pending = { columns, rows: [row] };
-      }
+      await queueUpsert(entry.value);
       continue;
+    }
+
+    if (entry.kind === 'update' && entry.oldValue !== undefined) {
+      const oldKey = entry.oldValue;
+      const keyChanged = key.some((c) => c in oldKey && oldKey[c] !== entry.value[c]);
+      const fullRow = schemaColumns.length > 0 && schemaColumns.every((c) => c in entry.value);
+      if (keyChanged) {
+        await flush();
+        const mergedOldKey = Object.fromEntries(
+          key.map((c) => [c, c in oldKey ? oldKey[c] : entry.value[c]]),
+        );
+        await tx.exec(`DELETE FROM ${target.table} WHERE ${keyWhere}`, keyValues(mergedOldKey));
+        await queueUpsert(entry.value);
+        continue;
+      }
+      if (fullRow) {
+        await queueUpsert(entry.value);
+        continue;
+      }
     }
 
     await flush();

@@ -390,11 +390,28 @@ function describe(value: unknown): string {
  *   naming nothing the caller wrote. TypeScript rules this out; untyped
  *   JavaScript, which the browser build is used from, does not.
  */
-export function resolveQueryCall(
+const DEFAULT_STREAM_BATCH_SIZE = 500;
+
+/**
+ * Validate and resolve `QueryStreamOptions.batchSize`.
+ *
+ * @throws {RangeError} if `batchSize` is not a positive integer (`>= 1`).
+ */
+export function resolveBatchSize(batchSize?: number): number {
+  if (batchSize === undefined) return DEFAULT_STREAM_BATCH_SIZE;
+  if (!Number.isInteger(batchSize) || batchSize < 1) {
+    throw new RangeError(
+      `batchSize must be a positive integer, got ${String(batchSize)}`,
+    );
+  }
+  return batchSize;
+}
+
+export function resolveQueryCall<O extends object = TransactionOptions>(
   sql: string | SqlFragment,
-  paramsOrOptions: QueryParams | TransactionOptions = [],
-  maybeOptions: TransactionOptions = {},
-): { statement: Statement; options: TransactionOptions } {
+  paramsOrOptions: QueryParams | O = [],
+  maybeOptions: O = {} as O,
+): { statement: Statement; options: O } {
   if (Array.isArray(paramsOrOptions)) {
     return {
       statement: toStatement(sql, paramsOrOptions),
@@ -412,6 +429,6 @@ export function resolveQueryCall(
 
   return {
     statement: toStatement(sql, []),
-    options: paramsOrOptions as TransactionOptions,
+    options: paramsOrOptions as O,
   };
 }

@@ -91,6 +91,7 @@ export type {
   FieldInfo,
   FirebirdTypeName,
   QueryOptions,
+  QueryStreamOptions,
   QueryDescription,
   StatementKind,
   RowMode,

@@ -504,6 +504,34 @@ export class SharedEngineTransport implements EngineTransport {
     );
   }
 
+  cursorOpen(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    sql: string,
+    params: QueryParams = [],
+  ): Promise<EngineHandle> {
+    return this.call<EngineHandle>('cursorOpen', dbHandle, txHandle, sql, params);
+  }
+
+  cursorFetch<T = Row>(
+    cursorHandle: EngineHandle,
+    batchSize: number,
+    rowMode: RowMode = 'object',
+    binaryBlobs = false,
+  ): Promise<QueryResult<T>> {
+    return this.call<QueryResult<T>>(
+      'cursorFetch',
+      cursorHandle,
+      batchSize,
+      rowMode,
+      binaryBlobs,
+    );
+  }
+
+  cursorClose(cursorHandle: EngineHandle): Promise<void> {
+    return this.call<void>('cursorClose', cursorHandle);
+  }
+
   setSharedReads(dbHandle: EngineHandle, on: boolean): Promise<void> {
     return this.call<void>('setSharedReads', dbHandle, on);
   }

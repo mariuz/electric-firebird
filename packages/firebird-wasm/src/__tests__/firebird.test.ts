@@ -4,6 +4,9 @@ import * as fs from 'fs';
 import { FirebirdLite } from '../firebird';
 import { sql } from '../sql-tag';
 import type { SqlFragment } from '../sql-tag';
+import type { FirebirdLiteOptions } from '../types';
+import { createKysely } from '../kysely';
+import { drizzle, firebirdTable, integer, varchar, eq, asc } from '../drizzle';
 
 /** The major version of the client library the driver loads; set by the probe below. */
 let clientMajor = 0;
@@ -35,7 +38,7 @@ const hasFirebirdLib = (() => {
  */
 function makeDb(
   dbName: string,
-  options: { sharedReads?: boolean; statementCache?: number } = {},
+  options: Omit<FirebirdLiteOptions, 'username' | 'password'> = {},
 ): FirebirdLite {
   const host = process.env['FIREBIRD_HOST'] ?? 'localhost';
   const user = process.env['FIREBIRD_USER'] ?? 'SYSDBA';
@@ -951,6 +954,238 @@ describeIfFirebird('FirebirdLite.execBatch in blocks', () => {
       [2, 'why?'],
       [3, 'why?'],
     ]);
+  });
+
+  it('streams rows in batches with queryStream() and cleans up on early break', async () => {
+    await db.exec('CREATE TABLE s (id INTEGER NOT NULL PRIMARY KEY, label VARCHAR(20))');
+    await db.execBatch(
+      'INSERT INTO s VALUES (?, ?)',
+      Array.from({ length: 7 }, (_, i) => [i + 1, `r${i + 1}`]),
+    );
+
+    const batches: number[] = [];
+    const labels: string[] = [];
+    for await (const batch of db.queryStream<{ ID: number; LABEL: string }>(
+      'SELECT id, label FROM s ORDER BY id',
+      [],
+      { batchSize: 3 },
+    )) {
+      batches.push(batch.rows.length);
+      for (const row of batch.rows) labels.push(row.LABEL);
+    }
+    expect(batches).toEqual([3, 3, 1]);
+    expect(labels).toEqual(['r1', 'r2', 'r3', 'r4', 'r5', 'r6', 'r7']);
+
+    const firstBatchOnly: unknown[][] = [];
+    for await (const batch of db.queryStream(
+      sql`SELECT id, label FROM s WHERE id >= ${2} ORDER BY id`,
+      { rowMode: 'array', batchSize: 2 },
+    )) {
+      firstBatchOnly.push(...batch.rows);
+      break;
+    }
+    expect(firstBatchOnly).toEqual([
+      [2, 'r2'],
+      [3, 'r3'],
+    ]);
+
+    // Subsequent DDL (DROP TABLE) succeeds because early break closed the cursor and transaction
+    await db.exec('DROP TABLE s');
+  });
+});
+
+describeIfFirebird('FirebirdLite with types parity', () => {
+  let db: FirebirdLite;
+  let dbPath: string;
+
+  afterEach(async () => {
+    await db?.close();
+    if (dbPath && fs.existsSync(dbPath)) {
+      try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+    }
+  });
+
+  it('returns browser-identical wire values by default and converts with types: { bigint, dates, binary, parsers, serializers }', async () => {
+    const name = tmpDbName('types-parity');
+    dbPath = path.join(os.tmpdir(), name);
+    db = makeDb(name);
+
+    await db.exec(
+      'CREATE TABLE typed_items (' +
+        'id BIGINT NOT NULL PRIMARY KEY, ' +
+        'price NUMERIC(18,4), ' +
+        'dt DATE, ' +
+        'tm TIME, ' +
+        'ts TIMESTAMP, ' +
+        'note BLOB SUB_TYPE TEXT, ' +
+        'raw BLOB SUB_TYPE BINARY, ' +
+        'oct VARCHAR(4) CHARACTER SET OCTETS)',
+    );
+    await db.exec(
+      'INSERT INTO typed_items VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [
+        9007199254740993n,
+        '12345678901234.5678',
+        '2024-02-29',
+        '13:45:01.5000',
+        '2024-05-01 12:00:00.1234',
+        'text blob ✓',
+        new Uint8Array([0, 0xff, 0x80, 0x0a]),
+        new Uint8Array([1, 2, 3, 4]),
+      ],
+    );
+
+    const wire = await db.query('SELECT * FROM typed_items');
+    expect(wire.fields.map((f) => [f.name, f.typeName])).toEqual([
+      ['ID', 'BIGINT'],
+      ['PRICE', 'NUMERIC'],
+      ['DT', 'DATE'],
+      ['TM', 'TIME'],
+      ['TS', 'TIMESTAMP'],
+      ['NOTE', 'BLOB'],
+      ['RAW', 'BLOB'],
+      ['OCT', 'VARYING'],
+    ]);
+    expect(wire.rows[0]).toEqual({
+      ID: '9007199254740993',
+      PRICE: '12345678901234.5678',
+      DT: '2024-02-29',
+      TM: '13:45:01.5000',
+      TS: '2024-05-01T12:00:00.1234',
+      NOTE: 'text blob ✓',
+      RAW: Buffer.from([0, 0xff, 0x80, 0x0a]).toString('base64'),
+      OCT: Buffer.from([1, 2, 3, 4]).toString('base64'),
+    });
+    await db.close();
+
+    class Price {
+      constructor(readonly value: string) {}
+    }
+    const SQL_INT64 = 580;
+
+    db = makeDb(name, {
+      types: {
+        bigint: true,
+        dates: true,
+        binary: true,
+        parsers: {
+          [SQL_INT64]: (v, f) =>
+            f.scale === 0 ? BigInt(v as string | number) : new Price(String(v)),
+        },
+        serializers: [(v) => (v instanceof Price ? v.value : undefined)],
+      },
+    });
+
+    const rich = await db.query(
+      'SELECT * FROM typed_items WHERE price = ?',
+      [new Price('12345678901234.5678')],
+    );
+    expect(rich.rows[0]).toEqual({
+      ID: 9007199254740993n,
+      PRICE: new Price('12345678901234.5678'),
+      DT: new Date('2024-02-29T00:00:00.000Z'),
+      TM: '13:45:01.5000',
+      TS: new Date('2024-05-01T12:00:00.123Z'),
+      NOTE: 'text blob ✓',
+      RAW: new Uint8Array([0, 0xff, 0x80, 0x0a]),
+      OCT: new Uint8Array([1, 2, 3, 4]),
+    });
+  });
+});
+
+describeIfFirebird('FirebirdLite with Kysely and Drizzle ORM', () => {
+  let db: FirebirdLite;
+  let dbPath: string;
+
+  afterEach(async () => {
+    await db?.close();
+    if (dbPath && fs.existsSync(dbPath)) {
+      try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+    }
+  });
+
+  it('runs Kysely and Drizzle ORM queries end-to-end against FirebirdLite', async () => {
+    const name = tmpDbName('orm-parity');
+    dbPath = path.join(os.tmpdir(), name);
+    db = makeDb(name);
+
+    interface OrmSchema {
+      users: {
+        id: number;
+        name: string;
+        score: number;
+      };
+    }
+    const kdb = createKysely<OrmSchema>(db);
+    await kdb.schema
+      .createTable('users')
+      .addColumn('id', 'integer', (col) => col.primaryKey())
+      .addColumn('name', 'varchar(64)', (col) => col.notNull())
+      .addColumn('score', 'integer', (col) => col.defaultTo(0).notNull())
+      .execute();
+
+    const inserted = await kdb
+      .insertInto('users')
+      .values({ id: 1, name: 'Alice', score: 10 })
+      .returning(['id', 'name', 'score'])
+      .executeTakeFirstOrThrow();
+    expect(inserted).toEqual({ id: 1, name: 'Alice', score: 10 });
+
+    await kdb
+      .insertInto('users')
+      .values([
+        { id: 2, name: 'Bob', score: 20 },
+        { id: 3, name: 'Carol', score: 30 },
+      ])
+      .execute();
+
+    await kdb
+      .insertInto('users')
+      .values({ id: 2, name: 'Bobby', score: 25 })
+      .onConflict((oc) => oc.column('id').doUpdateSet({ name: 'Bobby', score: 25 }))
+      .execute();
+
+    const page = await kdb
+      .selectFrom('users')
+      .select(['id', 'name', 'score'])
+      .orderBy('id', 'asc')
+      .offset(1)
+      .limit(2)
+      .execute();
+    expect(page).toEqual([
+      { id: 2, name: 'Bobby', score: 25 },
+      { id: 3, name: 'Carol', score: 30 },
+    ]);
+
+    const usersTable = firebirdTable('users', {
+      id: integer('id').primaryKey(),
+      name: varchar('name', { length: 64 }).notNull(),
+      score: integer('score').notNull().default(0),
+    });
+    const ddb = drizzle(db, { schema: { users: usersTable } });
+
+    const updated = await ddb
+      .update(usersTable)
+      .set({ score: 99 })
+      .where(eq(usersTable.id, 1))
+      .returning({ id: usersTable.id, score: usersTable.score });
+    expect(updated).toEqual([{ id: 1, score: 99 }]);
+
+    const allUsers = await ddb
+      .select()
+      .from(usersTable)
+      .orderBy(asc(usersTable.id))
+      .offset(0)
+      .limit(2);
+    expect(allUsers).toEqual([
+      { id: 1, name: 'Alice', score: 99 },
+      { id: 2, name: 'Bobby', score: 25 },
+    ]);
+
+    const count = await ddb.$count(usersTable);
+    expect(count).toBe(3);
+
+    await kdb.destroy();
   });
 });
 

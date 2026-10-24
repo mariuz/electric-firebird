@@ -22,6 +22,8 @@ import type { QueryParams } from '../types';
 import { FirebirdBrowser } from '../browser/firebird-browser';
 import { DirectTransport } from '../browser/engine-transport';
 import type { EngineTransport } from '../browser/engine-transport';
+import { createKysely } from '../kysely';
+import { drizzle, firebirdTable, integer, varchar, eq, asc } from '../drizzle';
 
 // The WASM artifacts live at dist/wasm/ after `npm run build:wasm` +
 // `npm run build`.  The suite runs once per build: with threads
@@ -508,7 +510,12 @@ for (const variant of VARIANTS) {
           CAST(-9223372036854775808 AS BIGINT), CAST(9007199254740991 AS BIGINT),
           CAST(9007199254740992 AS BIGINT), CAST(-12345.6789 AS NUMERIC(18,4)),
           CAST(0.1 AS DOUBLE PRECISION), CAST(-0e0 AS DOUBLE PRECISION),
-          CAST(1e21 AS DOUBLE PRECISION), CAST(1e-7 AS DOUBLE PRECISION)
+          CAST(1e21 AS DOUBLE PRECISION), CAST(1e-7 AS DOUBLE PRECISION),
+          CAST(0.5 AS FLOAT),
+          TIME '23:30:00.0000 -02:00', TIME '01:15:00.2500 +03:00',
+          TIMESTAMP '2024-05-01 01:30:00.1234 +05:30',
+          TIMESTAMP '2024-05-01 23:30:00.0000 -02:00',
+          TIMESTAMP '2024-05-01 12:00:00.0000 UTC'
         FROM RDB$DATABASE`);
       try {
         const resultPtr = mod._fb_query(db, 0, sqlPtr, 0);
@@ -527,12 +534,20 @@ for (const variant of VARIANTS) {
           -32768, -2147483648, '-9223372036854775808', 9007199254740991,
           '9007199254740992', '-12345.6789',
         ]);
-        const doubles = row.slice(17);
+        const doubles = row.slice(17, 21);
         expect(doubles.length).toBe(4);
         expect(Object.is(doubles[0], 0.1)).toBe(true);
         expect(Object.is(doubles[1], -0)).toBe(true);
         expect(Object.is(doubles[2], 1e21)).toBe(true);
         expect(Object.is(doubles[3], 1e-7)).toBe(true);
+        expect(row[21]).toBe(0.5);
+        expect(row.slice(22)).toEqual([
+          '23:30:00.0000 -02:00',
+          '01:15:00.2500 +03:00',
+          '2024-05-01T01:30:00.1234 +05:30',
+          '2024-05-01T23:30:00.0000 -02:00',
+          '2024-05-01T12:00:00.0000 UTC',
+        ]);
       } finally {
         mod._free(sqlPtr);
       }
@@ -1059,6 +1074,102 @@ for (const variant of VARIANTS) {
       }
 
       mod._fb_detach_database(db);
+    });
+
+    it('runs Kysely and Drizzle ORM queries end-to-end against FirebirdBrowser', async () => {
+      const fb = new FirebirdBrowser(`memory://orm-e2e-${variant.threads ? 'mt' : 'st'}`, {
+        transport: new DirectTransport({ threads: variant.threads }),
+      });
+      try {
+        interface OrmSchema {
+          users: {
+            id: number;
+            name: string;
+            score: number;
+          };
+        }
+        const kdb = createKysely<OrmSchema>(fb);
+        await kdb.schema
+          .createTable('users')
+          .addColumn('id', 'integer', (col) => col.primaryKey())
+          .addColumn('name', 'varchar(64)', (col) => col.notNull())
+          .addColumn('score', 'integer', (col) => col.defaultTo(0).notNull())
+          .execute();
+
+        const inserted = await kdb
+          .insertInto('users')
+          .values({ id: 1, name: 'Alice', score: 10 })
+          .returning(['id', 'name', 'score'])
+          .executeTakeFirstOrThrow();
+        expect(inserted).toEqual({ id: 1, name: 'Alice', score: 10 });
+
+        await kdb
+          .insertInto('users')
+          .values([
+            { id: 2, name: 'Bob', score: 20 },
+            { id: 3, name: 'Carol', score: 30 },
+          ])
+          .execute();
+
+        await kdb
+          .insertInto('users')
+          .values({ id: 2, name: 'Bobby', score: 25 })
+          .onConflict((oc) =>
+            oc.column('id').doUpdateSet({ name: 'Bobby', score: 25 }),
+          )
+          .execute();
+
+        const page = await kdb
+          .selectFrom('users')
+          .select(['id', 'name', 'score'])
+          .orderBy('id', 'asc')
+          .offset(1)
+          .limit(2)
+          .execute();
+        expect(page).toEqual([
+          { id: 2, name: 'Bobby', score: 25 },
+          { id: 3, name: 'Carol', score: 30 },
+        ]);
+
+        const tables = await kdb.introspection.getTables();
+        expect(tables.find((t) => t.name === 'users')?.columns.map((c) => c.name)).toEqual([
+          'id',
+          'name',
+          'score',
+        ]);
+
+        const usersTable = firebirdTable('users', {
+          id: integer('id').primaryKey(),
+          name: varchar('name', { length: 64 }).notNull(),
+          score: integer('score').notNull().default(0),
+        });
+        const ddb = drizzle(fb, { schema: { users: usersTable } });
+
+        const updated = await ddb
+          .update(usersTable)
+          .set({ score: 99 })
+          .where(eq(usersTable.id, 1))
+          .returning({ id: usersTable.id, score: usersTable.score });
+        expect(updated).toEqual([{ id: 1, score: 99 }]);
+
+        const allUsers = await ddb
+          .select()
+          .from(usersTable)
+          .orderBy(asc(usersTable.id))
+          .offset(0)
+          .limit(2);
+        expect(allUsers).toEqual([
+          { id: 1, name: 'Alice', score: 99 },
+          { id: 2, name: 'Bobby', score: 25 },
+        ]);
+
+        const count = await ddb.$count(usersTable);
+        expect(count).toBe(3);
+
+        await kdb.destroy();
+      } finally {
+        await fb.close();
+      }
     });
   },
 );

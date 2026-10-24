@@ -105,8 +105,9 @@ export function planColumn(column: FirebirdColumn): ColumnPlan {
       return { ...base, select: `CAST(${q} AT TIME ZONE 'UTC' AS VARCHAR(48))`, render: 'utc', schema: schema('timestamptz') };
     case 24:
     case 25:
-      // DECFLOAT renders in exponent notation, which numeric does not take.
-      return { ...base, select: 'NULL', render: 'text', schema: schema('decfloat') };
+      // DECFLOAT(16) and DECFLOAT(34): rendered as text by Firebird, with no
+      // fixed precision/scale so tableFromSchema maps it back to DECFLOAT(34).
+      return exact('numeric');
     default:
       return { ...base, select: 'NULL', render: 'text', schema: schema(`firebird_type_${column.type}`) };
   }

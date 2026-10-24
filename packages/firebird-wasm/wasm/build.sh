@@ -274,6 +274,20 @@ fi
 # deleted, say) then compiled that native tool against the 32-bit edits and failed with
 # "conflicting declaration 'typedef int ISC_LONG'".  The edits below are idempotent and run on
 # every build, so refreshing the native copy here costs nothing.
+#
+# Save any existing 32-bit WASM autoconfig.h (preserving its mtime with cp -p)
+# before temporarily placing the 64-bit host autoconfig.h in the source tree
+# for native bootstrap targets (btyacc/parse and gpre_boot).  After the 32-bit
+# WASM edits are applied below, if the resulting header is byte-for-byte
+# identical to the previous WASM header, restoring the saved file preserves its
+# timestamp so incremental Emscripten builds do not recompile every translation
+# unit that includes firebird.h / autoconfig.h.
+AUTOCONFIG_PREV="${NATIVE_BUILD_DIR}/.autoconfig.h.wasm-prev"
+if [[ -f "${AUTOCONFIG_SRC}" ]]; then
+  cp -p "${AUTOCONFIG_SRC}" "${AUTOCONFIG_PREV}"
+else
+  rm -f "${AUTOCONFIG_PREV}"
+fi
 if [[ -f "${AUTOCONFIG_NATIVE}" ]]; then
   mkdir -p "${FIREBIRD_SRC}/src/include/gen"
   cp "${AUTOCONFIG_NATIVE}" "${AUTOCONFIG_SRC}"
@@ -296,13 +310,15 @@ fi
 # We build only the "parse" target (and its btyacc dependency) using the
 # native host compiler.  The generated files are then copied into the
 # source tree so the Emscripten cross-compilation can find them.
-if [[ ! -f "${PARSE_H_SRC}" ]]; then
+if [[ ! -f "${PARSE_H_SRC}" || ! -f "${PARSE_H_NATIVE}" ]]; then
   echo "Generating parse.h and parse.cpp (building btyacc + parse target)…"
   cmake --build "${NATIVE_BUILD_DIR}" --target parse -j"$(nproc)" 2>&1 || true
 
   if [[ -f "${PARSE_H_NATIVE}" ]]; then
     mkdir -p "${FIREBIRD_SRC}/src/include/gen"
-    cp "${PARSE_H_NATIVE}" "${PARSE_H_SRC}"
+    if [[ ! -f "${PARSE_H_SRC}" ]] || ! cmp -s "${PARSE_H_NATIVE}" "${PARSE_H_SRC}"; then
+      cp "${PARSE_H_NATIVE}" "${PARSE_H_SRC}"
+    fi
     echo "parse.h generated and copied to source tree."
   else
     echo "Error: native build did not produce parse.h." >&2
@@ -311,7 +327,9 @@ if [[ ! -f "${PARSE_H_SRC}" ]]; then
   fi
 
   if [[ -s "${PARSE_CPP_NATIVE}" ]]; then   # -s: not the empty placeholder the configure step left
-    cp "${PARSE_CPP_NATIVE}" "${PARSE_CPP_SRC}"
+    if [[ ! -f "${PARSE_CPP_SRC}" ]] || ! cmp -s "${PARSE_CPP_NATIVE}" "${PARSE_CPP_SRC}"; then
+      cp "${PARSE_CPP_NATIVE}" "${PARSE_CPP_SRC}"
+    fi
     echo "parse.cpp generated and copied to source tree."
   else
     echo "Error: native build did not produce parse.cpp." >&2
@@ -336,6 +354,8 @@ fi
 # describe a 32-bit target and would break the native compile of gpre_boot.
 GPRE_BOOT="${NATIVE_BUILD_DIR}/src/bin/gpre_boot"
 EPP_OUT_DIR="${NATIVE_BUILD_DIR}/epp-generated"
+EPP_CACHE_DIR="${SCRIPT_DIR}/build-epp-cache"
+GPRE_REBUILT=0
 
 # Every .epp under src/jrd and src/dsql, all of which upstream preprocesses
 # with the same -n -ids -gds_cxx boot flags.
@@ -351,6 +371,7 @@ mapfile -t EPP_GDS_FILES < <(
 if [[ ! -f "${GPRE_BOOT}" ]]; then
   echo "Building gpre_boot (embedded-SQL preprocessor)…"
   cmake --build "${NATIVE_BUILD_DIR}" --target gpre_boot -j"$(nproc)"
+  GPRE_REBUILT=1
 fi
 
 if [[ ! -f "${GPRE_BOOT}" ]]; then
@@ -358,16 +379,28 @@ if [[ ! -f "${GPRE_BOOT}" ]]; then
   exit 1
 fi
 
+# If build-native-config was wiped during an incremental rebuild, seed
+# epp-generated from build-epp-cache (preserving mtimes) so unchanged .epp
+# outputs do not force Emscripten to recompile all 14 metadata units.
+if [[ ! -d "${EPP_OUT_DIR}" && -d "${EPP_CACHE_DIR}" ]]; then
+  cp -rp "${EPP_CACHE_DIR}" "${EPP_OUT_DIR}"
+fi
+
 echo "Preprocessing .epp sources with gpre_boot…"
 mkdir -p "${EPP_OUT_DIR}"
 for epp in "${EPP_GDS_FILES[@]}"; do
   out="${EPP_OUT_DIR}/$(basename "${epp}" .epp).cpp"
-  if [[ -f "${out}" && "${out}" -nt "${FIREBIRD_SRC}/src/${epp}" ]]; then
+  if [[ "${GPRE_REBUILT}" -eq 0 && -f "${out}" && "${out}" -nt "${FIREBIRD_SRC}/src/${epp}" ]]; then
     continue
   fi
   echo "  → ${epp}"
   # gpre resolves includes relative to the working directory.
-  ( cd "${FIREBIRD_SRC}/src" && "${GPRE_BOOT}" -n -ids -gds_cxx "${epp}" "${out}" )
+  ( cd "${FIREBIRD_SRC}/src" && "${GPRE_BOOT}" -n -ids -gds_cxx "${epp}" "${out}.tmp" )
+  if [[ -f "${out}" && "${out}" -nt "${FIREBIRD_SRC}/src/${epp}" ]] && cmp -s "${out}.tmp" "${out}"; then
+    rm -f "${out}.tmp"
+  else
+    mv -f "${out}.tmp" "${out}"
+  fi
 done
 
 # ── Patch autoconfig.h for 32-bit WASM ──────────────────────────────────────
@@ -379,6 +412,9 @@ done
 # No backup is needed: this file is a generated copy we placed here ourselves;
 # the canonical source is ${NATIVE_BUILD_DIR}/src/include/gen/autoconfig.h.
 # The substitution is idempotent (no-op if already patched to 4).
+rm -rf "${EPP_CACHE_DIR}"
+cp -rp "${EPP_OUT_DIR}" "${EPP_CACHE_DIR}"
+
 sed -i 's/^#define SIZEOF_LONG[[:space:]]*8/#define SIZEOF_LONG 4/' "${AUTOCONFIG_SRC}"
 
 # ── Patch SIZEOF_VOID_P / SIZEOF_SIZE_T for 32-bit WASM ─────────────────────
@@ -443,6 +479,16 @@ sed -i '/^#define HAVE_LINUX_FALLOC_H/d' "${AUTOCONFIG_SRC}"
 # disables that code path.  The PIO functions provided by unix.cpp are
 # still compiled and provide real in-memory I/O via Emscripten's MEMFS.
 sed -i '/^#define SUPPORT_RAW_DEVICES/d' "${AUTOCONFIG_SRC}"
+
+# Restore the previous 32-bit WASM autoconfig.h (and its original mtime) if
+# the patched contents are byte-for-byte identical.
+if [[ -f "${AUTOCONFIG_PREV}" ]]; then
+  if cmp -s "${AUTOCONFIG_SRC}" "${AUTOCONFIG_PREV}"; then
+    mv -f "${AUTOCONFIG_PREV}" "${AUTOCONFIG_SRC}"
+  else
+    rm -f "${AUTOCONFIG_PREV}"
+  fi
+fi
 
 # ── CMake configure + build ──────────────────────────────────────────────────
 # NOTE: The CMakeLists.txt uses -sUSE_ICU=1 which causes Emscripten to

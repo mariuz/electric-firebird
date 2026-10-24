@@ -205,6 +205,32 @@ export interface FirebirdWasmModule {
   _fb_events_cancel(subscriptionHandle: number): number;
   /** Free a result set returned by `_fb_query`. */
   _fb_free_result(resultPtr: number): void;
+  /**
+   * Open a streaming cursor for `sqlPtr` (with optional packed `paramsPtr`).
+   * Returns a cursor handle (>0) on success, or 0 on failure.
+   */
+  _fb_cursor_open?(
+    handle: FbHandle,
+    txHandle: FbHandle,
+    sqlPtr: number,
+    paramsPtr: number,
+    paramsLength: number,
+  ): FbHandle;
+  /**
+   * Fetch up to `maxRows` rows from an open cursor and return a pointer to a
+   * JSON-encoded batch (`{columns, rows}` or `{shape, rows}`), or 0 on failure.
+   * Free the returned string with `_fb_free_result`.
+   */
+  _fb_cursor_fetch?(
+    cursorHandle: FbHandle,
+    maxRows: number,
+    flags: number,
+  ): number;
+  /**
+   * Close an open cursor, release its statement, and commit (or roll back on
+   * fetch failure) any transaction that `_fb_cursor_open` started for itself.
+   */
+  _fb_cursor_close?(cursorHandle: FbHandle): number;
   /** Start a new transaction and return a transaction handle (0 = failed). */
   _fb_start_transaction(handle: FbHandle): FbHandle;
   /**

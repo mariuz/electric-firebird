@@ -91,6 +91,29 @@ export interface EngineTransport {
     binaryBlobs?: boolean,
   ): Promise<QueryResult<T>>;
   /**
+   * Open a streaming cursor for `sql` (with optional `params`).
+   * With `txHandle` of 0 the cursor runs in its own transaction, committed by
+   * {@link EngineTransport.cursorClose}.
+   */
+  cursorOpen?(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    sql: string,
+    params?: QueryParams,
+  ): Promise<EngineHandle>;
+  /**
+   * Fetch up to `batchSize` rows from an open cursor.
+   * An empty `rows` array signals end-of-cursor.
+   */
+  cursorFetch?<T = Row>(
+    cursorHandle: EngineHandle,
+    batchSize: number,
+    rowMode?: RowMode,
+    binaryBlobs?: boolean,
+  ): Promise<QueryResult<T>>;
+  /** Close an open cursor and finish any transaction it started for itself. */
+  cursorClose?(cursorHandle: EngineHandle): Promise<void>;
+  /**
    * Run this database's autocommit SELECTs in a read-only transaction it
    * keeps open (`true`), or each in one of its own (`false`, the default).
    * Optional, so a transport written before it still type-checks;
@@ -534,6 +557,12 @@ export class DirectTransport implements EngineTransport {
   private opfsHandle: { close(): void } | null = null;
   /** What each shape id of this module's engine means (see SHAPE_IDS). */
   private readonly shapes = new Map<number, readonly FieldInfo[]>();
+  /** Fallback cursor state when running against an older WASM artifact without `_fb_cursor_open`. */
+  private readonly fallbackCursors = new Map<
+    EngineHandle,
+    { fields: FieldInfo[]; rows: unknown[][]; offset: number }
+  >();
+  private nextFallbackCursor = 1;
 
   /**
    * The fields of shape `id`: remembered, or asked of the engine once. Called
@@ -737,6 +766,102 @@ export class DirectTransport implements EngineTransport {
     );
   }
 
+  async cursorOpen(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    sql: string,
+    params: QueryParams = [],
+  ): Promise<EngineHandle> {
+    const mod = this.module;
+    if (typeof mod._fb_cursor_open !== 'function') {
+      const full = await this.query<unknown[]>(
+        dbHandle,
+        txHandle,
+        sql,
+        params,
+        'array',
+        true,
+      );
+      const handle = this.nextFallbackCursor++;
+      this.fallbackCursors.set(handle, {
+        fields: full.fields,
+        rows: full.rows,
+        offset: 0,
+      });
+      return handle;
+    }
+
+    const openFn = mod._fb_cursor_open;
+    const handle = this.withString(sql, (sqlPtr) =>
+      this.withParams(params, (paramPtr, paramLen) =>
+        openFn.call(mod, dbHandle, txHandle, sqlPtr, paramPtr, paramLen),
+      ),
+    );
+    if (handle === 0) {
+      throw engineError(mod, `Firebird cursor open failed for: ${sql}`);
+    }
+    return handle;
+  }
+
+  async cursorFetch<T = Row>(
+    cursorHandle: EngineHandle,
+    batchSize: number,
+    rowMode: RowMode = 'object',
+    binaryBlobs = false,
+  ): Promise<QueryResult<T>> {
+    const mod = this.module;
+    if (typeof mod._fb_cursor_fetch !== 'function') {
+      const entry = this.fallbackCursors.get(cursorHandle);
+      if (!entry) {
+        throw new Error('Firebird cursor fetch failed: unknown cursor handle');
+      }
+      const fields = entry.fields.map((f) => ({ ...f }));
+      const slice = entry.rows.slice(entry.offset, entry.offset + batchSize);
+      entry.offset += slice.length;
+      if (rowMode === 'array') {
+        return { rows: slice.map((r) => [...r]) as T[], fields };
+      }
+      const names = fields.map((f) => f.name);
+      const build = rowBuilder(names);
+      const rows = (
+        build
+          ? slice.map(build)
+          : slice.map((cols) =>
+              Object.fromEntries(names.map((name, i) => [name, cols[i]])),
+            )
+      ) as T[];
+      return { rows, fields };
+    }
+
+    const flags = (binaryBlobs ? BLOB_SIDE_CHANNEL : 0) | SHAPE_IDS;
+    const resultPtr = mod._fb_cursor_fetch(cursorHandle, batchSize, flags);
+    if (resultPtr === 0) {
+      throw engineError(mod, 'Firebird cursor fetch failed');
+    }
+
+    const json = mod.UTF8ToString(resultPtr);
+    mod._fb_free_result(resultPtr);
+
+    const blobs = binaryBlobs ? readBlobs(mod) : null;
+    const result = decodeResultSet<T>(json, rowMode, this.shapeColumns);
+    return blobs ? attachBlobs(result, blobs, rowMode) : result;
+  }
+
+  async cursorClose(cursorHandle: EngineHandle): Promise<void> {
+    const mod = this.module;
+    if (typeof mod._fb_cursor_close !== 'function') {
+      if (!this.fallbackCursors.delete(cursorHandle)) {
+        throw new Error('Firebird cursor close failed: unknown cursor handle');
+      }
+      return;
+    }
+
+    const rc = mod._fb_cursor_close(cursorHandle);
+    if (rc !== 0) {
+      throw engineError(mod, 'Firebird cursor close failed', rc);
+    }
+  }
+
   async setSharedReads(dbHandle: EngineHandle, on: boolean): Promise<void> {
     const mod = this.module;
     if (mod._fb_read_transaction(dbHandle, on ? 1 : 0) < 0) {
@@ -877,6 +1002,7 @@ export class DirectTransport implements EngineTransport {
     this.mod = null;
     this.initPromise = null;
     this.opfsHandle = null;
+    this.fallbackCursors.clear();
     if (opfs && mod) {
       // The database is detached by now.  The handle is exclusive: left open,
       // it locked the file against the next open until the Worker went.

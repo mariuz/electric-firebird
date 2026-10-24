@@ -52,10 +52,10 @@ const asFloat: Convert = (text, column) => {
 };
 
 const asNumeric: Convert = (text, column) => {
-  if (!/^-?\d+(\.\d+)?$/.test(text)) {
+  if (!/^-?\d+(\.\d+)?([eE][+-]?\d+)?$/.test(text)) {
     throw new RangeError(`Column ${column} holds ${text}, which Firebird cannot store`);
   }
-  // Exact: the text goes to a NUMERIC column, which converts it digit for digit.
+  // Exact: the text goes to a NUMERIC or DECFLOAT column, which converts it digit for digit.
   return text;
 };
 
@@ -123,6 +123,7 @@ const CONVERSIONS: Record<string, Convert> = {
   int4: asInteger,
   int8: asBigInt,
   numeric: asNumeric,
+  decfloat: asNumeric,
   float4: asFloat,
   float8: asFloat,
   bool: asBoolean,
@@ -219,6 +220,8 @@ function firebirdType(info: ElectricColumn): string {
       return info.precision !== undefined
         ? `NUMERIC(${Math.min(info.precision, 38)}, ${info.scale ?? 0})`
         : 'DECFLOAT(34)';
+    case 'decfloat':
+      return 'DECFLOAT(34)';
     case 'float4': return 'FLOAT';
     case 'float8': return 'DOUBLE PRECISION';
     case 'bool': return 'BOOLEAN';

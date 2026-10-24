@@ -71,7 +71,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake git
+            build-essential cmake git libicu-dev
 
       - name: Cache native config
         uses: actions/cache@v4
@@ -87,6 +87,33 @@ jobs:
       # Both builds: the threaded one and firebird-embedded-st, without threads.
       - name: Build WASM modules (compile Firebird with Emscripten)
         run: npm run build:wasm -w packages/firebird-wasm
+
+      # Incremental rebuild check (roadmap §M6): re-runs build.sh after wiping
+      # build-native-config and the patch marker and touching a source file,
+      # verifying that patches re-check idempotently, btyacc/parse and
+      # gpre_boot rebuild cleanly against a tree that already holds the 32-bit
+      # WASM autoconfig.h, and the Emscripten CMake build only recompiles the
+      # touched translation unit rather than every file that includes
+      # autoconfig.h or parse.h.
+      - name: Incremental WASM rebuild check
+        working-directory: packages/firebird-wasm
+        run: |
+          set -euo pipefail
+          UNTOUCHED_OBJ="wasm/build-st/CMakeFiles/firebird-embedded.dir/fb_wasm_stubs.cpp.o"
+          TOUCHED_OBJ="wasm/build-st/CMakeFiles/firebird-embedded.dir/fb_wasm_api.cpp.o"
+          BEFORE_UNTOUCHED="$(stat -c %Y "$UNTOUCHED_OBJ")"
+          BEFORE_TOUCHED="$(stat -c %Y "$TOUCHED_OBJ")"
+          sleep 2
+          rm -rf wasm/build-native-config
+          rm -f wasm/firebird-src/.wasm-patches-applied
+          touch wasm/fb_wasm_api.cpp
+          npm run build:wasm
+          AFTER_UNTOUCHED="$(stat -c %Y "$UNTOUCHED_OBJ")"
+          AFTER_TOUCHED="$(stat -c %Y "$TOUCHED_OBJ")"
+          test -f wasm/build-native-config/src/bin/gpre_boot
+          test -f wasm/firebird-src/.wasm-patches-applied
+          test "$AFTER_TOUCHED" -gt "$BEFORE_TOUCHED"
+          test "$AFTER_UNTOUCHED" -eq "$BEFORE_UNTOUCHED"
 
       - name: Build TypeScript package
         run: npm run build -w packages/firebird-wasm

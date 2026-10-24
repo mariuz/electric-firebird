@@ -59,4 +59,35 @@ describe('wasm-loader', () => {
       expect(heap[ptr + 5]).toBe(0); // null terminator
     });
   });
+
+  describe('wasm/build.sh and CI incremental rebuild guards', () => {
+    it('preserves autoconfig.h, parse.h/parse.cpp, and epp-generated mtimes across incremental rebuilds and runs a second build in CI', () => {
+      const buildShPath = path.resolve(__dirname, '../../wasm/build.sh');
+      const buildSh = fs.readFileSync(buildShPath, 'utf8');
+
+      // 1. Saves previous 32-bit WASM autoconfig.h before native bootstrap and restores it if byte-identical
+      expect(buildSh).toContain('AUTOCONFIG_PREV=');
+      expect(buildSh).toContain('cp -p "${AUTOCONFIG_SRC}" "${AUTOCONFIG_PREV}"');
+      expect(buildSh).toContain('cmp -s "${AUTOCONFIG_SRC}" "${AUTOCONFIG_PREV}"');
+      expect(buildSh).toContain('mv -f "${AUTOCONFIG_PREV}" "${AUTOCONFIG_SRC}"');
+
+      // 2. Preserves parse.h and parse.cpp mtimes when generated parser output is unchanged
+      expect(buildSh).toContain('cmp -s "${PARSE_H_NATIVE}" "${PARSE_H_SRC}"');
+      expect(buildSh).toContain('cmp -s "${PARSE_CPP_NATIVE}" "${PARSE_CPP_SRC}"');
+
+      // 3. Caches epp-generated outputs across build-native-config wipes and compares .tmp before overwriting
+      expect(buildSh).toContain('EPP_CACHE_DIR=');
+      expect(buildSh).toContain('cmp -s "${out}.tmp" "${out}"');
+
+      // 4. CI workflow runs an incremental rebuild check after wiping build-native-config and touching fb_wasm_api.cpp
+      const workflowPath = path.resolve(__dirname, '../../../../.github/workflows/build-wasm.yml');
+      const workflow = fs.readFileSync(workflowPath, 'utf8');
+      expect(workflow).toContain('Incremental WASM rebuild check');
+      expect(workflow).toContain('rm -rf wasm/build-native-config');
+      expect(workflow).toContain('rm -f wasm/firebird-src/.wasm-patches-applied');
+      expect(workflow).toContain('touch wasm/fb_wasm_api.cpp');
+      expect(workflow).toContain('test "$AFTER_TOUCHED" -gt "$BEFORE_TOUCHED"');
+      expect(workflow).toContain('test "$AFTER_UNTOUCHED" -eq "$BEFORE_UNTOUCHED"');
+    });
+  });
 });

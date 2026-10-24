@@ -1219,4 +1219,68 @@ test.describe('FirebirdBrowser against the real engine', () => {
     // instead of being truncated into a Date.
     expect(result.ts).toEqual({ exact: '2026-08-11T11:22:33.4567' });
   });
+
+  test('streams batches with queryStream() and supports early break and transactions', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('memory://stream-engine', {
+        worker: new Worker('/firebird-engine-worker.js'),
+        autoPersist: false,
+      });
+
+      await db.exec('CREATE TABLE items (id INTEGER NOT NULL PRIMARY KEY, name VARCHAR(20))');
+      await db.execBatch(
+        'INSERT INTO items VALUES (?, ?)',
+        Array.from({ length: 7 }, (_, i) => [i + 1, `item-${i + 1}`]),
+      );
+
+      const batchLengths: number[] = [];
+      const names: string[] = [];
+      for await (const batch of db.queryStream<{ ID: number; NAME: string }>(
+        'SELECT id, name FROM items ORDER BY id',
+        [],
+        { batchSize: 3 },
+      )) {
+        batchLengths.push(batch.rows.length);
+        for (const r of batch.rows) names.push(r.NAME);
+      }
+
+      const earlyIds: number[] = [];
+      for await (const batch of db.queryStream(
+        window.FB.sql`SELECT id, name FROM items WHERE id >= ${2} ORDER BY id`,
+        { rowMode: 'array', batchSize: 2 },
+      )) {
+        for (const r of batch.rows) earlyIds.push(r[0] as number);
+        break;
+      }
+
+      const txIds: number[] = [];
+      await db.transaction(async (tx) => {
+        for await (const batch of tx.queryStream<{ ID: number }>(
+          'SELECT id FROM items WHERE id <= ? ORDER BY id',
+          [3],
+          { batchSize: 2 },
+        )) {
+          for (const r of batch.rows) txIds.push(r.ID);
+        }
+      });
+
+      await db.close();
+      return { batchLengths, names, earlyIds, txIds };
+    });
+
+    expect(result.batchLengths).toEqual([3, 3, 1]);
+    expect(result.names).toEqual([
+      'item-1',
+      'item-2',
+      'item-3',
+      'item-4',
+      'item-5',
+      'item-6',
+      'item-7',
+    ]);
+    expect(result.earlyIds).toEqual([2, 3]);
+    expect(result.txIds).toEqual([1, 2, 3]);
+  });
 });
