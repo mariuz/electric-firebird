@@ -307,9 +307,9 @@ written; what remains:
 - ~~`loadFirebirdWasm()` caches one module process-wide with no way to
   dispose it.~~ Disposed in 0.9.0: `disposeFirebirdWasm()`, and closing a
   transport's last database disposes its module.
-- Only the built-in character sets are compiled in, and the UNICODE collations
-  do not work. Both are solved on `icu-collation` (§6, PR #12) and neither is
-  merged.
+- ~~Only the built-in character sets are compiled in, and the UNICODE collations~~
+  ~~do not work.~~ `UNICODE`, `UNICODE_CI` and `UNICODE_CI_AI` collations now work by default (`FB_WASM_ICU_COLLATION=ON`, §6); the 48 extra legacy character sets remain opt-in (`-DFB_WASM_FULL_INTL=ON`).
+
 - ~~ElectricSQL sync (§M5)~~ — the project's namesake. Done: shapes sync in
   from Postgres through Electric and from a Firebird server through
   `firebird-wasm/electric-server`, and writes go back through
@@ -1245,7 +1245,7 @@ both now assert real rows rather than shapes a stub could satisfy.
 
 ---
 
-## 6. ICU collation data — branch `icu-collation`, PR #12, not merged
+## 6. ICU collation data — merged (`FB_WASM_ICU_COLLATION=ON`)
 
 `main` ships with `UNICODE`, `UNICODE_CI` and `UNICODE_CI_AI` listed in
 `RDB$COLLATIONS` and failing on use, so there is no case-insensitive
@@ -1290,9 +1290,9 @@ locale-aware ORDER BY               -> Apfel < Ärzte < Zebra
 | `coll/root.res` + `coll/ucadata.icu` | 800 KB | 270 KB |
 | Whole collation tree, 170 locales | 3.3 MB | ~1.1 MB |
 
-Open before it merges: which package to ship (the 800 KB one has not been
-retested since the loading mechanism started working, so the minimum is
-unknown), whether either flag defaults on, CI needing `icu-devtools`, the
-unenforced coupling between the data file and the port's ICU `TAG`, and the
-absence of any automated test — the evidence above is from a script run by
-hand.
+Merged on `main`: `FB_WASM_ICU_COLLATION=ON` defaults on, `wasm/build.sh` builds the root collation package (`coll/ucadata.icu`, `coll/root.res`, `coll/en*.res`, `coll/res_index.res`) via `wasm/tools/build-icu-data.sh`, `fb_wasm_icu_data.cpp` enforces `U_ICU_VERSION_MAJOR_NUM == 68` at compile time, and `wasm-single-thread.test.ts` tests `UNICODE`, `UNICODE_CI` and `UNICODE_CI_AI`.
+
+
+
+
+

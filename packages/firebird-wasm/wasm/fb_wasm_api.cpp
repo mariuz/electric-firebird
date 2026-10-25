@@ -83,6 +83,7 @@ using namespace Firebird;
  * internal headers, which are not consumable from outside the engine build.
  */
 extern "C" void FB_PLUGIN_ENTRY_POINT(Firebird::IMaster* master);
+extern "C" bool fb_wasm_load_icu_data();
 extern "C" int fb_shutdown(unsigned int timeout, const int reason);   // yvalve/why.cpp (ibase.h)
 #ifndef fb_shutrsn_app_stopped
 #define fb_shutrsn_app_stopped -3   // firebird/impl/consts_pub.h
@@ -2572,6 +2573,10 @@ int fb_init(void)
 	// chosen a root means it deliberately.
 	setenv("FIREBIRD", "/firebird", 0);
 #endif
+
+	// Before anything touches ICU: the engine's UNICODE collations open a
+	// collator during database creation, and ICU only reads its data once.
+	fb_wasm_load_icu_data();
 
 	g_master = fb_get_master_interface();
 	if (!g_master)

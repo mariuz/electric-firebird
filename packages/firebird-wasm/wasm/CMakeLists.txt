@@ -162,6 +162,34 @@ list(FILTER FB_JRD_SRCS EXCLUDE REGEX ".*/jrd/os/win32/.*")
 # applications never touch.  Measure before enabling — see docs/roadmap.md.
 option(FB_WASM_FULL_INTL "Compile the loadable character sets and collations into the engine" OFF)
 
+# ---------------------------------------------------------------------------
+# ICU collation data
+# ---------------------------------------------------------------------------
+#
+# Emscripten's ICU port links libicu_stubdata — ICU's code with none of its
+# data — so ucol_open() fails and Firebird reports UNICODE, UNICODE_CI and
+# UNICODE_CI_AI as "not installed".  Supplying data at runtime is what stub
+# data is for.
+#
+# icu-data/icudt68l.dat is ICU 68.2's own package reduced with icupkg to the
+# root collator and Unicode collation weights (coll/ucadata.icu, coll/root.res,
+# coll/en*.res, coll/res_index.res): ~808 KB raw, ~270 KB gzipped.  Generated
+# by tools/build-icu-data.sh during wasm/build.sh.
+option(FB_WASM_ICU_COLLATION "Embed ICU collation data so UNICODE collations work" ON)
+
+if(FB_WASM_ICU_COLLATION)
+  set(FB_ICU_DATA "${CMAKE_CURRENT_SOURCE_DIR}/icu-data/icudt68l.dat")
+  if(NOT EXISTS "${FB_ICU_DATA}")
+    message(FATAL_ERROR
+      "FB_WASM_ICU_COLLATION needs ${FB_ICU_DATA}. "
+      "Generate it with tools/build-icu-data.sh")
+  endif()
+  add_compile_definitions(
+    FB_WASM_ICU_COLLATION_DATA
+    FB_WASM_ICU_DATA_PATH="/firebird/icu/icudt68l.dat")
+  message(STATUS "FB_WASM_ICU_COLLATION=ON: embedding ICU collation data")
+endif()
+
 if(FB_WASM_FULL_INTL)
   # Enabling this today buys size and nothing else.  The sources compile and
   # link, but IntlManager still reaches the module through ModuleLoader, which
@@ -308,6 +336,7 @@ set(FB_WASM_GLUE_SRCS
   "${CMAKE_CURRENT_SOURCE_DIR}/fb_wasm_api.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/fb_wasm_stubs.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/fb_wasm_mod_loader.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/fb_wasm_icu_data.cpp"
 )
 
 # Diagnostic: exercises Firebird's MemoryPool directly, with no engine
@@ -569,6 +598,11 @@ if(FB_WASM_DEBUG AND FB_WASM_DEBUG_SOURCES)
     set_source_files_properties("${dbg_src}" PROPERTIES COMPILE_OPTIONS "-g")
     message(STATUS "  debug line info: ${dbg_src}")
   endforeach()
+endif()
+
+if(FB_WASM_ICU_COLLATION)
+  list(APPEND EMSCRIPTEN_LINK_FLAGS
+    "--embed-file ${FB_ICU_DATA}@/firebird/icu/icudt68l.dat")
 endif()
 
 string(REPLACE ";" " " EMSCRIPTEN_LINK_FLAGS_STR "${EMSCRIPTEN_LINK_FLAGS}")

@@ -21,13 +21,14 @@ const MB = 1024 * 1024;
 /**
  * Bytes, raw and gzipped.  Set in October 2026 from 8.82 / 8.72 MB raw and
  * 2.90 / 2.88 MB gzipped (2.06 / 2.05 MB brotli) for the threaded and the
- * single-threaded engine.
+ * single-threaded engine, plus ~808 KB raw / ~270 KB gzipped for embedded ICU
+ * root collation data (icudt68l.dat: UNICODE, UNICODE_CI, UNICODE_CI_AI).
  */
 const BUDGETS = {
-  'firebird-embedded.wasm': { raw: 9.5 * MB, gzip: 3.2 * MB },
-  'firebird-embedded-st.wasm': { raw: 9.5 * MB, gzip: 3.2 * MB },
-  'firebird-embedded.js': { raw: 0.15 * MB, gzip: 0.05 * MB },
-  'firebird-embedded-st.js': { raw: 0.15 * MB, gzip: 0.05 * MB },
+  'firebird-embedded.wasm': { raw: 10.5 * MB, gzip: 3.6 * MB },
+  'firebird-embedded-st.wasm': { raw: 10.5 * MB, gzip: 3.6 * MB },
+  'firebird-embedded.js': { raw: 1.0 * MB, gzip: 0.35 * MB },
+  'firebird-embedded-st.js': { raw: 1.0 * MB, gzip: 0.35 * MB },
 };
 
 const fmt = (bytes) => `${(bytes / MB).toFixed(2)} MB`;

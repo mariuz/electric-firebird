@@ -89,5 +89,33 @@ describe('wasm-loader', () => {
       expect(workflow).toContain('test "$AFTER_TOUCHED" -gt "$BEFORE_TOUCHED"');
       expect(workflow).toContain('test "$AFTER_UNTOUCHED" -eq "$BEFORE_UNTOUCHED"');
     });
+
+    it('wires ICU collation data (UNICODE, UNICODE_CI, UNICODE_CI_AI) into the WASM build', () => {
+      const patch2 = fs.readFileSync(
+        path.resolve(__dirname, '../../wasm/patches/0002-unicode-util-static-icu-wasm.patch'),
+        'utf8',
+      );
+      expect(patch2).toContain('wasmUcolGetContractionsAndExpansions');
+
+      const icuDataCpp = fs.readFileSync(
+        path.resolve(__dirname, '../../wasm/fb_wasm_icu_data.cpp'),
+        'utf8',
+      );
+      expect(icuDataCpp).toContain('udata_setCommonData');
+      expect(icuDataCpp).toContain('static_assert(U_ICU_VERSION_MAJOR_NUM == 68');
+
+      const cmake = fs.readFileSync(
+        path.resolve(__dirname, '../../wasm/CMakeLists.txt'),
+        'utf8',
+      );
+      expect(cmake).toContain('option(FB_WASM_ICU_COLLATION "Embed ICU collation data so UNICODE collations work" ON)');
+      expect(cmake).toContain('--embed-file ${FB_ICU_DATA}@/firebird/icu/icudt68l.dat');
+
+      const buildIcuSh = fs.readFileSync(
+        path.resolve(__dirname, '../../wasm/tools/build-icu-data.sh'),
+        'utf8',
+      );
+      expect(buildIcuSh).toContain('icupkg');
+    });
   });
 });

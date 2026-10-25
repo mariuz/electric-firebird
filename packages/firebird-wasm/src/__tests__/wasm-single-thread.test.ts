@@ -155,4 +155,35 @@ describe('wasmGlueFile', () => {
       await db.close();
     }
   });
+
+  it('supports UNICODE, UNICODE_CI, and UNICODE_CI_AI collations when ICU data is embedded', async () => {
+    if (!mod.FS.analyzePath('/firebird/icu/icudt68l.dat').exists) {
+      return;
+    }
+    const db = new FirebirdBrowser('memory://st-icu', { transport: new DirectTransport({ threads: false }) });
+    try {
+      await db.exec(
+        'CREATE TABLE words (' +
+          'id INTEGER, ' +
+          'ci VARCHAR(40) CHARACTER SET UTF8 COLLATE UNICODE_CI, ' +
+          'ciai VARCHAR(40) CHARACTER SET UTF8 COLLATE UNICODE_CI_AI, ' +
+          'u VARCHAR(40) CHARACTER SET UTF8 COLLATE UNICODE' +
+          ')',
+      );
+      await db.exec("INSERT INTO words VALUES (1, 'Ähnlich', 'café', 'Zebra')");
+      await db.exec("INSERT INTO words VALUES (2, 'Beta', 'plain', 'Apfel')");
+      await db.exec("INSERT INTO words VALUES (3, 'Gamma', 'other', 'Ärzte')");
+
+      const ciMatch = await db.query<{ CI: string }>("SELECT ci FROM words WHERE ci = 'ähnlich'");
+      expect(ciMatch.rows).toEqual([{ CI: 'Ähnlich' }]);
+
+      const ciaiMatch = await db.query<{ CIAI: string }>("SELECT ciai FROM words WHERE ciai = 'CAFE'");
+      expect(ciaiMatch.rows).toEqual([{ CIAI: 'café' }]);
+
+      const sorted = await db.query<{ U: string }>('SELECT u FROM words ORDER BY u');
+      expect(sorted.rows.map((r) => r.U)).toEqual(['Apfel', 'Ärzte', 'Zebra']);
+    } finally {
+      await db.close();
+    }
+  });
 });

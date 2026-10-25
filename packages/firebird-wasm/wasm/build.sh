@@ -507,6 +507,11 @@ fi
 #   "--preload-file /path/to/icudt<ver>l.dat@/usr/share/icu/<ver>/icudt<ver>l.dat"
 # One build tree per variant: -pthread changes how every object is compiled,
 # so the two cannot share objects.
+if [[ ! -f "${SCRIPT_DIR}/icu-data/icudt68l.dat" ]]; then
+  echo "Generating ICU collation data package (icudt68l.dat)…"
+  bash "${SCRIPT_DIR}/tools/build-icu-data.sh"
+fi
+
 build_variant() {
   local threads="$1" build_dir="$2" name="$3"
 
