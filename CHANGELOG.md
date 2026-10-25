@@ -4,6 +4,30 @@ All notable changes to `firebird-wasm`. This project follows
 [semantic versioning](https://semver.org/); while the major version is 0 the
 API may still move between minor releases.
 
+## 0.10.1 — 2026-10-25
+
+### Fixed
+
+- **Rebuilt WASM binaries in the published npm tarball.** The `0.10.0` npm
+  package was packed before the local WASM rebuild ran and shipped the `0.9.0`
+  `dist/wasm/firebird-embedded.{js,wasm}` and
+  `dist/wasm/firebird-embedded-st.{js,wasm}` binaries (missing
+  `_fb_cursor_open` / `_fb_cursor_fetch` / `_fb_cursor_close` for
+  `queryStream()`, `DECFLOAT` decoding, and C bridge formatting fast paths).
+  `0.10.1` ships the rebuilt `0.10.x` WASM artifacts in both the npm package
+  and the GitHub release.
+- **Multi-row `INSERT`s in Kysely and Drizzle now execute via `execBatch`.**
+  Multi-row `INSERT` statements without `RETURNING` in `firebird-wasm/kysely`
+  and `firebird-wasm/drizzle` now route through `db.execBatch('INSERT INTO …
+  VALUES (?, …)', rows)` instead of `INSERT INTO … SELECT ? FROM RDB$DATABASE
+  UNION ALL …`, avoiding Firebird SQL error `-804` (`Data type unknown`) on
+  untyped `?` parameter markers in `SELECT` projection lists.
+- **WASM build script (`wasm/build.sh`) and CI fixes.** Passes `-C1` to
+  `git apply --reverse --check` when verifying already-applied patches, passes
+  `-DCMAKE_C_FLAGS="-std=gnu11 -Wno-implicit-int"` during the native host
+  bootstrap configure for GCC 15 compatibility, and pins Playwright CI jobs to
+  `ubuntu-24.04`.
+
 ## 0.10.0 — 2026-10-24
 
 ### Added

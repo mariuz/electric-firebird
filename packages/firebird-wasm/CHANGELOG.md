@@ -4,6 +4,30 @@ All notable changes to `firebird-wasm`. This project follows
 [semantic versioning](https://semver.org/); while the major version is 0 the
 API may still move between minor releases.
 
+## 0.10.1 — 2026-10-25
+
+### Fixed
+
+- **Rebuilt WASM binaries in the published npm tarball.** The `0.10.0` npm
+  package was packed before the local WASM rebuild ran and shipped the `0.9.0`
+  `dist/wasm/firebird-embedded.{js,wasm}` and
+  `dist/wasm/firebird-embedded-st.{js,wasm}` binaries (missing
+  `_fb_cursor_open` / `_fb_cursor_fetch` / `_fb_cursor_close` for
+  `queryStream()`, `DECFLOAT` decoding, and C bridge formatting fast paths).
+  `0.10.1` ships the rebuilt `0.10.x` WASM artifacts in both the npm package
+  and the GitHub release.
+- **Multi-row `INSERT`s in Kysely and Drizzle now execute via `execBatch`.**
+  Multi-row `INSERT` statements without `RETURNING` in `firebird-wasm/kysely`
+  and `firebird-wasm/drizzle` now route through `db.execBatch('INSERT INTO …
+  VALUES (?, …)', rows)` instead of `INSERT INTO … SELECT ? FROM RDB$DATABASE
+  UNION ALL …`, avoiding Firebird SQL error `-804` (`Data type unknown`) on
+  untyped `?` parameter markers in `SELECT` projection lists.
+- **WASM build script (`wasm/build.sh`) and CI fixes.** Passes `-C1` to
+  `git apply --reverse --check` when verifying already-applied patches, passes
+  `-DCMAKE_C_FLAGS="-std=gnu11 -Wno-implicit-int"` during the native host
+  bootstrap configure for GCC 15 compatibility, and pins Playwright CI jobs to
+  `ubuntu-24.04`.
+
 ## 0.10.0 — 2026-10-24
 
 ### Added
@@ -63,6 +87,14 @@ API may still move between minor releases.
   - `DECFLOAT(16)` and `DECFLOAT(34)` (`SQL_DEC16 = 260`, `SQL_DEC34 = 262`)
     are decoded in the C bridge, mapped in `firebird-wasm/electric-server`, and
     accepted by `firebird-wasm/electric`.
+- **Native `IBatch` in `FirebirdLite.execBatch` (`node-firebird-drivers#178`).**
+  When `statementHandle.createBatchAsync` is available on the native client
+  (merged upstream in [`asfernandes/node-firebird-drivers#178`](https://github.com/asfernandes/node-firebird-drivers/pull/178)),
+  `FirebirdLite.execBatch` and `FirebirdTransaction.execBatch` execute batches
+  through Firebird 4.0+'s `IBatch` API (including `addBlobAsync` with
+  `TAG_BLOB_POLICY = BLOB_ID_ENGINE` so `BLOB` parameters take no per-row round
+  trips), falling back automatically to `EXECUTE BLOCK` on older drivers or
+  Firebird 3.0 servers.
 
 ### Changed
 
@@ -75,12 +107,14 @@ API may still move between minor releases.
   offset-based `SQL_TIME_TZ` and `SQL_TIMESTAMP_TZ` (`0..2878`) are decoded in
   C without `IUtil`, and `appendScaledDecimal` writes directly into the JSON
   buffer without temporary string shifts.
-- **Incremental WASM rebuilds and CI verification.** `wasm/build.sh` preserves
-  the timestamps of unchanged `autoconfig.h`, `parse.h` / `parse.cpp`, and
-  `epp-generated` outputs across native bootstrap rebuilds, and
-  `build-wasm.yml` runs an incremental rebuild check after wiping
-  `build-native-config` and `.wasm-patches-applied` and touching
-  `fb_wasm_api.cpp`.
+- **Incremental WASM rebuilds, GCC 15 host bootstrap, and CI verification.**
+  `wasm/build.sh` preserves the timestamps of unchanged `autoconfig.h`,
+  `parse.h` / `parse.cpp`, and `epp-generated` outputs across native bootstrap
+  rebuilds, passes `-DCMAKE_C_FLAGS="-std=gnu11 -Wno-implicit-int"` so
+  Firebird's `Configure.cmake` checks succeed under GCC 15 (`-std=gnu23`),
+  checks already-applied patches with `-C1`, and `build-wasm.yml` runs an
+  incremental rebuild check after wiping `build-native-config` and
+  `.wasm-patches-applied` and touching `fb_wasm_api.cpp`.
 
 ## 0.9.0 — 2026-10-19
 
