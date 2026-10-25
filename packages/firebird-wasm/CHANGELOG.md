@@ -4,6 +4,28 @@ All notable changes to `firebird-wasm`. This project follows
 [semantic versioning](https://semver.org/); while the major version is 0 the
 API may still move between minor releases.
 
+## 0.11.0 — 2026-10-25
+
+### Added
+
+- **Embedded ICU 68 collation data (`UNICODE`, `UNICODE_CI`, `UNICODE_CI_AI`).**
+  The WASM engine now ships a stripped ICU 68 common data package
+  (`icudt68l.dat`, ~343 KB uncompressed / ~130 KB gzipped) containing the DUCET
+  root collation table (`coll/ucadata.icu`, `coll/root.res`), Unicode
+  normalization tables (`nfc.nrm`, `nfkc.nrm`), and character property resources,
+  embedded at `/icu/icudt68l.dat` via `--embed-file` and registered with
+  `udata_setCommonData()` inside `fb_init()`:
+  - `COLLATE UNICODE`, `COLLATE UNICODE_CI` (case-insensitive), and
+    `COLLATE UNICODE_CI_AI` (case- and accent-insensitive) now work out of the
+    box in `CREATE TABLE`, `ORDER BY`, `WHERE` (`=`, `LIKE`, `CONTAINING`,
+    `STARTING WITH`), `GROUP BY`, `DISTINCT`, and expression indexes (`CREATE
+    INDEX`) on both `firebird-embedded-st` and `firebird-embedded`.
+  - Fixed the static-ICU function pointer signature mismatch on
+    `ucol_getContractionsAndExpansions` (`void` in ICU 68 vs `int32_t` expected
+    by Firebird's `UnicodeUtil::ICU::ucolGetContractionsAndExpansions` under
+    WASM's strict indirect-call type checking) via the
+    `wasmUcolGetContractionsAndExpansions` wrapper in patch `0002`.
+
 ## 0.10.1 — 2026-10-25
 
 ### Fixed
