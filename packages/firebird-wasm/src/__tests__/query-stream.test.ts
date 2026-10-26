@@ -125,7 +125,7 @@ class MockCursorTransport implements EngineTransport {
     }
   }
   async describe(): Promise<QueryDescription> {
-    return { fields: this.fields, statementType: 'SELECT', hasResultSet: true };
+    return { params: [], fields: this.fields, statementType: 'SELECT', hasResultSet: true };
   }
   async startTransaction(
     dbHandle: EngineHandle,

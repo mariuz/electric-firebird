@@ -589,12 +589,12 @@ export class FirebirdLite {
       };
     };
 
-    const statusAction = attachment?.client?.statusAction;
+    const client = attachment?.client;
     const getInfoAsync = attachment?.attachmentHandle?.getInfoAsync;
     const getInfoSync = attachment?.attachmentHandle?.getInfoSync;
 
-    if (typeof statusAction === 'function' && typeof getInfoAsync === 'function') {
-      return statusAction(async (status) => {
+    if (typeof client?.statusAction === 'function' && typeof getInfoAsync === 'function') {
+      return client.statusAction(async (status) => {
         const buffer = new Uint8Array(512);
         await getInfoAsync.call(
           attachment.attachmentHandle,
@@ -607,8 +607,8 @@ export class FirebirdLite {
         return parseDatabaseInfoBuffer(buffer);
       });
     }
-    if (typeof statusAction === 'function' && typeof getInfoSync === 'function') {
-      return statusAction(async (status) => {
+    if (typeof client?.statusAction === 'function' && typeof getInfoSync === 'function') {
+      return client.statusAction(async (status) => {
         const buffer = new Uint8Array(512);
         getInfoSync.call(
           attachment.attachmentHandle,
@@ -1698,13 +1698,13 @@ async function explainStatement(stmt: Statement, detailed: boolean): Promise<str
     getPlan?: (detailed: boolean) => Promise<string | undefined> | string | undefined;
   };
   let raw: string | undefined;
-  const statusAction = internal.attachment?.client?.statusAction;
+  const client = internal.attachment?.client;
   const getPlanAsync = internal.statementHandle?.getPlanAsync;
   const getPlanSync = internal.statementHandle?.getPlanSync;
-  if (typeof statusAction === 'function' && typeof getPlanAsync === 'function') {
-    raw = await statusAction((status) => getPlanAsync.call(internal.statementHandle, status, detailed));
-  } else if (typeof statusAction === 'function' && typeof getPlanSync === 'function') {
-    raw = await statusAction(async (status) => getPlanSync.call(internal.statementHandle, status, detailed));
+  if (typeof client?.statusAction === 'function' && typeof getPlanAsync === 'function') {
+    raw = await client.statusAction((status) => getPlanAsync.call(internal.statementHandle, status, detailed));
+  } else if (typeof client?.statusAction === 'function' && typeof getPlanSync === 'function') {
+    raw = await client.statusAction(async (status) => getPlanSync.call(internal.statementHandle, status, detailed));
   } else if (typeof internal.getPlan === 'function') {
     raw = await internal.getPlan(detailed);
   } else if (!detailed && typeof stmt.getExecPathText === 'function') {
@@ -1716,19 +1716,19 @@ async function explainStatement(stmt: Statement, detailed: boolean): Promise<str
 
 async function readAffectedRecords(stmt: Statement): Promise<number> {
   const internal = stmt as unknown as NativeStatement;
-  const statusAction = internal.attachment?.client?.statusAction;
+  const client = internal.attachment?.client;
   const getAsync = internal.statementHandle?.getAffectedRecordsAsync;
   const getSync = internal.statementHandle?.getAffectedRecordsSync;
-  if (typeof statusAction === 'function' && typeof getAsync === 'function') {
+  if (typeof client?.statusAction === 'function' && typeof getAsync === 'function') {
     try {
-      return await statusAction((status) => getAsync.call(internal.statementHandle, status));
+      return await client.statusAction((status) => getAsync.call(internal.statementHandle, status));
     } catch {
       return 0;
     }
   }
-  if (typeof statusAction === 'function' && typeof getSync === 'function') {
+  if (typeof client?.statusAction === 'function' && typeof getSync === 'function') {
     try {
-      return await statusAction(async (status) => getSync.call(internal.statementHandle, status));
+      return await client.statusAction(async (status) => getSync.call(internal.statementHandle, status));
     } catch {
       return 0;
     }

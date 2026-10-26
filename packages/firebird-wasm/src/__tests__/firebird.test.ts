@@ -1336,7 +1336,13 @@ describe('FirebirdLite (no Firebird installed)', () => {
     const mockTx = { commit, rollback: jest.fn(async () => undefined) };
     const mockAttachment: Record<string, unknown> = {
       client: {
-        statusAction: async <T>(fn: (s: unknown) => Promise<T>) => fn({}),
+        master: {},
+        async statusAction<T>(this: { master?: unknown }, fn: (s: unknown) => Promise<T>): Promise<T> {
+          if (!this.master) {
+            throw new TypeError("Cannot read properties of undefined (reading 'master')");
+          }
+          return fn({});
+        },
       },
       startTransaction: jest.fn(async () => mockTx),
       prepare: jest.fn(async () => ({
@@ -1376,7 +1382,13 @@ describe('FirebirdLite (no Firebird installed)', () => {
     const mockTx = { commit, rollback: jest.fn(async () => undefined) };
     const mockAttachment: Record<string, unknown> = {
       client: {
-        statusAction: async <T>(fn: (s: unknown) => Promise<T>) => fn({}),
+        master: {},
+        async statusAction<T>(this: { master?: unknown }, fn: (s: unknown) => Promise<T>): Promise<T> {
+          if (!this.master) {
+            throw new TypeError("Cannot read properties of undefined (reading 'master')");
+          }
+          return fn({});
+        },
       },
       startTransaction: jest.fn(async () => mockTx),
       prepare: jest.fn(async () => ({
@@ -1488,7 +1500,13 @@ describe('FirebirdLite (no Firebird installed)', () => {
     );
     (db as unknown as { attachment: unknown }).attachment = {
       client: {
-        statusAction: async <T>(fn: (s: unknown) => Promise<T>) => fn({}),
+        master: {},
+        async statusAction<T>(this: { master?: unknown }, fn: (s: unknown) => Promise<T>): Promise<T> {
+          if (!this.master) {
+            throw new TypeError("Cannot read properties of undefined (reading 'master')");
+          }
+          return fn({});
+        },
       },
       attachmentHandle: {
         getInfoAsync,
@@ -1536,7 +1554,13 @@ describe('FirebirdLite (no Firebird installed)', () => {
 
     const mockAttachment: Record<string, unknown> = {
       client: {
-        statusAction: async <T>(fn: (s: unknown) => Promise<T>) => fn({}),
+        master: {},
+        async statusAction<T>(this: { master?: unknown }, fn: (s: unknown) => Promise<T>): Promise<T> {
+          if (!this.master) {
+            throw new TypeError("Cannot read properties of undefined (reading 'master')");
+          }
+          return fn({});
+        },
       },
       startTransaction: jest.fn(async () => ({ commit, rollback })),
       prepare: jest.fn(async () => ({
