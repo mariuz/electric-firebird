@@ -3353,7 +3353,6 @@ const char* fb_explain(int db_handle, int tx_handle, const char* sql, int detail
 	return allocCString(plan);
 }
 
-FB_WASM_EXPORT
 /**
  * Return database storage, ODS, memory pool, I/O, and OIT/OAT/OST transaction
  * health diagnostics (`IAttachment::getInfo`) as a JSON object.

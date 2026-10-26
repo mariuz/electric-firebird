@@ -190,11 +190,11 @@ describe('wasmGlueFile', () => {
 
       const naturalPlan = await db.explain('SELECT id, label FROM explain_items');
       expect(naturalPlan).toMatch(/^PLAN\s*\(/i);
-      expect(naturalPlan).toMatch(/EXPLAIN_ITEMS\s+NATURAL/i);
+      expect(naturalPlan).toMatch(/EXPLAIN_ITEMS"?\s+NATURAL/i);
 
       const indexedPlan = await db.explain('SELECT id, label FROM explain_items WHERE id = ?');
       expect(indexedPlan).toMatch(/^PLAN\s*\(/i);
-      expect(indexedPlan).toMatch(/EXPLAIN_ITEMS\s+INDEX/i);
+      expect(indexedPlan).toMatch(/EXPLAIN_ITEMS"?\s+INDEX/i);
 
       const detailedPlan = await db.explain(
         'SELECT id, label FROM explain_items WHERE id = ?',

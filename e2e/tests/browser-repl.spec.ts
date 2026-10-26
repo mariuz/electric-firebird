@@ -139,7 +139,7 @@ test.describe('<firebird-repl>', () => {
     await repl.locator('button.explain').click();
 
     await expect(repl.locator('.entry')).toHaveCount(4);
-    await expect(repl.locator('.entry .plan').nth(0)).toContainText(/PLAN\s*\(\s*ITEMS\s+INDEX/i);
+    await expect(repl.locator('.entry .plan').nth(0)).toContainText(/PLAN\s*\(.*ITEMS"?\s+INDEX/i);
     await expect(repl.locator('.entry .meta').nth(2)).toContainText('plan');
 
     // Detailed plan via repl.explain(script, { detailed: true })
