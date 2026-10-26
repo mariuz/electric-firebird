@@ -28,6 +28,13 @@ import { DirectTransport } from './engine-transport';
 import type { EngineHandle, EngineTransport } from './engine-transport';
 import { WorkerTransport } from './worker-transport';
 import { splitStatements } from './sql-script';
+import {
+  compressGzipStream,
+  readDatabaseStreamChunks,
+  resolveStreamChunkSize,
+} from './data-stream';
+import { extractReferencedTables, liveTableTriggerDDL } from './live-tables';
+import { ICU_LOCALE_DATA_PATH, isValidIcuDataPackage } from './icu-locales';
 import { hasTransactionOptions } from './isolation';
 import { applyTypes, applySerializers } from './value-types';
 import type { TypeOptions } from './value-types';
@@ -40,6 +47,10 @@ import type {
   ArrayRow,
   QueryResult,
   QueryDescription,
+  ExplainOptions,
+  DatabaseInfo,
+  PreparedStatement,
+  DataStreamOptions,
   QueryOptions,
   QueryStreamOptions,
   Row,
@@ -90,11 +101,16 @@ export interface LiveQueryOptions {
   /**
    * Event names to watch, as posted by `POST_EVENT`.
    *
-   * Required, and deliberately not inferred from the statement. Firebird
-   * delivers events a trigger chose to post; nothing connects them to the
-   * tables a query reads, so guessing which events matter would be guessing.
+   * When omitted (`undefined`), `live()` extracts the user tables referenced
+   * by the statement, installs an idempotent `AFTER INSERT OR UPDATE OR DELETE`
+   * `POST_EVENT` trigger (`FB_LIVE$<hash>`) on each table, and watches those
+   * events automatically.
+   *
+   * Pass an explicit non-empty array when watching custom application events
+   * posted by your own triggers or `db.notify()`. Passing an empty array `[]`
+   * throws a `RangeError`.
    */
-  events: string[];
+  events?: readonly string[];
   /** Parameters for the statement, as `query()` takes them. */
   params?: QueryParams;
   /**
@@ -275,6 +291,33 @@ export interface FirebirdBrowserOptions {
    * database: `new FirebirdBrowser('memory://', { loadDataDir: bytes })`.
    */
   loadDataDir?: Uint8Array;
+  /**
+   * Initial contents for the database as a stream of bytes produced by
+   * {@link FirebirdBrowser.dumpDataStream} (raw or gzip-compressed), or a
+   * factory returning one.
+   *
+   * Used **only when there is no database yet** — a stored one always wins.
+   */
+  loadDataStream?:
+    | ReadableStream<Uint8Array>
+    | AsyncIterable<Uint8Array>
+    | (() =>
+        | ReadableStream<Uint8Array>
+        | AsyncIterable<Uint8Array>
+        | Promise<ReadableStream<Uint8Array> | AsyncIterable<Uint8Array>>);
+  /**
+   * Optional lazy-loaded ICU `.dat` (or gzip-compressed `.dat.gz`) locale
+   * tailoring bundle (e.g., built via `wasm/tools/build-icu-data.sh --locales`
+   * or {@link buildIcuLocalePack}) for locale-specific collations such as
+   * `LOCALE=de_DE`, `es_ES`, `fr_FR`, `ja_JP`, registered via a second
+   * `udata_setCommonData()` slot without increasing the default WASM binary
+   * size.
+   */
+  icuLocaleData?:
+    | Uint8Array
+    | ArrayBuffer
+    | ArrayBufferLike
+    | (() => Uint8Array | ArrayBufferLike | Promise<Uint8Array | ArrayBufferLike>);
 }
 
 // ---------------------------------------------------------------------------
@@ -360,6 +403,9 @@ export class FirebirdBrowser {
   private lock: DatabaseLock | null = null;
   /** Live queries to tear down with the connection. */
   private readonly liveQueries = new Set<{ unsubscribe(): Promise<void> }>();
+  private readonly preparedStatements = new Set<PreparedStatement>();
+  /** Per-table auto-installed live trigger promises (table -> event name). */
+  private readonly liveTriggerPromises = new Map<string, Promise<string>>();
   /** Set only in shared mode; owns the election and the channel. */
   private shared: SharedEngineTransport | null = null;
 
@@ -506,6 +552,9 @@ export class FirebirdBrowser {
     const results: ExecResult[] = [];
 
     for (const statement of statements) {
+      if (/^\s*(DROP|RECREATE)\b/i.test(statement.sql)) {
+        this.liveTriggerPromises.clear();
+      }
       const affectedRows = await this.engine.execute(
         this.dbHandle,
         0,
@@ -932,12 +981,26 @@ export class FirebirdBrowser {
 
   async live<T extends Row = Row>(
     sql: string | SqlFragment,
+    onChange: (rows: T[], result: QueryResult<T>) => void,
+  ): Promise<LiveQuery<T>>;
+  async live<T extends Row = Row>(
+    sql: string | SqlFragment,
     options: LiveQueryOptions,
     onChange: (rows: T[], result: QueryResult<T>) => void,
+  ): Promise<LiveQuery<T>>;
+  async live<T extends Row = Row>(
+    sql: string | SqlFragment,
+    optionsOrOnChange: LiveQueryOptions | ((rows: T[], result: QueryResult<T>) => void),
+    maybeOnChange?: (rows: T[], result: QueryResult<T>) => void,
   ): Promise<LiveQuery<T>> {
     await this.ensureReady();
 
-    if (options.events.length === 0) {
+    const options: LiveQueryOptions =
+      typeof optionsOrOnChange === 'function' ? {} : optionsOrOnChange;
+    const onChange =
+      typeof optionsOrOnChange === 'function' ? optionsOrOnChange : maybeOnChange!;
+
+    if (options.events !== undefined && options.events.length === 0) {
       throw new RangeError(
         'live() needs at least one event name to watch; without one it would ' +
           'never refresh, which a plain query() already does better',
@@ -945,6 +1008,11 @@ export class FirebirdBrowser {
     }
 
     const statement = toStatement(sql, options.params ?? []);
+    const watchedEvents =
+      options.events !== undefined
+        ? [...options.events]
+        : await this.ensureLiveTableEvents(statement.sql);
+
     const onError =
       options.onError ??
       ((error: Error) => console.error('[firebird-wasm] live query failed', error));
@@ -996,7 +1064,7 @@ export class FirebirdBrowser {
     // Built on listen() rather than beside it: the subscription, the polling
     // and the teardown are the same problem, and a second copy would be a
     // second thing to keep correct.
-    const subscription = await this.listen(options.events, requestRefresh, {
+    const subscription = await this.listen(watchedEvents, requestRefresh, {
       pollIntervalMs: options.pollIntervalMs,
       onError,
     });
@@ -1034,6 +1102,41 @@ export class FirebirdBrowser {
   }
 
   /**
+   * Ensure an idempotent `AFTER INSERT OR UPDATE OR DELETE` `POST_EVENT`
+   * trigger exists on each user table referenced by `sqlText`, returning the
+   * event names to subscribe to.
+   */
+  private async ensureLiveTableEvents(sqlText: string): Promise<string[]> {
+    const tables = extractReferencedTables(sqlText);
+    if (tables.length === 0) {
+      throw new RangeError(
+        'live() could not find any user tables in the statement to watch automatically; ' +
+          'pass { events: [...] } explicitly',
+      );
+    }
+    const events: string[] = [];
+    for (const table of tables) {
+      let pending = this.liveTriggerPromises.get(table);
+      if (!pending) {
+        const { eventName, ddl } = liveTableTriggerDDL(table);
+        pending = this.engine
+          .execute(this.dbHandle, 0, ddl, [])
+          .then(() => {
+            this.markDirty();
+            return eventName;
+          })
+          .catch((err) => {
+            this.liveTriggerPromises.delete(table);
+            throw err;
+          });
+        this.liveTriggerPromises.set(table, pending);
+      }
+      events.push(await pending);
+    }
+    return events;
+  }
+
+  /**
    * Describe a statement's shape without running it.
    *
    * ```ts
@@ -1059,6 +1162,169 @@ export class FirebirdBrowser {
   /**
    * Run a function inside an explicit transaction.
    */
+  /**
+   * Return Firebird's execution plan for `sql` (`IStatement::getPlan`) without
+   * executing the statement.
+   *
+   * ```ts
+   * const plan = await db.explain('SELECT * FROM items WHERE id = ?');
+   * // → 'PLAN (ITEMS INDEX (RDB$PRIMARY1))'
+   *
+   * const detailed = await db.explain('SELECT * FROM items WHERE id = ?', { detailed: true });
+   * // → 'Select Expression\n    -> Filter\n        -> Table "ITEMS" Access By ID\n...'
+   * ```
+   *
+   * Statements that carry no execution plan (such as DDL) return `""`.
+   */
+  async explain(
+    sql: string | SqlFragment,
+    options: ExplainOptions = {},
+  ): Promise<string> {
+    await this.ensureReady();
+    if (typeof this.engine.explain !== 'function') {
+      throw new Error('The configured EngineTransport does not support explain()');
+    }
+    return this.engine.explain(
+      this.dbHandle,
+      0,
+      toStatement(sql).sql,
+      options.detailed === true,
+    );
+  }
+
+  /**
+   * Inspect database size, page utilization, ODS version, transaction counters
+   * (OIT/OAT/OST/Next), memory pool usage, and page I/O statistics
+   * (`IAttachment::getInfo`).
+   *
+   * ```ts
+   * const info = await db.databaseInfo();
+   * // info.pageSize          → 8192
+   * // info.allocatedPages    → 280
+   * // info.databaseSizeBytes → 2293760
+   * // info.transactionGap    → info.nextTransaction - info.oldestActive
+   * ```
+   */
+  async databaseInfo(): Promise<DatabaseInfo> {
+    await this.ensureReady();
+    if (typeof this.engine.databaseInfo !== 'function') {
+      throw new Error('The configured EngineTransport does not support databaseInfo()');
+    }
+    return this.engine.databaseInfo(this.dbHandle);
+  }
+
+  /**
+   * Prepare a SQL statement explicitly and return a reusable
+   * {@link PreparedStatement} handle exposing `fields`, `params`, `query()`,
+   * `exec()`, `execBatch()`, and `close()`.
+   *
+   * ```ts
+   * const stmt = await db.prepare('INSERT INTO items (id, name) VALUES (?, ?)');
+   * // stmt.params → [{ type: 496, typeName: 'INTEGER', … }, { type: 448, typeName: 'VARCHAR', … }]
+   * await stmt.exec([1, 'alpha']);
+   * await stmt.execBatch([[2, 'beta'], [3, 'gamma']]);
+   * await stmt.close();
+   * ```
+   */
+  async prepare(sql: string | SqlFragment): Promise<PreparedStatement> {
+    await this.ensureReady();
+    const sqlText = toStatement(sql).sql;
+    const desc: QueryDescription & { handle?: EngineHandle } =
+      typeof this.engine.prepare === 'function'
+        ? await this.engine.prepare(this.dbHandle, 0, sqlText)
+        : await this.engine.describe(this.dbHandle, 0, sqlText);
+
+    const params = desc.params.map((p) => ({ ...p }));
+    const fields = desc.fields.map((f) => ({ ...f }));
+    const stmtHandle = desc.handle ?? 0;
+    let isClosed = false;
+
+    const assertOpen = (): void => {
+      if (isClosed || this.closed) {
+        throw new Error('PreparedStatement has been closed');
+      }
+    };
+
+    const checkParamCount = (actual: number): void => {
+      if (actual !== params.length) {
+        throw new Error(
+          `PreparedStatement expects ${params.length} parameter(s) but ${actual} were supplied`,
+        );
+      }
+    };
+
+    const isDbClosed = () => this.closed;
+
+    const stmt: PreparedStatement = {
+      sql: sqlText,
+      get params() {
+        return params.map((p) => ({ ...p }));
+      },
+      get fields() {
+        return fields.map((f) => ({ ...f }));
+      },
+      statementType: desc.statementType,
+      hasResultSet: desc.hasResultSet,
+      get closed() {
+        return isClosed || isDbClosed();
+      },
+      query: (async (
+        paramsOrOptions: QueryParams | QueryOptions = [],
+        maybeOptions: QueryOptions = {},
+      ) => {
+        assertOpen();
+        const callParams = Array.isArray(paramsOrOptions)
+          ? paramsOrOptions
+          : [];
+        const callOptions = Array.isArray(paramsOrOptions)
+          ? maybeOptions
+          : (paramsOrOptions ?? {});
+        checkParamCount(callParams.length);
+        return this.query(sqlText, callParams, callOptions);
+      }) as PreparedStatement['query'],
+      exec: async (callParams: QueryParams = []) => {
+        assertOpen();
+        checkParamCount(callParams.length);
+        const affectedRows = await this.engine.execute(
+          this.dbHandle,
+          0,
+          sqlText,
+          this.serialize(callParams),
+        );
+        this.markDirty();
+        return { affectedRows };
+      },
+      execBatch: async (rows: QueryParams[]) => {
+        assertOpen();
+        if (!Array.isArray(rows)) {
+          throw new TypeError('execBatch takes an array of parameter rows');
+        }
+        for (const row of rows) {
+          checkParamCount(row.length);
+        }
+        return this.execBatch(sqlText, rows);
+      },
+      close: async () => {
+        if (isClosed) return;
+        isClosed = true;
+        this.preparedStatements.delete(stmt);
+        if (
+          stmtHandle > 0 &&
+          !this.closed &&
+          typeof this.engine.stmtClose === 'function'
+        ) {
+          await this.engine.stmtClose(stmtHandle).catch(() => undefined);
+        }
+      },
+      [Symbol.asyncDispose]: async () => {
+        await stmt.close();
+      },
+    };
+
+    this.preparedStatements.add(stmt);
+    return stmt;
+  }
+
   async transaction<T>(
     fn: (tx: FirebirdBrowserTransaction) => Promise<T>,
     options: TransactionOptions = {},
@@ -1124,6 +1390,165 @@ export class FirebirdBrowser {
     return this.engine.readFile(this.dbPath);
   }
 
+  /**
+   * Stream the live `.fdb` database file in fixed-size chunks
+   * (`ReadableStream<Uint8Array>`) without allocating a single contiguous
+   * `Uint8Array` of the entire database in memory.
+   *
+   * Pass `{ compression: 'gzip' }` to compress on the fly via
+   * `CompressionStream('gzip')`.
+   *
+   * ```ts
+   * const stream = db.dumpDataStream({ compression: 'gzip' });
+   * ```
+   */
+  dumpDataStream(options: DataStreamOptions = {}): ReadableStream<Uint8Array> {
+    const chunkSize = resolveStreamChunkSize(options.chunkSize);
+    let offset = 0;
+    let totalSize: number | null = null;
+    let fallbackBytes: Uint8Array | null = null;
+
+    const raw = new ReadableStream<Uint8Array>({
+      pull: async (controller) => {
+        await this.ensureReady();
+        if (totalSize === null) {
+          if (
+            typeof this.engine.fileSize === 'function' &&
+            typeof this.engine.readFileChunk === 'function'
+          ) {
+            totalSize = await this.engine.fileSize(this.dbPath);
+          } else {
+            fallbackBytes = await this.engine.readFile(this.dbPath);
+            totalSize = fallbackBytes.byteLength;
+          }
+        }
+        if (offset >= totalSize) {
+          controller.close();
+          return;
+        }
+        const length = Math.min(chunkSize, totalSize - offset);
+        const chunk = fallbackBytes
+          ? fallbackBytes.slice(offset, offset + length)
+          : await this.engine.readFileChunk!(this.dbPath, offset, length);
+        if (chunk.byteLength === 0) {
+          controller.close();
+          return;
+        }
+        offset += chunk.byteLength;
+        controller.enqueue(chunk);
+        if (offset >= totalSize) {
+          controller.close();
+        }
+      },
+    });
+
+    return options.compression === 'gzip' ? compressGzipStream(raw) : raw;
+  }
+
+  /**
+   * Replace the database with a raw or gzip-compressed `.fdb` byte stream
+   * produced by {@link dumpDataStream} without buffering the entire database
+   * in a single `Uint8Array`.
+   *
+   * ```ts
+   * await db.loadDataStream(stream);
+   * ```
+   */
+  async loadDataStream(
+    stream: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array>,
+    options: DataStreamOptions = {},
+  ): Promise<void> {
+    if (this.closed) {
+      throw new Error('FirebirdBrowser instance has been closed');
+    }
+    await this.ensureReady();
+    this.cancelScheduledPersist();
+
+    for (const stmt of [...this.preparedStatements]) {
+      await stmt.close().catch(() => undefined);
+    }
+    this.liveTriggerPromises.clear();
+
+    if (this.dbHandle) {
+      await this.engine.detachDatabase(this.dbHandle);
+      this.dbHandle = 0;
+    }
+
+    await this.writeStreamToDbPath(stream, options);
+
+    this.dbHandle = await this.engine.attachDatabase(this.dbPath);
+    if (this.options.sharedReads) {
+      await this.engine.setSharedReads!(this.dbHandle, true);
+    }
+    this.markDirty();
+  }
+
+  private async writeStreamToDbPath(
+    stream: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array>,
+    options: DataStreamOptions = {},
+  ): Promise<void> {
+    let offset = 0;
+    let first = true;
+    if (typeof this.engine.writeFileChunk === 'function') {
+      for await (const chunk of readDatabaseStreamChunks(stream, options)) {
+        await this.engine.writeFileChunk(this.dbPath, chunk, offset, first);
+        first = false;
+        offset += chunk.byteLength;
+      }
+    } else {
+      const chunks: Uint8Array[] = [];
+      for await (const chunk of readDatabaseStreamChunks(stream, options)) {
+        chunks.push(chunk);
+        offset += chunk.byteLength;
+      }
+      if (offset > 0) {
+        const merged = new Uint8Array(offset);
+        let pos = 0;
+        for (const c of chunks) {
+          merged.set(c, pos);
+          pos += c.byteLength;
+        }
+        await this.engine.writeFile(this.dbPath, merged);
+      }
+    }
+    if (offset === 0) {
+      throw new RangeError(
+        'loadDataStream received an empty stream; pass a stream from dumpDataStream()',
+      );
+    }
+  }
+
+  /**
+   * Register an optional ICU `.dat` (or gzip-compressed `.dat.gz`) locale
+   * tailoring bundle at runtime via a second `udata_setCommonData()` slot so
+   * `CREATE COLLATION ... FOR UTF8 FROM UNICODE 'LOCALE=de_DE'` (`es_ES`,
+   * `fr_FR`, `ja_JP`, etc.) can be used without increasing the default WASM
+   * binary size.
+   */
+  async loadIcuLocaleData(data: Uint8Array | ArrayBufferLike): Promise<void> {
+    if (this.closed) {
+      throw new Error('FirebirdBrowser instance has been closed');
+    }
+    await this.ensureReady();
+    await this.applyIcuLocaleData(data);
+  }
+
+  private async applyIcuLocaleData(data: Uint8Array | ArrayBufferLike): Promise<void> {
+    const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+    if (this.engine.loadIcuLocaleData) {
+      await this.engine.loadIcuLocaleData(bytes);
+      return;
+    }
+    if (!isValidIcuDataPackage(bytes)) {
+      throw new Error(
+        'Invalid ICU locale data package: expected an ICU CmnD (.dat) header (magic 0xda 0x27)',
+      );
+    }
+    await this.engine.mkdir('/firebird');
+    await this.engine.mkdir('/firebird/icu');
+    await this.engine.writeFile(ICU_LOCALE_DATA_PATH, bytes);
+  }
+
   async persist(): Promise<void> {
     if (!this.dbHandle || !this.mayPersist) return;
 
@@ -1180,11 +1605,15 @@ export class FirebirdBrowser {
 
     // Before the handle goes: each one holds a subscription on it, and a
     // timer that would otherwise keep firing at a closed database.
+    for (const stmt of [...this.preparedStatements]) {
+      await stmt.close().catch(() => undefined);
+    }
     for (const live of [...this.liveQueries]) {
       await live.unsubscribe().catch(() => undefined);
     }
 
     this.closed = true;
+    this.liveTriggerPromises.clear();
 
     if (this.dbHandle) {
       // Persist before closing.
@@ -1345,6 +1774,13 @@ export class FirebirdBrowser {
 
     try {
       await this.engine.init();
+      if (this.options.icuLocaleData) {
+        const localeBytes =
+          typeof this.options.icuLocaleData === 'function'
+            ? await this.options.icuLocaleData()
+            : this.options.icuLocaleData;
+        await this.applyIcuLocaleData(localeBytes);
+      }
       if (this.opfs) {
         // The mount both opens the file and decides where it lives, so the path
         // comes back rather than being assumed on this side.
@@ -1398,6 +1834,15 @@ export class FirebirdBrowser {
         );
       }
       await this.engine.writeFile(this.dbPath, seed);
+    }
+
+    const seedStreamOpt = this.options.loadDataStream;
+    if (seedStreamOpt && !(await this.engine.exists(this.dbPath))) {
+      const seedStream =
+        typeof seedStreamOpt === 'function'
+          ? await seedStreamOpt()
+          : seedStreamOpt;
+      await this.writeStreamToDbPath(seedStream);
     }
 
     // Works unchanged for OPFS: that filesystem reports a file as existing
@@ -1552,6 +1997,125 @@ export class FirebirdBrowserTransaction {
       this.types,
       rowMode,
     );
+  }
+
+  /**
+   * Return Firebird's execution plan for `sql` (`IStatement::getPlan`) inside
+   * this transaction without executing the statement.
+   */
+  async explain(
+    sql: string | SqlFragment,
+    options: ExplainOptions = {},
+  ): Promise<string> {
+    this.assertUsable();
+    if (typeof this.engine.explain !== 'function') {
+      throw new Error('The configured EngineTransport does not support explain()');
+    }
+    return this.engine.explain(
+      this.dbHandle,
+      this.txHandle,
+      toStatement(sql).sql,
+      options.detailed === true,
+    );
+  }
+
+  /**
+   * Prepare a SQL statement inside this transaction and return a reusable
+   * {@link PreparedStatement} handle.
+   */
+  async prepare(sql: string | SqlFragment): Promise<PreparedStatement> {
+    this.assertUsable();
+    const sqlText = toStatement(sql).sql;
+    const desc: QueryDescription & { handle?: EngineHandle } =
+      typeof this.engine.prepare === 'function'
+        ? await this.engine.prepare(this.dbHandle, this.txHandle, sqlText)
+        : await this.engine.describe(this.dbHandle, this.txHandle, sqlText);
+
+    const params = desc.params.map((p) => ({ ...p }));
+    const fields = desc.fields.map((f) => ({ ...f }));
+    const stmtHandle = desc.handle ?? 0;
+    let isClosed = false;
+
+    const assertOpen = (): void => {
+      if (isClosed) {
+        throw new Error('PreparedStatement has been closed');
+      }
+      this.assertUsable();
+    };
+
+    const checkParamCount = (actual: number): void => {
+      if (actual !== params.length) {
+        throw new Error(
+          `PreparedStatement expects ${params.length} parameter(s) but ${actual} were supplied`,
+        );
+      }
+    };
+
+    const isTxFinished = () => this.finished;
+
+    const stmt: PreparedStatement = {
+      sql: sqlText,
+      get params() {
+        return params.map((p) => ({ ...p }));
+      },
+      get fields() {
+        return fields.map((f) => ({ ...f }));
+      },
+      statementType: desc.statementType,
+      hasResultSet: desc.hasResultSet,
+      get closed() {
+        return isClosed || isTxFinished();
+      },
+      query: (async (
+        paramsOrOptions: QueryParams | QueryOptions = [],
+        maybeOptions: QueryOptions = {},
+      ) => {
+        assertOpen();
+        const callParams = Array.isArray(paramsOrOptions)
+          ? paramsOrOptions
+          : [];
+        const callOptions = Array.isArray(paramsOrOptions)
+          ? maybeOptions
+          : (paramsOrOptions ?? {});
+        checkParamCount(callParams.length);
+        return this.query(sqlText, callParams, { rowMode: callOptions.rowMode });
+      }) as PreparedStatement['query'],
+      exec: async (callParams: QueryParams = []) => {
+        assertOpen();
+        checkParamCount(callParams.length);
+        return this.exec(sqlText, callParams);
+      },
+      execBatch: async (rows: QueryParams[]) => {
+        assertOpen();
+        if (!Array.isArray(rows)) {
+          throw new TypeError('execBatch takes an array of parameter rows');
+        }
+        for (const row of rows) {
+          checkParamCount(row.length);
+        }
+        return this.execBatch(sqlText, rows);
+      },
+      close: async () => {
+        if (isClosed) return;
+        isClosed = true;
+        if (stmtHandle > 0 && typeof this.engine.stmtClose === 'function') {
+          await this.engine.stmtClose(stmtHandle).catch(() => undefined);
+        }
+      },
+      [Symbol.asyncDispose]: async () => {
+        await stmt.close();
+      },
+    };
+
+    return stmt;
+  }
+
+  /**
+   * Describe a statement's shape inside this transaction without running it.
+   */
+  async describeQuery(sql: string | SqlFragment): Promise<QueryDescription> {
+    this.assertUsable();
+    return this.engine.describe(this.dbHandle, this.txHandle, toStatement(sql).sql);
   }
 
   /** Stream a SELECT inside this transaction in batches of `batchSize` rows. */

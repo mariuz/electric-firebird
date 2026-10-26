@@ -228,6 +228,20 @@ describe('QueryStore, live', () => {
     db.lives[0]!.options.onError!(new Error('deadlock'));
     expect(store.getSnapshot()).toEqual({ rows: [{ ID: 1 }], error: new Error('deadlock'), loading: false });
   });
+
+  it('runs through live() with events: undefined when live: true is set (zero-config)', async () => {
+    const db = new FakeDb();
+    const store = new QueryStore(db, 'SELECT * FROM t', [42], { live: true, pollIntervalMs: 25 });
+    store.start();
+    expect(db.queries).toHaveLength(0);
+    expect(db.lives).toHaveLength(1);
+    expect(db.lives[0]!.options.events).toBeUndefined();
+    expect(db.lives[0]!.options.params).toEqual([42]);
+
+    db.openLive(0, [{ ID: 42 }]);
+    await settle();
+    expect(store.getSnapshot().rows).toEqual([{ ID: 42 }]);
+  });
 });
 
 describe('queryKey', () => {
@@ -243,8 +257,9 @@ describe('queryKey', () => {
     expect(queryKey('?', [undefined])).not.toBe(queryKey('?', [null]));
   });
 
-  it('includes the events and the poll interval', () => {
+  it('includes the events, live flag, and the poll interval', () => {
     expect(queryKey('S', [], { events: ['a'] })).not.toBe(queryKey('S', [], { events: ['b'] }));
+    expect(queryKey('S', [], { live: true })).not.toBe(queryKey('S', []));
     expect(queryKey('S', [], { events: ['a'], pollIntervalMs: 10 }))
       .not.toBe(queryKey('S', [], { events: ['a'], pollIntervalMs: 20 }));
   });

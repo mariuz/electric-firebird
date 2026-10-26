@@ -84,6 +84,7 @@ using namespace Firebird;
  */
 extern "C" void FB_PLUGIN_ENTRY_POINT(Firebird::IMaster* master);
 extern "C" bool fb_wasm_load_icu_data();
+extern "C" bool fb_wasm_register_icu_data(const void* data, unsigned size);
 extern "C" int fb_shutdown(unsigned int timeout, const int reason);   // yvalve/why.cpp (ibase.h)
 #ifndef fb_shutrsn_app_stopped
 #define fb_shutrsn_app_stopped -3   // firebird/impl/consts_pub.h
@@ -158,6 +159,8 @@ struct CachedStatement
 	unsigned type = 0;
 	std::shared_ptr<OutputShape> shape;     // filled by the first query that runs it
 	bool busy = false;                      // in use by an open cursor or running query
+	int handle = 0;                         // explicit handle from fb_prepare (0 if cache-only)
+	bool pinned = false;                    // pinned by fb_prepare until fb_stmt_close
 };
 
 /** An attached database, and the statements kept prepared for it, most recently used first. */
@@ -206,6 +209,7 @@ std::map<int, CursorEntry> g_cursors;
 int g_nextDbHandle = 1;
 int g_nextTxHandle = 1;
 int g_nextCursorHandle = 1;
+int g_nextStmtHandle = 1;
 
 std::string g_lastError;
 /** The last error said "attempted update during read-only transaction". */
@@ -655,7 +659,7 @@ IStatement* acquireStatement(int db_handle, IAttachment* attachment, ITransactio
 
 	if (entry && g_statementCacheSize && cacheableType(type))
 	{
-		entry->statements.push_front(CachedStatement{sql, statement, type, nullptr, true});
+		entry->statements.push_front(CachedStatement{sql, statement, type, nullptr, true, 0, false});
 		cached = true;
 		while (entry->statements.size() > g_statementCacheSize)
 		{
@@ -663,7 +667,7 @@ IStatement* acquireStatement(int db_handle, IAttachment* attachment, ITransactio
 			for (auto it = entry->statements.end(); it != entry->statements.begin(); )
 			{
 				--it;
-				if (!it->busy)
+				if (!it->busy && !it->pinned)
 				{
 					victim = it;
 					break;
@@ -2609,6 +2613,29 @@ int fb_init(void)
 	return 0;
 }
 
+/**
+ * Register an optional ICU `.dat` common data bundle (such as a locale
+ * tailoring pack for `LOCALE=de_DE`, `es_ES`, `fr_FR`, `ja_JP`) in a second
+ * `udata_setCommonData()` slot without increasing the default WASM binary
+ * size.  Returns 0 on success, non-zero on failure.
+ */
+FB_WASM_EXPORT
+int fb_load_icu_data(const unsigned char* data, unsigned size)
+{
+	clearError();
+	if (!data || size == 0)
+	{
+		setError("fb_load_icu_data: empty ICU data buffer");
+		return 1;
+	}
+	if (!fb_wasm_register_icu_data(data, size))
+	{
+		setError("fb_load_icu_data: ICU rejected the collation data package");
+		return 2;
+	}
+	return 0;
+}
+
 /** Last error message, or "" when the previous call succeeded. */
 FB_WASM_EXPORT
 const char* fb_last_error(void)
@@ -3074,6 +3101,404 @@ const char* fb_describe(int db_handle, int tx_handle, const char* sql)
 	json += tail;
 
 	cleanup();
+	return allocCString(json);
+}
+
+FB_WASM_EXPORT
+const char* fb_prepare(int db_handle, int tx_handle, const char* sql)
+{
+	clearError();
+
+	DbEntry* entry = lookupEntry(db_handle);
+	IAttachment* attachment = entry ? entry->attachment : nullptr;
+	if (!attachment)
+	{
+		setError("fb_prepare: unknown database handle");
+		return nullptr;
+	}
+
+	ITransaction* transaction = nullptr;
+	bool ownTransaction = false;
+
+	if (tx_handle)
+	{
+		transaction = lookupTransaction(tx_handle);
+		if (!transaction)
+		{
+			setError("fb_prepare: unknown transaction handle");
+			return nullptr;
+		}
+	}
+	else
+	{
+		Status status;
+		transaction = attachment->startTransaction(status.ptr(), 0, nullptr);
+		if (status.failed() || !transaction)
+		{
+			setErrorFromStatus("fb_prepare: could not start transaction", status.ptr());
+			return nullptr;
+		}
+		ownTransaction = true;
+	}
+
+	Status status;
+	bool cached = false;
+	unsigned statementType = 0;
+	IStatement* statement = acquireStatement(db_handle, attachment, transaction, sql, status, cached, &statementType);
+	if (status.failed() || !statement)
+	{
+		setErrorFromStatus("fb_prepare: prepare failed", status.ptr());
+		if (ownTransaction && transaction)
+		{
+			Status s;
+			transaction->commit(s.ptr());
+		}
+		return nullptr;
+	}
+
+	IMessageMetadata* inMeta = nullptr;
+	IMessageMetadata* outMeta = nullptr;
+
+	auto cleanup = [&](bool failed)
+	{
+		if (inMeta)
+			inMeta->release();
+		if (outMeta)
+			outMeta->release();
+
+		releaseStatement(db_handle, statement, cached, failed);
+
+		if (ownTransaction && transaction)
+		{
+			Status s;
+			transaction->commit(s.ptr());
+			transaction = nullptr;
+		}
+	};
+
+	inMeta = statement->getInputMetadata(status.ptr());
+	if (status.failed())
+	{
+		setErrorFromStatus("fb_prepare: could not read input metadata", status.ptr());
+		cleanup(true);
+		return nullptr;
+	}
+
+	outMeta = statement->getOutputMetadata(status.ptr());
+	if (status.failed())
+	{
+		setErrorFromStatus("fb_prepare: could not read output metadata", status.ptr());
+		cleanup(true);
+		return nullptr;
+	}
+
+	if (!statementType)
+	{
+		statementType = statement->getType(status.ptr());
+		if (status.failed())
+		{
+			setErrorFromStatus("fb_prepare: could not read statement type", status.ptr());
+			cleanup(true);
+			return nullptr;
+		}
+	}
+
+	int stmtHandle = 0;
+	if (entry && cached)
+	{
+		for (auto& c : entry->statements)
+		{
+			if (c.statement == statement)
+			{
+				if (!c.handle)
+					c.handle = g_nextStmtHandle++;
+				c.pinned = true;
+				stmtHandle = c.handle;
+				break;
+			}
+		}
+	}
+
+	std::string json = "{\"handle\":";
+	appendInteger(stmtHandle, json);
+	json += ",\"params\":";
+	if (!describeMetadata(inMeta, json))
+	{
+		cleanup(true);
+		return nullptr;
+	}
+
+	json += ",\"columns\":";
+	if (!describeMetadata(outMeta, json))
+	{
+		cleanup(true);
+		return nullptr;
+	}
+
+	char tail[64];
+	snprintf(tail, sizeof(tail), ",\"statementType\":%u}", statementType);
+	json += tail;
+
+	cleanup(false);
+	return allocCString(json);
+}
+
+FB_WASM_EXPORT
+int fb_stmt_close(int stmt_handle)
+{
+	clearError();
+	if (stmt_handle <= 0)
+		return 0;
+
+	for (auto& kv : g_databases)
+	{
+		DbEntry& entry = kv.second;
+		for (auto it = entry.statements.begin(); it != entry.statements.end(); ++it)
+		{
+			if (it->handle == stmt_handle)
+			{
+				it->pinned = false;
+				it->handle = 0;
+				if (!it->busy)
+				{
+					freeStatement(it->statement);
+					entry.statements.erase(it);
+				}
+				return 0;
+			}
+		}
+	}
+	return 0;
+}
+
+FB_WASM_EXPORT
+const char* fb_explain(int db_handle, int tx_handle, const char* sql, int detailed)
+{
+	clearError();
+
+	IAttachment* attachment = lookupAttachment(db_handle);
+	if (!attachment)
+	{
+		setError("fb_explain: unknown database handle");
+		return nullptr;
+	}
+
+	ITransaction* transaction = nullptr;
+	bool ownTransaction = false;
+
+	if (tx_handle)
+	{
+		transaction = lookupTransaction(tx_handle);
+		if (!transaction)
+		{
+			setError("fb_explain: unknown transaction handle");
+			return nullptr;
+		}
+	}
+	else
+	{
+		Status status;
+		transaction = attachment->startTransaction(status.ptr(), 0, nullptr);
+		if (status.failed() || !transaction)
+		{
+			setErrorFromStatus("fb_explain: could not start transaction", status.ptr());
+			return nullptr;
+		}
+		ownTransaction = true;
+	}
+
+	IStatement* statement = nullptr;
+
+	auto cleanup = [&]()
+	{
+		if (statement)
+			statement->free(Status().ptr());
+
+		if (ownTransaction && transaction)
+		{
+			Status s;
+			transaction->commit(s.ptr());
+			transaction = nullptr;
+		}
+	};
+
+	Status status;
+	const unsigned prefetchFlags = detailed
+		? IStatement::PREPARE_PREFETCH_DETAILED_PLAN
+		: IStatement::PREPARE_PREFETCH_LEGACY_PLAN;
+	statement = attachment->prepare(status.ptr(), transaction, 0, sql, SQL_DIALECT_V6, prefetchFlags);
+
+	if (status.failed() || !statement)
+	{
+		setErrorFromStatus("fb_explain: prepare failed", status.ptr());
+		cleanup();
+		return nullptr;
+	}
+
+	const char* rawPlan = statement->getPlan(status.ptr(), detailed ? FB_TRUE : FB_FALSE);
+	if (status.failed())
+	{
+		setErrorFromStatus("fb_explain: could not read execution plan", status.ptr());
+		cleanup();
+		return nullptr;
+	}
+
+	std::string plan = rawPlan ? rawPlan : "";
+	while (!plan.empty() && (plan.front() == '\n' || plan.front() == '\r'))
+		plan.erase(plan.begin());
+	while (!plan.empty() && (plan.back() == '\n' || plan.back() == '\r'))
+		plan.pop_back();
+
+	cleanup();
+	return allocCString(plan);
+}
+
+FB_WASM_EXPORT
+/**
+ * Return database storage, ODS, memory pool, I/O, and OIT/OAT/OST transaction
+ * health diagnostics (`IAttachment::getInfo`) as a JSON object.
+ *
+ * Caller frees the returned buffer with `fb_free_result`.
+ */
+FB_WASM_EXPORT
+const char* fb_database_info(int db_handle)
+{
+	clearError();
+
+	IAttachment* attachment = lookupAttachment(db_handle);
+	if (!attachment)
+	{
+		setError("fb_database_info: unknown database handle");
+		return nullptr;
+	}
+
+	constexpr unsigned char INFO_END            = 1;   // isc_info_end
+	constexpr unsigned char INFO_TRUNCATED      = 2;   // isc_info_truncated
+	constexpr unsigned char INFO_READS          = 5;   // isc_info_reads
+	constexpr unsigned char INFO_WRITES         = 6;   // isc_info_writes
+	constexpr unsigned char INFO_FETCHES        = 7;   // isc_info_fetches
+	constexpr unsigned char INFO_MARKS          = 8;   // isc_info_marks
+	constexpr unsigned char INFO_PAGE_SIZE      = 14;  // isc_info_page_size
+	constexpr unsigned char INFO_NUM_BUFFERS    = 15;  // isc_info_num_buffers
+	constexpr unsigned char INFO_CURRENT_MEMORY = 17;  // isc_info_current_memory
+	constexpr unsigned char INFO_MAX_MEMORY     = 18;  // isc_info_max_memory
+	constexpr unsigned char INFO_ALLOCATION     = 21;  // isc_info_allocation
+	constexpr unsigned char INFO_ODS_VERSION    = 32;  // isc_info_ods_version
+	constexpr unsigned char INFO_ODS_MINOR      = 33;  // isc_info_ods_minor_version
+	constexpr unsigned char INFO_OLDEST_TX      = 104; // isc_info_oldest_transaction
+	constexpr unsigned char INFO_OLDEST_ACTIVE  = 105; // isc_info_oldest_active
+	constexpr unsigned char INFO_OLDEST_SNAP    = 106; // isc_info_oldest_snapshot
+	constexpr unsigned char INFO_NEXT_TX        = 107; // isc_info_next_transaction
+
+	const unsigned char items[] = {
+		INFO_PAGE_SIZE,
+		INFO_ALLOCATION,
+		INFO_ODS_VERSION,
+		INFO_ODS_MINOR,
+		INFO_OLDEST_TX,
+		INFO_OLDEST_ACTIVE,
+		INFO_OLDEST_SNAP,
+		INFO_NEXT_TX,
+		INFO_CURRENT_MEMORY,
+		INFO_MAX_MEMORY,
+		INFO_NUM_BUFFERS,
+		INFO_READS,
+		INFO_WRITES,
+		INFO_FETCHES,
+		INFO_MARKS
+	};
+
+	unsigned char buffer[512] = {};
+	Status status;
+	attachment->getInfo(status.ptr(), sizeof(items), items, sizeof(buffer), buffer);
+	if (status.failed())
+	{
+		setErrorFromStatus("fb_database_info: getInfo failed", status.ptr());
+		return nullptr;
+	}
+
+	auto readPortableInt = [](const unsigned char* p, unsigned len) -> long long
+	{
+		unsigned long long value = 0;
+		const unsigned n = len > 8 ? 8 : len;
+		for (unsigned i = 0; i < n; i++)
+			value |= static_cast<unsigned long long>(p[i]) << (8 * i);
+		return static_cast<long long>(value);
+	};
+
+	long long pageSize = 0;
+	long long allocatedPages = 0;
+	long long odsVersion = 0;
+	long long odsMinorVersion = 0;
+	long long oldestTransaction = 0;
+	long long oldestActive = 0;
+	long long oldestSnapshot = 0;
+	long long nextTransaction = 0;
+	long long currentMemory = 0;
+	long long maxMemory = 0;
+	long long pageBuffers = 0;
+	long long reads = 0;
+	long long writes = 0;
+	long long fetches = 0;
+	long long marks = 0;
+
+	size_t pos = 0;
+	while (pos < sizeof(buffer))
+	{
+		const unsigned char tag = buffer[pos++];
+		if (tag == 0 || tag == INFO_END || tag == INFO_TRUNCATED)
+			break;
+		if (pos + 2 > sizeof(buffer))
+			break;
+		const unsigned len = static_cast<unsigned>(buffer[pos]) |
+			(static_cast<unsigned>(buffer[pos + 1]) << 8);
+		pos += 2;
+		if (pos + len > sizeof(buffer))
+			break;
+		const long long val = readPortableInt(buffer + pos, len);
+		pos += len;
+
+		switch (tag)
+		{
+			case INFO_PAGE_SIZE:      pageSize = val; break;
+			case INFO_ALLOCATION:     allocatedPages = val; break;
+			case INFO_ODS_VERSION:    odsVersion = val; break;
+			case INFO_ODS_MINOR:      odsMinorVersion = val; break;
+			case INFO_OLDEST_TX:      oldestTransaction = val; break;
+			case INFO_OLDEST_ACTIVE:  oldestActive = val; break;
+			case INFO_OLDEST_SNAP:    oldestSnapshot = val; break;
+			case INFO_NEXT_TX:        nextTransaction = val; break;
+			case INFO_CURRENT_MEMORY: currentMemory = val; break;
+			case INFO_MAX_MEMORY:     maxMemory = val; break;
+			case INFO_NUM_BUFFERS:    pageBuffers = val; break;
+			case INFO_READS:          reads = val; break;
+			case INFO_WRITES:         writes = val; break;
+			case INFO_FETCHES:        fetches = val; break;
+			case INFO_MARKS:          marks = val; break;
+			default: break;
+		}
+	}
+
+	const long long databaseSizeBytes = pageSize * allocatedPages;
+	const long long transactionGap = nextTransaction >= oldestActive
+		? (nextTransaction - oldestActive)
+		: 0;
+
+	char json[640];
+	snprintf(json, sizeof(json),
+		"{\"pageSize\":%lld,\"allocatedPages\":%lld,\"databaseSizeBytes\":%lld,"
+		"\"odsVersion\":%lld,\"odsMinorVersion\":%lld,"
+		"\"oldestTransaction\":%lld,\"oldestActive\":%lld,"
+		"\"oldestSnapshot\":%lld,\"nextTransaction\":%lld,\"transactionGap\":%lld,"
+		"\"currentMemory\":%lld,\"maxMemory\":%lld,\"pageBuffers\":%lld,"
+		"\"reads\":%lld,\"writes\":%lld,\"fetches\":%lld,\"marks\":%lld}",
+		pageSize, allocatedPages, databaseSizeBytes,
+		odsVersion, odsMinorVersion,
+		oldestTransaction, oldestActive,
+		oldestSnapshot, nextTransaction, transactionGap,
+		currentMemory, maxMemory, pageBuffers,
+		reads, writes, fetches, marks);
+
 	return allocCString(json);
 }
 

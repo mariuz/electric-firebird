@@ -9,6 +9,7 @@
  * subscription's baseline is in.
  */
 import { FirebirdBrowser } from '../browser/firebird-browser';
+import { extractReferencedTables, liveTableEventName } from '../browser/live-tables';
 import type { EngineTransport } from '../browser/engine-transport';
 
 interface Gate {
@@ -21,6 +22,7 @@ interface Gate {
 class ScriptedEngine {
   committed = 0;
   queries = 0;
+  executedDdl: string[] = [];
   /** The next query to start waits for its gate. */
   private nextGate: { started: () => void; wait: Promise<void> } | null = null;
   /** The next query to start throws this. */
@@ -59,7 +61,10 @@ class ScriptedEngine {
       createDatabase: async () => 1,
       attachDatabase: async () => 1,
       detachDatabase: async () => undefined,
-      execute: unused,
+      execute: async (_db, _tx, sql) => {
+        this.executedDdl.push(sql);
+        return 0;
+      },
       executeBatch: unused,
       describe: unused,
       startTransaction: unused,
@@ -229,5 +234,72 @@ describe('live()', () => {
     expect(engine.activeSubscriptions).toBe(0);
 
     await db.close();
+  });
+
+  it('auto-installs POST_EVENT triggers and watches referenced tables when events is omitted', async () => {
+    const engine = new ScriptedEngine();
+    const db = open(engine);
+    const seen: number[] = [];
+
+    // 2-argument form: db.live(sql, onChange) with no options object at all,
+    // plus a second live query on the same table to verify trigger DDL runs once.
+    const live1 = await db.live(
+      'SELECT i.id FROM items i JOIN categories c ON c.id = i.cat_id',
+      { pollIntervalMs: POLL_MS },
+      (rows) => seen.push(rows.length),
+    );
+    const live2 = await db.live('SELECT id FROM items', () => undefined);
+
+    // Trigger created once for ITEMS and once for CATEGORIES (not twice for ITEMS).
+    expect(engine.executedDdl).toHaveLength(2);
+    expect(engine.executedDdl[0]).toContain('FOR "ITEMS"');
+    expect(engine.executedDdl[1]).toContain('FOR "CATEGORIES"');
+
+    // Firing the auto-generated event for either table refreshes live1.
+    engine.insert(liveTableEventName('CATEGORIES'));
+    await until(() => live1.rows.length === 1);
+    expect(seen).toEqual([0, 1]);
+
+    await live1.unsubscribe();
+    await live2.unsubscribe();
+    await db.close();
+  });
+
+  it('rejects when events is omitted and the statement references no user tables', async () => {
+    const engine = new ScriptedEngine();
+    const db = open(engine);
+
+    await expect(
+      db.live('SELECT 1 FROM RDB$DATABASE', () => undefined),
+    ).rejects.toThrow(RangeError);
+
+    await db.close();
+  });
+});
+
+describe('extractReferencedTables()', () => {
+  it('extracts base tables from FROM, JOIN, comma joins, and subqueries while skipping CTEs, system tables, and functions with FROM', () => {
+    expect(extractReferencedTables('SELECT id, name FROM todos WHERE done = FALSE ORDER BY id')).toEqual([
+      'TODOS',
+    ]);
+    expect(
+      extractReferencedTables(
+        'SELECT a.id, b.name FROM items a LEFT JOIN categories b ON b.id = a.cat_id, tags t WHERE t.item_id = a.id',
+      ),
+    ).toEqual(['ITEMS', 'CATEGORIES', 'TAGS']);
+    expect(
+      extractReferencedTables(
+        'WITH recent AS (SELECT * FROM notes), counts (id, c) AS (SELECT id, 1 FROM recent) ' +
+          'SELECT * FROM counts JOIN authors ON authors.id = counts.id',
+      ),
+    ).toEqual(['NOTES', 'AUTHORS']);
+    expect(
+      extractReferencedTables(
+        "SELECT EXTRACT(YEAR FROM created_at), TRIM(BOTH ' ' FROM title), SUBSTRING(title FROM 1 FOR 3) FROM articles",
+      ),
+    ).toEqual(['ARTICLES']);
+    expect(
+      extractReferencedTables('SELECT * FROM "MixedCase" JOIN my_proc(1, 2) ON 1=1 FROM RDB$DATABASE'),
+    ).toEqual(['MixedCase']);
   });
 });

@@ -31,6 +31,7 @@ import type {
   Row,
   QueryResult,
   QueryDescription,
+  DatabaseInfo,
   QueryParams,
   RowMode,
   TransactionOptions,
@@ -94,8 +95,14 @@ const REPLAYABLE: ReadonlySet<SharedOp> = new Set<SharedOp>([
   // Prepares a statement and drops it, executing nothing, so re-issuing it is
   // indistinguishable from issuing it once.
   'describe',
+  'explain',
+  'databaseInfo',
+  'prepare',
+  'stmtClose',
   'exists',
   'readFile',
+  'fileSize',
+  'readFileChunk',
 ]);
 
 // ---------------------------------------------------------------------------
@@ -544,6 +551,40 @@ export class SharedEngineTransport implements EngineTransport {
     return this.call<QueryDescription>('describe', dbHandle, txHandle, sql);
   }
 
+  explain(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    sql: string,
+    detailed = false,
+  ): Promise<string> {
+    return this.call<string>('explain', dbHandle, txHandle, sql, detailed);
+  }
+
+  databaseInfo(dbHandle: EngineHandle): Promise<DatabaseInfo> {
+    return this.call<DatabaseInfo>('databaseInfo', dbHandle);
+  }
+
+  prepare(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    sql: string,
+  ): Promise<QueryDescription & { handle?: EngineHandle }> {
+    return this.call<QueryDescription & { handle?: EngineHandle }>(
+      'prepare',
+      dbHandle,
+      txHandle,
+      sql,
+    );
+  }
+
+  stmtClose(stmtHandle: EngineHandle): Promise<void> {
+    return this.call<void>('stmtClose', stmtHandle);
+  }
+
+  loadIcuLocaleData(data: Uint8Array): Promise<void> {
+    return this.call<void>('loadIcuLocaleData', data);
+  }
+
   startTransaction(
     dbHandle: EngineHandle,
     options: TransactionOptions = {},
@@ -573,6 +614,27 @@ export class SharedEngineTransport implements EngineTransport {
 
   writeFile(path: string, data: Uint8Array): Promise<void> {
     return this.call<void>('writeFile', path, data);
+  }
+
+  fileSize(path: string): Promise<number> {
+    return this.call<number>('fileSize', path);
+  }
+
+  readFileChunk(
+    path: string,
+    offset: number,
+    length: number,
+  ): Promise<Uint8Array> {
+    return this.call<Uint8Array>('readFileChunk', path, offset, length);
+  }
+
+  writeFileChunk(
+    path: string,
+    data: Uint8Array,
+    offset: number,
+    truncate = false,
+  ): Promise<void> {
+    return this.call<void>('writeFileChunk', path, data, offset, truncate);
   }
 
   unlink(path: string): Promise<void> {

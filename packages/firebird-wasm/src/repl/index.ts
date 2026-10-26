@@ -25,13 +25,17 @@
 
 import { splitStatements } from '../browser/sql-script';
 import type { ScriptStatement } from '../browser/sql-script';
-import type { ArrayRow, FieldInfo, QueryResult } from '../types';
+import type { ArrayRow, DatabaseInfo, ExplainOptions, FieldInfo, QueryResult } from '../types';
 
 /** What the console needs of a database: `FirebirdBrowser` has it. */
 export interface ReplDatabase {
   query(sql: string, params: unknown[], options: { rowMode: 'array' }): Promise<QueryResult<ArrayRow>>;
   /** Whether a statement yields rows, before running it. */
   describeQuery(sql: string): Promise<{ hasResultSet: boolean }>;
+  /** Return the execution plan for `sql` without running it. */
+  explain?(sql: string, options?: ExplainOptions): Promise<string>;
+  /** Inspect database diagnostics and transaction counters. */
+  databaseInfo?(): Promise<DatabaseInfo>;
   /**
    * For a statement without rows: a transaction's `exec()` runs exactly one
    * statement and reports what it changed.  (`FirebirdBrowser.exec()` would
@@ -50,6 +54,8 @@ export interface ReplEntry {
   fields?: FieldInfo[];
   rows?: ArrayRow[];
   affectedRows?: number;
+  plan?: string;
+  info?: DatabaseInfo;
   error?: Error;
 }
 
@@ -61,6 +67,10 @@ export interface FirebirdReplElement extends HTMLElement {
   value: string;
   /** Run `script` (default: the editor's text); resolves with what each statement did. */
   run(script?: string): Promise<ReplEntry[]>;
+  /** Explain `script` (default: the editor's text) without executing it; resolves with each statement's plan. */
+  explain(script?: string, options?: ExplainOptions): Promise<ReplEntry[]>;
+  /** Inspect database diagnostics and OIT/OAT transaction health; resolves with the info entry. */
+  info(): Promise<ReplEntry | undefined>;
   /** Empty the output. */
   clear(): void;
 }
@@ -93,6 +103,7 @@ const STYLE = `
 .sql { white-space: pre-wrap; margin: 0; }
 .sql::before { content: '> '; color: var(--firebird-repl-muted); }
 .meta { color: var(--firebird-repl-muted); margin: 0.15rem 0 0; }
+.plan { white-space: pre-wrap; margin: 0.2rem 0 0; }
 .error { color: var(--firebird-repl-error); white-space: pre-wrap; margin: 0.15rem 0 0; }
 .table { overflow-x: auto; margin-top: 0.25rem; }
 table { border-collapse: collapse; }
@@ -125,6 +136,8 @@ export function defineFirebirdRepl(tag = 'firebird-repl'): { new (): FirebirdRep
     private readonly output: HTMLDivElement;
     private readonly editor: HTMLTextAreaElement;
     private readonly button: HTMLButtonElement;
+    private readonly explainButton: HTMLButtonElement;
+    private readonly infoButton: HTMLButtonElement;
     private readonly history: string[] = [];
     /** Position in `history` while walking it; `history.length` is the draft. */
     private cursor = 0;
@@ -147,10 +160,23 @@ export function defineFirebirdRepl(tag = 'firebird-repl'): { new (): FirebirdRep
       this.button = document.createElement('button');
       this.button.type = 'button';
       this.button.textContent = 'Run';
-      input.append(this.editor, this.button);
+      this.explainButton = document.createElement('button');
+      this.explainButton.type = 'button';
+      this.explainButton.className = 'explain';
+      this.explainButton.textContent = 'Explain';
+      this.explainButton.title = 'Explain query plan (Shift+click for detailed plan)';
+      this.explainButton.title = 'Explain query plan (Shift+click for detailed plan)';
+      this.infoButton = document.createElement('button');
+      this.infoButton.type = 'button';
+      this.infoButton.className = 'info';
+      this.infoButton.textContent = 'Info';
+      this.infoButton.title = 'Inspect database diagnostics and transaction counters';
+      input.append(this.editor, this.infoButton, this.explainButton, this.button);
       root.append(style, this.output, input);
 
       this.button.addEventListener('click', () => void this.run());
+      this.explainButton.addEventListener('click', (event) => void this.explain(undefined, { detailed: event.shiftKey }));
+      this.infoButton.addEventListener('click', () => void this.info());
       this.editor.addEventListener('keydown', (event) => this.onKey(event));
 
       // A property set before the element was defined (React and Vue both
@@ -199,6 +225,8 @@ export function defineFirebirdRepl(tag = 'firebird-repl'): { new (): FirebirdRep
 
       this.busy = true;
       this.button.disabled = true;
+      this.explainButton.disabled = true;
+      this.infoButton.disabled = true;
       if (this.history[this.history.length - 1] !== text) this.history.push(text);
       this.cursor = this.history.length;
       this.draft = '';
@@ -239,9 +267,121 @@ export function defineFirebirdRepl(tag = 'firebird-repl'): { new (): FirebirdRep
       } finally {
         this.busy = false;
         this.button.disabled = false;
+        this.explainButton.disabled = false;
+        this.infoButton.disabled = false;
       }
       this.dispatchEvent(new CustomEvent('firebird-repl-run', { detail: entries, bubbles: true, composed: true }));
       return entries;
+    }
+
+    async explain(script?: string, options?: ExplainOptions): Promise<ReplEntry[]> {
+      const text = script ?? this.editor.value;
+      if (this.busy || text.trim() === '') return [];
+      if (!this.db || typeof this.db.explain !== 'function') {
+        const entry: ReplEntry = {
+          sql: text.trim(),
+          line: 1,
+          ms: 0,
+          error: new Error(
+            !this.db
+              ? 'No database: set the element’s db property first'
+              : 'Database does not support explain()',
+          ),
+        };
+        this.show(entry);
+        return [entry];
+      }
+
+      this.busy = true;
+      this.button.disabled = true;
+      this.explainButton.disabled = true;
+      this.infoButton.disabled = true;
+      if (this.history[this.history.length - 1] !== text) this.history.push(text);
+      this.cursor = this.history.length;
+
+      const entries: ReplEntry[] = [];
+      try {
+        let statements: ScriptStatement[];
+        try {
+          statements = splitStatements(text);
+        } catch (err) {
+          statements = [];
+          const entry: ReplEntry = { sql: text.trim(), line: 1, ms: 0, error: asError(err) };
+          entries.push(entry);
+          this.show(entry);
+        }
+        for (const statement of statements) {
+          const started = performance.now();
+          const entry: ReplEntry = { sql: statement.sql, line: statement.line, ms: 0 };
+          try {
+            entry.plan = await this.db.explain(statement.sql, options);
+          } catch (err) {
+            entry.error = asError(err);
+          }
+          entry.ms = performance.now() - started;
+          entries.push(entry);
+          this.show(entry);
+          if (entry.error) break;
+        }
+      } finally {
+        this.busy = false;
+        this.button.disabled = false;
+        this.explainButton.disabled = false;
+        this.infoButton.disabled = false;
+      }
+      this.dispatchEvent(
+        new CustomEvent('firebird-repl-explain', {
+          detail: entries,
+          bubbles: true,
+          composed: true,
+        }),
+      );
+      return entries;
+    }
+
+    async info(): Promise<ReplEntry | undefined> {
+      if (this.busy) return undefined;
+      if (!this.db || typeof this.db.databaseInfo !== 'function') {
+        const entry: ReplEntry = {
+          sql: 'DATABASE INFO',
+          line: 1,
+          ms: 0,
+          error: new Error(
+            !this.db
+              ? 'No database: set the element’s db property first'
+              : 'Database does not support databaseInfo()',
+          ),
+        };
+        this.show(entry);
+        return entry;
+      }
+
+      this.busy = true;
+      this.button.disabled = true;
+      this.explainButton.disabled = true;
+      this.infoButton.disabled = true;
+      const started = performance.now();
+      const entry: ReplEntry = { sql: 'DATABASE INFO', line: 1, ms: 0 };
+      try {
+        entry.info = await this.db.databaseInfo();
+      } catch (err) {
+        entry.error = asError(err);
+      } finally {
+        entry.ms = performance.now() - started;
+        this.busy = false;
+        this.button.disabled = false;
+        this.explainButton.disabled = false;
+        this.infoButton.disabled = false;
+      }
+      this.show(entry);
+      this.dispatchEvent(
+        new CustomEvent('firebird-repl-info', {
+          detail: entry,
+          bubbles: true,
+          composed: true,
+        }),
+      );
+      return entry;
     }
 
     private onKey(event: KeyboardEvent): void {
@@ -286,6 +426,35 @@ export function defineFirebirdRepl(tag = 'firebird-repl'): { new (): FirebirdRep
         const fields = entry.fields ?? [];
         const rows = entry.rows ?? [];
         if (fields.length > 0) block.append(table(fields, rows));
+        if (entry.plan !== undefined) {
+          const plan = el('pre', 'plan');
+          plan.textContent = entry.plan || '(no plan)';
+          block.append(plan);
+        }
+        if (entry.info !== undefined) {
+          const d = entry.info;
+          block.append(
+            table(
+              [{ name: 'Metric' }, { name: 'Value' }],
+              [
+                ['Page size', d.pageSize],
+                ['Allocated pages', d.allocatedPages],
+                ['Database size (bytes)', d.databaseSizeBytes],
+                ['ODS version', `${d.odsVersion}.${d.odsMinorVersion}`],
+                ['Oldest transaction (OIT)', d.oldestTransaction],
+                ['Oldest active (OAT)', d.oldestActive],
+                ['Oldest snapshot (OST)', d.oldestSnapshot],
+                ['Next transaction', d.nextTransaction],
+                ['Transaction gap', d.transactionGap],
+                ['Current memory (bytes)', d.currentMemory],
+                ['Max memory (bytes)', d.maxMemory],
+                ['Page buffers', d.pageBuffers],
+                ['Page reads / writes', `${d.reads} / ${d.writes}`],
+                ['Page fetches / marks', `${d.fetches} / ${d.marks}`],
+              ],
+            ),
+          );
+        }
         const meta = el('p', 'meta');
         meta.textContent = `${summary(entry, fields.length > 0)} · ${entry.ms.toFixed(1)} ms`;
         block.append(meta);
@@ -311,6 +480,8 @@ function asError(err: unknown): Error {
 }
 
 function summary(entry: ReplEntry, returnsRows: boolean): string {
+  if (entry.plan !== undefined) return 'plan';
+  if (entry.info !== undefined) return 'info';
   if (returnsRows) {
     const n = entry.rows?.length ?? 0;
     return `${n} ${n === 1 ? 'row' : 'rows'}`;

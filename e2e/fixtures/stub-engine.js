@@ -57,6 +57,29 @@
     // description is about a statement's shape, not about any rows.
     description: { params: [], columns: [], statementType: 1 },
     describeReturnsNull: false,
+    plan: 'PLAN (T NATURAL)',
+    detailedPlan: 'Select Expression\n    -> Table "T" Full Scan',
+    explainReturnsNull: false,
+    databaseInfo: {
+      pageSize: 8192,
+      allocatedPages: 2,
+      databaseSizeBytes: 16384,
+      odsVersion: 13,
+      odsMinorVersion: 1,
+      oldestTransaction: 1,
+      oldestActive: 2,
+      oldestSnapshot: 2,
+      nextTransaction: 3,
+      transactionGap: 1,
+      currentMemory: 65536,
+      maxMemory: 131072,
+      pageBuffers: 2048,
+      reads: 4,
+      writes: 2,
+      fetches: 16,
+      marks: 4,
+    },
+    databaseInfoReturnsNull: false,
     // Bytes the side channel hands back, one Uint8Array per {"$blob":N}
     // placeholder in queryResult.rows.
     blobs: [],
@@ -341,6 +364,12 @@
         return 0;
       },
 
+      _fb_load_icu_data(dataPtr, dataLen) {
+        stub.calls.push({ fn: '_fb_load_icu_data', args: [dataPtr, dataLen] });
+        if (!dataPtr || dataLen <= 0) return 1;
+        return 0;
+      },
+
       _fb_create_database(pathPtr) {
         const path = UTF8ToString(pathPtr);
         stub.calls.push({ fn: '_fb_create_database', args: [path] });
@@ -404,6 +433,44 @@
         const ptr = heapString(JSON.stringify(described));
         liveResults.add(ptr);
         return ptr;
+      },
+
+      _fb_explain(handle, txHandle, sqlPtr, detailed) {
+        const sql = UTF8ToString(sqlPtr);
+        stub.calls.push({ fn: '_fb_explain', args: [handle, txHandle, sql, detailed] });
+        if (stub.explainReturnsNull) return 0;
+        const text = detailed ? (stub.detailedPlan ?? '') : (stub.plan ?? '');
+        const ptr = heapString(text);
+        liveResults.add(ptr);
+        return ptr;
+      },
+
+      _fb_database_info(handle) {
+        stub.calls.push({ fn: '_fb_database_info', args: [handle] });
+        if (stub.databaseInfoReturnsNull) return 0;
+        const ptr = heapString(JSON.stringify(stub.databaseInfo ?? {}));
+        liveResults.add(ptr);
+        return ptr;
+      },
+
+      _fb_prepare(handle, txHandle, sqlPtr) {
+        const sql = UTF8ToString(sqlPtr);
+        stub.calls.push({ fn: '_fb_prepare', args: [handle, txHandle, sql] });
+        if (stub.describeReturnsNull) return 0;
+        const described = {
+          handle: 1,
+          params: stub.description.params ?? [],
+          columns: stub.description.columns ?? [],
+          statementType: stub.description.statementType ?? 1,
+        };
+        const ptr = heapString(JSON.stringify(described));
+        liveResults.add(ptr);
+        return ptr;
+      },
+
+      _fb_stmt_close(stmtHandle) {
+        stub.calls.push({ fn: '_fb_stmt_close', args: [stmtHandle] });
+        return 0;
       },
 
       _fb_last_blobs() {

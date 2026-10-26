@@ -44,6 +44,13 @@ export {
 export type { DatabaseLock, DatabaseLockOptions } from './db-lock';
 
 export { splitStatements } from './sql-script';
+export {
+  buildIcuLocalePack,
+  isValidIcuDataPackage,
+  ICU_LOCALE_DATA_PATH,
+  DEFAULT_ICU_TAILORING_LOCALES,
+} from './icu-locales';
+export { extractReferencedTables, liveTableEventName, liveTableTriggerDDL } from './live-tables';
 export type { ScriptStatement } from './sql-script';
 
 export { DirectTransport } from './engine-transport';
@@ -93,6 +100,10 @@ export type {
   QueryOptions,
   QueryStreamOptions,
   QueryDescription,
+  ExplainOptions,
+  DatabaseInfo,
+  PreparedStatement,
+  DataStreamOptions,
   StatementKind,
   RowMode,
   ArrayRow,

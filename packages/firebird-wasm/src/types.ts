@@ -233,17 +233,157 @@ export type StatementKind =
  */
 export interface QueryDescription {
   /**
-   * One entry per `?`, in order.
-   *
-   * `undefined` where the backend cannot report them — the Node driver
-   * exposes no public input metadata, and an empty array there would claim the
-   * statement takes no parameters.
+   * One entry per `?` parameter, in order.  Empty for a statement that takes
+   * no parameters.
    */
-  params?: FieldInfo[];
+  params: FieldInfo[];
   /** One entry per result column, in order.  Empty for a statement returning none. */
   fields: FieldInfo[];
   /** What kind of statement it is. */
   statementType: StatementKind;
   /** Whether executing it yields rows. */
   hasResultSet: boolean;
+}
+
+/**
+ * Options for `explain()`.
+ */
+export interface ExplainOptions {
+  /**
+   * When `true`, returns Firebird 5/6's structured multi-line explained plan
+   * tree (`Select Expression\n    -> ...`). When `false` or omitted, returns
+   * the compact `PLAN (...)` string.
+   *
+   * @default false
+   */
+  detailed?: boolean;
+}
+
+/**
+ * Database storage, ODS, memory pool, I/O, and transaction health diagnostics
+ * returned by `db.databaseInfo()` (`IAttachment::getInfo`).
+ */
+export interface DatabaseInfo {
+  /** Database page size in bytes (`isc_info_page_size`, e.g. 8192). */
+  pageSize: number;
+  /** Number of allocated database pages (`isc_info_allocation`). */
+  allocatedPages: number;
+  /** Total allocated database size in bytes (`pageSize * allocatedPages`). */
+  databaseSizeBytes: number;
+  /** On-Disk Structure major version (`isc_info_ods_version`, e.g. 13 or 14). */
+  odsVersion: number;
+  /** On-Disk Structure minor version (`isc_info_ods_minor_version`). */
+  odsMinorVersion: number;
+  /** Oldest Interesting Transaction (`isc_info_oldest_transaction` / OIT). */
+  oldestTransaction: number;
+  /** Oldest Active Transaction (`isc_info_oldest_active` / OAT). */
+  oldestActive: number;
+  /** Oldest Snapshot Transaction (`isc_info_oldest_snapshot` / OST). */
+  oldestSnapshot: number;
+  /** Next transaction ID to be assigned (`isc_info_next_transaction`). */
+  nextTransaction: number;
+  /**
+   * Transaction health gap (`nextTransaction - oldestActive`).
+   * A growing gap indicates an uncommitted long-running transaction holding
+   * back garbage collection.
+   */
+  transactionGap: number;
+  /** Bytes currently in use across the attachment's memory pools (`isc_info_current_memory`). */
+  currentMemory: number;
+  /** Peak bytes allocated across the attachment's memory pools (`isc_info_max_memory`). */
+  maxMemory: number;
+  /** Page cache buffer count (`isc_info_num_buffers`). */
+  pageBuffers: number;
+  /** Physical page reads since attachment opened (`isc_info_reads`). */
+  reads: number;
+  /** Physical page writes since attachment opened (`isc_info_writes`). */
+  writes: number;
+  /** Page cache fetches since attachment opened (`isc_info_fetches`). */
+  fetches: number;
+  /** Page cache marks (modified pages) since attachment opened (`isc_info_marks`). */
+  /** Page cache marks (modified pages) since attachment opened (`isc_info_marks`). */
+  marks: number;
+}
+
+/**
+ * An explicitly prepared SQL statement handle returned by `db.prepare(sql)`
+ * (or `tx.prepare(sql)`).
+ *
+ * Exposes the statement's input parameter metadata (`params`), output column
+ * metadata (`fields`), statement classification (`statementType`,
+ * `hasResultSet`), and execution methods (`query`, `exec`, `execBatch`,
+ * `close`).
+ */
+export interface PreparedStatement {
+  /** The SQL statement text that was prepared. */
+  readonly sql: string;
+  /** Input `?` parameter metadata, in positional order. */
+  readonly params: FieldInfo[];
+  /** Output column metadata, in positional order. */
+  readonly fields: FieldInfo[];
+  /** What kind of statement it is (`'SELECT'`, `'INSERT'`, etc.). */
+  readonly statementType: StatementKind;
+  /** Whether executing the statement yields a result set. */
+  readonly hasResultSet: boolean;
+  /** Whether `close()` has been called on this handle. */
+  readonly closed: boolean;
+
+  /**
+   * Execute the prepared statement and return its result rows.
+   */
+  query(
+    options: QueryOptions & { rowMode: 'array' },
+  ): Promise<QueryResult<ArrayRow>>;
+  query(
+    params: QueryParams | undefined,
+    options: QueryOptions & { rowMode: 'array' },
+  ): Promise<QueryResult<ArrayRow>>;
+  query<T extends Row = Row>(
+    params?: QueryParams | QueryOptions,
+    options?: QueryOptions,
+  ): Promise<QueryResult<T>>;
+
+  /**
+   * Execute the prepared statement without returning rows.
+   */
+  exec(params?: QueryParams): Promise<{ affectedRows: number }>;
+
+  /**
+   * Execute the prepared statement once per row of parameters in a single
+   * atomic batch transaction.
+   */
+  execBatch(rows: QueryParams[]): Promise<{ affectedRows: number }>;
+
+  /**
+   * Release the prepared statement handle. Safe to call more than once.
+   */
+  close(): Promise<void>;
+
+  /** Support `await using stmt = await db.prepare(...)`. */
+  /** Support `await using stmt = await db.prepare(...)`. */
+  [Symbol.asyncDispose]?(): Promise<void>;
+}
+
+/**
+ * Options for `dumpDataStream()` and `loadDataStream()`.
+ */
+export interface DataStreamOptions {
+  /**
+   * Compress (`dumpDataStream`) or decompress (`loadDataStream`) the stream on
+   * the fly using Web Streams `CompressionStream('gzip')` /
+   * `DecompressionStream('gzip')`.
+   *
+   * On `loadDataStream()`, when `compression` is omitted, gzip streams (magic
+   * bytes `0x1f 0x8b`) are also detected and decompressed automatically.
+   *
+   * @default 'none'
+   */
+  compression?: 'none' | 'gzip';
+  /**
+   * Byte size of each chunk read from the database file during
+   * `dumpDataStream()`. Defaults to `65536` (64 KiB, i.e. 8 × 8 KiB pages).
+   *
+   * @default 65536
+   */
+  chunkSize?: number;
 }

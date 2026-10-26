@@ -1,3 +1,4 @@
+import * as fs from 'fs';
 import * as os from 'os';
 import {
   Blob as FbBlob,
@@ -14,6 +15,10 @@ import type {
   ArrayRow,
   FirebirdLiteOptions,
   QueryDescription,
+  ExplainOptions,
+  DatabaseInfo,
+  PreparedStatement,
+  DataStreamOptions,
   QueryResult,
   QueryOptions,
   QueryStreamOptions,
@@ -25,6 +30,16 @@ import type {
 } from './types';
 import { statementKind } from './statement-types';
 import { firebirdTypeName } from './browser/field-types';
+import {
+  compressGzipStream,
+  readDatabaseStreamChunks,
+  resolveStreamChunkSize,
+} from './browser/data-stream';
+import {
+  DATABASE_INFO_REQUEST_ITEMS,
+  parseDatabaseInfoBuffer,
+  normalizeDatabaseInfo,
+} from './browser/engine-transport';
 import { applyTypes, applySerializers } from './browser/value-types';
 import type { TypeOptions } from './browser/value-types';
 import { toStatement, resolveQueryCall, resolveBatchSize } from './sql-tag';
@@ -100,6 +115,7 @@ export class FirebirdLite {
   private readonly statementCacheSize: number;
   /** Statements kept prepared by their SQL text, once connected (`statementCache`). */
   private statements: StatementCache | null = null;
+  private readonly preparedStatements = new Set<PreparedStatement>();
   private readonly types: TypeOptions | undefined;
 
   constructor(dbPath: string, options: FirebirdLiteOptions = {}) {
@@ -467,16 +483,14 @@ export class FirebirdLite {
    *
    * ```ts
    * const shape = await db.describeQuery('SELECT id, name FROM items WHERE id = ?');
+   * // shape.params        → [{ name: '', type: 496, typeName: 'INTEGER', ... }]
    * // shape.fields        → [{ name: 'ID', type: 496, typeName: 'INTEGER', ... }, ...]
    * // shape.statementType → 'SELECT'
    * ```
    *
    * The statement is prepared and disposed, so nothing runs: describing an
-   * `INSERT` inserts nothing.
-   *
-   * **`params` is `undefined` here.** The native driver exposes no public input
-   * metadata, and an empty array would claim the statement takes none. `fields`
-   * carries the full {@link FieldInfo} from the prepared output metadata.
+   * `INSERT` inserts nothing. Both `params` and `fields` carry the full
+   * {@link FieldInfo} from Firebird's prepared input and output metadata.
    */
   async describeQuery(sql: string | SqlFragment): Promise<QueryDescription> {
     await this.ensureReady();
@@ -487,11 +501,12 @@ export class FirebirdLite {
     try {
       const stmt = await attachment.prepare(transaction, text);
       try {
+        const params = await describeInputFields(stmt);
         const fields = await outputFields(stmt);
         const type = await stmt.type;
 
         return {
-          params: undefined,
+          params,
           fields,
           statementType: statementKind(type),
           hasResultSet: stmt.hasResultSet,
@@ -504,6 +519,350 @@ export class FirebirdLite {
       // has to be finished.
       await transaction.commit().catch(() => undefined);
     }
+  }
+
+  /**
+   * Return Firebird's execution plan for `sql` (`IStatement::getPlan`) without
+   * executing the statement.
+   *
+   * By default (`{ detailed: false }`), returns the compact `PLAN (...)` string.
+   * With `{ detailed: true }`, returns Firebird 5/6's structured multi-line
+   * explained plan tree (`Select Expression\n    -> ...`). Statements that carry
+   * no execution plan (such as DDL) return `""`.
+   */
+  async explain(
+    sql: string | SqlFragment,
+    options: ExplainOptions = {},
+  ): Promise<string> {
+    await this.ensureReady();
+    const attachment = this.attachment!;
+    const text = toStatement(sql).sql;
+    const detailed = options.detailed === true;
+
+    const transaction = await attachment.startTransaction();
+    try {
+      const stmt = await attachment.prepare(transaction, text);
+      try {
+        return await explainStatement(stmt, detailed);
+      } finally {
+        await stmt.dispose().catch(() => undefined);
+      }
+    } finally {
+      await transaction.commit().catch(() => undefined);
+    }
+  }
+
+  /**
+   * Inspect database size, page utilization, ODS version, transaction counters
+   * (OIT/OAT/OST/Next), memory pool usage, and page I/O statistics
+   * (`IAttachment::getInfo`).
+   *
+   * ```ts
+   * const info = await db.databaseInfo();
+   * // info.pageSize          → 8192
+   * // info.allocatedPages    → 280
+   * // info.databaseSizeBytes → 2293760
+   * // info.transactionGap    → info.nextTransaction - info.oldestActive
+   * ```
+   */
+  async databaseInfo(): Promise<DatabaseInfo> {
+    await this.ensureReady();
+    const attachment = this.attachment as unknown as {
+      attachmentHandle?: {
+        getInfoAsync?: (
+          status: unknown,
+          itemsLength: number,
+          items: Uint8Array,
+          bufferLength: number,
+          buffer: Uint8Array,
+        ) => Promise<void>;
+        getInfoSync?: (
+          status: unknown,
+          itemsLength: number,
+          items: Uint8Array,
+          bufferLength: number,
+          buffer: Uint8Array,
+        ) => void;
+      };
+      client?: {
+        statusAction?: <T>(fn: (status: unknown) => Promise<T>) => Promise<T>;
+      };
+    };
+
+    const statusAction = attachment?.client?.statusAction;
+    const getInfoAsync = attachment?.attachmentHandle?.getInfoAsync;
+    const getInfoSync = attachment?.attachmentHandle?.getInfoSync;
+
+    if (typeof statusAction === 'function' && typeof getInfoAsync === 'function') {
+      return statusAction(async (status) => {
+        const buffer = new Uint8Array(512);
+        await getInfoAsync.call(
+          attachment.attachmentHandle,
+          status,
+          DATABASE_INFO_REQUEST_ITEMS.byteLength,
+          DATABASE_INFO_REQUEST_ITEMS,
+          buffer.byteLength,
+          buffer,
+        );
+        return parseDatabaseInfoBuffer(buffer);
+      });
+    }
+    if (typeof statusAction === 'function' && typeof getInfoSync === 'function') {
+      return statusAction(async (status) => {
+        const buffer = new Uint8Array(512);
+        getInfoSync.call(
+          attachment.attachmentHandle,
+          status,
+          DATABASE_INFO_REQUEST_ITEMS.byteLength,
+          DATABASE_INFO_REQUEST_ITEMS,
+          buffer.byteLength,
+          buffer,
+        );
+        return parseDatabaseInfoBuffer(buffer);
+      });
+    }
+
+    const dbRes = await this.query<Record<string, unknown>>(
+      'SELECT MON$PAGE_SIZE, MON$PAGES, MON$ODS_MAJOR, MON$ODS_MINOR, ' +
+        'MON$OLDEST_TRANSACTION, MON$OLDEST_ACTIVE, MON$OLDEST_SNAPSHOT, ' +
+        'MON$NEXT_TRANSACTION, MON$PAGE_BUFFERS FROM MON$DATABASE',
+    );
+    const dbRow = dbRes.rows[0] ?? {};
+    let currentMemory = 0;
+    let maxMemory = 0;
+    let reads = 0;
+    let writes = 0;
+    let fetches = 0;
+    let marks = 0;
+    try {
+      const memRes = await this.query<Record<string, unknown>>(
+        'SELECT MON$MEMORY_USED, MON$MEMORY_MAX_USED FROM MON$MEMORY_USAGE WHERE MON$STAT_GROUP = 0',
+      );
+      const memRow = memRes.rows[0] ?? {};
+      currentMemory = Number(memRow['MON$MEMORY_USED'] ?? 0);
+      maxMemory = Number(memRow['MON$MEMORY_MAX_USED'] ?? 0);
+    } catch {
+      // Optional monitoring table
+    }
+    try {
+      const ioRes = await this.query<Record<string, unknown>>(
+        'SELECT MON$PAGE_READS, MON$PAGE_WRITES, MON$PAGE_FETCHES, MON$PAGE_MARKS FROM MON$IO_STATS WHERE MON$STAT_GROUP = 0',
+      );
+      const ioRow = ioRes.rows[0] ?? {};
+      reads = Number(ioRow['MON$PAGE_READS'] ?? 0);
+      writes = Number(ioRow['MON$PAGE_WRITES'] ?? 0);
+      fetches = Number(ioRow['MON$PAGE_FETCHES'] ?? 0);
+      marks = Number(ioRow['MON$PAGE_MARKS'] ?? 0);
+    } catch {
+      // Optional monitoring table
+    }
+    return normalizeDatabaseInfo({
+      pageSize: Number(dbRow['MON$PAGE_SIZE'] ?? 0),
+      allocatedPages: Number(dbRow['MON$PAGES'] ?? 0),
+      odsVersion: Number(dbRow['MON$ODS_MAJOR'] ?? 0),
+      odsMinorVersion: Number(dbRow['MON$ODS_MINOR'] ?? 0),
+      oldestTransaction: Number(dbRow['MON$OLDEST_TRANSACTION'] ?? 0),
+      oldestActive: Number(dbRow['MON$OLDEST_ACTIVE'] ?? 0),
+      oldestSnapshot: Number(dbRow['MON$OLDEST_SNAPSHOT'] ?? 0),
+      nextTransaction: Number(dbRow['MON$NEXT_TRANSACTION'] ?? 0),
+      currentMemory,
+      maxMemory,
+      pageBuffers: Number(dbRow['MON$PAGE_BUFFERS'] ?? 0),
+      reads,
+      writes,
+      fetches,
+      marks,
+    });
+  }
+
+  /**
+   * Prepare a SQL statement explicitly and return a reusable
+   * {@link PreparedStatement} handle exposing `fields`, `params`, `query()`,
+   * `exec()`, `execBatch()`, and `close()`.
+   */
+  async prepare(sql: string | SqlFragment): Promise<PreparedStatement> {
+    await this.ensureReady();
+    const attachment = this.attachment!;
+    const sqlText = toStatement(sql).sql;
+
+    const prepareTx = await attachment.startTransaction();
+    let nativeStmt: Statement;
+    let params: FieldInfo[];
+    let fields: FieldInfo[];
+    let type: number;
+    try {
+      nativeStmt = await attachment.prepare(prepareTx, sqlText);
+      try {
+        params = await describeInputFields(nativeStmt);
+        fields = await outputFields(nativeStmt);
+        type = await nativeStmt.type;
+      } catch (err) {
+        await nativeStmt.dispose().catch(() => undefined);
+        throw err;
+      }
+    } finally {
+      await prepareTx.commit().catch(() => undefined);
+    }
+
+    const statementType = statementKind(type);
+    const hasResultSet = nativeStmt.hasResultSet;
+    let isClosed = false;
+    let busy = false;
+    const isDbClosed = () => this.closed;
+
+    const assertOpen = (): void => {
+      if (isClosed || this.closed) {
+        throw new Error('PreparedStatement has been closed');
+      }
+    };
+
+    const checkParamCount = (actual: number): void => {
+      if (actual !== params.length) {
+        throw new Error(
+          `PreparedStatement expects ${params.length} parameter(s) but ${actual} were supplied`,
+        );
+      }
+    };
+
+    const withStatement = async <R>(
+      transaction: Transaction,
+      fn: (target: Statement) => Promise<R>,
+    ): Promise<R> => {
+      if (!busy) {
+        busy = true;
+        try {
+          return await fn(nativeStmt);
+        } finally {
+          busy = false;
+        }
+      }
+      const tempStmt = await attachment.prepare(transaction, sqlText);
+      try {
+        return await fn(tempStmt);
+      } finally {
+        await tempStmt.dispose().catch(() => undefined);
+      }
+    };
+
+    const stmt: PreparedStatement = {
+      sql: sqlText,
+      get params() {
+        return params.map((p) => ({ ...p }));
+      },
+      get fields() {
+        return fields.map((f) => ({ ...f }));
+      },
+      statementType,
+      hasResultSet,
+      get closed() {
+        return isClosed || isDbClosed();
+      },
+      query: (async <T = Row>(
+        paramsOrOptions: QueryParams | QueryOptions = [],
+        maybeOptions: QueryOptions = {},
+      ): Promise<QueryResult<T>> => {
+        assertOpen();
+        const callParams = Array.isArray(paramsOrOptions)
+          ? paramsOrOptions
+          : [];
+        const callOptions = Array.isArray(paramsOrOptions)
+          ? maybeOptions
+          : (paramsOrOptions ?? {});
+        checkParamCount(callParams.length);
+        const rowMode: RowMode = callOptions.rowMode ?? 'object';
+        const serializedParams = this.serialize(callParams);
+        await this.endReadTransaction();
+        const txOptions = buildTransactionOptions(callOptions);
+        const transaction = await attachment.startTransaction(txOptions);
+        try {
+          const rawRows = await withStatement(transaction, (target) =>
+            fetchRows(target, transaction, serializedParams, fields, this.types),
+          );
+          await transaction.commit();
+          const outFields = fields.map((f) => ({ ...f }));
+          return applyTypes(
+            { rows: shapeRows<T>(rawRows, outFields, rowMode), fields: outFields },
+            this.types,
+            rowMode,
+          );
+        } catch (err) {
+          await transaction.rollback().catch(() => undefined);
+          throw err;
+        }
+      }) as PreparedStatement['query'],
+      exec: async (callParams: QueryParams = []) => {
+        assertOpen();
+        checkParamCount(callParams.length);
+        const serializedParams = this.serialize(callParams);
+        await this.endReadTransaction();
+        const transaction = await attachment.startTransaction();
+        try {
+          const affectedRows = await withStatement(transaction, async (target) => {
+            await target.execute(
+              transaction,
+              await bindParams(target, transaction, serializedParams),
+            );
+            return readAffectedRecords(target);
+          });
+          await transaction.commit();
+          return { affectedRows };
+        } catch (err) {
+          await transaction.rollback().catch(() => undefined);
+          throw err;
+        }
+      },
+      execBatch: async (rows: QueryParams[]) => {
+        assertOpen();
+        if (!Array.isArray(rows)) {
+          throw new TypeError('execBatch takes an array of parameter rows');
+        }
+        for (const row of rows) {
+          checkParamCount(row.length);
+        }
+        if (rows.length === 0) return { affectedRows: 0 };
+        const serializedRows = this.types?.serializers?.length
+          ? rows.map((row) => this.serialize(row))
+          : rows;
+        await this.endReadTransaction();
+        const transaction = await attachment.startTransaction();
+        try {
+          const affectedRows = await withStatement(transaction, async (target) => {
+            if (
+              serializedRows.length > 1 &&
+              (await tryExecuteNativeBatch(target, transaction, serializedRows))
+            ) {
+              return serializedRows.length;
+            }
+            let total = 0;
+            for (const row of serializedRows) {
+              await target.execute(
+                transaction,
+                await bindParams(target, transaction, row),
+              );
+              total += (await readAffectedRecords(target)) || 1;
+            }
+            return total;
+          });
+          await transaction.commit();
+          return { affectedRows };
+        } catch (err) {
+          await transaction.rollback().catch(() => undefined);
+          throw err;
+        }
+      },
+      close: async () => {
+        if (isClosed) return;
+        isClosed = true;
+        this.preparedStatements.delete(stmt);
+        await nativeStmt.dispose().catch(() => undefined);
+      },
+      [Symbol.asyncDispose]: async () => {
+        await stmt.close();
+      },
+    };
+
+    this.preparedStatements.add(stmt);
+    return stmt;
   }
 
   /**
@@ -554,6 +913,124 @@ export class FirebirdLite {
   }
 
   /**
+   * Read the database file as a `Uint8Array`.
+   */
+  async dumpDataDir(): Promise<Uint8Array> {
+    await this.ensureReady();
+    const buf = await fs.promises.readFile(this.dbPath);
+    return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+  }
+
+  /**
+   * Stream the database file in fixed-size chunks
+   * (`ReadableStream<Uint8Array>`) without allocating a single contiguous
+   * `Uint8Array` of the entire database in memory.
+   *
+   * Pass `{ compression: 'gzip' }` to compress on the fly via
+   * `CompressionStream('gzip')`.
+   */
+  dumpDataStream(options: DataStreamOptions = {}): ReadableStream<Uint8Array> {
+    const chunkSize = resolveStreamChunkSize(options.chunkSize);
+    let handle: fs.promises.FileHandle | null = null;
+    let totalSize = 0;
+    let offset = 0;
+
+    const closeHandle = async (): Promise<void> => {
+      if (handle) {
+        const h = handle;
+        handle = null;
+        await h.close().catch(() => undefined);
+      }
+    };
+
+    const raw = new ReadableStream<Uint8Array>({
+      pull: async (controller) => {
+        try {
+          await this.ensureReady();
+          if (!handle) {
+            handle = await fs.promises.open(this.dbPath, 'r');
+            const stat = await handle.stat();
+            totalSize = stat.size;
+          }
+          if (offset >= totalSize) {
+            await closeHandle();
+            controller.close();
+            return;
+          }
+          const toRead = Math.min(chunkSize, totalSize - offset);
+          const buf = new Uint8Array(toRead);
+          const { bytesRead } = await handle.read(buf, 0, toRead, offset);
+          if (bytesRead <= 0) {
+            await closeHandle();
+            controller.close();
+            return;
+          }
+          offset += bytesRead;
+          controller.enqueue(bytesRead === toRead ? buf : buf.slice(0, bytesRead));
+          if (offset >= totalSize) {
+            await closeHandle();
+            controller.close();
+          }
+        } catch (err) {
+          await closeHandle();
+          throw err;
+        }
+      },
+      cancel: async () => {
+        await closeHandle();
+      },
+    });
+
+    return options.compression === 'gzip' ? compressGzipStream(raw) : raw;
+  }
+
+  /**
+   * Replace the database file with a raw or gzip-compressed `.fdb` byte stream
+   * produced by {@link dumpDataStream} without buffering the entire database
+   * in a single `Uint8Array`.
+   */
+  async loadDataStream(
+    stream: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array>,
+    options: DataStreamOptions = {},
+  ): Promise<void> {
+    if (this.closed) {
+      throw new Error('FirebirdLite instance has been closed');
+    }
+    await this.ensureReady();
+
+    await this.endReadTransaction();
+    for (const stmt of [...this.preparedStatements]) {
+      await stmt.close().catch(() => undefined);
+    }
+    await this.statements?.flush();
+    this.statements = null;
+    if (this.attachment) {
+      await this.attachment.disconnect().catch(() => undefined);
+      this.attachment = null;
+    }
+
+    const handle = await fs.promises.open(this.dbPath, 'w');
+    let offset = 0;
+    try {
+      for await (const chunk of readDatabaseStreamChunks(stream, options)) {
+        await handle.write(chunk, 0, chunk.byteLength, offset);
+        offset += chunk.byteLength;
+      }
+    } finally {
+      await handle.close().catch(() => undefined);
+    }
+
+    if (offset === 0) {
+      throw new RangeError(
+        'loadDataStream received an empty stream; pass a stream from dumpDataStream()',
+      );
+    }
+
+    this.attachment = await this.client!.connect(this.dbPath, this.connectOptions);
+    this.statements = new StatementCache(this.attachment, this.statementCacheSize);
+  }
+
+  /**
    * Close the database connection and release all resources.
    */
   async close(): Promise<void> {
@@ -561,6 +1038,9 @@ export class FirebirdLite {
     this.closed = true;
 
     await this.endReadTransaction();
+    for (const stmt of [...this.preparedStatements]) {
+      await stmt.close().catch(() => undefined);
+    }
     await this.statements?.flush();
     this.statements = null;
     if (this.attachment) {
@@ -837,6 +1317,188 @@ export class FirebirdTransaction {
     );
   }
 
+  /**
+   * Prepare a SQL statement inside this transaction and return a reusable
+   * {@link PreparedStatement} handle.
+   */
+  async prepare(sql: string | SqlFragment): Promise<PreparedStatement> {
+    this.assertUsable();
+    await this.beforeStatement();
+    const sqlText = toStatement(sql).sql;
+    const nativeStmt = await this.attachment.prepare(this.transaction, sqlText);
+
+    let params: FieldInfo[];
+    let fields: FieldInfo[];
+    let type: number;
+    try {
+      params = await describeInputFields(nativeStmt);
+      fields = await outputFields(nativeStmt);
+      type = await nativeStmt.type;
+    } catch (err) {
+      await nativeStmt.dispose().catch(() => undefined);
+      throw err;
+    }
+
+    const statementType = statementKind(type);
+    const hasResultSet = nativeStmt.hasResultSet;
+    let isClosed = false;
+    const isTxFinished = () => this.finished;
+
+    const assertOpen = (): void => {
+      if (isClosed) {
+        throw new Error('PreparedStatement has been closed');
+      }
+      this.assertUsable();
+    };
+
+    const checkParamCount = (actual: number): void => {
+      if (actual !== params.length) {
+        throw new Error(
+          `PreparedStatement expects ${params.length} parameter(s) but ${actual} were supplied`,
+        );
+      }
+    };
+
+    const stmt: PreparedStatement = {
+      sql: sqlText,
+      get params() {
+        return params.map((p) => ({ ...p }));
+      },
+      get fields() {
+        return fields.map((f) => ({ ...f }));
+      },
+      statementType,
+      hasResultSet,
+      get closed() {
+        return isClosed || isTxFinished();
+      },
+      query: (async <T = Row>(
+        paramsOrOptions: QueryParams | QueryOptions = [],
+        maybeOptions: QueryOptions = {},
+      ): Promise<QueryResult<T>> => {
+        assertOpen();
+        await this.beforeStatement();
+        const callParams = Array.isArray(paramsOrOptions)
+          ? paramsOrOptions
+          : [];
+        const callOptions = Array.isArray(paramsOrOptions)
+          ? maybeOptions
+          : (paramsOrOptions ?? {});
+        checkParamCount(callParams.length);
+        const rowMode: RowMode = callOptions.rowMode ?? 'object';
+        const rawRows = await fetchRows(
+          nativeStmt,
+          this.transaction,
+          this.serialize(callParams),
+          fields,
+          this.types,
+        );
+        const outFields = fields.map((f) => ({ ...f }));
+        return applyTypes(
+          { rows: shapeRows<T>(rawRows, outFields, rowMode), fields: outFields },
+          this.types,
+          rowMode,
+        );
+      }) as PreparedStatement['query'],
+      exec: async (callParams: QueryParams = []) => {
+        assertOpen();
+        await this.beforeStatement();
+        checkParamCount(callParams.length);
+        await nativeStmt.execute(
+          this.transaction,
+          await bindParams(nativeStmt, this.transaction, this.serialize(callParams)),
+        );
+        const affectedRows = await readAffectedRecords(nativeStmt);
+        return { affectedRows };
+      },
+      execBatch: async (rows: QueryParams[]) => {
+        assertOpen();
+        await this.beforeStatement();
+        if (!Array.isArray(rows)) {
+          throw new TypeError('execBatch takes an array of parameter rows');
+        }
+        for (const row of rows) {
+          checkParamCount(row.length);
+        }
+        if (rows.length === 0) return { affectedRows: 0 };
+        const serializedRows = this.types?.serializers?.length
+          ? rows.map((row) => this.serialize(row))
+          : rows;
+        if (
+          serializedRows.length > 1 &&
+          (await tryExecuteNativeBatch(nativeStmt, this.transaction, serializedRows))
+        ) {
+          return { affectedRows: serializedRows.length };
+        }
+        let total = 0;
+        for (const row of serializedRows) {
+          await nativeStmt.execute(
+            this.transaction,
+            await bindParams(nativeStmt, this.transaction, row),
+          );
+          total += (await readAffectedRecords(nativeStmt)) || 1;
+        }
+        return { affectedRows: total };
+      },
+      close: async () => {
+        if (isClosed) return;
+        isClosed = true;
+        await nativeStmt.dispose().catch(() => undefined);
+      },
+      [Symbol.asyncDispose]: async () => {
+        await stmt.close();
+      },
+    };
+
+    return stmt;
+  }
+
+  /**
+   * Describe a statement's shape inside this transaction without running it.
+   */
+  async describeQuery(sql: string | SqlFragment): Promise<QueryDescription> {
+    this.assertUsable();
+    await this.beforeStatement();
+    const text = toStatement(sql).sql;
+
+    const stmt = await this.attachment.prepare(this.transaction, text);
+    try {
+      const params = await describeInputFields(stmt);
+      const fields = await outputFields(stmt);
+      const type = await stmt.type;
+
+      return {
+        params,
+        fields,
+        statementType: statementKind(type),
+        hasResultSet: stmt.hasResultSet,
+      };
+    } finally {
+      await stmt.dispose().catch(() => undefined);
+    }
+  }
+
+  /**
+   * Return Firebird's execution plan for `sql` (`IStatement::getPlan`) inside
+   * this transaction without executing the statement.
+   */
+  async explain(
+    sql: string | SqlFragment,
+    options: ExplainOptions = {},
+  ): Promise<string> {
+    this.assertUsable();
+    await this.beforeStatement();
+    const text = toStatement(sql).sql;
+    const detailed = options.detailed === true;
+
+    const stmt = await this.attachment.prepare(this.transaction, text);
+    try {
+      return await explainStatement(stmt, detailed);
+    } finally {
+      await stmt.dispose().catch(() => undefined);
+    }
+  }
+
   private async *streamQuery<T>(
     statement: ParsedStatement,
     rowMode: RowMode,
@@ -963,6 +1625,10 @@ type NativeStatement = Partial<InputMessage> &
     statementHandle?: {
       getInputMetadataAsync?: (status: unknown) => Promise<NativeMetadata | undefined>;
       getOutputMetadataAsync?: (status: unknown) => Promise<NativeMetadata | undefined>;
+      getPlanAsync?: (status: unknown, detailed: boolean) => Promise<string | undefined>;
+      getAffectedRecordsAsync?: (status: unknown) => Promise<number>;
+      getAffectedRecordsSync?: (status: unknown) => number;
+      getPlanSync?: (status: unknown, detailed: boolean) => string | undefined;
       createBatchAsync?: (
         status: unknown,
         inMetadata: NativeMetadata | undefined,
@@ -1022,6 +1688,54 @@ interface Binding {
   disposeHooked?: boolean;
 }
 
+/**
+ * Read the execution plan of a prepared statement (`IStatement::getPlan`),
+ * trimming Firebird's leading/trailing newlines. Returns `""` for statements
+ * that have no plan (such as DDL).
+ */
+async function explainStatement(stmt: Statement, detailed: boolean): Promise<string> {
+  const internal = stmt as unknown as NativeStatement & {
+    getPlan?: (detailed: boolean) => Promise<string | undefined> | string | undefined;
+  };
+  let raw: string | undefined;
+  const statusAction = internal.attachment?.client?.statusAction;
+  const getPlanAsync = internal.statementHandle?.getPlanAsync;
+  const getPlanSync = internal.statementHandle?.getPlanSync;
+  if (typeof statusAction === 'function' && typeof getPlanAsync === 'function') {
+    raw = await statusAction((status) => getPlanAsync.call(internal.statementHandle, status, detailed));
+  } else if (typeof statusAction === 'function' && typeof getPlanSync === 'function') {
+    raw = await statusAction(async (status) => getPlanSync.call(internal.statementHandle, status, detailed));
+  } else if (typeof internal.getPlan === 'function') {
+    raw = await internal.getPlan(detailed);
+  } else if (!detailed && typeof stmt.getExecPathText === 'function') {
+    raw = await stmt.getExecPathText();
+  }
+  if (!raw) return '';
+  return raw.replace(/^[\r\n]+|[\r\n]+$/g, '');
+}
+
+async function readAffectedRecords(stmt: Statement): Promise<number> {
+  const internal = stmt as unknown as NativeStatement;
+  const statusAction = internal.attachment?.client?.statusAction;
+  const getAsync = internal.statementHandle?.getAffectedRecordsAsync;
+  const getSync = internal.statementHandle?.getAffectedRecordsSync;
+  if (typeof statusAction === 'function' && typeof getAsync === 'function') {
+    try {
+      return await statusAction((status) => getAsync.call(internal.statementHandle, status));
+    } catch {
+      return 0;
+    }
+  }
+  if (typeof statusAction === 'function' && typeof getSync === 'function') {
+    try {
+      return await statusAction(async (status) => getSync.call(internal.statementHandle, status));
+    } catch {
+      return 0;
+    }
+  }
+  return 0;
+}
+
 const bindings = new WeakMap<Statement, Binding>();
 
 async function bindingOf(stmt: Statement): Promise<Binding> {
@@ -1034,6 +1748,67 @@ async function bindingOf(stmt: Statement): Promise<Binding> {
     bindings.set(stmt, binding);
   }
   return binding;
+}
+
+/**
+ * Return `stmt`'s prepared input parameter metadata (`FieldInfo[]`), reading
+ * `statementHandle.getInputMetadataAsync` directly so the driver's `fixMetadata`
+ * coercion (`INTEGER`/`BIGINT`/`NUMERIC` → `SQL_DOUBLE`, `CHAR` → `VARCHAR`)
+ * does not obscure the real parameter types. Falls back to `stmt.params` for
+ * unit test stubs.
+ */
+async function describeInputFields(stmt: Statement): Promise<FieldInfo[]> {
+  const internal = stmt as unknown as NativeStatement & { params?: FieldInfo[] };
+  const client = internal.attachment?.client;
+  if (
+    typeof internal.statementHandle?.getInputMetadataAsync === 'function' &&
+    typeof client?.statusAction === 'function'
+  ) {
+    return client.statusAction(async (status) => {
+      const prepared = await internal.statementHandle!.getInputMetadataAsync!(status);
+      if (!prepared) return [];
+      try {
+        const count = prepared.getCountSync(status);
+        const params: FieldInfo[] = [];
+        for (let i = 0; i < count; i++) {
+          const rawType = prepared.getTypeSync(status, i);
+          const type = rawType & ~1;
+          const subType = prepared.getSubTypeSync(status, i);
+          const scale = prepared.getScaleSync(status, i);
+          const length = prepared.getLengthSync(status, i);
+          const nullable =
+            typeof prepared.isNullableSync === 'function'
+              ? Boolean(prepared.isNullableSync(status, i))
+              : (rawType & 1) !== 0;
+          const alias =
+            typeof prepared.getAliasSync === 'function'
+              ? prepared.getAliasSync(status, i)
+              : '';
+          params.push({
+            name: alias || '',
+            type,
+            typeName: firebirdTypeName(type, scale),
+            subType,
+            scale,
+            length,
+            nullable,
+          });
+        }
+        return params;
+      } finally {
+        prepared.releaseSync();
+      }
+    });
+  }
+  if (Array.isArray(internal.params)) {
+    return internal.params.map((p) => ({
+      ...p,
+      ...(p.type !== undefined && p.typeName === undefined
+        ? { typeName: firebirdTypeName(p.type, p.scale ?? 0) }
+        : {}),
+    }));
+  }
+  return [];
 }
 
 /**

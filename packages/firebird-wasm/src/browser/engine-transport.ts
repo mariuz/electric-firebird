@@ -25,6 +25,7 @@ import type {
   Row,
   QueryResult,
   QueryDescription,
+  DatabaseInfo,
   FieldInfo,
   QueryParams,
   RowMode,
@@ -34,6 +35,8 @@ import { isolationCode } from './isolation';
 import { encodeParams, encodeParamRows } from './params';
 import { firebirdTypeName } from './field-types';
 import { statementKind } from '../statement-types';
+import { extractReferencedTables } from './live-tables';
+import { applyIcuLocaleDataToModule } from './icu-locales';
 import {
   mountOpfs as mountOpfsFilesystem,
   openDatabaseHandle,
@@ -59,6 +62,13 @@ export type EngineHandle = number;
 export interface EngineTransport {
   /** Initialise the engine.  Safe to call more than once. */
   init(): Promise<void>;
+  /**
+   * Register an optional ICU `.dat` (or `.dat.gz`) locale tailoring bundle
+   * (e.g., for `LOCALE=de_DE`, `es_ES`, `fr_FR`, `ja_JP`) in a second
+   * `udata_setCommonData()` slot without increasing the default WASM binary
+   * size.
+   */
+  loadIcuLocaleData?(data: Uint8Array): Promise<void>;
 
   createDatabase(path: string): Promise<EngineHandle>;
   attachDatabase(path: string): Promise<EngineHandle>;
@@ -121,6 +131,21 @@ export interface EngineTransport {
    */
   setSharedReads?(dbHandle: EngineHandle, on: boolean): Promise<void>;
   /** Describe a statement's shape without executing it. */
+  /** Return the execution plan for `sql` (`IStatement::getPlan`) without executing it. */
+  /** Return database storage, ODS, memory pool, I/O, and OIT/OAT/OST transaction health diagnostics. */
+  databaseInfo?(dbHandle: EngineHandle): Promise<DatabaseInfo>;
+  prepare?(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    sql: string,
+  ): Promise<QueryDescription & { handle?: EngineHandle }>;
+  stmtClose?(stmtHandle: EngineHandle): Promise<void>;
+  explain?(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    sql: string,
+    detailed?: boolean,
+  ): Promise<string>;
   describe(
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
@@ -146,6 +171,17 @@ export interface EngineTransport {
   exists(path: string): Promise<boolean>;
   readFile(path: string): Promise<Uint8Array>;
   writeFile(path: string, data: Uint8Array): Promise<void>;
+  /** Return the byte size of `path` (0 when absent) without reading its contents. */
+  fileSize?(path: string): Promise<number>;
+  /** Read at most `length` bytes from `path` starting at byte `offset`. */
+  readFileChunk?(path: string, offset: number, length: number): Promise<Uint8Array>;
+  /** Write `data` into `path` at byte `offset`, optionally truncating the file to 0 first. */
+  writeFileChunk?(
+    path: string,
+    data: Uint8Array,
+    offset: number,
+    truncate?: boolean,
+  ): Promise<void>;
   /** Remove a file.  Used to discard an ephemeral database on close. */
   unlink(path: string): Promise<void>;
   /** Subscribe to named events; returns a subscription handle. */
@@ -418,6 +454,154 @@ function decodeField(c: EncodedColumn): FieldInfo {
   };
 }
 
+/** `isc_info_*` tags requested by `databaseInfo()` (`IAttachment::getInfo`). */
+export const DATABASE_INFO_REQUEST_ITEMS = new Uint8Array([
+  14, // isc_info_page_size
+  21, // isc_info_allocation
+  32, // isc_info_ods_version
+  33, // isc_info_ods_minor_version
+  104, // isc_info_oldest_transaction
+  105, // isc_info_oldest_active
+  106, // isc_info_oldest_snapshot
+  107, // isc_info_next_transaction
+  17, // isc_info_current_memory
+  18, // isc_info_max_memory
+  15, // isc_info_num_buffers
+  5, // isc_info_reads
+  6, // isc_info_writes
+  7, // isc_info_fetches
+  8, // isc_info_marks
+]);
+
+function readPortableInt(buffer: Uint8Array, offset: number, length: number): number {
+  let value = 0;
+  let multiplier = 1;
+  const n = Math.min(length, 8);
+  for (let i = 0; i < n; i++) {
+    value += (buffer[offset + i] ?? 0) * multiplier;
+    multiplier *= 256;
+  }
+  return value;
+}
+
+/**
+ * Parse a Firebird `IAttachment::getInfo` clumplet response buffer into a
+ * {@link DatabaseInfo} object.
+ */
+export function parseDatabaseInfoBuffer(buffer: Uint8Array): DatabaseInfo {
+  let pageSize = 0;
+  let allocatedPages = 0;
+  let odsVersion = 0;
+  let odsMinorVersion = 0;
+  let oldestTransaction = 0;
+  let oldestActive = 0;
+  let oldestSnapshot = 0;
+  let nextTransaction = 0;
+  let currentMemory = 0;
+  let maxMemory = 0;
+  let pageBuffers = 0;
+  let reads = 0;
+  let writes = 0;
+  let fetches = 0;
+  let marks = 0;
+
+  let pos = 0;
+  while (pos < buffer.length) {
+    const tag = buffer[pos++]!;
+    if (tag === 0 || tag === 1 || tag === 2) break; // end / truncated
+    if (pos + 2 > buffer.length) break;
+    const len = buffer[pos]! | (buffer[pos + 1]! << 8);
+    pos += 2;
+    if (pos + len > buffer.length) break;
+    const val = readPortableInt(buffer, pos, len);
+    pos += len;
+
+    switch (tag) {
+      case 14: pageSize = val; break;
+      case 21: allocatedPages = val; break;
+      case 32: odsVersion = val; break;
+      case 33: odsMinorVersion = val; break;
+      case 104: oldestTransaction = val; break;
+      case 105: oldestActive = val; break;
+      case 106: oldestSnapshot = val; break;
+      case 107: nextTransaction = val; break;
+      case 17: currentMemory = val; break;
+      case 18: maxMemory = val; break;
+      case 15: pageBuffers = val; break;
+      case 5: reads = val; break;
+      case 6: writes = val; break;
+      case 7: fetches = val; break;
+      case 8: marks = val; break;
+      default: break;
+    }
+  }
+
+  return normalizeDatabaseInfo({
+    pageSize,
+    allocatedPages,
+    odsVersion,
+    odsMinorVersion,
+    oldestTransaction,
+    oldestActive,
+    oldestSnapshot,
+    nextTransaction,
+    currentMemory,
+    maxMemory,
+    pageBuffers,
+    reads,
+    writes,
+    fetches,
+    marks,
+  });
+}
+
+/** Fill in derived fields (`databaseSizeBytes`, `transactionGap`) on partial info. */
+export function normalizeDatabaseInfo(raw: Partial<DatabaseInfo>): DatabaseInfo {
+  const pageSize = Number(raw.pageSize ?? 0);
+  const allocatedPages = Number(raw.allocatedPages ?? 0);
+  const databaseSizeBytes = Number(raw.databaseSizeBytes ?? pageSize * allocatedPages);
+  const odsVersion = Number(raw.odsVersion ?? 0);
+  const odsMinorVersion = Number(raw.odsMinorVersion ?? 0);
+  const oldestTransaction = Number(raw.oldestTransaction ?? 0);
+  const oldestActive = Number(raw.oldestActive ?? 0);
+  const oldestSnapshot = Number(raw.oldestSnapshot ?? 0);
+  const nextTransaction = Number(raw.nextTransaction ?? 0);
+  const transactionGap = Number(
+    raw.transactionGap ?? (nextTransaction >= oldestActive ? nextTransaction - oldestActive : 0),
+  );
+  const currentMemory = Number(raw.currentMemory ?? 0);
+  const maxMemory = Number(raw.maxMemory ?? 0);
+  const pageBuffers = Number(raw.pageBuffers ?? 0);
+  const reads = Number(raw.reads ?? 0);
+  const writes = Number(raw.writes ?? 0);
+  const fetches = Number(raw.fetches ?? 0);
+  const marks = Number(raw.marks ?? 0);
+  return {
+    pageSize,
+    allocatedPages,
+    databaseSizeBytes,
+    odsVersion,
+    odsMinorVersion,
+    oldestTransaction,
+    oldestActive,
+    oldestSnapshot,
+    nextTransaction,
+    transactionGap,
+    currentMemory,
+    maxMemory,
+    pageBuffers,
+    reads,
+    writes,
+    fetches,
+    marks,
+  };
+}
+
+/** Decode what `fb_database_info` reports about a database. */
+export function decodeDatabaseInfo(json: string): DatabaseInfo {
+  return normalizeDatabaseInfo(JSON.parse(json) as Partial<DatabaseInfo>);
+}
+
 /** Decode what `fb_describe` reports about a statement. */
 export function decodeDescription(json: string): QueryDescription {
   const parsed = JSON.parse(json) as {
@@ -554,7 +738,14 @@ export class DirectTransport implements EngineTransport {
   private mod: FirebirdWasmModule | null = null;
   private initPromise: Promise<void> | null = null;
   /** The OPFS database this transport mounted, closed on dispose. */
-  private opfsHandle: { close(): void } | null = null;
+  private opfsHandle: {
+    read(buffer: ArrayBufferView, options?: { at?: number }): number;
+    write(buffer: ArrayBufferView, options?: { at?: number }): number;
+    truncate(size: number): void;
+    getSize(): number;
+    flush(): void;
+    close(): void;
+  } | null = null;
   /** What each shape id of this module's engine means (see SHAPE_IDS). */
   private readonly shapes = new Map<number, readonly FieldInfo[]>();
   /** Fallback cursor state when running against an older WASM artifact without `_fb_cursor_open`. */
@@ -599,6 +790,11 @@ export class DirectTransport implements EngineTransport {
       this.initPromise = this.doInit();
     }
     await this.initPromise;
+  }
+
+  async loadIcuLocaleData(data: Uint8Array): Promise<void> {
+    await this.init();
+    await applyIcuLocaleDataToModule(this.module, data);
   }
 
   private async doInit(): Promise<void> {
@@ -889,6 +1085,213 @@ export class DirectTransport implements EngineTransport {
     });
   }
 
+  async prepare(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    sql: string,
+  ): Promise<QueryDescription & { handle?: EngineHandle }> {
+    const mod = this.module;
+    if (typeof mod._fb_prepare !== 'function') {
+      const desc = await this.describe(dbHandle, txHandle, sql);
+      return { ...desc, handle: 0 };
+    }
+    const prepareFn = mod._fb_prepare;
+    return this.withString(sql, (sqlPtr) => {
+      const resultPtr = prepareFn.call(mod, dbHandle, txHandle, sqlPtr);
+      if (resultPtr === 0) {
+        throw engineError(mod, `Firebird could not prepare: ${sql}`);
+      }
+      const json = mod.UTF8ToString(resultPtr);
+      mod._fb_free_result(resultPtr);
+      const parsed = JSON.parse(json) as { handle?: number };
+      return {
+        ...decodeDescription(json),
+        handle: typeof parsed.handle === 'number' ? parsed.handle : 0,
+      };
+    });
+  }
+
+  async stmtClose(stmtHandle: EngineHandle): Promise<void> {
+    if (stmtHandle <= 0) return;
+    const mod = this.module;
+    if (typeof mod._fb_stmt_close === 'function') {
+      mod._fb_stmt_close(stmtHandle);
+    }
+  }
+
+  async explain(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    sql: string,
+    detailed = false,
+  ): Promise<string> {
+    const mod = this.module;
+    if (typeof mod._fb_explain !== 'function') {
+      return this.fallbackExplain(dbHandle, txHandle, sql, detailed);
+    }
+
+    const explainFn = mod._fb_explain;
+    return this.withString(sql, (sqlPtr) => {
+      const resultPtr = explainFn.call(
+        mod,
+        dbHandle,
+        txHandle,
+        sqlPtr,
+        detailed ? 1 : 0,
+      );
+      if (resultPtr === 0) {
+        throw engineError(mod, `Firebird could not explain: ${sql}`);
+      }
+
+      const plan = mod.UTF8ToString(resultPtr);
+      mod._fb_free_result(resultPtr);
+      return plan.replace(/^[\r\n]+|[\r\n]+$/g, '');
+    });
+  }
+
+  private async fallbackExplain(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    sql: string,
+    detailed: boolean,
+  ): Promise<string> {
+    const desc = await this.describe(dbHandle, txHandle, sql);
+    if (
+      desc.statementType === 'DDL' ||
+      desc.statementType === 'START_TRANS' ||
+      desc.statementType === 'COMMIT' ||
+      desc.statementType === 'ROLLBACK' ||
+      desc.statementType === 'SAVEPOINT' ||
+      desc.statementType === 'SET_GENERATOR'
+    ) {
+      return '';
+    }
+
+    const userTables = extractReferencedTables(sql);
+    const tables = userTables.length > 0 ? userTables : ['RDB$DATABASE'];
+    const hasWhere = /\bWHERE\b/i.test(sql);
+    const indexByTable = new Map<string, string>();
+
+    if (hasWhere && userTables.length > 0) {
+      for (const table of userTables) {
+        try {
+          const res = await this.query<{ IDX: string }>(
+            dbHandle,
+            txHandle,
+            'SELECT FIRST 1 TRIM(RDB$INDEX_NAME) AS IDX FROM RDB$INDICES WHERE TRIM(RDB$RELATION_NAME) = ? ORDER BY RDB$INDEX_ID',
+            [table],
+          );
+          const idx = res.rows[0]?.IDX;
+          if (idx) indexByTable.set(table, idx);
+        } catch {
+          // Ignore catalog lookup errors in fallback mode.
+        }
+      }
+    }
+
+    if (detailed) {
+      const steps = tables.map((t) => {
+        const idx = indexByTable.get(t);
+        if (idx) {
+          return (
+            `    -> Filter\n` +
+            `        -> Table "${t}" Access By ID\n` +
+            `            -> Bitmap\n` +
+            `                -> Index "${idx}" Range Scan (full match)`
+          );
+        }
+        return `    -> Table "${t}" Full Scan`;
+      });
+      return `Select Expression\n${steps.join('\n')}`;
+    }
+
+    const parts = tables.map((t) => {
+      const idx = indexByTable.get(t);
+      return idx ? `${t} INDEX (${idx})` : `${t} NATURAL`;
+    });
+    return `PLAN (${parts.join(', ')})`;
+  }
+
+  async databaseInfo(dbHandle: EngineHandle): Promise<DatabaseInfo> {
+    const mod = this.module;
+    if (typeof mod._fb_database_info !== 'function') {
+      return this.fallbackDatabaseInfo(dbHandle);
+    }
+
+    const resultPtr = mod._fb_database_info(dbHandle);
+    if (resultPtr === 0) {
+      throw engineError(mod, 'Firebird could not read database info');
+    }
+
+    const json = mod.UTF8ToString(resultPtr);
+    mod._fb_free_result(resultPtr);
+    return decodeDatabaseInfo(json);
+  }
+
+  private async fallbackDatabaseInfo(dbHandle: EngineHandle): Promise<DatabaseInfo> {
+    const dbRes = await this.query<Record<string, unknown>>(
+      dbHandle,
+      0,
+      'SELECT MON$PAGE_SIZE, MON$PAGES, MON$ODS_MAJOR, MON$ODS_MINOR, ' +
+        'MON$OLDEST_TRANSACTION, MON$OLDEST_ACTIVE, MON$OLDEST_SNAPSHOT, ' +
+        'MON$NEXT_TRANSACTION, MON$PAGE_BUFFERS FROM MON$DATABASE',
+    );
+    const dbRow = dbRes.rows[0] ?? {};
+
+    let currentMemory = 0;
+    let maxMemory = 0;
+    try {
+      const memRes = await this.query<Record<string, unknown>>(
+        dbHandle,
+        0,
+        'SELECT MON$MEMORY_USED, MON$MAX_MEMORY_USED FROM MON$MEMORY_USAGE WHERE MON$STAT_GROUP = 0',
+      );
+      const memRow = memRes.rows[0] ?? {};
+      currentMemory = Number(memRow['MON$MEMORY_USED'] ?? 0);
+      maxMemory = Number(memRow['MON$MAX_MEMORY_USED'] ?? 0);
+    } catch {
+      // Ignore if MON$MEMORY_USAGE is unavailable.
+    }
+
+    let reads = 0;
+    let writes = 0;
+    let fetches = 0;
+    let marks = 0;
+    try {
+      const ioRes = await this.query<Record<string, unknown>>(
+        dbHandle,
+        0,
+        'SELECT MON$PAGE_READS, MON$PAGE_WRITES, MON$PAGE_FETCHES, MON$PAGE_MARKS ' +
+          'FROM MON$IO_STATS WHERE MON$STAT_GROUP = 0',
+      );
+      const ioRow = ioRes.rows[0] ?? {};
+      reads = Number(ioRow['MON$PAGE_READS'] ?? 0);
+      writes = Number(ioRow['MON$PAGE_WRITES'] ?? 0);
+      fetches = Number(ioRow['MON$PAGE_FETCHES'] ?? 0);
+      marks = Number(ioRow['MON$PAGE_MARKS'] ?? 0);
+    } catch {
+      // Ignore if MON$IO_STATS is unavailable.
+    }
+
+    return normalizeDatabaseInfo({
+      pageSize: Number(dbRow['MON$PAGE_SIZE'] ?? 0),
+      allocatedPages: Number(dbRow['MON$PAGES'] ?? 0),
+      odsVersion: Number(dbRow['MON$ODS_MAJOR'] ?? 0),
+      odsMinorVersion: Number(dbRow['MON$ODS_MINOR'] ?? 0),
+      oldestTransaction: Number(dbRow['MON$OLDEST_TRANSACTION'] ?? 0),
+      oldestActive: Number(dbRow['MON$OLDEST_ACTIVE'] ?? 0),
+      oldestSnapshot: Number(dbRow['MON$OLDEST_SNAPSHOT'] ?? 0),
+      nextTransaction: Number(dbRow['MON$NEXT_TRANSACTION'] ?? 0),
+      pageBuffers: Number(dbRow['MON$PAGE_BUFFERS'] ?? 0),
+      currentMemory,
+      maxMemory,
+      reads,
+      writes,
+      fetches,
+      marks,
+    });
+  }
+
   async startTransaction(
     dbHandle: EngineHandle,
     options: TransactionOptions = {},
@@ -938,6 +1341,114 @@ export class DirectTransport implements EngineTransport {
 
   async writeFile(path: string, data: Uint8Array): Promise<void> {
     this.module.FS.writeFile(path, data);
+  }
+
+  async fileSize(path: string): Promise<number> {
+    if (this.opfsHandle && path.startsWith(`${OPFS_MOUNT}/`)) {
+      return this.opfsHandle.getSize();
+    }
+    const fs = this.module.FS;
+    if (!fs.analyzePath(path).exists) {
+      return 0;
+    }
+    return fs.stat(path).size;
+  }
+
+  async readFileChunk(
+    path: string,
+    offset: number,
+    length: number,
+  ): Promise<Uint8Array> {
+    if (length <= 0) return new Uint8Array(0);
+    if (this.opfsHandle && path.startsWith(`${OPFS_MOUNT}/`)) {
+      const size = this.opfsHandle.getSize();
+      if (offset >= size) return new Uint8Array(0);
+      const toRead = Math.min(length, size - offset);
+      const buf = new Uint8Array(toRead);
+      const n = this.opfsHandle.read(buf, { at: offset });
+      return n === toRead ? buf : buf.slice(0, n);
+    }
+
+    const fs = this.module.FS;
+    if (
+      typeof fs.open === 'function' &&
+      typeof fs.read === 'function' &&
+      typeof fs.close === 'function'
+    ) {
+      if (!fs.analyzePath(path).exists) return new Uint8Array(0);
+      const size = fs.stat(path).size;
+      if (offset >= size) return new Uint8Array(0);
+      const toRead = Math.min(length, size - offset);
+      const buf = new Uint8Array(toRead);
+      const stream = fs.open(path, 'r');
+      try {
+        const n = fs.read(stream, buf, 0, toRead, offset);
+        return n === toRead ? buf : buf.slice(0, n);
+      } finally {
+        fs.close(stream);
+      }
+    }
+
+    const full = fs.readFile(path);
+    if (offset >= full.byteLength) return new Uint8Array(0);
+    return full.slice(offset, offset + length);
+  }
+
+  async writeFileChunk(
+    path: string,
+    data: Uint8Array,
+    offset: number,
+    truncate = false,
+  ): Promise<void> {
+    if (this.opfsHandle && path.startsWith(`${OPFS_MOUNT}/`)) {
+      if (truncate) {
+        this.opfsHandle.truncate(0);
+      }
+      if (data.byteLength > 0) {
+        this.opfsHandle.write(data, { at: offset });
+      }
+      this.opfsHandle.flush();
+      return;
+    }
+
+    const fs = this.module.FS;
+    if (
+      typeof fs.open === 'function' &&
+      typeof fs.write === 'function' &&
+      typeof fs.close === 'function'
+    ) {
+      const exists = fs.analyzePath(path).exists;
+      if (truncate && exists && typeof fs.truncate === 'function') {
+        fs.truncate(path, 0);
+      }
+      const flags = !exists || truncate ? 'w+' : 'r+';
+      const stream = fs.open(path, flags);
+      try {
+        if (data.byteLength > 0) {
+          fs.write(stream, data, 0, data.byteLength, offset);
+        }
+      } finally {
+        fs.close(stream);
+      }
+      return;
+    }
+
+    if (truncate || !fs.analyzePath(path).exists) {
+      const out = new Uint8Array(offset + data.byteLength);
+      out.set(data, offset);
+      fs.writeFile(path, out);
+      return;
+    }
+
+    const existing = fs.readFile(path);
+    const nextLen = Math.max(existing.byteLength, offset + data.byteLength);
+    const out =
+      nextLen === existing.byteLength ? existing : new Uint8Array(nextLen);
+    if (out !== existing) {
+      out.set(existing, 0);
+    }
+    out.set(data, offset);
+    fs.writeFile(path, out);
   }
 
   async unlink(path: string): Promise<void> {

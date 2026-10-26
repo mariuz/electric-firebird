@@ -32,7 +32,15 @@ OUT_DAT="${OUT_DIR}/icudt68l.dat"
 # locale fallback chain (~808 KB raw, ~270 KB gzipped), which is what
 # Firebird's UNICODE, UNICODE_CI, and UNICODE_CI_AI collations use.
 # Pass '^coll/' to keep all 170 locale-specific collations (~3.3 MB raw).
-KEEP="${1:-^coll/(ucadata\.icu|root\.res|en(_US(_POSIX)?)?\.res|res_index\.res)$}"
+# Pass '--locales' to build the optional lazy-loaded locale tailoring pack
+# (wasm/icu-data/icudt68l-locales.dat) for LOCALE=de_DE, es_ES, fr_FR, ja_JP.
+if [[ "${1:-}" == "--locales" ]]; then
+  shift
+  OUT_DAT="${OUT_DIR}/icudt68l-locales.dat"
+  KEEP="${1:-^(res_index\.res|coll/((de|es|fr|ja)(_[A-Z0-9]+)?\.res|res_index\.res))$}"
+else
+  KEEP="${1:-^(res_index\.res|coll/(ucadata\.icu|root\.res|en(_US(_POSIX)?)?\.res|res_index\.res))$}"
+fi
 
 if ! command -v icupkg >/dev/null; then
   echo "icupkg not found. On Debian/Ubuntu: apt-get install icu-devtools" >&2

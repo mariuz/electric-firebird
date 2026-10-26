@@ -561,7 +561,7 @@ Legend: ✅ shipped · 🟡 partial · ❌ missing · n/a not applicable
 | `rowMode: 'object' \| 'array'` | ✅ | ✅ | Per query, on both backends. Names stay in `fields`. Worth it less for speed (1.1× on 10k rows, since the generated constructor already made object building cheap) than for `SELECT a.ID, b.ID`, which object mode can only half-represent |
 | `queryStream(sql, params, options)` | — | ✅ | Async-iterable cursor batching (`batchSize` default 500) on both backends and inside transactions; breaking out of `for await` closes the cursor and finishes the transaction immediately |
 | Custom `parsers` / `serializers` | ✅ | ✅ | `types: { bigint, dates, binary, parsers, serializers }` on both backends (`FirebirdBrowser` and `FirebirdLite`). Parsers key on the Firebird type code and replace the built-in conversion; serializers are a list, because an outgoing parameter has no declared type to key on |
-| `describeQuery()` | ✅ | ✅ | Prepares and drops the statement, executing nothing. Both backends report full output column metadata (`FieldInfo`) and the statement kind; WASM also reports `params`, whereas `params` is `undefined` on Node |
+| `describeQuery()` | ✅ | ✅ | Prepares and drops the statement, executing nothing. Both backends report full input `params` (`FieldInfo[]`) and output `fields` (`FieldInfo[]`) metadata plus the statement kind |
 | Typed field metadata (`dataTypeID`) | ✅ | ✅ | `FieldInfo` carries type, typeName, subType, scale, length, nullable |
 | Affected-row count | ✅ | ✅ | `exec()` returns `{ affectedRows }` |
 | Binary / BLOB values | ✅ | ✅ | Text BLOBs as strings, read and written (a string parameter into a BLOB column is written as a blob); binary as base64 by default, or `Uint8Array` with `types: { binary: true }`, which carries the bytes beside the JSON rather than through it — 6.3× faster to decode on a blob-heavy result set, and transferred rather than cloned across a Worker |
@@ -1206,47 +1206,46 @@ gaps it ran into, with its numbers, in rough order of what they would buy.
 With M0–M6 and §6 (`UNICODE` / `UNICODE_CI` / `UNICODE_CI_AI` collations)
 shipped, these are the highest-leverage candidates for upcoming releases:
 
-- [ ] **Zero-config reactive queries (`db.live(sql, params?, onChange)` without manual `events`).**
-      Today `db.live(sql, { events: ['items_changed'] }, cb)` requires the caller
-      to write a `POST_EVENT` trigger and name the events explicitly, whereas
-      PGlite's `live.query()` automatically tracks the tables a query reads.
-      By extracting referenced tables from the statement's explained plan
-      (`IStatement::getPlan(status, true)`) or SQL AST and auto-installing
-      idempotent `AFTER INSERT OR UPDATE OR DELETE` `POST_EVENT` triggers,
-      `db.live()` can become zero-config while keeping `POST_EVENT`'s
-      post-commit efficiency.
-- [ ] **Query execution plans (`db.explain(sql, options?)`).**
+- [x] **Zero-config reactive queries (`db.live(sql, onChange)` and `useLiveQuery(sql)` without manual `events`).**
+      `db.live()` and `useLiveQuery()` (in `firebird-wasm/react` and
+      `firebird-wasm/vue`) now make `events` optional: when omitted,
+      `extractReferencedTables()` extracts the user tables read by the statement
+      (skipping CTEs, selectable procedures, and system tables) and
+      `ensureLiveTableEvents()` auto-installs an idempotent
+      `CREATE OR ALTER TRIGGER FB_LIVE$<hash> FOR <table> ACTIVE AFTER INSERT OR UPDATE OR DELETE POSITION 32767 AS BEGIN POST_EVENT 'FB_LIVE$<hash>'; END`
+      once per table per session.
+- [x] **Query execution plans (`db.explain(sql, options?)`).**
       Expose `IStatement::getPlan(status, detailed)` through `_fb_explain` in
       the C bridge and `db.explain(sql, { detailed?: boolean })` on both
       `FirebirdBrowser` and `FirebirdLite`, plus an `Explain` action in
       `<firebird-repl>`, returning either the compact `PLAN (...)` string or
       Firebird's structured explained plan tree without executing the query.
-- [ ] **Node `describeQuery()` input parameter metadata (`params`) parity.**
+- [x] **Node `describeQuery()` input parameter metadata (`params`) parity.**
       In §2, `FirebirdBrowser.describeQuery(sql)` returns both output `fields`
       and input `params` (`FieldInfo[]`), while `FirebirdLite.describeQuery(sql)`
       on Node currently leaves `params` as `undefined`. Reading
       `statementHandle.getInputMetadataAsync` closes the last metadata difference
       between the browser and Node backends.
-- [ ] **Database diagnostics & OIT/OAT transaction health (`db.databaseInfo()`).**
+- [x] **Database diagnostics & OIT/OAT transaction health (`db.databaseInfo()`).**
       Expose `IAttachment::getInfo` for `isc_info_page_size`,
       `isc_info_allocation`, `isc_info_ods_version`, `isc_info_oldest_transaction`
       (OIT), `isc_info_oldest_active` (OAT), `isc_info_oldest_snapshot` (OST),
       `isc_info_next_transaction`, and memory pool statistics so long-running
       browser sessions and `<firebird-repl>` can inspect database size, page
       utilization, and transaction health.
-- [ ] **Explicit prepared statement handles (`db.prepare(sql)`).**
+- [x] **Explicit prepared statement handles (`db.prepare(sql)`).**
       Complement the transparent 64-entry SQL statement cache with an explicit
       `const stmt = await db.prepare(sql)` handle exposing `stmt.fields`,
       `stmt.params`, `stmt.query(params)`, `stmt.exec(params)`,
       `stmt.execBatch(rows)`, and `stmt.close()` for hot loops that want
       zero SQL-string lookup overhead and upfront parameter inspection.
-- [ ] **Streaming / compressed database dump & restore.**
+- [x] **Streaming / compressed database dump & restore.**
       `dumpDataDir()` and `loadDataDir` currently hold the entire `.fdb` image
       in a single `Uint8Array`. Adding `dumpDataStream()` / `loadDataStream()`
       (with optional `CompressionStream('gzip')` support) allows large OPFS-backed
       databases (50–200 MB) to be backed up and restored without doubling peak
       memory.
-- [ ] **Optional locale tailoring packs for ICU collations.**
+- [x] **Optional locale tailoring packs for ICU collations.**
       Now that the root DUCET table (`icudt68l.dat`, 343 KB raw / 130 KB gzipped)
       powers `UNICODE`, `UNICODE_CI`, and `UNICODE_CI_AI`, language-specific
       tailoring rules (`LOCALE=de_DE`, `es_ES`, `fr_FR`, `ja_JP`) can be

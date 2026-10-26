@@ -97,6 +97,44 @@ test.describe('firebird-wasm/react and firebird-wasm/vue', () => {
     expect(closed).toBe('closed');
   });
 
+  test('React: useLiveQuery without explicit events auto-installs triggers and follows writes', async ({ page }) => {
+    await page.goto('/no-isolation/browser-harness-frameworks-st');
+    await page.waitForFunction(() => Boolean(window.FB && window.Frameworks));
+    await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('memory://react-live-auto');
+      // Notice: NO manual trigger created on auto_todos!
+      await db.exec('CREATE TABLE auto_todos (id INTEGER, title VARCHAR(40))');
+      await db.exec("INSERT INTO auto_todos VALUES (1, 'zero-config')");
+      window.db = db;
+
+      const { React, createRoot, FBReact } = window.Frameworks;
+      const h = React.createElement;
+      function AutoTodos() {
+        const { rows, loading } = FBReact.useLiveQuery<{ ID: number; TITLE: string }>(
+          'SELECT id, title FROM auto_todos ORDER BY id',
+          { pollIntervalMs: 20 },
+        );
+        if (loading) return h('span', null, 'loading');
+        return h('span', null, rows!.map((r) => `${r.ID}:${r.TITLE}`).join(','));
+      }
+      const app = document.getElementById('app')!;
+      app.textContent = '';
+      window.view = createRoot(app);
+      window.view.render(
+        h(React.StrictMode, null, h(FBReact.FirebirdProvider, { db: window.db }, h(AutoTodos))),
+      );
+    });
+
+    await appShows(page, '1:zero-config');
+    await page.evaluate(() => window.db.exec("INSERT INTO auto_todos VALUES (2, 'auto-triggered')"));
+    await appShows(page, '1:zero-config,2:auto-triggered');
+
+    await page.evaluate(async () => {
+      window.view.unmount();
+      await window.db.close();
+    });
+  });
+
   test('React: useQuery runs again when its parameters change, and shows errors', async ({ page }) => {
     await openHarness(page, 'memory://react-params');
     await page.evaluate(() => window.db.exec("INSERT INTO todos VALUES (2, 'second', TRUE)"));

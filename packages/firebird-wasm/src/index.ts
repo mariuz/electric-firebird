@@ -22,6 +22,12 @@ export { sql, SqlFragment, RawSql, isSqlFragment, toStatement } from './sql-tag'
 export { statementKind } from './statement-types';
 export { firebirdTypeName } from './browser/field-types';
 export { applyTypes, applySerializers, hasTypeOptions } from './browser/value-types';
+export {
+  buildIcuLocalePack,
+  isValidIcuDataPackage,
+  ICU_LOCALE_DATA_PATH,
+  DEFAULT_ICU_TAILORING_LOCALES,
+} from './browser/icu-locales';
 export type { TypeOptions, Parser, Serializer } from './browser/value-types';
 export type { SqlTag, Statement } from './sql-tag';
 
@@ -35,6 +41,10 @@ export type {
   QueryOptions,
   QueryStreamOptions,
   QueryDescription,
+  ExplainOptions,
+  DatabaseInfo,
+  PreparedStatement,
+  DataStreamOptions,
   StatementKind,
   RowMode,
   ArrayRow,

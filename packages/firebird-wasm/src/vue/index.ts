@@ -64,8 +64,12 @@ export interface UseQueryOptions {
 
 /** Options of {@link useLiveQuery}. */
 export interface UseLiveQueryOptions extends UseQueryOptions {
-  /** Event names whose firing re-runs the statement (`POST_EVENT`). */
-  events: MaybeRefOrGetter<readonly string[]>;
+  /**
+   * Event names whose firing re-runs the statement (`POST_EVENT`).
+   * When omitted, `FirebirdBrowser.live()` infers the referenced tables and
+   * installs `POST_EVENT` triggers automatically.
+   */
+  events?: MaybeRefOrGetter<readonly string[] | undefined>;
   /** Parameters, when the statement is a string with `?` placeholders. */
   params?: MaybeRefOrGetter<QueryParams | undefined>;
   /** How often to poll for events, in milliseconds.  @default 250 */
@@ -95,14 +99,18 @@ export function useQuery<T extends Row = Row>(
  */
 export function useLiveQuery<T extends Row = Row>(
   query: MaybeRefOrGetter<string | SqlFragment>,
-  options: UseLiveQueryOptions,
+  options: UseLiveQueryOptions = {},
 ): QueryRefs<T> {
   return useStore<T>(options.db, query, options.params, () => {
-    const events = toValue(options.events);
-    if (events.length === 0) {
+    const events = options.events !== undefined ? toValue(options.events) : undefined;
+    if (events !== undefined && events.length === 0) {
       throw new RangeError('useLiveQuery() needs at least one event name; useQuery() runs a statement once');
     }
-    return { events: [...events], pollIntervalMs: options.pollIntervalMs };
+    return {
+      events: events !== undefined ? [...events] : undefined,
+      live: true,
+      pollIntervalMs: options.pollIntervalMs,
+    };
   });
 }
 

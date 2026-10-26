@@ -126,6 +126,53 @@ test.describe('<firebird-repl>', () => {
     expect(await page.evaluate(() => (window as any).injected)).toBeUndefined();
   });
 
+  test('explains queries with the Explain button and repl.explain() without executing them', async ({ page }) => {
+    const repl = await openRepl(page, 'memory://repl-explain');
+    await runTyped(repl, [
+      'CREATE TABLE items (id INTEGER NOT NULL PRIMARY KEY, name VARCHAR(20));',
+      "INSERT INTO items VALUES (1, 'alpha');",
+    ].join('\n'));
+    await expect(repl.locator('.entry')).toHaveCount(2);
+
+    const editor = repl.locator('textarea');
+    await editor.fill("SELECT id, name FROM items WHERE id = 1;\nINSERT INTO items VALUES (2, 'beta');");
+    await repl.locator('button.explain').click();
+
+    await expect(repl.locator('.entry')).toHaveCount(4);
+    await expect(repl.locator('.entry .plan').nth(0)).toContainText(/PLAN\s*\(\s*ITEMS\s+INDEX/i);
+    await expect(repl.locator('.entry .meta').nth(2)).toContainText('plan');
+
+    // Detailed plan via repl.explain(script, { detailed: true })
+    const detailed = await repl.evaluate(async (el: any) => {
+      const entries = await el.explain('SELECT id, name FROM items', { detailed: true });
+      return entries[0].plan;
+    });
+    expect(detailed).toMatch(/Select Expression/i);
+    expect(detailed).toMatch(/ITEMS/i);
+
+    // Explaining INSERT INTO items VALUES (2, 'beta') did not insert row 2
+    const rows = await repl.evaluate(async (el: any) => (await el.run('SELECT COUNT(*) FROM items'))[0].rows);
+    expect(rows).toEqual([[1]]);
+  });
+
+  test('inspects database diagnostics with the Info button and repl.info()', async ({ page }) => {
+    const repl = await openRepl(page, 'memory://repl-info');
+    await runTyped(repl, 'CREATE TABLE info_test (id INTEGER)');
+    await expect(repl.locator('.entry')).toHaveCount(1);
+
+    await repl.locator('button.info').click();
+    await expect(repl.locator('.entry')).toHaveCount(2);
+    await expect(repl.locator('.entry .meta').nth(1)).toContainText('info');
+    await expect(repl.locator('.entry').nth(1).locator('tbody')).toContainText('Page size');
+    await expect(repl.locator('.entry').nth(1).locator('tbody')).toContainText('8192');
+    await expect(repl.locator('.entry').nth(1).locator('tbody')).toContainText('Oldest active (OAT)');
+
+    const info = await repl.evaluate(async (el: any) => (await el.info()).info);
+    expect(info.pageSize).toBe(8192);
+    expect(info.allocatedPages).toBeGreaterThan(0);
+    expect(info.databaseSizeBytes).toBe(info.pageSize * info.allocatedPages);
+  });
+
   test('takes a db property set before it was defined, and reports runs', async ({ page }) => {
     await page.goto('/no-isolation/browser-harness-frameworks-st');
     await page.waitForFunction(() => Boolean((window as any).FB && (window as any).Frameworks));

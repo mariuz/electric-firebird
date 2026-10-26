@@ -68,8 +68,12 @@ export interface UseQueryOptions {
 
 /** Options of {@link useLiveQuery}. */
 export interface UseLiveQueryOptions extends UseQueryOptions {
-  /** Event names whose firing re-runs the statement (`POST_EVENT`). */
-  events: readonly string[];
+  /**
+   * Event names whose firing re-runs the statement (`POST_EVENT`).
+   * When omitted, `FirebirdBrowser.live()` infers the referenced tables and
+   * installs `POST_EVENT` triggers automatically.
+   */
+  events?: readonly string[];
   /** Parameters, when the statement is a string with `?` placeholders. */
   params?: QueryParams;
   /** How often to poll for events, in milliseconds.  @default 250 */
@@ -101,13 +105,14 @@ export function useQuery<T extends Row = Row>(
  */
 export function useLiveQuery<T extends Row = Row>(
   query: string | SqlFragment,
-  options: UseLiveQueryOptions,
+  options: UseLiveQueryOptions = {},
 ): QueryHookResult<T> {
-  if (options.events.length === 0) {
+  if (options.events !== undefined && options.events.length === 0) {
     throw new RangeError('useLiveQuery() needs at least one event name; useQuery() runs a statement once');
   }
   return useStore<T>(options.db, query, options.params, {
     events: options.events,
+    live: true,
     pollIntervalMs: options.pollIntervalMs,
   });
 }

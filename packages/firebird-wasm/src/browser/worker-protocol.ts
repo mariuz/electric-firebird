@@ -6,12 +6,13 @@
  * several calls be in flight at once.
  */
 
-import type { Row, QueryResult } from '../types';
+import type { Row, QueryResult, DatabaseInfo } from '../types';
 import type { EngineHandle } from './engine-transport';
 
 /** Operations the Worker understands.  One per EngineTransport method. */
 export type EngineOp =
   | 'init'
+  | 'loadIcuLocaleData'
   | 'createDatabase'
   | 'attachDatabase'
   | 'detachDatabase'
@@ -22,6 +23,10 @@ export type EngineOp =
   | 'cursorFetch'
   | 'cursorClose'
   | 'describe'
+  | 'explain'
+  | 'databaseInfo'
+  | 'prepare'
+  | 'stmtClose'
   | 'setSharedReads'
   | 'startTransaction'
   | 'commit'
@@ -30,6 +35,9 @@ export type EngineOp =
   | 'exists'
   | 'readFile'
   | 'writeFile'
+  | 'fileSize'
+  | 'readFileChunk'
+  | 'writeFileChunk'
   | 'unlink'
   | 'mountOpfs'
   | 'eventsSubscribe'
@@ -48,7 +56,7 @@ export interface EngineResponse {
   id: number;
   ok: boolean;
   /** Present when `ok`. */
-  result?: EngineHandle | number | boolean | Uint8Array | QueryResult<Row> | null;
+  result?: EngineHandle | number | boolean | string | Uint8Array | QueryResult<Row> | DatabaseInfo | null;
   /**
    * Present when not `ok`.  A string rather than an Error because structured
    * cloning drops the prototype and the stack is the Worker's, not the

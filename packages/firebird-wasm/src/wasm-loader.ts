@@ -11,6 +11,7 @@
  */
 
 import { VERSION } from './version';
+import { prepareModuleIcuSlack } from './browser/icu-locales';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -27,6 +28,23 @@ export interface EmscriptenFS {
   stat(path: string): { size: number; mtime: Date };
   analyzePath(path: string): { exists: boolean };
   syncfs(populate: boolean, callback: (err: unknown) => void): void;
+  open?(path: string, flags: string | number, mode?: number): unknown;
+  close?(stream: unknown): void;
+  read?(
+    stream: unknown,
+    buffer: Uint8Array,
+    offset: number,
+    length: number,
+    position?: number,
+  ): number;
+  write?(
+    stream: unknown,
+    buffer: Uint8Array,
+    offset: number,
+    length: number,
+    position?: number,
+  ): number;
+  truncate?(path: string, len: number): void;
 }
 
 /** Handle value returned by the C API (opaque integer pointer). */
@@ -46,6 +64,13 @@ export interface FirebirdWasmModule {
    * {@link FirebirdWasmModule._fb_last_error}.
    */
   _fb_init(): number;
+  /**
+   * Register an optional ICU `.dat` common data bundle (such as a locale
+   * tailoring pack for `LOCALE=de_DE`, `es_ES`, `fr_FR`, `ja_JP`) in a second
+   * `udata_setCommonData()` slot without increasing the default WASM binary
+   * size.  Returns 0 on success, non-zero on failure.
+   */
+  _fb_load_icu_data?(dataPtr: number, dataLength: number): number;
   /**
    * End the engine for good: detach every database (rolling back what is
    * open) and shut Firebird down.  `_fb_init` fails afterwards.  Call
@@ -191,6 +216,29 @@ export interface FirebirdWasmModule {
    *
    * Returns a subscription handle, or 0 on failure.
    */
+  /**
+   * Return the execution plan for `sqlPtr` (`IStatement::getPlan`) without
+   * running it.  Returns a pointer to a UTF-8 plan string (empty `""` for DDL)
+   * or 0 on failure.  Released with `_fb_free_result`.
+   */
+  _fb_explain?(
+    dbHandle: FbHandle,
+    txHandle: FbHandle,
+    sqlPtr: number,
+    detailed: number,
+  ): number;
+  /**
+   * Return database storage, ODS, memory pool, and OIT/OAT/OST transaction
+   * health diagnostics (`IAttachment::getInfo`) as a JSON object pointer, or 0
+   * on failure.  Released with `_fb_free_result`.
+   */
+  _fb_database_info?(dbHandle: FbHandle): number;
+  _fb_prepare?(
+    dbHandle: FbHandle,
+    txHandle: FbHandle,
+    sqlPtr: number,
+  ): number;
+  _fb_stmt_close?(stmtHandle: FbHandle): number;
   _fb_events_subscribe(dbHandle: FbHandle, namesPtr: number): number;
   /**
    * Counts that have arrived since the last poll, as a JSON object keyed by
@@ -503,6 +551,7 @@ async function loadModule(glueFile: string, options: WasmLoadOptions, entry: Mod
   const proc = nodeProcess();
   const before = new Map(LISTENED.map((event) => [event, new Set(proc?.listeners(event) ?? [])]));
   const mod: FirebirdWasmModule = await factory(moduleOptions);
+  prepareModuleIcuSlack(mod);
   for (const event of LISTENED) {
     for (const listener of proc?.listeners(event) ?? []) {
       if (!before.get(event)!.has(listener)) entry.listeners.push([event, listener]);

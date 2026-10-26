@@ -14,6 +14,13 @@
  * `coll/res_index.res`): ~808 KB raw, ~270 KB gzipped. That is what Firebird's
  * UNICODE, UNICODE_CI and UNICODE_CI_AI need.
  *
+ * Optional locale tailoring packs (`icudt68l-locales.dat`, built with
+ * `tools/build-icu-data.sh --locales` for `LOCALE=de_DE`, `es_ES`, `fr_FR`,
+ * `ja_JP`) can be lazy-loaded at runtime via `fb_wasm_register_icu_data()`
+ * (`_fb_load_icu_data`) or placed at `/firebird/icu/icudt68l-locales.dat`
+ * before `fb_init()`, registering a second `udata_setCommonData()` slot
+ * without increasing the default WASM binary size.
+ *
  * The version in the file name is not decoration: ICU only accepts data whose
  * major version matches the library, so this file and the port's TAG
  * (release-68-2) are checked together at compile time via static_assert.
@@ -22,6 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <vector>
 
 #ifdef __EMSCRIPTEN__
 #include <unicode/udata.h>
@@ -35,30 +43,76 @@ static_assert(U_ICU_VERSION_MAJOR_NUM == 68,
 #define FB_WASM_ICU_DATA_PATH "/firebird/icu/icudt68l.dat"
 #endif
 
+#ifndef FB_WASM_ICU_LOCALE_DATA_PATH
+#define FB_WASM_ICU_LOCALE_DATA_PATH "/firebird/icu/icudt68l-locales.dat"
+#endif
+
 namespace {
 
-/** Loaded once, and never freed: ICU keeps the pointer for the process. */
-void* g_icuData = nullptr;
-
-} // namespace
-
-/**
- * Hand the embedded (or VFS-mounted) ICU data package to ICU.
- * Safe to call more than once.
- *
- * @return true if ICU accepted it, or it was already loaded.
- */
-extern "C" bool fb_wasm_load_icu_data()
+struct RegisteredIcuPack
 {
-	if (g_icuData)
-		return true;
+	void*    buffer = nullptr;
+	unsigned size   = 0;
+};
 
-	FILE* file = fopen(FB_WASM_ICU_DATA_PATH, "rb");
+/** Loaded once, and never freed: ICU keeps the pointers for the process. */
+void* g_icuData = nullptr;
+std::vector<RegisteredIcuPack> g_icuPacks;
+
+bool registerIcuBuffer(const void* data, unsigned size, void** outBuffer = nullptr)
+{
+	if (!data || size == 0)
+		return false;
+
+	for (const auto& pack : g_icuPacks)
+	{
+		if (pack.size == size && memcmp(pack.buffer, data, size) == 0)
+		{
+			if (outBuffer)
+				*outBuffer = pack.buffer;
+			return true;
+		}
+	}
+
+	// ICU requires the data to stay mapped and aligned. malloc gives suitable
+	// alignment and the allocation outlives the process deliberately —
+	// udata_setCommonData does not copy.
+	void* buffer = malloc(static_cast<size_t>(size));
+	if (!buffer)
+		return false;
+
+	memcpy(buffer, data, static_cast<size_t>(size));
+
+	UErrorCode status = U_ZERO_ERROR;
+	udata_setCommonData(buffer, &status);
+
+	if (U_FAILURE(status))
+	{
+		fprintf(stderr, "[firebird-wasm] ICU rejected the collation data: %s\n",
+			u_errorName(status));
+		free(buffer);
+		return false;
+	}
+
+	g_icuPacks.push_back(RegisteredIcuPack{buffer, size});
+	if (outBuffer)
+		*outBuffer = buffer;
+	return true;
+}
+
+bool loadIcuFile(const char* path, bool warnIfMissing, void** outBuffer = nullptr)
+{
+	FILE* file = fopen(path, "rb");
 	if (!file)
 	{
 #ifdef FB_WASM_ICU_COLLATION_DATA
-		fprintf(stderr, "[firebird-wasm] ICU collation data missing at %s; "
-			"UNICODE collations will not work\n", FB_WASM_ICU_DATA_PATH);
+		if (warnIfMissing)
+		{
+			fprintf(stderr, "[firebird-wasm] ICU collation data missing at %s; "
+				"UNICODE collations will not work\n", path);
+		}
+#else
+		(void) warnIfMissing;
 #endif
 		return false;
 	}
@@ -73,42 +127,53 @@ extern "C" bool fb_wasm_load_icu_data()
 		return false;
 	}
 
-	// ICU requires the data to stay mapped and aligned. malloc gives suitable
-	// alignment and the allocation outlives the process deliberately —
-	// udata_setCommonData does not copy.
-	void* buffer = malloc(static_cast<size_t>(size));
-	if (!buffer)
-	{
-		fclose(file);
-		return false;
-	}
-
-	const size_t read = fread(buffer, 1, static_cast<size_t>(size), file);
+	std::vector<unsigned char> temp(static_cast<size_t>(size));
+	const size_t read = fread(temp.data(), 1, static_cast<size_t>(size), file);
 	fclose(file);
 
 	if (read != static_cast<size_t>(size))
-	{
-		free(buffer);
 		return false;
-	}
 
-	UErrorCode status = U_ZERO_ERROR;
-	udata_setCommonData(buffer, &status);
+	return registerIcuBuffer(temp.data(), static_cast<unsigned>(size), outBuffer);
+}
 
-	if (U_FAILURE(status))
-	{
-		fprintf(stderr, "[firebird-wasm] ICU rejected the collation data: %s\n",
-			u_errorName(status));
-		free(buffer);
-		return false;
-	}
+} // namespace
 
-	g_icuData = buffer;
+/**
+ * Register an additional ICU `.dat` common data package (e.g., an optional
+ * locale tailoring bundle for `LOCALE=de_DE`, `es_ES`, `fr_FR`, `ja_JP`) in
+ * the next `udata_setCommonData()` slot.  Idempotent for identical buffers.
+ */
+extern "C" bool fb_wasm_register_icu_data(const void* data, unsigned size)
+{
+	return registerIcuBuffer(data, size);
+}
 
-	return true;
+/**
+ * Hand the embedded (or VFS-mounted) ICU data package to ICU, plus any
+ * optional locale tailoring bundle at `/firebird/icu/icudt68l-locales.dat`.
+ * Safe to call more than once.
+ *
+ * @return true if ICU accepted the root package, or it was already loaded.
+ */
+extern "C" bool fb_wasm_load_icu_data()
+{
+	// If an optional locale tailoring pack was written to VFS before fb_init()
+	// (or after), register its udata_setCommonData() slot as well.
+	loadIcuFile(FB_WASM_ICU_LOCALE_DATA_PATH, false);
+
+	if (g_icuData)
+		return true;
+
+	return loadIcuFile(FB_WASM_ICU_DATA_PATH, true, &g_icuData);
 }
 
 #else
+
+extern "C" bool fb_wasm_register_icu_data(const void* /*data*/, unsigned /*size*/)
+{
+	return false;
+}
 
 extern "C" bool fb_wasm_load_icu_data()
 {

@@ -457,11 +457,11 @@ endif()
 # The exported C API.  Built as a list so optional components (the pool probe)
 # can extend it; exporting a symbol that was not compiled is a link error.
 set(FB_EXPORTED_FUNCTIONS
-  _fb_init _fb_dispose _fb_last_error _fb_last_affected_rows _fb_statement_cache _fb_metadata_commits _fb_read_transaction _fb_shape_columns
+  _fb_init _fb_dispose _fb_load_icu_data _fb_last_error _fb_last_affected_rows _fb_statement_cache _fb_metadata_commits _fb_read_transaction _fb_shape_columns
   _fb_create_database _fb_attach_database _fb_detach_database
   _fb_execute _fb_query _fb_execute_params _fb_query_params _fb_execute_batch _fb_free_result
   _fb_cursor_open _fb_cursor_fetch _fb_cursor_close
-  _fb_describe _fb_last_blobs _fb_last_blobs_size
+  _fb_describe _fb_prepare _fb_stmt_close _fb_explain _fb_database_info _fb_last_blobs _fb_last_blobs_size
   _fb_start_transaction _fb_start_transaction_ex _fb_commit _fb_rollback
   _fb_events_subscribe _fb_events_poll _fb_events_cancel
   _malloc _free

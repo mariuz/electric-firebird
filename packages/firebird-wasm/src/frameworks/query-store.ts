@@ -48,10 +48,16 @@ export interface QueryState<T> {
 export interface QueryStoreOptions {
   /**
    * Event names to watch, as posted by `POST_EVENT`: with any, the statement
-   * runs again each time one fires (`FirebirdBrowser.live()`).  Without, it
-   * runs once.
+   * runs again each time one fires (`FirebirdBrowser.live()`).  When `live`
+   * is `true` and `events` is omitted, `FirebirdBrowser.live()` infers the
+   * referenced tables and installs `POST_EVENT` triggers automatically.
    */
   events?: readonly string[];
+  /**
+   * Whether to run as a live query even when `events` is omitted (auto-detecting
+   * referenced tables).
+   */
+  live?: boolean;
   /** As `LiveQueryOptions.pollIntervalMs`. */
   pollIntervalMs?: number;
 }
@@ -99,9 +105,10 @@ export class QueryStore<T extends Row = Row> {
     this.running = true;
     const generation = ++this.generation;
     const current = () => generation === this.generation;
-    const events = this.options.events ?? [];
+    const hasExplicitEvents = this.options.events !== undefined && this.options.events.length > 0;
+    const isLive = Boolean(this.options.live || hasExplicitEvents);
 
-    if (events.length === 0) {
+    if (!isLive) {
       this.pending = this.db.query<T>(this.sql, this.params).then(
         (result) => {
           if (current()) this.set({ rows: result.rows, error: undefined, loading: false });
@@ -117,7 +124,7 @@ export class QueryStore<T extends Row = Row> {
       .live<T>(
         this.sql,
         {
-          events: [...events],
+          events: this.options.events !== undefined ? [...this.options.events] : undefined,
           params: this.params,
           pollIntervalMs: this.options.pollIntervalMs,
           onError: (error) => {
@@ -209,8 +216,14 @@ export function resolveStatement(
  * array of numbers.
  */
 export function queryKey(sql: string, params: QueryParams, options: QueryStoreOptions = {}): string {
+  const eventsOrAuto =
+    options.events !== undefined
+      ? options.events
+      : options.live
+        ? '$auto'
+        : [];
   return JSON.stringify(
-    [sql, params, options.events ?? [], options.pollIntervalMs ?? null],
+    [sql, params, eventsOrAuto, options.pollIntervalMs ?? null],
     function (this: Record<string, unknown>, key: string, value: unknown) {
       const raw = this[key];
       if (typeof raw === 'bigint') return { $bigint: raw.toString() };
