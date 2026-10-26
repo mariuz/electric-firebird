@@ -3,4 +3,4 @@
  * (see {@link cdnArtifacts}).  Kept equal to package.json's by a test, so a
  * release that bumps one and not the other fails before it is published.
  */
-export const VERSION = '0.11.0';
+export const VERSION = '0.12.0';

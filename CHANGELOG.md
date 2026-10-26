@@ -4,6 +4,61 @@ All notable changes to `firebird-wasm`. This project follows
 [semantic versioning](https://semver.org/); while the major version is 0 the
 API may still move between minor releases.
 
+## 0.12.0 — 2026-10-26
+
+### Added
+
+- **Zero-config reactive queries (`db.live(sql, onChange)` and `useLiveQuery(sql)` without manual `events`).**
+  `db.live()` and `useLiveQuery()` (in `firebird-wasm/react` and
+  `firebird-wasm/vue`) now make `events` optional. When omitted,
+  `extractReferencedTables()` extracts the user tables referenced by the query
+  (skipping CTEs, selectable procedures, and system tables) and auto-installs an
+  idempotent `AFTER INSERT OR UPDATE OR DELETE POSITION 32767` trigger
+  (`FB_LIVE$<hash>`) once per table per session.
+- **Query execution plans (`db.explain(sql, options?)` and `<firebird-repl>` `Explain` button).**
+  Exposes `IStatement::getPlan(status, detailed)` through `_fb_explain` in the
+  WASM C bridge and `db.explain(sql, { detailed?: boolean })` (plus `tx.explain`
+  and `sql` tagged-template overloads) on both `FirebirdBrowser` and
+  `FirebirdLite`, returning either the compact `PLAN (...)` string or Firebird's
+  structured explained plan tree without executing the statement. Added an
+  `Explain` button to `<firebird-repl>`.
+- **Node `describeQuery()` input parameter metadata (`params`) parity.**
+  `FirebirdLite.describeQuery(sql)` and `FirebirdTransaction.describeQuery(sql)`
+  now read `statementHandle.getInputMetadataAsync` and populate full `FieldInfo[]`
+  metadata on `params`, matching `FirebirdBrowser.describeQuery(sql)`.
+- **Database diagnostics & OIT/OAT transaction health (`db.databaseInfo()` and `<firebird-repl>` `Info` button).**
+  Exposes `IAttachment::getInfo` via `_fb_database_info` in the WASM C bridge and
+  `db.databaseInfo()` on both `FirebirdBrowser` and `FirebirdLite` (plus an
+  `Info` button in `<firebird-repl>`), reporting `pageSize`, `allocatedPages`,
+  `databaseSizeBytes`, `odsVersion`, `odsMinorVersion`, `oldestTransaction`
+  (OIT), `oldestActive` (OAT), `oldestSnapshot` (OST), `nextTransaction`,
+  `transactionGap`, `currentMemory`, `maxMemory`, `pageBuffers`, `reads`,
+  `writes`, `fetches`, and `marks`.
+- **Explicit prepared statement handles (`db.prepare(sql)` and `tx.prepare(sql)`).**
+  Complements the internal 64-entry SQL statement cache with an explicit
+  `PreparedStatement` handle (`stmt.sql`, `stmt.fields`, `stmt.params`,
+  `stmt.statementType`, `stmt.hasResultSet`, `stmt.closed`, `stmt.query(params?, options?)`,
+  `stmt.exec(params?)`, `stmt.execBatch(rows)`, `stmt.close()`) on
+  `FirebirdBrowser`, `FirebirdBrowserTransaction`, `FirebirdLite`, and
+  `FirebirdTransaction`, backed by `_fb_prepare` / `_fb_stmt_close` in the WASM
+  C bridge and native `Statement` handles on Node.
+- **Streaming & gzip-compressed database dump and restore (`dumpDataStream()` and `loadDataStream()`).**
+  `db.dumpDataStream({ chunkSize?, compression?: 'none' | 'gzip' })`,
+  `db.loadDataStream(source, options?)`, and `options.loadDataStream` on both
+  `FirebirdBrowser` and `FirebirdLite` export and import database images in
+  64 KiB page-aligned chunks (with automatic `DecompressionStream('gzip')`
+  detection on `0x1f 0x8b` headers) without allocating a single contiguous
+  `Uint8Array` of the entire database file in memory.
+- **Optional lazy-loaded ICU locale tailoring packs (`db.loadIcuLocaleData()` and `buildIcuLocalePack()`).**
+  Added `wasm/tools/build-icu-data.sh --locales`, `_fb_load_icu_data`
+  (`fb_wasm_register_icu_data` registering a second `udata_setCommonData()` slot
+  in `fb_wasm_icu_data.cpp`), `db.loadIcuLocaleData(data)`,
+  `FirebirdBrowserOptions.icuLocaleData`, and `buildIcuLocalePack(locales?)` so
+  locale-specific collations (`CREATE COLLATION ... FOR UTF8 FROM UNICODE
+  'LOCALE=de_DE'`, `es_ES`, `fr_FR`, `ja_JP`) can be lazy-loaded on demand
+  (raw `.dat` or gzipped `.dat.gz`) without increasing the default WASM binary
+  size.
+
 ## 0.11.0 — 2026-10-25
 
 ### Added
