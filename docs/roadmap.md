@@ -5,7 +5,7 @@ electric-firebird's stated goal is "Firebird embedded in WASM, similar to
 that goal actually is, compares the API surface against PGlite feature by
 feature, and proposes a staged roadmap.
 
-Last reviewed: 2026-10-24.
+Last reviewed: 2026-10-26.
 
 ---
 
@@ -666,10 +666,13 @@ be built:
    `Atomics.waitAsync` on its mailbox, which only Emscripten's
    `terminateRuntime` settles.  Over ten cycles in Node, RSS levels off at
    about 200 MB (without threads) and 300 MB (threaded).
-5. **Only built-in character sets, and no working UNICODE collations.**
-   Solved on a branch, not merged — see
-   [PR #12](https://github.com/mariuz/electric-firebird/pull/12) and §6.
-   Groundwork on `main`:
+5. ~~**Only built-in character sets, and no working UNICODE collations.**~~
+   **Solved and shipped in 0.11.0 (`FB_WASM_ICU_COLLATION=ON`)** — `UNICODE`,
+   `UNICODE_CI` and `UNICODE_CI_AI` collations now work out of the box (see
+   [PR #12](https://github.com/mariuz/electric-firebird/pull/12) and §6); the
+   43 extra table-driven legacy character sets remain opt-in via
+   `-DFB_WASM_FULL_INTL=ON`.
+   How we got here:
 
       `src/intl` **compiles and links cleanly under Emscripten** — all 29 files,
       no errors. Cost, measured rather than estimated: **+616 KB raw, +245 KB
@@ -1197,6 +1200,58 @@ gaps it ran into, with its numbers, in rough order of what they would buy.
       `ENGINE_VERSION` and failing rather than skipping when the client
       library will not load. Left: the browser engine built from other
       branches than `master`, each a build of its own.
+
+### M7 — Next-horizon suggestions
+
+With M0–M6 and §6 (`UNICODE` / `UNICODE_CI` / `UNICODE_CI_AI` collations)
+shipped, these are the highest-leverage candidates for upcoming releases:
+
+- [ ] **Zero-config reactive queries (`db.live(sql, params?, onChange)` without manual `events`).**
+      Today `db.live(sql, { events: ['items_changed'] }, cb)` requires the caller
+      to write a `POST_EVENT` trigger and name the events explicitly, whereas
+      PGlite's `live.query()` automatically tracks the tables a query reads.
+      By extracting referenced tables from the statement's explained plan
+      (`IStatement::getPlan(status, true)`) or SQL AST and auto-installing
+      idempotent `AFTER INSERT OR UPDATE OR DELETE` `POST_EVENT` triggers,
+      `db.live()` can become zero-config while keeping `POST_EVENT`'s
+      post-commit efficiency.
+- [ ] **Query execution plans (`db.explain(sql, options?)`).**
+      Expose `IStatement::getPlan(status, detailed)` through `_fb_explain` in
+      the C bridge and `db.explain(sql, { detailed?: boolean })` on both
+      `FirebirdBrowser` and `FirebirdLite`, plus an `Explain` action in
+      `<firebird-repl>`, returning either the compact `PLAN (...)` string or
+      Firebird's structured explained plan tree without executing the query.
+- [ ] **Node `describeQuery()` input parameter metadata (`params`) parity.**
+      In §2, `FirebirdBrowser.describeQuery(sql)` returns both output `fields`
+      and input `params` (`FieldInfo[]`), while `FirebirdLite.describeQuery(sql)`
+      on Node currently leaves `params` as `undefined`. Reading
+      `statementHandle.getInputMetadataAsync` closes the last metadata difference
+      between the browser and Node backends.
+- [ ] **Database diagnostics & OIT/OAT transaction health (`db.databaseInfo()`).**
+      Expose `IAttachment::getInfo` for `isc_info_page_size`,
+      `isc_info_allocation`, `isc_info_ods_version`, `isc_info_oldest_transaction`
+      (OIT), `isc_info_oldest_active` (OAT), `isc_info_oldest_snapshot` (OST),
+      `isc_info_next_transaction`, and memory pool statistics so long-running
+      browser sessions and `<firebird-repl>` can inspect database size, page
+      utilization, and transaction health.
+- [ ] **Explicit prepared statement handles (`db.prepare(sql)`).**
+      Complement the transparent 64-entry SQL statement cache with an explicit
+      `const stmt = await db.prepare(sql)` handle exposing `stmt.fields`,
+      `stmt.params`, `stmt.query(params)`, `stmt.exec(params)`,
+      `stmt.execBatch(rows)`, and `stmt.close()` for hot loops that want
+      zero SQL-string lookup overhead and upfront parameter inspection.
+- [ ] **Streaming / compressed database dump & restore.**
+      `dumpDataDir()` and `loadDataDir` currently hold the entire `.fdb` image
+      in a single `Uint8Array`. Adding `dumpDataStream()` / `loadDataStream()`
+      (with optional `CompressionStream('gzip')` support) allows large OPFS-backed
+      databases (50–200 MB) to be backed up and restored without doubling peak
+      memory.
+- [ ] **Optional locale tailoring packs for ICU collations.**
+      Now that the root DUCET table (`icudt68l.dat`, 343 KB raw / 130 KB gzipped)
+      powers `UNICODE`, `UNICODE_CI`, and `UNICODE_CI_AI`, language-specific
+      tailoring rules (`LOCALE=de_DE`, `es_ES`, `fr_FR`, `ja_JP`) can be
+      packaged as an optional lazy-loaded data bundle registered via a second
+      `udata_setCommonData()` slot without increasing the default WASM download.
 
 ---
 
