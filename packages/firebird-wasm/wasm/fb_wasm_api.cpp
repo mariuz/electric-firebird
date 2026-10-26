@@ -3479,6 +3479,13 @@ const char* fb_database_info(int db_handle)
 		}
 	}
 
+	if (oldestActive <= 0 && oldestTransaction > 0)
+		oldestActive = oldestTransaction;
+	if (oldestSnapshot <= 0 && oldestActive > 0)
+		oldestSnapshot = oldestActive;
+	if (nextTransaction <= 0 && oldestActive > 0)
+		nextTransaction = oldestActive;
+
 	const long long databaseSizeBytes = pageSize * allocatedPages;
 	const long long transactionGap = nextTransaction >= oldestActive
 		? (nextTransaction - oldestActive)

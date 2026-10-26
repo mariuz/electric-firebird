@@ -563,9 +563,12 @@ export function normalizeDatabaseInfo(raw: Partial<DatabaseInfo>): DatabaseInfo 
   const odsVersion = Number(raw.odsVersion ?? 0);
   const odsMinorVersion = Number(raw.odsMinorVersion ?? 0);
   const oldestTransaction = Number(raw.oldestTransaction ?? 0);
-  const oldestActive = Number(raw.oldestActive ?? 0);
-  const oldestSnapshot = Number(raw.oldestSnapshot ?? 0);
-  const nextTransaction = Number(raw.nextTransaction ?? 0);
+  const rawOldestActive = Number(raw.oldestActive ?? 0);
+  const oldestActive = rawOldestActive > 0 ? rawOldestActive : oldestTransaction;
+  const rawOldestSnapshot = Number(raw.oldestSnapshot ?? 0);
+  const oldestSnapshot = rawOldestSnapshot > 0 ? rawOldestSnapshot : oldestActive;
+  const rawNextTransaction = Number(raw.nextTransaction ?? 0);
+  const nextTransaction = rawNextTransaction > 0 ? rawNextTransaction : oldestActive;
   const transactionGap = Number(
     raw.transactionGap ?? (nextTransaction >= oldestActive ? nextTransaction - oldestActive : 0),
   );
