@@ -721,3 +721,63 @@ export interface MigrateResult {
   /** Full ordered list of applied migrations currently in `FB_MIGRATIONS$`. */
   history: AppliedMigration[];
 }
+
+/**
+ * Options for `db.openBlobStream()`, `tx.openBlobStream()`, `db.createBlobStream()`,
+ * and `tx.createBlobStream()`.
+ */
+export interface BlobStreamOptions {
+  /**
+   * Maximum segment/chunk size in bytes transferred per `IBlob::getSegment` or
+   * `IBlob::putSegment` step. Must be a positive integer (`<= 65535` when writing).
+   *
+   * @default 32768
+   */
+  segmentSize?: number;
+  /**
+   * 0-based column index or column name (case-insensitive) to stream when
+   * opening a BLOB via a `SELECT` query that returns multiple columns.
+   *
+   * @default 0
+   */
+  column?: number | string;
+}
+
+/**
+ * Reference to a Firebird BLOB written via `createBlobStream()`.
+ *
+ * Can be passed directly as a parameter in `exec()`, `query()`, or
+ * `PreparedStatement.exec()` (e.g. `await tx.exec('INSERT INTO files VALUES (?, ?)', [1, handle])`),
+ * or re-opened for reading via `openBlobStream(handle)`.
+ */
+export interface BlobHandle {
+  readonly __brand: 'FirebirdBlobHandle';
+  /** The 8-byte Firebird `ISC_QUAD` BLOB identifier. */
+  readonly blobId: Uint8Array;
+  /** Total byte length written to the BLOB. */
+  readonly byteLength: number;
+}
+
+/**
+ * A Web `WritableStream<Uint8Array>` backed by Firebird `IBlob::putSegment`.
+ *
+ * Can be piped to from any `ReadableStream<Uint8Array>` (e.g. `await readable.pipeTo(blobStream)`)
+ * or written to via `getWriter()` or `writeChunk()` + `finish()`. Once the stream
+ * closes, `blobStream.handle` (or `blobStream` itself) can be bound as a parameter
+ * in an `INSERT` or `UPDATE` statement.
+ */
+export interface BlobWritableStream extends WritableStream<Uint8Array> {
+  /** Resolves to the finalized {@link BlobHandle} once the stream is closed. */
+  readonly closed: Promise<BlobHandle>;
+  /**
+   * The finalized {@link BlobHandle} after the stream has been closed,
+   * or `null` while the stream is still open.
+   */
+  readonly handle: BlobHandle | null;
+  /** Total bytes written to the BLOB so far. */
+  readonly byteLength: number;
+  /** Write a single `Uint8Array` or UTF-8 `string` chunk to the BLOB. */
+  writeChunk(chunk: Uint8Array | string): Promise<void>;
+  /** Close the writer and return the finalized {@link BlobHandle}. */
+  finish(): Promise<BlobHandle>;
+}

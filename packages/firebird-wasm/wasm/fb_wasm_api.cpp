@@ -203,7 +203,23 @@ struct CursorEntry
 	bool failed = false;
 };
 
+/** An open streaming BLOB (fb_blob_create / fb_blob_open_* / fb_blob_close). */
+struct BlobEntry
+{
+	int db_handle = 0;
+	int tx_handle = 0;
+	IAttachment* attachment = nullptr;
+	ITransaction* transaction = nullptr;
+	bool ownTransaction = false;
+	IBlob* blob = nullptr;
+	ISC_QUAD blobId = {0, 0};
+	bool isRead = false;
+	bool eof = false;
+};
+
 std::map<int, DbEntry> g_databases;
+std::map<int, BlobEntry> g_blobs;
+int g_nextBlobHandle = 1;
 std::map<int, TxEntry> g_transactions;
 std::map<int, CursorEntry> g_cursors;
 
@@ -1458,6 +1474,7 @@ struct ParamValue
 	unsigned char binaryKind = 0;
 	/** `text` holds bytes, not text: bound only where bytes go (a BLOB, OCTETS). */
 	bool          bytes = false;
+	bool          isBlobId = false;
 	ISC_INT64     i64 = 0;
 	double        dbl = 0;
 };
@@ -1500,6 +1517,7 @@ bool parseParamsAt(const unsigned char* data, unsigned length, unsigned& pos,
 		const unsigned char flags = data[pos++];
 		value.isNull = (flags & 1) != 0;
 		value.bytes = (flags & 4) != 0;
+		value.isBlobId = (flags & 8) != 0;
 
 		if (!value.isNull)
 		{
@@ -1708,7 +1726,9 @@ public:
 				// parameter takes a blob's id.  So the text is written as a
 				// blob in the statement's transaction, and its id bound.
 				ISC_QUAD blobId;
-				if (!writeBlob(values[i].text, blobId, i))
+				if (values[i].isBlobId && values[i].text.size() == sizeof(ISC_QUAD))
+					memcpy(&blobId, values[i].text.data(), sizeof(ISC_QUAD));
+				else if (!writeBlob(values[i].text, blobId, i))
 					return false;
 				memcpy(buffer.data() + f.offset, &blobId, sizeof(blobId));
 				continue;
@@ -4931,6 +4951,496 @@ int fb_cursor_close(int cursor_handle)
 
 	const bool ok = closeCursorEntry(it->second, true);
 	g_cursors.erase(it);
+	return ok ? 0 : 2;
+}
+
+/** Close an open BlobEntry and release any self-owned transaction. */
+static bool closeBlobEntry(BlobEntry& entry, bool cancel)
+{
+	bool ok = true;
+	if (entry.blob)
+	{
+		Status s;
+		if (cancel && !entry.isRead)
+			entry.blob->cancel(s.ptr());
+		else
+			entry.blob->close(s.ptr());
+		if (s.failed())
+		{
+			setErrorFromStatus("fb_blob_close: failed to close blob", s.ptr());
+			entry.blob->release();
+			ok = false;
+		}
+		entry.blob = nullptr;
+	}
+	if (entry.ownTransaction && entry.transaction)
+	{
+		ITransaction* tx = entry.transaction;
+		entry.transaction = nullptr;
+		Status txStatus;
+		if (!cancel && ok)
+			tx->commit(txStatus.ptr());
+		else
+			tx->rollback(txStatus.ptr());
+	}
+	return ok;
+}
+
+/**
+ * Create a new segmented BLOB in `(db_handle, tx_handle)`, writing its 8-byte
+ * `ISC_QUAD` identifier into `out_blob_id` (when non-null), and return a
+ * positive blob handle (or 0 on failure).
+ */
+FB_WASM_EXPORT
+int fb_blob_create(int db_handle, int tx_handle, unsigned char* out_blob_id)
+{
+	clearError();
+	IAttachment* attachment = lookupDb(db_handle);
+	if (!attachment)
+	{
+		setError("fb_blob_create: unknown database handle");
+		return 0;
+	}
+
+	ITransaction* transaction = nullptr;
+	bool ownTransaction = false;
+	if (tx_handle != 0)
+	{
+		transaction = lookupTx(tx_handle, db_handle);
+		if (!transaction)
+			return 0;
+	}
+	else
+	{
+		Status txStatus;
+		transaction = attachment->startTransaction(txStatus.ptr(), 0, nullptr);
+		if (txStatus.failed() || !transaction)
+		{
+			setErrorFromStatus("fb_blob_create: startTransaction failed", txStatus.ptr());
+			return 0;
+		}
+		ownTransaction = true;
+	}
+
+	Status status;
+	ISC_QUAD blobId = {0, 0};
+	IBlob* blob = attachment->createBlob(status.ptr(), transaction, &blobId, 0, nullptr);
+	if (status.failed() || !blob)
+	{
+		setErrorFromStatus("fb_blob_create: createBlob failed", status.ptr());
+		if (ownTransaction && transaction)
+		{
+			Status rb;
+			transaction->rollback(rb.ptr());
+		}
+		return 0;
+	}
+
+	if (out_blob_id)
+		memcpy(out_blob_id, &blobId, sizeof(ISC_QUAD));
+
+	BlobEntry entry;
+	entry.db_handle = db_handle;
+	entry.tx_handle = tx_handle;
+	entry.attachment = attachment;
+	entry.transaction = transaction;
+	entry.ownTransaction = ownTransaction;
+	entry.blob = blob;
+	entry.blobId = blobId;
+	entry.isRead = false;
+	entry.eof = false;
+
+	const int handle = g_nextBlobHandle++;
+	g_blobs[handle] = entry;
+	return handle;
+}
+
+/**
+ * Write `length` bytes from `data` into an open writable BLOB handle via
+ * `IBlob::putSegment`. Returns 0 on success, non-zero on failure.
+ */
+FB_WASM_EXPORT
+int fb_blob_put_segment(int blob_handle, const unsigned char* data, unsigned length)
+{
+	clearError();
+	const auto it = g_blobs.find(blob_handle);
+	if (it == g_blobs.end() || it->second.isRead || !it->second.blob)
+	{
+		setError("fb_blob_put_segment: invalid writable blob handle");
+		return 1;
+	}
+	if (length == 0)
+		return 0;
+
+	BlobEntry& entry = it->second;
+	Status status;
+	constexpr unsigned MAX_SEG = 32768;
+	for (unsigned at = 0; at < length; at += MAX_SEG)
+	{
+		const unsigned n = std::min(MAX_SEG, length - at);
+		entry.blob->putSegment(status.ptr(), n, data + at);
+		if (status.failed())
+		{
+			setErrorFromStatus("fb_blob_put_segment: putSegment failed", status.ptr());
+			return 2;
+		}
+	}
+	return 0;
+}
+
+/**
+ * Open an existing BLOB by its 8-byte `ISC_QUAD` identifier (`blob_id_ptr`)
+ * for segmented reading via `fb_blob_get_segment`. Returns a positive blob
+ * handle, or 0 on failure.
+ */
+FB_WASM_EXPORT
+int fb_blob_open_id(int db_handle, int tx_handle, const unsigned char* blob_id_ptr)
+{
+	clearError();
+	if (!blob_id_ptr)
+	{
+		setError("fb_blob_open_id: null blob_id_ptr");
+		return 0;
+	}
+	IAttachment* attachment = lookupDb(db_handle);
+	if (!attachment)
+	{
+		setError("fb_blob_open_id: unknown database handle");
+		return 0;
+	}
+
+	ITransaction* transaction = nullptr;
+	bool ownTransaction = false;
+	if (tx_handle != 0)
+	{
+		transaction = lookupTx(tx_handle, db_handle);
+		if (!transaction)
+			return 0;
+	}
+	else
+	{
+		Status txStatus;
+		transaction = attachment->startTransaction(txStatus.ptr(), 0, nullptr);
+		if (txStatus.failed() || !transaction)
+		{
+			setErrorFromStatus("fb_blob_open_id: startTransaction failed", txStatus.ptr());
+			return 0;
+		}
+		ownTransaction = true;
+	}
+
+	ISC_QUAD blobId = {0, 0};
+	memcpy(&blobId, blob_id_ptr, sizeof(ISC_QUAD));
+
+	Status status;
+	IBlob* blob = attachment->openBlob(status.ptr(), transaction, &blobId, 0, nullptr);
+	if (status.failed() || !blob)
+	{
+		setErrorFromStatus("fb_blob_open_id: openBlob failed", status.ptr());
+		if (ownTransaction && transaction)
+		{
+			Status rb;
+			transaction->rollback(rb.ptr());
+		}
+		return 0;
+	}
+
+	BlobEntry entry;
+	entry.db_handle = db_handle;
+	entry.tx_handle = tx_handle;
+	entry.attachment = attachment;
+	entry.transaction = transaction;
+	entry.ownTransaction = ownTransaction;
+	entry.blob = blob;
+	entry.blobId = blobId;
+	entry.isRead = true;
+	entry.eof = false;
+
+	const int handle = g_nextBlobHandle++;
+	g_blobs[handle] = entry;
+	return handle;
+}
+
+/**
+ * Execute `sql` (with optional packed `param_buf`), extract the 8-byte
+ * `ISC_QUAD` from column `col_index` of the first row without materializing
+ * the BLOB in memory, and open an `IBlob` reader handle for `fb_blob_get_segment`.
+ * Returns a positive blob handle, or 0 on failure.
+ */
+FB_WASM_EXPORT
+int fb_blob_open_query(int db_handle, int tx_handle, const char* sql,
+	const unsigned char* param_buf, unsigned param_len, int col_index)
+{
+	clearError();
+	if (!sql || !*sql)
+	{
+		setError("fb_blob_open_query: empty SQL");
+		return 0;
+	}
+	IAttachment* attachment = lookupDb(db_handle);
+	if (!attachment)
+	{
+		setError("fb_blob_open_query: unknown database handle");
+		return 0;
+	}
+
+	std::vector<ParamValue> params;
+	if (!parseParams(param_buf, param_len, params))
+	{
+		setError("fb_blob_open_query: malformed parameter buffer");
+		return 0;
+	}
+
+	ITransaction* transaction = nullptr;
+	bool ownTransaction = false;
+	if (tx_handle != 0)
+	{
+		transaction = lookupTx(tx_handle, db_handle);
+		if (!transaction)
+			return 0;
+	}
+	else
+	{
+		Status txStatus;
+		transaction = attachment->startTransaction(txStatus.ptr(), 0, nullptr);
+		if (txStatus.failed() || !transaction)
+		{
+			setErrorFromStatus("fb_blob_open_query: startTransaction failed", txStatus.ptr());
+			return 0;
+		}
+		ownTransaction = true;
+	}
+
+	Status status;
+	bool cached = false;
+	unsigned stmtType = 0;
+	IStatement* statement = acquireStatement(db_handle, attachment, transaction, sql, status, cached, &stmtType);
+	if (status.failed() || !statement)
+	{
+		setErrorFromStatus("fb_blob_open_query: prepare failed", status.ptr());
+		if (ownTransaction && transaction)
+		{
+			Status rb;
+			transaction->rollback(rb.ptr());
+		}
+		return 0;
+	}
+
+	InputMessage input;
+	input.writeBlobsTo(attachment, transaction);
+	if (!params.empty() && !input.build(statement, params))
+	{
+		releaseStatement(db_handle, statement, cached, false);
+		if (ownTransaction && transaction)
+		{
+			Status rb;
+			transaction->rollback(rb.ptr());
+		}
+		return 0;
+	}
+
+	std::shared_ptr<OutputShape> shape = shapeForStatement(db_handle, statement, status);
+	if (!shape || shape->columnCount == 0)
+	{
+		releaseStatement(db_handle, statement, cached, true);
+		if (ownTransaction && transaction)
+		{
+			Status rb;
+			transaction->rollback(rb.ptr());
+		}
+		setError("openBlobStream: query does not return any columns");
+		return 0;
+	}
+
+	if (col_index < 0 || static_cast<unsigned>(col_index) >= shape->columnCount)
+	{
+		releaseStatement(db_handle, statement, cached, false);
+		if (ownTransaction && transaction)
+		{
+			Status rb;
+			transaction->rollback(rb.ptr());
+		}
+		setError("openBlobStream: column index out of range");
+		return 0;
+	}
+
+	const unsigned idx = static_cast<unsigned>(col_index);
+	if (shape->types[idx] != SQL_BLOB)
+	{
+		releaseStatement(db_handle, statement, cached, false);
+		if (ownTransaction && transaction)
+		{
+			Status rb;
+			transaction->rollback(rb.ptr());
+		}
+		setError("openBlobStream: selected column is not a BLOB");
+		return 0;
+	}
+
+	IResultSet* rs = statement->openCursor(status.ptr(), transaction,
+		input.meta(), input.data(), shape->metadata, 0);
+	if (status.failed() || !rs)
+	{
+		setErrorFromStatus("fb_blob_open_query: openCursor failed", status.ptr());
+		releaseStatement(db_handle, statement, cached, true);
+		if (ownTransaction && transaction)
+		{
+			Status rb;
+			transaction->rollback(rb.ptr());
+		}
+		return 0;
+	}
+
+	std::vector<unsigned char> rowBuf(shape->messageLength);
+	const int rc = rs->fetchNext(status.ptr(), rowBuf.data());
+	Status closeRsStatus;
+	rs->close(closeRsStatus.ptr());
+	rs->release();
+	releaseStatement(db_handle, statement, cached, status.failed());
+
+	if (status.failed())
+	{
+		setErrorFromStatus("fb_blob_open_query: fetchNext failed", status.ptr());
+		if (ownTransaction && transaction)
+		{
+			Status rb;
+			transaction->rollback(rb.ptr());
+		}
+		return 0;
+	}
+	if (rc != IStatus::RESULT_OK)
+	{
+		if (ownTransaction && transaction)
+		{
+			Status rb;
+			transaction->rollback(rb.ptr());
+		}
+		setError("openBlobStream: query returned no rows");
+		return 0;
+	}
+
+	short nullFlag = 0;
+	memcpy(&nullFlag, rowBuf.data() + shape->nullOffsets[idx], sizeof(nullFlag));
+	if (nullFlag == -1)
+	{
+		if (ownTransaction && transaction)
+		{
+			Status rb;
+			transaction->rollback(rb.ptr());
+		}
+		setError("openBlobStream: BLOB column value is NULL");
+		return 0;
+	}
+
+	ISC_QUAD blobId = {0, 0};
+	memcpy(&blobId, rowBuf.data() + shape->offsets[idx], sizeof(ISC_QUAD));
+
+	IBlob* blob = attachment->openBlob(status.ptr(), transaction, &blobId, 0, nullptr);
+	if (status.failed() || !blob)
+	{
+		setErrorFromStatus("fb_blob_open_query: openBlob failed", status.ptr());
+		if (ownTransaction && transaction)
+		{
+			Status rb;
+			transaction->rollback(rb.ptr());
+		}
+		return 0;
+	}
+
+	BlobEntry entry;
+	entry.db_handle = db_handle;
+	entry.tx_handle = tx_handle;
+	entry.attachment = attachment;
+	entry.transaction = transaction;
+	entry.ownTransaction = ownTransaction;
+	entry.blob = blob;
+	entry.blobId = blobId;
+	entry.isRead = true;
+	entry.eof = false;
+
+	const int handle = g_nextBlobHandle++;
+	g_blobs[handle] = entry;
+	return handle;
+}
+
+/**
+ * Read up to `max_len` bytes from an open BLOB handle into `out_buf` and store
+ * the number of bytes read into `*actual_len_out`.
+ * Returns:
+ *   0 when `> 0` bytes were read,
+ *   1 when EOF has been reached (`*actual_len_out == 0`),
+ *  -1 on error.
+ */
+FB_WASM_EXPORT
+int fb_blob_get_segment(int blob_handle, unsigned char* out_buf, unsigned max_len, unsigned* actual_len_out)
+{
+	clearError();
+	if (actual_len_out)
+		*actual_len_out = 0;
+
+	const auto it = g_blobs.find(blob_handle);
+	if (it == g_blobs.end() || !it->second.isRead || !it->second.blob)
+	{
+		setError("fb_blob_get_segment: invalid readable blob handle");
+		return -1;
+	}
+	if (!out_buf || max_len == 0)
+	{
+		setError("fb_blob_get_segment: invalid output buffer");
+		return -1;
+	}
+
+	BlobEntry& entry = it->second;
+	if (entry.eof)
+		return 1;
+
+	unsigned total = 0;
+	Status status;
+	while (total < max_len && !entry.eof)
+	{
+		unsigned segLen = 0;
+		const unsigned chunkCap = std::min<unsigned>(32768u, max_len - total);
+		const int rc = entry.blob->getSegment(status.ptr(), chunkCap, out_buf + total, &segLen);
+		if (status.failed())
+		{
+			setErrorFromStatus("fb_blob_get_segment: getSegment failed", status.ptr());
+			return -1;
+		}
+		total += segLen;
+		if (rc == IStatus::RESULT_NO_DATA)
+		{
+			entry.eof = true;
+			break;
+		}
+	}
+
+	if (actual_len_out)
+		*actual_len_out = total;
+
+	return (total == 0 && entry.eof) ? 1 : 0;
+}
+
+/**
+ * Close (or cancel when `cancel != 0`) an open BLOB handle. If `out_blob_id`
+ * is non-null, copies the 8-byte `ISC_QUAD` into `out_blob_id`.
+ * Returns 0 on success, non-zero on failure.
+ */
+FB_WASM_EXPORT
+int fb_blob_close(int blob_handle, int cancel, unsigned char* out_blob_id)
+{
+	clearError();
+	const auto it = g_blobs.find(blob_handle);
+	if (it == g_blobs.end())
+	{
+		setError("fb_blob_close: unknown blob handle");
+		return 1;
+	}
+
+	if (out_blob_id)
+		memcpy(out_blob_id, &it->second.blobId, sizeof(ISC_QUAD));
+
+	const bool ok = closeBlobEntry(it->second, cancel != 0);
+	g_blobs.erase(it);
 	return ok ? 0 : 2;
 }
 

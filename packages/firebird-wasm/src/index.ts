@@ -36,6 +36,12 @@ export {
   decodeFirebirdTriggerType,
   DEFAULT_MIGRATIONS_TABLE,
 } from './browser/schema';
+export {
+  isBlobHandle,
+  isBlobWritableStream,
+  DEFAULT_BLOB_SEGMENT_SIZE,
+  MAX_BLOB_SEGMENT_SIZE,
+} from './browser/blob-stream';
 export type { TypeOptions, Parser, Serializer } from './browser/value-types';
 export type { SqlTag, Statement } from './sql-tag';
 
@@ -70,6 +76,9 @@ export type {
   Migration,
   AppliedMigration,
   MigrateOptions,
+  BlobStreamOptions,
+  BlobHandle,
+  BlobWritableStream,
   MigrateResult,
   StatementKind,
   RowMode,

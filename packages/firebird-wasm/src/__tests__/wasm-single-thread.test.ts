@@ -763,4 +763,128 @@ describe('wasmGlueFile', () => {
       await db.close();
     }
   });
+
+  it('streams binary and text BLOBs in and out via createBlobStream() and openBlobStream()', async () => {
+    const db = new FirebirdBrowser('memory://st-blob-streams', {
+      transport: new DirectTransport({ threads: false }),
+      types: { binary: true },
+    });
+    try {
+      await db.exec(
+        'CREATE TABLE blob_files (id INTEGER NOT NULL PRIMARY KEY, name VARCHAR(60), bin_data BLOB SUB_TYPE BINARY, txt_data BLOB SUB_TYPE TEXT)',
+      );
+
+      // Build a 100 KB deterministic binary payload
+      const expectedBin = new Uint8Array(100 * 1024);
+      for (let i = 0; i < expectedBin.byteLength; i++) {
+        expectedBin[i] = (i * 31 + 7) & 0xff;
+      }
+
+      // 1. Inside an explicit transaction: pipe a ReadableStream into tx.createBlobStream()
+      await db.transaction(async (tx) => {
+        const binWritable = await tx.createBlobStream({ segmentSize: 8192 });
+        const sourceStream = createChunkedByteStream(expectedBin, 12000);
+        await sourceStream.pipeTo(binWritable);
+
+        expect(binWritable.byteLength).toBe(expectedBin.byteLength);
+        expect(binWritable.handle).not.toBeNull();
+
+        const txtWritable = await tx.createBlobStream({ segmentSize: 16 });
+        await txtWritable.writeChunk('Hello ');
+        await txtWritable.writeChunk('segmented ');
+        await txtWritable.writeChunk('Firebird BLOB!');
+        const txtHandle = await txtWritable.finish();
+        expect(txtHandle.byteLength).toBe(30);
+
+        // Read back from handle before inserting
+        const previewStream = await tx.openBlobStream(txtHandle, { segmentSize: 8 });
+        const previewChunks: Uint8Array[] = [];
+        const previewReader = previewStream.getReader();
+        for (;;) {
+          const { done, value } = await previewReader.read();
+          if (done) break;
+          previewChunks.push(value);
+        }
+        const previewBytes = new Uint8Array(previewChunks.reduce((n, c) => n + c.byteLength, 0));
+        let pPos = 0;
+        for (const c of previewChunks) {
+          previewBytes.set(c, pPos);
+          pPos += c.byteLength;
+        }
+        expect(new TextDecoder().decode(previewBytes)).toBe('Hello segmented Firebird BLOB!');
+
+        // Bind both the BlobWritableStream directly and the finalized BlobHandle
+        await tx.exec('INSERT INTO blob_files VALUES (?, ?, ?, ?)', [
+          1,
+          'first.bin',
+          binWritable,
+          txtHandle,
+        ]);
+      });
+
+      // 2. Read back the 100 KB binary BLOB via db.openBlobStream() in 16 KB segments
+      const readBinStream = await db.openBlobStream(
+        'SELECT bin_data, txt_data FROM blob_files WHERE id = ?',
+        [1],
+        { segmentSize: 16384, column: 'bin_data' },
+      );
+      const readChunks: Uint8Array[] = [];
+      const binReader = readBinStream.getReader();
+      for (;;) {
+        const { done, value } = await binReader.read();
+        if (done) break;
+        expect(value.byteLength).toBeLessThanOrEqual(16384);
+        readChunks.push(value);
+      }
+      expect(readChunks.length).toBeGreaterThanOrEqual(6);
+      const actualBin = new Uint8Array(readChunks.reduce((n, c) => n + c.byteLength, 0));
+      let offset = 0;
+      for (const c of readChunks) {
+        actualBin.set(c, offset);
+        offset += c.byteLength;
+      }
+      expect(actualBin).toEqual(expectedBin);
+
+      // 3. Read the text BLOB column by column index (1) and test early reader.cancel()
+      const readTxtStream = await db.openBlobStream(
+        'SELECT bin_data, txt_data FROM blob_files WHERE id = ?',
+        [1],
+        { segmentSize: 10, column: 1 },
+      );
+      const txtReader = readTxtStream.getReader();
+      const firstTxtChunk = await txtReader.read();
+      expect(firstTxtChunk.done).toBe(false);
+      expect(new TextDecoder().decode(firstTxtChunk.value)).toBe('Hello segm');
+      await txtReader.cancel();
+
+      // 4. Standalone db.createBlobStream() outside an explicit transaction
+      const standaloneBlob = await db.createBlobStream({ segmentSize: 4096 });
+      await standaloneBlob.writeChunk('Standalone BLOB payload');
+      await standaloneBlob.finish();
+      await db.exec('INSERT INTO blob_files VALUES (?, ?, ?, ?)', [
+        2,
+        'second.txt',
+        null,
+        standaloneBlob,
+      ]);
+
+      const checkRow2 = await db.query<{ TXT_DATA: string }>(
+        'SELECT txt_data FROM blob_files WHERE id = 2',
+      );
+      expect(checkRow2.rows).toEqual([{ TXT_DATA: 'Standalone BLOB payload' }]);
+
+      // Error cases: NULL blob, no rows, non-BLOB column
+      await expect(
+        db.openBlobStream('SELECT bin_data FROM blob_files WHERE id = 2'),
+      ).rejects.toThrow(/NULL/);
+      await expect(
+        db.openBlobStream('SELECT bin_data FROM blob_files WHERE id = 999'),
+      ).rejects.toThrow(/no rows/);
+      await expect(
+        db.openBlobStream('SELECT name FROM blob_files WHERE id = 1'),
+      ).rejects.toThrow(/not a BLOB|not BLOB/);
+    } finally {
+      await db.close();
+    }
+  });
 });

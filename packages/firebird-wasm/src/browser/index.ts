@@ -58,6 +58,12 @@ export {
   decodeFirebirdTriggerType,
   DEFAULT_MIGRATIONS_TABLE,
 } from './schema';
+export {
+  isBlobHandle,
+  isBlobWritableStream,
+  DEFAULT_BLOB_SEGMENT_SIZE,
+  MAX_BLOB_SEGMENT_SIZE,
+} from './blob-stream';
 export { extractReferencedTables, liveTableEventName, liveTableTriggerDDL } from './live-tables';
 export type { ScriptStatement } from './sql-script';
 
@@ -129,6 +135,9 @@ export type {
   Migration,
   AppliedMigration,
   MigrateOptions,
+  BlobStreamOptions,
+  BlobHandle,
+  BlobWritableStream,
   MigrateResult,
   StatementKind,
   RowMode,

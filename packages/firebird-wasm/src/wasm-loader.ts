@@ -240,6 +240,24 @@ export interface FirebirdWasmModule {
     sqlPtr: number,
   ): number;
   _fb_stmt_close?(stmtHandle: FbHandle): number;
+  _fb_blob_create?(dbHandle: FbHandle, txHandle: FbHandle, outBlobIdPtr: number): FbHandle;
+  _fb_blob_put_segment?(blobHandle: FbHandle, dataPtr: number, length: number): number;
+  _fb_blob_open_id?(dbHandle: FbHandle, txHandle: FbHandle, blobIdPtr: number): FbHandle;
+  _fb_blob_open_query?(
+    dbHandle: FbHandle,
+    txHandle: FbHandle,
+    sqlPtr: number,
+    paramsPtr: number,
+    paramsLength: number,
+    colIndex: number,
+  ): FbHandle;
+  _fb_blob_get_segment?(
+    blobHandle: FbHandle,
+    outBufPtr: number,
+    maxLength: number,
+    actualLengthOutPtr: number,
+  ): number;
+  _fb_blob_close?(blobHandle: FbHandle, cancel: number, outBlobIdPtr: number): number;
   _fb_events_subscribe(dbHandle: FbHandle, namesPtr: number): number;
   /**
    * Counts that have arrived since the last poll, as a JSON object keyed by

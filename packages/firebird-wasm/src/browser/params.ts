@@ -34,6 +34,7 @@
  */
 
 import type { QueryParams } from '../types';
+import { BLOB_INTERNAL_DATA, extractBlobHandle } from './blob-stream';
 
 /**
  * Render one parameter the way Firebird's string-to-type conversion expects.
@@ -116,9 +117,20 @@ interface EncodedParam {
   binary: { kind: number; value: bigint | number } | null;
   /** `text` holds the value's own bytes. */
   bytes?: boolean;
+  /** `text` holds an 8-byte Firebird `ISC_QUAD` BLOB ID created in the current transaction. */
+  blobId?: boolean;
 }
 
 function encodeOne(value: unknown, index: number, encoder: TextEncoder): EncodedParam {
+  if (value === null || value === undefined) return { text: null, binary: null };
+  const blobHandle = extractBlobHandle(value, index);
+  if (blobHandle) {
+    const staged = blobHandle[BLOB_INTERNAL_DATA]?.stagedBytes;
+    if (staged) {
+      return { text: staged, binary: null, bytes: true };
+    }
+    return { text: blobHandle.blobId, binary: null, blobId: true };
+  }
   if (value === null || value === undefined) return { text: null, binary: null };
   if (value instanceof Uint8Array) return { text: value, binary: null, bytes: true };
   if (value instanceof ArrayBuffer) return { text: new Uint8Array(value), binary: null, bytes: true };
@@ -134,7 +146,7 @@ function writeParams(out: Uint8Array, view: DataView, pos: number, encoded: Enco
   pos += 4;
 
   for (const p of encoded) {
-    out[pos++] = (p.text ? 0 : 1) | (p.binary ? 2 : 0) | (p.bytes ? 4 : 0);
+    out[pos++] = (p.text ? 0 : 1) | (p.binary ? 2 : 0) | (p.bytes ? 4 : 0) | (p.blobId ? 8 : 0);
     if (p.text) {
       view.setUint32(pos, p.text.length, true);
       pos += 4;

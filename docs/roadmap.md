@@ -1285,7 +1285,7 @@ With M7 shipped in `v0.12.0`, these are the next-horizon milestones for `v0.13.0
       the pending mutation log in a local `FB_WRITE_QUEUE$` table inside the
       Firebird database allows optimistic writes made while offline to survive
       page reloads and flush automatically when connectivity returns.
-- [ ] **Segmented BLOB streaming (`db.openBlobStream()` and `db.createBlobStream()`).**
+- [x] **Segmented BLOB streaming (`db.openBlobStream()` and `db.createBlobStream()`).**
       While standard `BLOB` columns bind and decode as `string` or `Uint8Array`,
       multi-megabyte binary blobs currently materialize whole in memory. Exposing
       `IBlob::getSegment` and `IBlob::putSegment` as Web `ReadableStream<Uint8Array>`

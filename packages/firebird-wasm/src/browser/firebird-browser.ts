@@ -36,6 +36,16 @@ import {
 import { extractReferencedTables, liveTableTriggerDDL } from './live-tables';
 import { ICU_LOCALE_DATA_PATH, isValidIcuDataPackage } from './icu-locales';
 import { introspect as introspectSchema, migrate as runMigrations } from './schema';
+import {
+  BLOB_INTERNAL_DATA,
+  type InternalBlobHandle,
+  buildBlobReadableStream,
+  buildBlobWritableStream,
+  createBlobHandle,
+  isBlobHandle,
+  resolveBlobColumnIndex,
+  resolveBlobSegmentSize,
+} from './blob-stream';
 import { hasTransactionOptions } from './isolation';
 import { applyTypes, applySerializers } from './value-types';
 import type { TypeOptions } from './value-types';
@@ -57,6 +67,9 @@ import type {
   SchemaIntrospection,
   Migration,
   MigrateOptions,
+  BlobStreamOptions,
+  BlobHandle,
+  BlobWritableStream,
   MigrateResult,
   QueryOptions,
   QueryStreamOptions,
@@ -1472,6 +1485,212 @@ export class FirebirdBrowser {
    * exists only in a browser, while this class also runs in Node against a
    * direct transport.
    */
+  /**
+   * Create a segmented writable BLOB stream (`WritableStream<Uint8Array>`)
+   * backed by Firebird `IBlob::putSegment`.
+   *
+   * Once closed (via `pipeTo()`, `writer.close()`, or `finish()`), the stream
+   * or its `.handle` can be bound directly as a parameter in `exec()` or
+   * `query()`.
+   */
+  async createBlobStream(
+    options: BlobStreamOptions = {},
+  ): Promise<BlobWritableStream> {
+    await this.ensureReady();
+    resolveBlobSegmentSize(options.segmentSize, true);
+
+    if (
+      typeof this.engine.blobCreate === 'function' &&
+      typeof this.engine.blobPutSegment === 'function' &&
+      typeof this.engine.blobClose === 'function'
+    ) {
+      const { blobHandle, blobId } = await this.engine.blobCreate(
+        this.dbHandle,
+        0,
+      );
+      return buildBlobWritableStream(
+        {
+          writeSegment: async (segment) => {
+            await this.engine.blobPutSegment!(blobHandle, segment);
+          },
+          close: async (totalBytes) => {
+            const finalId = await this.engine.blobClose!(blobHandle, false);
+            return createBlobHandle(
+              finalId.byteLength === 8 ? finalId : blobId,
+              totalBytes,
+            );
+          },
+          abort: async () => {
+            await this.engine
+              .blobClose!(blobHandle, true)
+              .catch(() => undefined);
+          },
+        },
+        options,
+      );
+    }
+
+    const chunks: Uint8Array[] = [];
+    return buildBlobWritableStream(
+      {
+        writeSegment: async (segment) => {
+          chunks.push(segment.slice());
+        },
+        close: async (totalBytes) => {
+          const stagedBytes = new Uint8Array(totalBytes);
+          let pos = 0;
+          for (const c of chunks) {
+            stagedBytes.set(c, pos);
+            pos += c.byteLength;
+          }
+          return createBlobHandle(new Uint8Array(8), totalBytes, {
+            stagedBytes,
+          });
+        },
+        abort: async () => {
+          chunks.length = 0;
+        },
+      },
+      options,
+    );
+  }
+
+  /**
+   * Open a Firebird `BLOB` column (from a `SELECT` query or a {@link BlobHandle})
+   * as a segmented Web `ReadableStream<Uint8Array>` backed by `IBlob::getSegment`.
+   */
+  async openBlobStream(
+    handle: BlobHandle,
+    options?: BlobStreamOptions,
+  ): Promise<ReadableStream<Uint8Array>>;
+  async openBlobStream(
+    sql: SqlFragment,
+    options?: BlobStreamOptions,
+  ): Promise<ReadableStream<Uint8Array>>;
+  async openBlobStream(
+    sql: string | SqlFragment,
+    params?: QueryParams | BlobStreamOptions,
+    options?: BlobStreamOptions,
+  ): Promise<ReadableStream<Uint8Array>>;
+  async openBlobStream(
+    sqlOrHandle: string | SqlFragment | BlobHandle,
+    paramsOrOptions: QueryParams | BlobStreamOptions = [],
+    maybeOptions: BlobStreamOptions = {},
+  ): Promise<ReadableStream<Uint8Array>> {
+    await this.ensureReady();
+
+    if (isBlobHandle(sqlOrHandle)) {
+      const opts = Array.isArray(paramsOrOptions) ? maybeOptions : paramsOrOptions;
+      resolveBlobSegmentSize(opts.segmentSize, false);
+    const stagingId = (sqlOrHandle as InternalBlobHandle)[BLOB_INTERNAL_DATA]?.stagedBytes;
+      const staged = stagingId;
+      if (staged || typeof this.engine.blobOpenId !== 'function') {
+        const bytes = staged ?? new Uint8Array(0);
+        let offset = 0;
+        return buildBlobReadableStream(
+          {
+            readSegment: async (maxBytes) => {
+              if (offset >= bytes.byteLength) return null;
+              const end = Math.min(offset + maxBytes, bytes.byteLength);
+              const slice = bytes.slice(offset, end);
+              offset = end;
+              return slice;
+            },
+            close: async () => undefined,
+          },
+          opts,
+        );
+      }
+
+      const blobHandle = await this.engine.blobOpenId(
+        this.dbHandle,
+        0,
+        sqlOrHandle.blobId,
+      );
+      return buildBlobReadableStream(
+        {
+          readSegment: (maxBytes) =>
+            this.engine.blobGetSegment!(blobHandle, maxBytes),
+          close: async () => {
+            await this.engine.blobClose!(blobHandle, false);
+          },
+        },
+        opts,
+      );
+    }
+
+    const { statement, options } = resolveQueryCall<BlobStreamOptions>(
+      sqlOrHandle,
+      paramsOrOptions,
+      maybeOptions,
+    );
+    resolveBlobSegmentSize(options.segmentSize, false);
+
+    let colIndex = 0;
+    if (options.column !== undefined) {
+      const desc = await this.describeQuery(statement.sql);
+      colIndex = resolveBlobColumnIndex(
+        options.column,
+        desc.fields.map((f) => f.name),
+      );
+    }
+
+    if (
+      typeof this.engine.blobOpenQuery === 'function' &&
+      typeof this.engine.blobGetSegment === 'function' &&
+      typeof this.engine.blobClose === 'function'
+    ) {
+      const blobHandle = await this.engine.blobOpenQuery(
+        this.dbHandle,
+        0,
+        statement.sql,
+        this.serialize(statement.params),
+        colIndex,
+      );
+      return buildBlobReadableStream(
+        {
+          readSegment: (maxBytes) =>
+            this.engine.blobGetSegment!(blobHandle, maxBytes),
+          close: async () => {
+            await this.engine.blobClose!(blobHandle, false);
+          },
+        },
+        options,
+      );
+    }
+
+    const res = await this.query(statement.sql, statement.params, {
+      rowMode: 'array',
+    });
+    if (res.rows.length === 0) {
+      throw new Error('openBlobStream: query returned no rows');
+    }
+    const cell = res.rows[0]![colIndex];
+    if (cell === null || cell === undefined) {
+      throw new Error('openBlobStream: BLOB column value is NULL');
+    }
+    const bytes =
+      cell instanceof Uint8Array
+        ? cell
+        : typeof cell === 'string'
+          ? new TextEncoder().encode(cell)
+          : new Uint8Array(0);
+    let offset = 0;
+    return buildBlobReadableStream(
+      {
+        readSegment: async (maxBytes) => {
+          if (offset >= bytes.byteLength) return null;
+          const end = Math.min(offset + maxBytes, bytes.byteLength);
+          const slice = bytes.slice(offset, end);
+          offset = end;
+          return slice;
+        },
+        close: async () => undefined,
+      },
+      options,
+    );
+  }
+
   async dumpDataDir(): Promise<Uint8Array> {
     await this.ensureReady();
     return this.engine.readFile(this.dbPath);
@@ -2226,6 +2445,225 @@ export class FirebirdBrowserTransaction {
   async describeQuery(sql: string | SqlFragment): Promise<QueryDescription> {
     this.assertUsable();
     return this.engine.describe(this.dbHandle, this.txHandle, toStatement(sql).sql);
+  }
+
+  /**
+   * Create a segmented writable BLOB stream (`WritableStream<Uint8Array>`)
+   * inside this transaction backed by Firebird `IBlob::putSegment`.
+   */
+  async createBlobStream(
+    options: BlobStreamOptions = {},
+  ): Promise<BlobWritableStream> {
+    this.assertUsable();
+    resolveBlobSegmentSize(options.segmentSize, true);
+
+    if (
+      typeof this.engine.blobCreate === 'function' &&
+      typeof this.engine.blobPutSegment === 'function' &&
+      typeof this.engine.blobClose === 'function'
+    ) {
+      const { blobHandle, blobId } = await this.engine.blobCreate(
+        this.dbHandle,
+        this.txHandle,
+      );
+      return buildBlobWritableStream(
+        {
+          writeSegment: async (segment) => {
+            this.assertUsable();
+            await this.engine.blobPutSegment!(blobHandle, segment);
+          },
+          close: async (totalBytes) => {
+            this.assertUsable();
+            const finalId = await this.engine.blobClose!(blobHandle, false);
+            return createBlobHandle(
+              finalId.byteLength === 8 ? finalId : blobId,
+              totalBytes,
+            );
+          },
+          abort: async () => {
+            if (!this.finished) {
+              await this.engine
+                .blobClose!(blobHandle, true)
+                .catch(() => undefined);
+            }
+          },
+        },
+        options,
+      );
+    }
+
+    const chunks: Uint8Array[] = [];
+    return buildBlobWritableStream(
+      {
+        writeSegment: async (segment) => {
+          this.assertUsable();
+          chunks.push(segment.slice());
+        },
+        close: async (totalBytes) => {
+          this.assertUsable();
+          const stagedBytes = new Uint8Array(totalBytes);
+          let pos = 0;
+          for (const c of chunks) {
+            stagedBytes.set(c, pos);
+            pos += c.byteLength;
+          }
+          return createBlobHandle(new Uint8Array(8), totalBytes, {
+            stagedBytes,
+          });
+        },
+        abort: async () => {
+          chunks.length = 0;
+        },
+      },
+      options,
+    );
+  }
+
+  /**
+   * Open a Firebird `BLOB` column (from a `SELECT` query or a {@link BlobHandle})
+   * inside this transaction as a segmented Web `ReadableStream<Uint8Array>`
+   * backed by `IBlob::getSegment`.
+   */
+  async openBlobStream(
+    handle: BlobHandle,
+    options?: BlobStreamOptions,
+  ): Promise<ReadableStream<Uint8Array>>;
+  async openBlobStream(
+    sql: SqlFragment,
+    options?: BlobStreamOptions,
+  ): Promise<ReadableStream<Uint8Array>>;
+  async openBlobStream(
+    sql: string | SqlFragment,
+    params?: QueryParams | BlobStreamOptions,
+    options?: BlobStreamOptions,
+  ): Promise<ReadableStream<Uint8Array>>;
+  async openBlobStream(
+    sqlOrHandle: string | SqlFragment | BlobHandle,
+    paramsOrOptions: QueryParams | BlobStreamOptions = [],
+    maybeOptions: BlobStreamOptions = {},
+  ): Promise<ReadableStream<Uint8Array>> {
+    this.assertUsable();
+
+    if (isBlobHandle(sqlOrHandle)) {
+      const opts = Array.isArray(paramsOrOptions) ? maybeOptions : paramsOrOptions;
+      resolveBlobSegmentSize(opts.segmentSize, false);
+    const stagingId = (sqlOrHandle as InternalBlobHandle)[BLOB_INTERNAL_DATA]?.stagedBytes;
+      const staged = stagingId;
+      if (staged || typeof this.engine.blobOpenId !== 'function') {
+        const bytes = staged ?? new Uint8Array(0);
+        let offset = 0;
+        return buildBlobReadableStream(
+          {
+            readSegment: async (maxBytes) => {
+              this.assertUsable();
+              if (offset >= bytes.byteLength) return null;
+              const end = Math.min(offset + maxBytes, bytes.byteLength);
+              const slice = bytes.slice(offset, end);
+              offset = end;
+              return slice;
+            },
+            close: async () => undefined,
+          },
+          opts,
+        );
+      }
+
+      const blobHandle = await this.engine.blobOpenId(
+        this.dbHandle,
+        this.txHandle,
+        sqlOrHandle.blobId,
+      );
+      return buildBlobReadableStream(
+        {
+          readSegment: async (maxBytes) => {
+            this.assertUsable();
+            return this.engine.blobGetSegment!(blobHandle, maxBytes);
+          },
+          close: async () => {
+            if (!this.finished) {
+              await this.engine.blobClose!(blobHandle, false);
+            }
+          },
+        },
+        opts,
+      );
+    }
+
+    const { statement, options } = resolveQueryCall<BlobStreamOptions>(
+      sqlOrHandle,
+      paramsOrOptions,
+      maybeOptions,
+    );
+    resolveBlobSegmentSize(options.segmentSize, false);
+
+    let colIndex = 0;
+    if (options.column !== undefined) {
+      const desc = await this.describeQuery(statement.sql);
+      colIndex = resolveBlobColumnIndex(
+        options.column,
+        desc.fields.map((f) => f.name),
+      );
+    }
+
+    if (
+      typeof this.engine.blobOpenQuery === 'function' &&
+      typeof this.engine.blobGetSegment === 'function' &&
+      typeof this.engine.blobClose === 'function'
+    ) {
+      const blobHandle = await this.engine.blobOpenQuery(
+        this.dbHandle,
+        this.txHandle,
+        statement.sql,
+        applySerializers(statement.params, this.types?.serializers),
+        colIndex,
+      );
+      return buildBlobReadableStream(
+        {
+          readSegment: async (maxBytes) => {
+            this.assertUsable();
+            return this.engine.blobGetSegment!(blobHandle, maxBytes);
+          },
+          close: async () => {
+            if (!this.finished) {
+              await this.engine.blobClose!(blobHandle, false);
+            }
+          },
+        },
+        options,
+      );
+    }
+
+    const res = await this.query(statement.sql, statement.params, {
+      rowMode: 'array',
+    });
+    if (res.rows.length === 0) {
+      throw new Error('openBlobStream: query returned no rows');
+    }
+    const cell = res.rows[0]![colIndex];
+    if (cell === null || cell === undefined) {
+      throw new Error('openBlobStream: BLOB column value is NULL');
+    }
+    const bytes =
+      cell instanceof Uint8Array
+        ? cell
+        : typeof cell === 'string'
+          ? new TextEncoder().encode(cell)
+          : new Uint8Array(0);
+    let offset = 0;
+    return buildBlobReadableStream(
+      {
+        readSegment: async (maxBytes) => {
+          this.assertUsable();
+          if (offset >= bytes.byteLength) return null;
+          const end = Math.min(offset + maxBytes, bytes.byteLength);
+          const slice = bytes.slice(offset, end);
+          offset = end;
+          return slice;
+        },
+        close: async () => undefined,
+      },
+      options,
+    );
   }
 
   /** Stream a SELECT inside this transaction in batches of `batchSize` rows. */

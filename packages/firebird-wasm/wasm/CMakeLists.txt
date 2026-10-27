@@ -461,6 +461,7 @@ set(FB_EXPORTED_FUNCTIONS
   _fb_create_database _fb_attach_database _fb_detach_database
   _fb_execute _fb_query _fb_execute_params _fb_query_params _fb_execute_batch _fb_free_result
   _fb_cursor_open _fb_cursor_fetch _fb_cursor_close
+  _fb_blob_create _fb_blob_put_segment _fb_blob_open_id _fb_blob_open_query _fb_blob_get_segment _fb_blob_close
   _fb_describe _fb_prepare _fb_stmt_close _fb_explain _fb_database_info _fb_sweep _fb_last_blobs _fb_last_blobs_size
   _fb_start_transaction _fb_start_transaction_ex _fb_commit _fb_rollback
   _fb_events_subscribe _fb_events_poll _fb_events_cancel

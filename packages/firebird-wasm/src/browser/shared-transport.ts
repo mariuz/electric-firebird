@@ -541,6 +541,61 @@ export class SharedEngineTransport implements EngineTransport {
     return this.call<void>('cursorClose', cursorHandle);
   }
 
+  blobCreate(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+  ): Promise<{ blobHandle: EngineHandle; blobId: Uint8Array }> {
+    return this.call<{ blobHandle: EngineHandle; blobId: Uint8Array }>(
+      'blobCreate',
+      dbHandle,
+      txHandle,
+    );
+  }
+
+  blobPutSegment(blobHandle: EngineHandle, segment: Uint8Array): Promise<void> {
+    return this.call<void>('blobPutSegment', blobHandle, segment);
+  }
+
+  blobOpenId(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    blobId: Uint8Array,
+  ): Promise<EngineHandle> {
+    return this.call<EngineHandle>('blobOpenId', dbHandle, txHandle, blobId);
+  }
+
+  blobOpenQuery(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    sql: string,
+    params: QueryParams = [],
+    colIndex = 0,
+  ): Promise<EngineHandle> {
+    return this.call<EngineHandle>(
+      'blobOpenQuery',
+      dbHandle,
+      txHandle,
+      sql,
+      params,
+      colIndex,
+    );
+  }
+
+  blobGetSegment(
+    blobHandle: EngineHandle,
+    maxLength: number,
+  ): Promise<Uint8Array | null> {
+    return this.call<Uint8Array | null>(
+      'blobGetSegment',
+      blobHandle,
+      maxLength,
+    );
+  }
+
+  blobClose(blobHandle: EngineHandle, cancel = false): Promise<Uint8Array> {
+    return this.call<Uint8Array>('blobClose', blobHandle, cancel);
+  }
+
   setSharedReads(dbHandle: EngineHandle, on: boolean): Promise<void> {
     return this.call<void>('setSharedReads', dbHandle, on);
   }

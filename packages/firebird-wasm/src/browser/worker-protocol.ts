@@ -22,6 +22,12 @@ export type EngineOp =
   | 'cursorOpen'
   | 'cursorFetch'
   | 'cursorClose'
+  | 'blobCreate'
+  | 'blobPutSegment'
+  | 'blobOpenId'
+  | 'blobOpenQuery'
+  | 'blobGetSegment'
+  | 'blobClose'
   | 'describe'
   | 'explain'
   | 'databaseInfo'
@@ -57,7 +63,7 @@ export interface EngineResponse {
   id: number;
   ok: boolean;
   /** Present when `ok`. */
-  result?: EngineHandle | number | boolean | string | Uint8Array | QueryResult<Row> | DatabaseInfo | SweepResult | null;
+  result?: EngineHandle | number | boolean | string | Uint8Array | { blobHandle: EngineHandle; blobId: Uint8Array } | QueryResult<Row> | DatabaseInfo | SweepResult | null;
   /**
    * Present when not `ok`.  A string rather than an Error because structured
    * cloning drops the prototype and the stack is the Worker's, not the
