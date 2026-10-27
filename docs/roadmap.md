@@ -1347,6 +1347,52 @@ With M0–M8 complete, these are the next-horizon milestones for `v0.14.0`:
       callbacks inspecting `before` and current server state) when flushing
       offline mutations after reconnect.
 
+### M10 — JS UDRs, Vector Search, Direct OPFS VFS, Encryption at Rest & Observability
+
+Next-horizon milestones for `v0.15.0`:
+
+- [ ] **JavaScript User-Defined Functions & Procedures (`db.registerFunction` / `db.registerProcedure`).**
+      Register a static `"JS"` `IExternalEngine` plugin in `fb_wasm_api.cpp` so
+      applications can register JavaScript functions and procedures callable
+      directly inside SQL `SELECT`, `WHERE`, and `COMPUTED BY` expressions.
+- [ ] **Client-Side Vector Similarity & Hybrid Search (`firebird-wasm/vector`).**
+      Provide `cosineDistance`, `l2Distance`, and `dotProduct` over packed
+      `Float32Array` embeddings stored in `BINARY(N)` / `BLOB` columns for
+      local semantic search and RAG in the browser and Node.
+- [ ] **Direct Page-Level OPFS VFS (`FileSystemSyncAccessHandle` in Worker PIO).**
+      Mount an Emscripten custom filesystem backend backed directly by
+      `FileSystemSyncAccessHandle.read()` / `.write()` at offset inside the Web
+      Worker so large `.fdb` databases (500 MB–2 GB+) run without holding the
+      entire database image in WASM `MEMFS` RAM.
+- [ ] **Encrypted Local Databases at Rest (`WebCrypto` AES-GCM page encryption for `idb://` & `opfs://`).**
+      Add an optional `encryptionKey: CryptoKey | Uint8Array` option to
+      `IndexedDBVFS` and `OPFSVFS` that encrypts 8 KB database pages with
+      AES-256-GCM before persisting to IndexedDB or OPFS.
+- [ ] **Point-in-Time Snapshots & Branching (`db.snapshot()` / `db.restoreSnapshot()`).**
+      Allow taking lightweight copy-on-write page snapshots in `IndexedDBVFS` /
+      `OPFSVFS` so browser sessions and tests can checkpoint database state,
+      run migrations or previews, and roll back instantaneously.
+- [ ] **Cross-Tab Reactive Live Queries (`BroadcastChannel` + `POST_EVENT` bridge).**
+      Automatically broadcast table-level `FB_LIVE$<table>` invalidations across
+      same-origin browser tabs so `useLiveQuery()` updates across all open tabs
+      when any tab commits writes.
+- [ ] **Filtered `WHERE` Pushdown in `firebird-wasm/electric-server`.**
+      Push parameterized `WHERE` predicates down into both the initial snapshot
+      query and the `ELECTRIC_CHANGES` / base-table join in `createShapeServer`
+      to reduce network and memory overhead for multi-tenant shape servers.
+- [ ] **Multi-Table Transactional Sync (`syncShapes` atomic batching across shapes).**
+      Coordinate initial snapshots and live `up-to-date` boundaries across
+      related tables in `firebird-wasm/electric` so foreign-key relationships
+      stay consistent during multi-shape sync.
+- [ ] **Query Profiler & `MON$` Telemetry Hook (`db.onQuery(listener)` & `db.monitorStats()`).**
+      Expose structured query timing, prepare-cache hit/miss rates, and page
+      reads/writes/fetches/marks (`isc_info_reads`, `isc_info_writes`,
+      `isc_info_fetches`, `isc_info_marks`), plus a `Profiler` tab in
+      `<firebird-repl>`.
+- [ ] **Svelte 5 Runes & SolidJS Reactive Adapters (`firebird-wasm/svelte`, `firebird-wasm/solid`).**
+      Complement `firebird-wasm/react` and `firebird-wasm/vue` with reactive
+      `createLiveQuery` helpers for Svelte and SolidJS.
+
 ---
 
 ## 5. Test coverage added alongside this review
