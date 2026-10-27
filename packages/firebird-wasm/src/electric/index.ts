@@ -35,7 +35,7 @@ import type { ElectricSchema } from './values';
 export { tableFromSchema, checkSchema, toFirebird, firebirdColumn, firebirdName } from './values';
 export type { ElectricSchema, ElectricColumn } from './values';
 export type { ElectricTransaction } from './apply';
-export { createWriteQueue, WriteRejected } from './writes';
+export { createWriteQueue, WriteRejected, DEFAULT_WRITE_QUEUE_TABLE } from './writes';
 export type { WriteQueue, WriteQueueOptions, LocalWrite, SendResult, WritesDatabase } from './writes';
 import type { WriteQueue } from './writes';
 import { writeKeyText } from './writes';

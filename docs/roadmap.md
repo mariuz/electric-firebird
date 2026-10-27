@@ -1279,7 +1279,7 @@ With M7 shipped in `v0.12.0`, these are the next-horizon milestones for `v0.13.0
       OIT/OAT counters and reclaimed pages) plus a `Sweep` action in
       `<firebird-repl>` lets applications trigger immediate garbage collection
       and advance OIT on demand.
-- [ ] **Durable offline write queue for Electric sync (`createWriteQueue` persistence).**
+- [x] **Durable offline write queue for Electric sync (`createWriteQueue` persistence).**
       `createWriteQueue` in `firebird-wasm/electric` currently keeps pending
       optimistic mutations in memory during a single page session. Persisting
       the pending mutation log in a local `FB_WRITE_QUEUE$` table inside the

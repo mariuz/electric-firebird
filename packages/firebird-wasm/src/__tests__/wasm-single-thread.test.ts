@@ -20,6 +20,7 @@ import { FirebirdBrowser } from '../browser/firebird-browser';
 import { DirectTransport } from '../browser/engine-transport';
 import { buildIcuLocalePack, ICU_LOCALE_DATA_PATH } from '../browser/icu-locales';
 import { compressGzipStream, createChunkedByteStream } from '../browser/data-stream';
+import { createWriteQueue, WriteRejected, DEFAULT_WRITE_QUEUE_TABLE } from '../electric';
 
 const ST_JS_PATH = path.resolve(__dirname, '../../dist/wasm/firebird-embedded-st.js');
 const hasSingleThread = fs.existsSync(ST_JS_PATH);
@@ -624,6 +625,140 @@ describe('wasmGlueFile', () => {
       expect(sweepRes.oitAdvanced).toBeGreaterThanOrEqual(0);
       expect(sweepRes.gapReduced).toBeGreaterThanOrEqual(0);
       expect(sweepRes.durationMs).toBeGreaterThanOrEqual(0);
+    } finally {
+      await db.close();
+    }
+  });
+
+  it('persists offline optimistic writes in FB_WRITE_QUEUE$, survives reload, and rolls back rejected or discarded mutations', async () => {
+    const db = new FirebirdBrowser('memory://st-write-queue', { transport: new DirectTransport({ threads: false }) });
+    try {
+      await db.exec('CREATE TABLE todos (id INTEGER NOT NULL PRIMARY KEY, title VARCHAR(80), done BOOLEAN)');
+      await db.exec("INSERT INTO todos VALUES (1, 'Initial task', FALSE)");
+
+      const sent1: Array<{ id: number; operation: string; value: Record<string, unknown> }> = [];
+      // Start offline (paused: true) and record mutations into FB_WRITE_QUEUE$
+      const queue1 = await createWriteQueue(db, {
+        tableName: DEFAULT_WRITE_QUEUE_TABLE,
+        paused: true,
+        autoFlushOnOnline: false,
+        send: async (w) => {
+          sent1.push({ id: w.id, operation: w.operation, value: w.value });
+        },
+      });
+
+      expect(queue1.paused).toBe(true);
+      const wInsert = await queue1.insert('todos', { id: 2, title: 'Offline task', done: false });
+      const wUpdate = await queue1.update('todos', { id: 1 }, { title: 'Updated offline', done: true });
+      expect(wInsert.id).toBe(1);
+      expect(wUpdate.id).toBe(2);
+      expect(sent1).toHaveLength(0);
+
+      // Optimistic mutations are immediately visible locally
+      const afterOffline = await db.query<{ ID: number; TITLE: string; DONE: boolean }>(
+        'SELECT id, title, done FROM todos ORDER BY id',
+      );
+      expect(afterOffline.rows).toEqual([
+        { ID: 1, TITLE: 'Updated offline', DONE: true },
+        { ID: 2, TITLE: 'Offline task', DONE: false },
+      ]);
+
+      // Introspect hides FB_WRITE_QUEUE$ by default, and includes it with includeInternal: true
+      const userSchema = await db.introspect();
+      expect(userSchema.tables.map((t) => t.name)).toEqual(['TODOS']);
+      const fullSchema = await db.introspect({ includeInternal: true });
+      expect(fullSchema.tables.map((t) => t.name)).toContain(DEFAULT_WRITE_QUEUE_TABLE);
+
+      // Simulate page reload while offline: close queue1 without flushing
+      await queue1.close();
+
+      // Re-attach a new WriteQueue on the same database when connectivity returns
+      const flushedBatches: number[][] = [];
+      const sent2: Array<{ id: number; operation: string }> = [];
+      let rejectWriteId: number | null = null;
+      const rejectedWriteIds: number[] = [];
+
+      const queue2 = await createWriteQueue(db, {
+        tableName: DEFAULT_WRITE_QUEUE_TABLE,
+        paused: true,
+        autoFlushOnOnline: false,
+        send: async (w) => {
+          if (w.id === rejectWriteId) {
+            throw new WriteRejected('Server rejected mutation');
+          }
+          sent2.push({ id: w.id, operation: w.operation });
+        },
+        onError: (err, w) => {
+          if (err instanceof WriteRejected) {
+            rejectedWriteIds.push(w.id);
+          }
+        },
+        onFlush: (batch) => {
+          flushedBatches.push(batch.map((b) => b.id));
+        },
+      });
+
+      // Pending mutations survived in FB_WRITE_QUEUE$ across reload
+      const pendingBeforeResume = await queue2.pending();
+      expect(pendingBeforeResume.map((w) => ({ id: w.id, operation: w.operation }))).toEqual([
+        { id: 1, operation: 'insert' },
+        { id: 2, operation: 'update' },
+      ]);
+
+      // Resume online delivery and verify automatic flush
+      queue2.resume();
+      expect(queue2.paused).toBe(false);
+      await queue2.flush();
+      expect(sent2).toEqual([
+        { id: 1, operation: 'insert' },
+        { id: 2, operation: 'update' },
+      ]);
+      expect(flushedBatches).toEqual([[1, 2]]);
+      expect((await queue2.pending()).map((w) => w.id)).toEqual([1, 2]);
+
+      // Test pre-image rollback on WriteRejected
+      queue2.pause();
+      const badUpdate = await queue2.update('todos', { id: 1 }, { title: 'Rejected title', done: false });
+      rejectWriteId = badUpdate.id;
+      queue2.resume();
+      await queue2.flush();
+
+      expect(rejectedWriteIds).toEqual([badUpdate.id]);
+      // Row 1 rolled back to its pre-image ('Updated offline', true)
+      const afterReject = await db.query<{ ID: number; TITLE: string; DONE: boolean }>(
+        'SELECT id, title, done FROM todos WHERE id = 1',
+      );
+      expect(afterReject.rows).toEqual([{ ID: 1, TITLE: 'Updated offline', DONE: true }]);
+
+      // Test discard(id) and clear() while paused
+      queue2.pause();
+      const delWrite = await queue2.delete('todos', { id: 2 });
+      expect((await db.query('SELECT id FROM todos WHERE id = 2')).rows).toEqual([]);
+
+      const discarded = await queue2.discard(delWrite.id);
+      expect(discarded).toBe(true);
+      // Row 2 restored after discarding the queued delete
+      const restoredRow = await db.query<{ ID: number; TITLE: string; DONE: boolean }>(
+        'SELECT id, title, done FROM todos WHERE id = 2',
+      );
+      expect(restoredRow.rows).toEqual([{ ID: 2, TITLE: 'Offline task', DONE: false }]);
+
+      await queue2.insert('todos', { id: 3, title: 'Temp task', done: false });
+      await queue2.update('todos', { id: 2 }, { title: 'Temp edit' });
+      const clearedCount = await queue2.clear();
+      // Clears both the 2 sent-unconfirmed writes (1, 2) and the 2 new paused writes
+      expect(clearedCount).toBe(4);
+      expect(await queue2.pending()).toEqual([]);
+
+      // Clearing all unconfirmed writes restores todos to the initial state before write #1 and #2
+      const finalRows = await db.query<{ ID: number; TITLE: string; DONE: boolean }>(
+        'SELECT id, title, done FROM todos ORDER BY id',
+      );
+      expect(finalRows.rows).toEqual([
+        { ID: 1, TITLE: 'Initial task', DONE: false },
+      ]);
+
+      await queue2.close();
     } finally {
       await db.close();
     }
