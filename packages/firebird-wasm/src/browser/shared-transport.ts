@@ -32,6 +32,7 @@ import type {
   QueryResult,
   QueryDescription,
   DatabaseInfo,
+  SweepResult,
   QueryParams,
   RowMode,
   TransactionOptions,
@@ -153,6 +154,7 @@ const MUTATING: ReadonlySet<SharedOp> = new Set<SharedOp>([
   'commit',
   'createDatabase',
   'writeFile',
+  'sweep',
 ]);
 
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -562,6 +564,10 @@ export class SharedEngineTransport implements EngineTransport {
 
   databaseInfo(dbHandle: EngineHandle): Promise<DatabaseInfo> {
     return this.call<DatabaseInfo>('databaseInfo', dbHandle);
+  }
+
+  sweep(dbHandle: EngineHandle): Promise<SweepResult> {
+    return this.call<SweepResult>('sweep', dbHandle);
   }
 
   prepare(

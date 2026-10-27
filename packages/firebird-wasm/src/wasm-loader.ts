@@ -233,6 +233,7 @@ export interface FirebirdWasmModule {
    * on failure.  Released with `_fb_free_result`.
    */
   _fb_database_info?(dbHandle: FbHandle): number;
+  _fb_sweep?(dbHandle: FbHandle): number;
   _fb_prepare?(
     dbHandle: FbHandle,
     txHandle: FbHandle,

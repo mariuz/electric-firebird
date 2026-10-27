@@ -26,6 +26,7 @@ import type {
   QueryResult,
   QueryDescription,
   DatabaseInfo,
+  SweepResult,
   FieldInfo,
   QueryParams,
   RowMode,
@@ -134,6 +135,8 @@ export interface EngineTransport {
   /** Return the execution plan for `sql` (`IStatement::getPlan`) without executing it. */
   /** Return database storage, ODS, memory pool, I/O, and OIT/OAT/OST transaction health diagnostics. */
   databaseInfo?(dbHandle: EngineHandle): Promise<DatabaseInfo>;
+  /** Trigger an immediate garbage-collection sweep and return before/after diagnostics. */
+  sweep?(dbHandle: EngineHandle): Promise<SweepResult>;
   prepare?(
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
@@ -603,6 +606,25 @@ export function normalizeDatabaseInfo(raw: Partial<DatabaseInfo>): DatabaseInfo 
 /** Decode what `fb_database_info` reports about a database. */
 export function decodeDatabaseInfo(json: string): DatabaseInfo {
   return normalizeDatabaseInfo(JSON.parse(json) as Partial<DatabaseInfo>);
+}
+
+/** Build a {@link SweepResult} comparing before/after {@link DatabaseInfo} snapshots. */
+export function buildSweepResult(
+  before: DatabaseInfo,
+  after: DatabaseInfo,
+  tablesScanned: number,
+  durationMs: number,
+): SweepResult {
+  const oitAdvanced = Math.max(0, after.oldestTransaction - before.oldestTransaction);
+  const gapReduced = Math.max(0, before.transactionGap - after.transactionGap);
+  return {
+    before,
+    after,
+    tablesScanned,
+    oitAdvanced,
+    gapReduced,
+    durationMs: Math.max(0, durationMs),
+  };
 }
 
 /** Decode what `fb_describe` reports about a statement. */
@@ -1229,6 +1251,53 @@ export class DirectTransport implements EngineTransport {
     const json = mod.UTF8ToString(resultPtr);
     mod._fb_free_result(resultPtr);
     return decodeDatabaseInfo(json);
+  }
+
+  async sweep(dbHandle: EngineHandle): Promise<SweepResult> {
+    const started = performance.now();
+    const before = await this.databaseInfo(dbHandle);
+    const mod = this.module;
+
+    // 1. Scan all user tables to trigger cooperative garbage collection of
+    //    old record versions on data pages.
+    let tablesScanned = 0;
+    try {
+      const relRes = await this.query<Record<string, unknown>>(
+        dbHandle,
+        0,
+        'SELECT TRIM(RDB$RELATION_NAME) AS REL FROM RDB$RELATIONS ' +
+          'WHERE COALESCE(RDB$SYSTEM_FLAG, 0) = 0 AND RDB$VIEW_BLR IS NULL ' +
+          'ORDER BY RDB$RELATION_NAME',
+      );
+      for (const row of relRes.rows) {
+        const rel = String(row['REL'] ?? row['rel'] ?? '').trim();
+        if (!rel) continue;
+        const escaped = rel.replace(/"/g, '""');
+        await this.query(dbHandle, 0, `SELECT COUNT(*) AS C FROM "${escaped}"`);
+        tablesScanned += 1;
+      }
+    } catch {
+      // Ignore table scan errors during sweep if a relation is inaccessible.
+    }
+
+    // 2. Run native DPB sweep (`isc_dpb_sweep = isc_dpb_records`) when
+    //    exported by the WASM bridge to advance OIT.
+    if (typeof mod._fb_sweep === 'function') {
+      const rc = mod._fb_sweep(dbHandle);
+      if (rc !== 0) {
+        throw engineError(mod, 'Database sweep failed', rc);
+      }
+    } else {
+      // Fallback for older WASM binaries without `_fb_sweep`: commit a fresh
+      // transaction so OAT/OST move forward.
+      const tx = await this.startTransaction(dbHandle, {
+        isolationLevel: 'READ_COMMITTED',
+      });
+      await this.commit(tx);
+    }
+
+    const after = await this.databaseInfo(dbHandle);
+    return buildSweepResult(before, after, tablesScanned, performance.now() - started);
   }
 
   private async fallbackDatabaseInfo(dbHandle: EngineHandle): Promise<DatabaseInfo> {

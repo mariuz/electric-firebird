@@ -6,6 +6,7 @@ import {
   introspect,
   migrate,
 } from '../browser/schema';
+import { buildSweepResult, normalizeDatabaseInfo } from '../browser/engine-transport';
 import type {
   MigratableDatabase,
   Migration,
@@ -581,5 +582,36 @@ describe('schema introspection & migrations (unit)', () => {
     await expect(
       migrate(db, [], { tableName: 'bad table; DROP TABLE x' }),
     ).rejects.toThrow(/Invalid migrations table name/);
+  });
+
+  it('computes OIT advancement and transactionGap reduction in buildSweepResult()', () => {
+    const before = normalizeDatabaseInfo({
+      pageSize: 8192,
+      allocatedPages: 300,
+      odsVersion: 14,
+      odsMinorVersion: 0,
+      oldestTransaction: 10,
+      oldestActive: 12,
+      oldestSnapshot: 12,
+      nextTransaction: 42,
+    });
+    const after = normalizeDatabaseInfo({
+      pageSize: 8192,
+      allocatedPages: 300,
+      odsVersion: 14,
+      odsMinorVersion: 0,
+      oldestTransaction: 40,
+      oldestActive: 41,
+      oldestSnapshot: 41,
+      nextTransaction: 43,
+    });
+
+    const sweep = buildSweepResult(before, after, 3, 12.5);
+    expect(sweep.tablesScanned).toBe(3);
+    expect(sweep.oitAdvanced).toBe(30);
+    expect(sweep.gapReduced).toBe(28);
+    expect(sweep.durationMs).toBe(12.5);
+    expect(sweep.before).toEqual(before);
+    expect(sweep.after).toEqual(after);
   });
 });

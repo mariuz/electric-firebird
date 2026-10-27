@@ -25,7 +25,7 @@
 
 import { splitStatements } from '../browser/sql-script';
 import type { ScriptStatement } from '../browser/sql-script';
-import type { ArrayRow, DatabaseInfo, ExplainOptions, FieldInfo, QueryResult } from '../types';
+import type { ArrayRow, DatabaseInfo, ExplainOptions, FieldInfo, QueryResult, SweepResult } from '../types';
 
 /** What the console needs of a database: `FirebirdBrowser` has it. */
 export interface ReplDatabase {
@@ -36,6 +36,8 @@ export interface ReplDatabase {
   explain?(sql: string, options?: ExplainOptions): Promise<string>;
   /** Inspect database diagnostics and transaction counters. */
   databaseInfo?(): Promise<DatabaseInfo>;
+  /** Trigger an immediate garbage-collection sweep and return before/after diagnostics. */
+  sweep?(): Promise<SweepResult>;
   /**
    * For a statement without rows: a transaction's `exec()` runs exactly one
    * statement and reports what it changed.  (`FirebirdBrowser.exec()` would
@@ -56,6 +58,7 @@ export interface ReplEntry {
   affectedRows?: number;
   plan?: string;
   info?: DatabaseInfo;
+  sweep?: SweepResult;
   error?: Error;
 }
 
@@ -71,6 +74,8 @@ export interface FirebirdReplElement extends HTMLElement {
   explain(script?: string, options?: ExplainOptions): Promise<ReplEntry[]>;
   /** Inspect database diagnostics and OIT/OAT transaction health; resolves with the info entry. */
   info(): Promise<ReplEntry | undefined>;
+  /** Run an immediate garbage-collection sweep and display before/after OIT/OAT counters. */
+  sweep(): Promise<ReplEntry | undefined>;
   /** Empty the output. */
   clear(): void;
 }
@@ -138,6 +143,7 @@ export function defineFirebirdRepl(tag = 'firebird-repl'): { new (): FirebirdRep
     private readonly button: HTMLButtonElement;
     private readonly explainButton: HTMLButtonElement;
     private readonly infoButton: HTMLButtonElement;
+    private readonly sweepButton: HTMLButtonElement;
     private readonly history: string[] = [];
     /** Position in `history` while walking it; `history.length` is the draft. */
     private cursor = 0;
@@ -171,12 +177,18 @@ export function defineFirebirdRepl(tag = 'firebird-repl'): { new (): FirebirdRep
       this.infoButton.className = 'info';
       this.infoButton.textContent = 'Info';
       this.infoButton.title = 'Inspect database diagnostics and transaction counters';
-      input.append(this.editor, this.infoButton, this.explainButton, this.button);
+      this.sweepButton = document.createElement('button');
+      this.sweepButton.type = 'button';
+      this.sweepButton.className = 'sweep';
+      this.sweepButton.textContent = 'Sweep';
+      this.sweepButton.title = 'Run garbage-collection sweep and advance OIT';
+      input.append(this.editor, this.sweepButton, this.infoButton, this.explainButton, this.button);
       root.append(style, this.output, input);
 
       this.button.addEventListener('click', () => void this.run());
       this.explainButton.addEventListener('click', (event) => void this.explain(undefined, { detailed: event.shiftKey }));
       this.infoButton.addEventListener('click', () => void this.info());
+      this.sweepButton.addEventListener('click', () => void this.sweep());
       this.editor.addEventListener('keydown', (event) => this.onKey(event));
 
       // A property set before the element was defined (React and Vue both
@@ -227,6 +239,7 @@ export function defineFirebirdRepl(tag = 'firebird-repl'): { new (): FirebirdRep
       this.button.disabled = true;
       this.explainButton.disabled = true;
       this.infoButton.disabled = true;
+      this.sweepButton.disabled = true;
       if (this.history[this.history.length - 1] !== text) this.history.push(text);
       this.cursor = this.history.length;
       this.draft = '';
@@ -269,6 +282,7 @@ export function defineFirebirdRepl(tag = 'firebird-repl'): { new (): FirebirdRep
         this.button.disabled = false;
         this.explainButton.disabled = false;
         this.infoButton.disabled = false;
+        this.sweepButton.disabled = false;
       }
       this.dispatchEvent(new CustomEvent('firebird-repl-run', { detail: entries, bubbles: true, composed: true }));
       return entries;
@@ -296,6 +310,7 @@ export function defineFirebirdRepl(tag = 'firebird-repl'): { new (): FirebirdRep
       this.button.disabled = true;
       this.explainButton.disabled = true;
       this.infoButton.disabled = true;
+      this.sweepButton.disabled = true;
       if (this.history[this.history.length - 1] !== text) this.history.push(text);
       this.cursor = this.history.length;
 
@@ -328,6 +343,7 @@ export function defineFirebirdRepl(tag = 'firebird-repl'): { new (): FirebirdRep
         this.button.disabled = false;
         this.explainButton.disabled = false;
         this.infoButton.disabled = false;
+        this.sweepButton.disabled = false;
       }
       this.dispatchEvent(
         new CustomEvent('firebird-repl-explain', {
@@ -360,6 +376,7 @@ export function defineFirebirdRepl(tag = 'firebird-repl'): { new (): FirebirdRep
       this.button.disabled = true;
       this.explainButton.disabled = true;
       this.infoButton.disabled = true;
+      this.sweepButton.disabled = true;
       const started = performance.now();
       const entry: ReplEntry = { sql: 'DATABASE INFO', line: 1, ms: 0 };
       try {
@@ -372,10 +389,58 @@ export function defineFirebirdRepl(tag = 'firebird-repl'): { new (): FirebirdRep
         this.button.disabled = false;
         this.explainButton.disabled = false;
         this.infoButton.disabled = false;
+        this.sweepButton.disabled = false;
       }
       this.show(entry);
       this.dispatchEvent(
         new CustomEvent('firebird-repl-info', {
+          detail: entry,
+          bubbles: true,
+          composed: true,
+        }),
+      );
+      return entry;
+    }
+
+    async sweep(): Promise<ReplEntry | undefined> {
+      if (this.busy) return undefined;
+      if (!this.db || typeof this.db.sweep !== 'function') {
+        const entry: ReplEntry = {
+          sql: 'SWEEP DATABASE',
+          line: 1,
+          ms: 0,
+          error: new Error(
+            !this.db
+              ? 'No database: set the element’s db property first'
+              : 'Database does not support sweep()',
+          ),
+        };
+        this.show(entry);
+        return entry;
+      }
+
+      this.busy = true;
+      this.button.disabled = true;
+      this.explainButton.disabled = true;
+      this.infoButton.disabled = true;
+      this.sweepButton.disabled = true;
+      const started = performance.now();
+      const entry: ReplEntry = { sql: 'SWEEP DATABASE', line: 1, ms: 0 };
+      try {
+        entry.sweep = await this.db.sweep();
+      } catch (err) {
+        entry.error = asError(err);
+      } finally {
+        entry.ms = performance.now() - started;
+        this.busy = false;
+        this.button.disabled = false;
+        this.explainButton.disabled = false;
+        this.infoButton.disabled = false;
+        this.sweepButton.disabled = false;
+      }
+      this.show(entry);
+      this.dispatchEvent(
+        new CustomEvent('firebird-repl-sweep', {
           detail: entry,
           bubbles: true,
           composed: true,
@@ -455,6 +520,25 @@ export function defineFirebirdRepl(tag = 'firebird-repl'): { new (): FirebirdRep
             ),
           );
         }
+        if (entry.sweep !== undefined) {
+          const s = entry.sweep;
+          block.append(
+            table(
+              [{ name: 'Metric' }, { name: 'Value' }],
+              [
+                ['Tables scanned', s.tablesScanned],
+                ['OIT (before → after)', `${s.before.oldestTransaction} → ${s.after.oldestTransaction}`],
+                ['OAT (before → after)', `${s.before.oldestActive} → ${s.after.oldestActive}`],
+                ['OST (before → after)', `${s.before.oldestSnapshot} → ${s.after.oldestSnapshot}`],
+                ['Next transaction', `${s.before.nextTransaction} → ${s.after.nextTransaction}`],
+                ['Transaction gap (before → after)', `${s.before.transactionGap} → ${s.after.transactionGap}`],
+                ['OIT advanced', s.oitAdvanced],
+                ['Gap reduced', s.gapReduced],
+                ['Allocated pages (before → after)', `${s.before.allocatedPages} → ${s.after.allocatedPages}`],
+              ],
+            ),
+          );
+        }
         const meta = el('p', 'meta');
         meta.textContent = `${summary(entry, fields.length > 0)} · ${entry.ms.toFixed(1)} ms`;
         block.append(meta);
@@ -482,6 +566,7 @@ function asError(err: unknown): Error {
 function summary(entry: ReplEntry, returnsRows: boolean): string {
   if (entry.plan !== undefined) return 'plan';
   if (entry.info !== undefined) return 'info';
+  if (entry.sweep !== undefined) return 'sweep';
   if (returnsRows) {
     const n = entry.rows?.length ?? 0;
     return `${n} ${n === 1 ? 'row' : 'rows'}`;

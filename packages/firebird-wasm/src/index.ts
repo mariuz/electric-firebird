@@ -51,6 +51,7 @@ export type {
   QueryDescription,
   ExplainOptions,
   DatabaseInfo,
+  SweepResult,
   PreparedStatement,
   DataStreamOptions,
   IntrospectOptions,

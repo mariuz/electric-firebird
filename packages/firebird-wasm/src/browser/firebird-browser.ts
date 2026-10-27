@@ -24,7 +24,7 @@
 
 import { IndexedDBVFS } from './indexeddb-vfs';
 import type { IndexedDBVFSOptions } from './indexeddb-vfs';
-import { DirectTransport } from './engine-transport';
+import { DirectTransport, buildSweepResult } from './engine-transport';
 import type { EngineHandle, EngineTransport } from './engine-transport';
 import { WorkerTransport } from './worker-transport';
 import { splitStatements } from './sql-script';
@@ -50,6 +50,7 @@ import type {
   QueryDescription,
   ExplainOptions,
   DatabaseInfo,
+  SweepResult,
   PreparedStatement,
   DataStreamOptions,
   IntrospectOptions,
@@ -1217,6 +1218,43 @@ export class FirebirdBrowser {
       throw new Error('The configured EngineTransport does not support databaseInfo()');
     }
     return this.engine.databaseInfo(this.dbHandle);
+  }
+
+  /**
+   * Trigger an immediate database garbage-collection sweep (`isc_dpb_sweep =
+   * isc_dpb_records` and cooperative user-table scan), advancing OIT and
+   * returning before/after {@link DatabaseInfo} diagnostics.
+   */
+  async sweep(): Promise<SweepResult> {
+    await this.ensureReady();
+    if (typeof this.engine.sweep === 'function') {
+      const result = await this.engine.sweep(this.dbHandle);
+      this.markDirty();
+      return result;
+    }
+
+    const started = performance.now();
+    const before = await this.databaseInfo();
+    let tablesScanned = 0;
+    try {
+      const relRes = await this.query<Record<string, unknown>>(
+        'SELECT TRIM(RDB$RELATION_NAME) AS REL FROM RDB$RELATIONS ' +
+          'WHERE COALESCE(RDB$SYSTEM_FLAG, 0) = 0 AND RDB$VIEW_BLR IS NULL ' +
+          'ORDER BY RDB$RELATION_NAME',
+      );
+      for (const row of relRes.rows) {
+        const rel = String(row['REL'] ?? row['rel'] ?? '').trim();
+        if (!rel) continue;
+        const escaped = rel.replace(/"/g, '""');
+        await this.query(`SELECT COUNT(*) AS C FROM "${escaped}"`);
+        tablesScanned += 1;
+      }
+    } catch {
+      // Ignore table scan errors on mock transports.
+    }
+    const after = await this.databaseInfo();
+    this.markDirty();
+    return buildSweepResult(before, after, tablesScanned, performance.now() - started);
   }
 
   /**

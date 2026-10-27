@@ -1271,7 +1271,7 @@ With M7 shipped in `v0.12.0`, these are the next-horizon milestones for `v0.13.0
       `primaryKeys`, `foreignKeys`, `indexes`, `sequences`, `triggers`), paired
       with a lightweight transactional migration runner (`migrate(db, migrations)`)
       recording applied versions in `FB_MIGRATIONS$`.
-- [ ] **Database maintenance & garbage-collection sweep (`db.sweep()`).**
+- [x] **Database maintenance & garbage-collection sweep (`db.sweep()`).**
       Long-running browser databases (`idb://` and `opfs://`) and embedded Node
       databases accumulate old record versions when `transactionGap` grows.
       Exposing `db.sweep()` (attaching with `isc_dpb_sweep = isc_dpb_records` in

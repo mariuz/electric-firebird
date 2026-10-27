@@ -173,6 +173,27 @@ test.describe('<firebird-repl>', () => {
     expect(info.databaseSizeBytes).toBe(info.pageSize * info.allocatedPages);
   });
 
+  test('sweeps the database with the Sweep button and repl.sweep()', async ({ page }) => {
+    const repl = await openRepl(page, 'memory://repl-sweep');
+    await runTyped(repl, [
+      'CREATE TABLE sweep_test (id INTEGER NOT NULL PRIMARY KEY, val VARCHAR(40));',
+      "INSERT INTO sweep_test VALUES (1, 'v1');",
+      "UPDATE sweep_test SET val = 'v2' WHERE id = 1;",
+    ].join('\n'));
+    await expect(repl.locator('.entry')).toHaveCount(3);
+
+    await repl.locator('button.sweep').click();
+    await expect(repl.locator('.entry')).toHaveCount(4);
+    await expect(repl.locator('.entry .meta').nth(3)).toContainText('sweep');
+    await expect(repl.locator('.entry').nth(3).locator('tbody')).toContainText('Tables scanned');
+    await expect(repl.locator('.entry').nth(3).locator('tbody')).toContainText('OIT (before → after)');
+
+    const sweep = await repl.evaluate(async (el: any) => (await el.sweep()).sweep);
+    expect(sweep.tablesScanned).toBeGreaterThanOrEqual(1);
+    expect(sweep.after.pageSize).toBe(8192);
+    expect(sweep.durationMs).toBeGreaterThanOrEqual(0);
+  });
+
   test('takes a db property set before it was defined, and reports runs', async ({ page }) => {
     await page.goto('/no-isolation/browser-harness-frameworks-st');
     await page.waitForFunction(() => Boolean((window as any).FB && (window as any).Frameworks));

@@ -29,7 +29,7 @@ export { statementKind } from '../statement-types';
 export { wasmGlueFile, hasSharedHeap, cdnArtifacts } from '../wasm-loader';
 export type { CdnOptions, CdnArtifacts } from '../wasm-loader';
 export { VERSION } from '../version';
-export { decodeDescription, attachBlobs, BLOB_SIDE_CHANNEL } from './engine-transport';
+export { decodeDescription, attachBlobs, buildSweepResult, BLOB_SIDE_CHANNEL } from './engine-transport';
 
 export { isolationCode, hasTransactionOptions } from './isolation';
 
@@ -110,6 +110,7 @@ export type {
   QueryDescription,
   ExplainOptions,
   DatabaseInfo,
+  SweepResult,
   PreparedStatement,
   DataStreamOptions,
   IntrospectOptions,

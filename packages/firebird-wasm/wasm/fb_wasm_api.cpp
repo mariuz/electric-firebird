@@ -172,6 +172,7 @@ struct DbEntry
 	ITransaction* readTransaction = nullptr;
 	std::set<std::string> writers;             // SELECTs that wrote: they get their own transaction
 	unsigned long long metadataSeen = 0;       // fb_wasm_metadata_commits when the cache was last checked
+	std::string path;                          // database path for sweep attachments
 };
 
 /** How many prepared statements each database keeps; 0 turns the cache off (fb_statement_cache). */
@@ -2679,6 +2680,7 @@ int fb_create_database(const char* path)
 
 	const int handle = g_nextDbHandle++;
 	g_databases[handle] = DbEntry{attachment};
+	g_databases[handle].path = path ? path : "";
 	return handle;
 }
 
@@ -2718,6 +2720,7 @@ int fb_attach_database(const char* path)
 
 	const int handle = g_nextDbHandle++;
 	g_databases[handle] = DbEntry{attachment};
+	g_databases[handle].path = path ? path : "";
 	return handle;
 }
 
@@ -3506,6 +3509,63 @@ const char* fb_database_info(int db_handle)
 		reads, writes, fetches, marks);
 
 	return allocCString(json);
+}
+
+/**
+ * Trigger an immediate database garbage-collection sweep (`isc_dpb_sweep =
+ * isc_dpb_records`) on the database identified by `db_handle`, advancing OIT
+ * once old record versions have been collected.
+ *
+ * Returns 0 on success, non-zero on failure.
+ */
+FB_WASM_EXPORT
+int fb_sweep(int db_handle)
+{
+	clearError();
+
+	DbEntry* entry = lookupEntry(db_handle);
+	if (!entry || !entry->attachment)
+	{
+		setError("fb_sweep: unknown database handle");
+		return 1;
+	}
+
+	endReadTransaction(*entry);
+
+	if (entry->path.empty() || !g_provider)
+		return 0;
+
+	Status status;
+	IXpbBuilder* dpb = buildDpb(status, false);
+	if (status.failed() || !dpb)
+	{
+		setErrorFromStatus("fb_sweep: could not build DPB", status.ptr());
+		return 2;
+	}
+
+	dpb->insertInt(status.ptr(), isc_dpb_sweep, isc_dpb_records);
+	if (status.failed())
+	{
+		dpb->dispose();
+		setErrorFromStatus("fb_sweep: could not set isc_dpb_sweep", status.ptr());
+		return 3;
+	}
+
+	IAttachment* sweepAttachment = g_provider->attachDatabase(status.ptr(),
+		entry->path.c_str(),
+		dpb->getBufferLength(status.ptr()),
+		dpb->getBuffer(status.ptr()));
+	dpb->dispose();
+
+	if (status.failed() || !sweepAttachment)
+	{
+		setErrorFromStatus("fb_sweep: sweep attach failed", status.ptr());
+		return 4;
+	}
+
+	Status detachStatus;
+	sweepAttachment->detach(detachStatus.ptr());
+	return 0;
 }
 
 FB_WASM_EXPORT

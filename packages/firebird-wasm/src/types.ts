@@ -306,6 +306,24 @@ export interface DatabaseInfo {
 }
 
 /**
+ * Diagnostic summary returned by `db.sweep()`.
+ */
+export interface SweepResult {
+  /** Database diagnostics captured immediately before the sweep. */
+  before: DatabaseInfo;
+  /** Database diagnostics captured immediately after the sweep. */
+  after: DatabaseInfo;
+  /** Number of user tables scanned during the garbage-collection pass. */
+  tablesScanned: number;
+  /** How many transaction IDs OIT (`oldestTransaction`) advanced (`Math.max(0, after.oldestTransaction - before.oldestTransaction)`). */
+  oitAdvanced: number;
+  /** Reduction in `transactionGap` (`Math.max(0, before.transactionGap - after.transactionGap)`). */
+  gapReduced: number;
+  /** Wall-clock duration of the sweep in milliseconds. */
+  durationMs: number;
+}
+
+/**
  * An explicitly prepared SQL statement handle returned by `db.prepare(sql)`
  * (or `tx.prepare(sql)`).
  *

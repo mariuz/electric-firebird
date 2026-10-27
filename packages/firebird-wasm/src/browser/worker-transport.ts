@@ -15,6 +15,7 @@ import type {
   QueryResult,
   QueryDescription,
   DatabaseInfo,
+  SweepResult,
   QueryParams,
   RowMode,
   TransactionOptions,
@@ -238,6 +239,10 @@ export class WorkerTransport implements EngineTransport {
 
   databaseInfo(dbHandle: EngineHandle): Promise<DatabaseInfo> {
     return this.call<DatabaseInfo>('databaseInfo', dbHandle);
+  }
+
+  sweep(dbHandle: EngineHandle): Promise<SweepResult> {
+    return this.call<SweepResult>('sweep', dbHandle);
   }
 
   prepare(

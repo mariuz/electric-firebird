@@ -17,6 +17,7 @@ import type {
   QueryDescription,
   ExplainOptions,
   DatabaseInfo,
+  SweepResult,
   PreparedStatement,
   DataStreamOptions,
   IntrospectOptions,
@@ -44,6 +45,7 @@ import {
   DATABASE_INFO_REQUEST_ITEMS,
   parseDatabaseInfoBuffer,
   normalizeDatabaseInfo,
+  buildSweepResult,
 } from './browser/engine-transport';
 import { applyTypes, applySerializers } from './browser/value-types';
 import { introspect as introspectSchema, migrate as runMigrations } from './browser/schema';
@@ -703,6 +705,43 @@ export class FirebirdLite {
   ): Promise<MigrateResult> {
     await this.ensureReady();
     return runMigrations(this, migrations, options);
+  }
+
+  /**
+   * Trigger an immediate database garbage-collection sweep, scanning user
+   * tables to collect old record versions and advancing OIT/OAT counters.
+   */
+  async sweep(): Promise<SweepResult> {
+    await this.ensureReady();
+    const started = performance.now();
+    await this.endReadTransaction();
+    const before = await this.databaseInfo();
+
+    let tablesScanned = 0;
+    try {
+      const relRes = await this.query<Record<string, unknown>>(
+        'SELECT TRIM(RDB$RELATION_NAME) AS REL FROM RDB$RELATIONS ' +
+          'WHERE COALESCE(RDB$SYSTEM_FLAG, 0) = 0 AND RDB$VIEW_BLR IS NULL ' +
+          'ORDER BY RDB$RELATION_NAME',
+      );
+      for (const row of relRes.rows) {
+        const rel = String(row['REL'] ?? row['rel'] ?? '').trim();
+        if (!rel) continue;
+        const escaped = rel.replace(/"/g, '""');
+        await this.query(`SELECT COUNT(*) AS C FROM "${escaped}"`);
+        tablesScanned += 1;
+      }
+    } catch {
+      // Ignore scan errors if a relation is inaccessible.
+    }
+
+    await this.endReadTransaction();
+    const attachment = this.attachment!;
+    const tx = await attachment.startTransaction();
+    await tx.commit().catch(() => tx.rollback().catch(() => undefined));
+
+    const after = await this.databaseInfo();
+    return buildSweepResult(before, after, tablesScanned, performance.now() - started);
   }
 
   /**

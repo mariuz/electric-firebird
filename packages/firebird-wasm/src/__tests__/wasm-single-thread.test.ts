@@ -610,6 +610,20 @@ describe('wasmGlueFile', () => {
       expect(downRes.currentVersion).toBe('1');
       const afterDown = await db.introspect();
       expect(afterDown.tables.map((t) => t.name)).not.toContain('BOOKS');
+
+      // Database sweep (`db.sweep()`) scans user tables and returns before/after diagnostics
+      await db.exec("INSERT INTO authors VALUES (1, 'Ada Lovelace')");
+      await db.exec("UPDATE authors SET name = 'Augusta Ada King' WHERE id = 1");
+      await db.exec("UPDATE authors SET name = 'Countess of Lovelace' WHERE id = 1");
+
+      const sweepRes = await db.sweep();
+      expect(sweepRes.tablesScanned).toBeGreaterThanOrEqual(1);
+      expect(sweepRes.before.pageSize).toBe(8192);
+      expect(sweepRes.after.pageSize).toBe(8192);
+      expect(sweepRes.after.nextTransaction).toBeGreaterThanOrEqual(sweepRes.before.nextTransaction);
+      expect(sweepRes.oitAdvanced).toBeGreaterThanOrEqual(0);
+      expect(sweepRes.gapReduced).toBeGreaterThanOrEqual(0);
+      expect(sweepRes.durationMs).toBeGreaterThanOrEqual(0);
     } finally {
       await db.close();
     }
