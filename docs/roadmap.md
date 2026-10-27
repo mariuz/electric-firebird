@@ -1307,7 +1307,7 @@ With M7 shipped in `v0.12.0`, these are the next-horizon milestones for `v0.13.0
 
 With M0–M8 complete, these are the next-horizon milestones for `v0.14.0`:
 
-- [ ] **Transferable binary result buffers across `WorkerTransport` & `SharedEngineTransport`.**
+- [x] **Transferable binary result buffers across `WorkerTransport` & `SharedEngineTransport`.**
       Extend the `"FBR\x01"` binary result wire format (`_fb_query_binary` and
       `_fb_cursor_fetch_binary`) so `engine-worker.ts` and `engine-shared-worker.ts`
       transfer the raw `ArrayBuffer` (via `postMessage(msg, [buffer])`) to the

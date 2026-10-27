@@ -33,11 +33,21 @@ import type {
   QueryDescription,
   DatabaseInfo,
   SweepResult,
+  FieldInfo,
   QueryParams,
   RowMode,
   TransactionOptions,
 } from '../types';
-import type { EngineHandle, EngineTransport } from './engine-transport';
+import type {
+  EngineHandle,
+  EngineTransport,
+  BinaryResultPayload,
+} from './engine-transport';
+import {
+  decodeBinaryResultPayload,
+  encodeBinaryResultSet,
+  isBinaryResultPayload,
+} from './binary-result';
 import { electLeader } from './leader-election';
 import type { LeaderElection } from './leader-election';
 
@@ -93,6 +103,7 @@ type SharedMessage = CallMessage | ReplyMessage | LeaderMessage | QueryLeaderMes
 const REPLAYABLE: ReadonlySet<SharedOp> = new Set<SharedOp>([
   'init',
   'query',
+  'queryBinary',
   // Prepares a statement and drops it, executing nothing, so re-issuing it is
   // indistinguishable from issuing it once.
   'describe',
@@ -197,6 +208,8 @@ export class SharedEngineTransport implements EngineTransport {
   private engine: EngineTransport | null = null;
 
   private readonly pending = new Map<number, Pending>();
+  private readonly shapes = new Map<number, readonly FieldInfo[]>();
+  private readonly sentShapesByClient = new Map<string, Set<number>>();
   private nextCallId = 1;
   private disposed = false;
 
@@ -242,6 +255,8 @@ export class SharedEngineTransport implements EngineTransport {
   private async assumeLeadership(): Promise<void> {
     if (this.disposed) return;
 
+    this.shapes.clear();
+    this.sentShapesByClient.clear();
     this.engine = this.createEngine();
     await this.engine.init();
 
@@ -321,6 +336,7 @@ export class SharedEngineTransport implements EngineTransport {
         // is a different engine, so this tab's handles mean nothing to it.
         if (message.epoch > this.epoch) {
           this.epoch = message.epoch;
+          this.shapes.clear();
           if (!this.engine) void this.reopenAfterLeaderChange();
         }
         return;
@@ -335,12 +351,112 @@ export class SharedEngineTransport implements EngineTransport {
     }
   };
 
+  private prepareFollowerBinaryPayload(
+    clientId: string,
+    payload: BinaryResultPayload,
+  ): BinaryResultPayload {
+    if (typeof payload.shapeId === 'number') {
+      let clientShapes = this.sentShapesByClient.get(clientId);
+      if (clientShapes?.has(payload.shapeId)) {
+        return {
+          binaryResult: payload.binaryResult,
+          shapeId: payload.shapeId,
+        };
+      }
+      if (payload.shapeFields) {
+        if (!clientShapes) {
+          if (this.sentShapesByClient.size >= 64) {
+            this.sentShapesByClient.clear();
+          }
+          clientShapes = new Set<number>();
+          this.sentShapesByClient.set(clientId, clientShapes);
+        } else if (clientShapes.size >= 256) {
+          clientShapes.clear();
+        }
+        clientShapes.add(payload.shapeId);
+      }
+    }
+    return payload;
+  }
+
+  private async serveBinary(
+    message: CallMessage,
+  ): Promise<BinaryResultPayload> {
+    const engine = this.engine;
+    if (!engine) {
+      throw new Error('not the leader');
+    }
+
+    if (message.op === 'query' || message.op === 'queryBinary') {
+      const dbHandle = message.args[0] as number;
+      const txHandle = message.args[1] as number;
+      const sql = message.args[2] as string;
+      const params = (message.args[3] as QueryParams | undefined) ?? [];
+      const binaryBlobs = Boolean(
+        message.op === 'query' ? message.args[5] : message.args[4],
+      );
+      if (typeof engine.queryBinary === 'function') {
+        const payload = await engine.queryBinary(
+          dbHandle,
+          txHandle,
+          sql,
+          params,
+          binaryBlobs,
+        );
+        return this.prepareFollowerBinaryPayload(message.from, payload);
+      }
+      const decoded = await engine.query<unknown[]>(
+        dbHandle,
+        txHandle,
+        sql,
+        params,
+        'array',
+        binaryBlobs,
+      );
+      return {
+        binaryResult: encodeBinaryResultSet(decoded, { rowMode: 'array' }),
+      };
+    }
+
+    const cursorHandle = message.args[0] as number;
+    const batchSize = message.args[1] as number;
+    const binaryBlobs = Boolean(
+      message.op === 'cursorFetch' ? message.args[3] : message.args[2],
+    );
+    if (typeof engine.cursorFetchBinary === 'function') {
+      const payload = await engine.cursorFetchBinary(
+        cursorHandle,
+        batchSize,
+        binaryBlobs,
+      );
+      return this.prepareFollowerBinaryPayload(message.from, payload);
+    }
+    if (typeof engine.cursorFetch === 'function') {
+      const decoded = await engine.cursorFetch<unknown[]>(
+        cursorHandle,
+        batchSize,
+        'array',
+        binaryBlobs,
+      );
+      return {
+        binaryResult: encodeBinaryResultSet(decoded, { rowMode: 'array' }),
+      };
+    }
+    throw new Error(`unknown engine operation: ${message.op}`);
+  }
+
   /** Leader side: run the operation and reply to the caller. */
   private async serve(message: CallMessage): Promise<void> {
     let reply: ReplyMessage;
 
     try {
-      const result = await this.runLocally(message.op, message.args);
+      const result =
+        message.op === 'query' ||
+        message.op === 'queryBinary' ||
+        message.op === 'cursorFetch' ||
+        message.op === 'cursorFetchBinary'
+          ? await this.serveBinary(message)
+          : await this.runLocally(message.op, message.args);
       reply = {
         kind: 'reply',
         to: message.from,
@@ -391,6 +507,15 @@ export class SharedEngineTransport implements EngineTransport {
 
     const fn = (engine as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>)[op];
     if (typeof fn !== 'function') {
+      if (op === 'queryBinary' || op === 'cursorFetchBinary') {
+        return this.serveBinary({
+          kind: 'call',
+          from: this.clientId,
+          id: 0,
+          op,
+          args,
+        });
+      }
       return Promise.reject(new Error(`unknown engine operation: ${op}`));
     }
     return fn.apply(engine, args);
@@ -489,7 +614,27 @@ export class SharedEngineTransport implements EngineTransport {
     return this.call<number>('executeBatch', dbHandle, txHandle, sql, rows);
   }
 
-  query<T = Row>(
+  private normalizeBinaryPayload(
+    raw: BinaryResultPayload | QueryResult<unknown[]>,
+  ): BinaryResultPayload {
+    if (isBinaryResultPayload(raw)) {
+      if (typeof raw.shapeId === 'number') {
+        if (raw.shapeFields) {
+          if (this.shapes.size >= 256) this.shapes.clear();
+          this.shapes.set(raw.shapeId, raw.shapeFields);
+          return raw;
+        }
+        const cached = this.shapes.get(raw.shapeId);
+        return cached ? { ...raw, shapeFields: cached } : raw;
+      }
+      return raw;
+    }
+    return {
+      binaryResult: encodeBinaryResultSet(raw, { rowMode: 'array' }),
+    };
+  }
+
+  async query<T = Row>(
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     sql: string,
@@ -497,12 +642,10 @@ export class SharedEngineTransport implements EngineTransport {
     rowMode: RowMode = 'object',
     binaryBlobs = false,
   ): Promise<QueryResult<T>> {
-    // Decoding happens on the far side, so both of these have to travel with
-    // the call rather than being applied to what comes back. They are a string
-    // and a boolean, so they survive structured cloning like the rest of the
-    // arguments — and the Uint8Arrays that come back from a side-channelled
-    // BLOB survive it too, which is what made this placement possible.
-    return this.call<QueryResult<T>>(
+    // The leader sends the raw "FBR\x01" binary result buffer over BroadcastChannel
+    // (avoiding decoding on the leader or cloning row objects across tabs) and the
+    // follower decodes rows directly into `rowMode`.
+    const raw = await this.call<BinaryResultPayload | QueryResult<T>>(
       'query',
       dbHandle,
       txHandle,
@@ -511,6 +654,30 @@ export class SharedEngineTransport implements EngineTransport {
       rowMode,
       binaryBlobs,
     );
+    return decodeBinaryResultPayload<T>(
+      raw,
+      rowMode,
+      binaryBlobs,
+      this.shapes,
+    );
+  }
+
+  async queryBinary(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    sql: string,
+    params: QueryParams = [],
+    binaryBlobs = false,
+  ): Promise<BinaryResultPayload> {
+    const raw = await this.call<BinaryResultPayload | QueryResult<unknown[]>>(
+      'queryBinary',
+      dbHandle,
+      txHandle,
+      sql,
+      params,
+      binaryBlobs,
+    );
+    return this.normalizeBinaryPayload(raw);
   }
 
   cursorOpen(
@@ -522,19 +689,39 @@ export class SharedEngineTransport implements EngineTransport {
     return this.call<EngineHandle>('cursorOpen', dbHandle, txHandle, sql, params);
   }
 
-  cursorFetch<T = Row>(
+  async cursorFetch<T = Row>(
     cursorHandle: EngineHandle,
     batchSize: number,
     rowMode: RowMode = 'object',
     binaryBlobs = false,
   ): Promise<QueryResult<T>> {
-    return this.call<QueryResult<T>>(
+    const raw = await this.call<BinaryResultPayload | QueryResult<T>>(
       'cursorFetch',
       cursorHandle,
       batchSize,
       rowMode,
       binaryBlobs,
     );
+    return decodeBinaryResultPayload<T>(
+      raw,
+      rowMode,
+      binaryBlobs,
+      this.shapes,
+    );
+  }
+
+  async cursorFetchBinary(
+    cursorHandle: EngineHandle,
+    batchSize: number,
+    binaryBlobs = false,
+  ): Promise<BinaryResultPayload> {
+    const raw = await this.call<BinaryResultPayload | QueryResult<unknown[]>>(
+      'cursorFetchBinary',
+      cursorHandle,
+      batchSize,
+      binaryBlobs,
+    );
+    return this.normalizeBinaryPayload(raw);
   }
 
   cursorClose(cursorHandle: EngineHandle): Promise<void> {
@@ -728,6 +915,8 @@ export class SharedEngineTransport implements EngineTransport {
       call.reject(new Error('SharedEngineTransport has been disposed'));
     }
     this.pending.clear();
+    this.shapes.clear();
+    this.sentShapesByClient.clear();
 
     this.channel.removeEventListener('message', this.onMessage);
     this.channel.close();

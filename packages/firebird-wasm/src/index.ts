@@ -93,6 +93,8 @@ export type { CdnOptions, CdnArtifacts } from './wasm-loader';
 export {
   decodeBinaryResultSet,
   encodeBinaryResultSet,
+  decodeBinaryResultPayload,
+  isBinaryResultPayload,
   BINARY_RESULT_MAGIC_0,
   BINARY_RESULT_MAGIC_1,
   BINARY_RESULT_MAGIC_2,
@@ -104,7 +106,10 @@ export {
   BINARY_CELL_UTF8,
   BINARY_CELL_BYTES,
 } from './browser/binary-result';
-export type { EncodeBinaryResultOptions } from './browser/binary-result';
+export type {
+  EncodeBinaryResultOptions,
+  BinaryResultPayload,
+} from './browser/binary-result';
 export { VERSION } from './version';
 export type {
   FirebirdWasmModule,

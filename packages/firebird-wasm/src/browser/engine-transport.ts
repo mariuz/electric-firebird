@@ -35,8 +35,14 @@ import type {
 import { isolationCode } from './isolation';
 import { encodeParams, encodeParamRows } from './params';
 import { extractBlobHandle } from './blob-stream';
-import { decodeBinaryResultSet, encodeBinaryResultSet } from './binary-result';
+import {
+  decodeBinaryResultSet,
+  encodeBinaryResultSet,
+  BINARY_HEADER_HAS_SHAPE_ID,
+} from './binary-result';
+import type { BinaryResultPayload } from './binary-result';
 export { decodeBinaryResultSet, encodeBinaryResultSet };
+export type { BinaryResultPayload };
 import { firebirdTypeName } from './field-types';
 import { statementKind } from '../statement-types';
 import { extractReferencedTables } from './live-tables';
@@ -109,6 +115,13 @@ export interface EngineTransport {
    * With `txHandle` of 0 the cursor runs in its own transaction, committed by
    * {@link EngineTransport.cursorClose}.
    */
+  queryBinary?(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    sql: string,
+    params?: QueryParams,
+    binaryBlobs?: boolean,
+  ): Promise<BinaryResultPayload>;
   cursorOpen?(
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
@@ -126,6 +139,11 @@ export interface EngineTransport {
     binaryBlobs?: boolean,
   ): Promise<QueryResult<T>>;
   /** Close an open cursor and finish any transaction it started for itself. */
+  cursorFetchBinary?(
+    cursorHandle: EngineHandle,
+    batchSize: number,
+    binaryBlobs?: boolean,
+  ): Promise<BinaryResultPayload>;
   cursorClose?(cursorHandle: EngineHandle): Promise<void>;
   /** Create a new writable BLOB handle in `(dbHandle, txHandle)`. */
   blobCreate?(
@@ -1066,6 +1084,88 @@ export class DirectTransport implements EngineTransport {
     );
   }
 
+  private extractBinaryPayload(
+    mod: FirebirdWasmModule,
+    binPtr: number,
+    byteLen: number,
+  ): BinaryResultPayload {
+    const binaryResult = new Uint8Array(byteLen);
+    binaryResult.set(mod.HEAPU8.subarray(binPtr, binPtr + byteLen));
+    if (
+      byteLen >= 9 &&
+      (binaryResult[4]! & BINARY_HEADER_HAS_SHAPE_ID) !== 0
+    ) {
+      const view = new DataView(
+        binaryResult.buffer,
+        binaryResult.byteOffset,
+        binaryResult.byteLength,
+      );
+      const shapeId = view.getUint32(5, true);
+      const shapeFields = this.shapeColumns(shapeId);
+      return { binaryResult, shapeId, shapeFields };
+    }
+    return { binaryResult };
+  }
+
+  async queryBinary(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    sql: string,
+    params: QueryParams = [],
+    binaryBlobs = false,
+  ): Promise<BinaryResultPayload> {
+    const mod = this.module;
+    if (typeof mod._fb_query_binary === 'function') {
+      const queryBinaryFn = mod._fb_query_binary;
+      const flags = (binaryBlobs ? BLOB_SIDE_CHANNEL : 0) | SHAPE_IDS;
+      return this.withString(sql, (sqlPtr) =>
+        this.withParams(params, (paramPtr, paramLen) => {
+          const lenPtr = mod._malloc(4);
+          let binPtr = 0;
+          try {
+            binPtr = queryBinaryFn.call(
+              mod,
+              dbHandle,
+              txHandle,
+              sqlPtr,
+              paramPtr,
+              paramLen,
+              flags,
+              lenPtr,
+            );
+            if (binPtr === 0) {
+              throw engineError(mod, `Firebird query failed for: ${sql}`);
+            }
+            const lenView = new DataView(
+              mod.HEAPU8.buffer,
+              mod.HEAPU8.byteOffset + lenPtr,
+              4,
+            );
+            const byteLen = lenView.getUint32(0, true);
+            return this.extractBinaryPayload(mod, binPtr, byteLen);
+          } finally {
+            if (binPtr !== 0) {
+              mod._fb_free_result(binPtr);
+            }
+            mod._free(lenPtr);
+          }
+        }),
+      );
+    }
+
+    const decoded = await this.query<unknown[]>(
+      dbHandle,
+      txHandle,
+      sql,
+      params,
+      'array',
+      binaryBlobs,
+    );
+    return {
+      binaryResult: encodeBinaryResultSet(decoded, { rowMode: 'array' }),
+    };
+  }
+
   async cursorOpen(
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
@@ -1179,6 +1279,52 @@ export class DirectTransport implements EngineTransport {
     const blobs = binaryBlobs ? readBlobs(mod) : null;
     const result = decodeResultSet<T>(json, rowMode, this.shapeColumns);
     return blobs ? attachBlobs(result, blobs, rowMode) : result;
+  }
+
+  async cursorFetchBinary(
+    cursorHandle: EngineHandle,
+    batchSize: number,
+    binaryBlobs = false,
+  ): Promise<BinaryResultPayload> {
+    const mod = this.module;
+    if (typeof mod._fb_cursor_fetch_binary === 'function') {
+      const flags = (binaryBlobs ? BLOB_SIDE_CHANNEL : 0) | SHAPE_IDS;
+      const lenPtr = mod._malloc(4);
+      let binPtr = 0;
+      try {
+        binPtr = mod._fb_cursor_fetch_binary(
+          cursorHandle,
+          batchSize,
+          flags,
+          lenPtr,
+        );
+        if (binPtr === 0) {
+          throw engineError(mod, 'Firebird cursor fetch failed');
+        }
+        const lenView = new DataView(
+          mod.HEAPU8.buffer,
+          mod.HEAPU8.byteOffset + lenPtr,
+          4,
+        );
+        const byteLen = lenView.getUint32(0, true);
+        return this.extractBinaryPayload(mod, binPtr, byteLen);
+      } finally {
+        if (binPtr !== 0) {
+          mod._fb_free_result(binPtr);
+        }
+        mod._free(lenPtr);
+      }
+    }
+
+    const decoded = await this.cursorFetch<unknown[]>(
+      cursorHandle,
+      batchSize,
+      'array',
+      binaryBlobs,
+    );
+    return {
+      binaryResult: encodeBinaryResultSet(decoded, { rowMode: 'array' }),
+    };
   }
 
   async cursorClose(cursorHandle: EngineHandle): Promise<void> {

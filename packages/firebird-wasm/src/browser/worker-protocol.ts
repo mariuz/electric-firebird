@@ -7,7 +7,7 @@
  */
 
 import type { Row, QueryResult, DatabaseInfo, SweepResult } from '../types';
-import type { EngineHandle } from './engine-transport';
+import type { EngineHandle, BinaryResultPayload } from './engine-transport';
 
 /** Operations the Worker understands.  One per EngineTransport method. */
 export type EngineOp =
@@ -19,8 +19,10 @@ export type EngineOp =
   | 'execute'
   | 'executeBatch'
   | 'query'
+  | 'queryBinary'
   | 'cursorOpen'
   | 'cursorFetch'
+  | 'cursorFetchBinary'
   | 'cursorClose'
   | 'blobCreate'
   | 'blobPutSegment'
@@ -63,7 +65,7 @@ export interface EngineResponse {
   id: number;
   ok: boolean;
   /** Present when `ok`. */
-  result?: EngineHandle | number | boolean | string | Uint8Array | { blobHandle: EngineHandle; blobId: Uint8Array } | QueryResult<Row> | DatabaseInfo | SweepResult | null;
+  result?: EngineHandle | number | boolean | string | Uint8Array | { blobHandle: EngineHandle; blobId: Uint8Array } | BinaryResultPayload | QueryResult<Row> | DatabaseInfo | SweepResult | null;
   /**
    * Present when not `ok`.  A string rather than an Error because structured
    * cloning drops the prototype and the stack is the Worker's, not the

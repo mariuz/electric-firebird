@@ -16,11 +16,21 @@ import type {
   QueryDescription,
   DatabaseInfo,
   SweepResult,
+  FieldInfo,
   QueryParams,
   RowMode,
   TransactionOptions,
 } from '../types';
-import type { EngineHandle, EngineTransport } from './engine-transport';
+import type {
+  EngineHandle,
+  EngineTransport,
+  BinaryResultPayload,
+} from './engine-transport';
+import {
+  decodeBinaryResultPayload,
+  encodeBinaryResultSet,
+  isBinaryResultPayload,
+} from './binary-result';
 import type { EngineOp, EngineRequest, EngineResponse } from './worker-protocol';
 
 /** Options accepted by {@link WorkerTransport}. */
@@ -58,6 +68,7 @@ export class WorkerTransport implements EngineTransport {
   private readonly worker: Worker;
   private readonly timeoutMs: number;
   private readonly pending = new Map<number, Pending>();
+  private readonly shapes = new Map<number, readonly FieldInfo[]>();
   private nextId = 1;
   private failure: Error | null = null;
 
@@ -164,7 +175,27 @@ export class WorkerTransport implements EngineTransport {
     return this.call<number>('executeBatch', dbHandle, txHandle, sql, rows);
   }
 
-  query<T = Row>(
+  private normalizeBinaryPayload(
+    raw: BinaryResultPayload | QueryResult<unknown[]>,
+  ): BinaryResultPayload {
+    if (isBinaryResultPayload(raw)) {
+      if (typeof raw.shapeId === 'number') {
+        if (raw.shapeFields) {
+          if (this.shapes.size >= 256) this.shapes.clear();
+          this.shapes.set(raw.shapeId, raw.shapeFields);
+          return raw;
+        }
+        const cached = this.shapes.get(raw.shapeId);
+        return cached ? { ...raw, shapeFields: cached } : raw;
+      }
+      return raw;
+    }
+    return {
+      binaryResult: encodeBinaryResultSet(raw, { rowMode: 'array' }),
+    };
+  }
+
+  async query<T = Row>(
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     sql: string,
@@ -172,12 +203,9 @@ export class WorkerTransport implements EngineTransport {
     rowMode: RowMode = 'object',
     binaryBlobs = false,
   ): Promise<QueryResult<T>> {
-    // Decoding happens on the far side, so both of these have to travel with
-    // the call rather than being applied to what comes back. They are a string
-    // and a boolean, so they survive structured cloning like the rest of the
-    // arguments — and the Uint8Arrays that come back from a side-channelled
-    // BLOB survive it too, which is what made this placement possible.
-    return this.call<QueryResult<T>>(
+    // The Worker transfers the raw "FBR\x01" binary result ArrayBuffer across
+    // postMessage and this thread decodes rows directly into `rowMode`.
+    const raw = await this.call<BinaryResultPayload | QueryResult<T>>(
       'query',
       dbHandle,
       txHandle,
@@ -186,6 +214,30 @@ export class WorkerTransport implements EngineTransport {
       rowMode,
       binaryBlobs,
     );
+    return decodeBinaryResultPayload<T>(
+      raw,
+      rowMode,
+      binaryBlobs,
+      this.shapes,
+    );
+  }
+
+  async queryBinary(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    sql: string,
+    params: QueryParams = [],
+    binaryBlobs = false,
+  ): Promise<BinaryResultPayload> {
+    const raw = await this.call<BinaryResultPayload | QueryResult<unknown[]>>(
+      'queryBinary',
+      dbHandle,
+      txHandle,
+      sql,
+      params,
+      binaryBlobs,
+    );
+    return this.normalizeBinaryPayload(raw);
   }
 
   cursorOpen(
@@ -197,19 +249,39 @@ export class WorkerTransport implements EngineTransport {
     return this.call<EngineHandle>('cursorOpen', dbHandle, txHandle, sql, params);
   }
 
-  cursorFetch<T = Row>(
+  async cursorFetch<T = Row>(
     cursorHandle: EngineHandle,
     batchSize: number,
     rowMode: RowMode = 'object',
     binaryBlobs = false,
   ): Promise<QueryResult<T>> {
-    return this.call<QueryResult<T>>(
+    const raw = await this.call<BinaryResultPayload | QueryResult<T>>(
       'cursorFetch',
       cursorHandle,
       batchSize,
       rowMode,
       binaryBlobs,
     );
+    return decodeBinaryResultPayload<T>(
+      raw,
+      rowMode,
+      binaryBlobs,
+      this.shapes,
+    );
+  }
+
+  async cursorFetchBinary(
+    cursorHandle: EngineHandle,
+    batchSize: number,
+    binaryBlobs = false,
+  ): Promise<BinaryResultPayload> {
+    const raw = await this.call<BinaryResultPayload | QueryResult<unknown[]>>(
+      'cursorFetchBinary',
+      cursorHandle,
+      batchSize,
+      binaryBlobs,
+    );
+    return this.normalizeBinaryPayload(raw);
   }
 
   cursorClose(cursorHandle: EngineHandle): Promise<void> {
@@ -399,6 +471,7 @@ export class WorkerTransport implements EngineTransport {
     this.worker.removeEventListener('message', this.onMessage);
     this.worker.removeEventListener('error', this.onError);
     this.fail(new Error('engine worker disposed'));
+    this.shapes.clear();
     this.worker.terminate();
   }
 }

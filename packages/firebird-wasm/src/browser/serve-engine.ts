@@ -7,7 +7,9 @@
  * starting an engine server.
  */
 
-import type { EngineTransport } from './engine-transport';
+import type { QueryParams } from '../types';
+import type { EngineTransport, BinaryResultPayload } from './engine-transport';
+import { encodeBinaryResultSet, isBinaryResultPayload } from './binary-result';
 import type { EngineRequest, EngineResponse } from './worker-protocol';
 
 /**
@@ -26,6 +28,13 @@ export interface EngineWorkerScope {
   ): void;
 }
 
+function isTransferableBuffer(buf: ArrayBufferLike): buf is ArrayBuffer {
+  return (
+    typeof SharedArrayBuffer === 'undefined' ||
+    !(buf instanceof SharedArrayBuffer)
+  );
+}
+
 /**
  * Every distinct ArrayBuffer behind a Uint8Array in a query result.
  *
@@ -37,7 +46,7 @@ export interface EngineWorkerScope {
  * DataCloneError, and two rows can hold views on one buffer if the same blob
  * appeared twice.
  */
-function collectBlobBuffers(result: unknown): ArrayBufferLike[] {
+function collectBlobBuffers(result: unknown): ArrayBuffer[] {
   if (typeof result !== 'object' || result === null) return [];
 
   const rows = (result as { rows?: unknown }).rows;
@@ -53,7 +62,19 @@ function collectBlobBuffers(result: unknown): ArrayBufferLike[] {
     }
   }
 
-  return [...buffers];
+  return [...buffers].filter(isTransferableBuffer);
+}
+
+function collectTransferables(result: unknown): Transferable[] {
+  if (result instanceof Uint8Array) {
+    return isTransferableBuffer(result.buffer) ? [result.buffer] : [];
+  }
+  if (isBinaryResultPayload(result)) {
+    return isTransferableBuffer(result.binaryResult.buffer)
+      ? [result.binaryResult.buffer]
+      : [];
+  }
+  return collectBlobBuffers(result);
 }
 
 /**
@@ -76,19 +97,29 @@ export function serveEngine(
         'any window that can postMessage to it.  Call it in the engine\'s Worker.',
     );
   }
+  const sentShapes = new Set<number>();
+  const prepareBinaryPayload = (
+    payload: BinaryResultPayload,
+  ): BinaryResultPayload => {
+    if (typeof payload.shapeId === 'number') {
+      if (sentShapes.has(payload.shapeId)) {
+        return {
+          binaryResult: payload.binaryResult,
+          shapeId: payload.shapeId,
+        };
+      }
+      if (payload.shapeFields) {
+        if (sentShapes.size >= 256) sentShapes.clear();
+        sentShapes.add(payload.shapeId);
+      }
+    }
+    return payload;
+  };
   const reply = (response: EngineResponse): void => {
-    // Transfer the buffer for readFile rather than copying it: a database
-    // image is measured in megabytes and this runs on every persist.
-    //
-    // The same applies to binary BLOBs coming back from a query, which arrive
-    // as Uint8Arrays inside the rows. Structured cloning would copy every one
-    // of them across the boundary — the cost a base64 string could never avoid
-    // and the reason the side channel is worth having at all.
-    const transfer =
-      response.result instanceof Uint8Array
-        ? [response.result.buffer]
-        : collectBlobBuffers(response.result);
-    scope.postMessage(response, transfer as Transferable[]);
+    // Transfer the buffer for readFile and "FBR\x01" binary query/cursor results
+    // rather than copying them across the Worker boundary.
+    const transfer = collectTransferables(response.result);
+    scope.postMessage(response, transfer);
   };
 
   scope.addEventListener('message', (event: MessageEvent<EngineRequest>) => {
@@ -96,6 +127,70 @@ export function serveEngine(
 
     void (async () => {
       try {
+        if (op === 'query' || op === 'queryBinary') {
+          const dbHandle = args[0] as number;
+          const txHandle = args[1] as number;
+          const sql = args[2] as string;
+          const params = (args[3] as QueryParams | undefined) ?? [];
+          const binaryBlobs = Boolean(op === 'query' ? args[5] : args[4]);
+          if (typeof transport.queryBinary === 'function') {
+            const payload = await transport.queryBinary(
+              dbHandle,
+              txHandle,
+              sql,
+              params,
+              binaryBlobs,
+            );
+            reply({ id, ok: true, result: prepareBinaryPayload(payload) });
+            return;
+          }
+          if (typeof transport.query === 'function') {
+            const decoded = await transport.query<unknown[]>(
+              dbHandle,
+              txHandle,
+              sql,
+              params,
+              'array',
+              binaryBlobs,
+            );
+            const binaryResult = encodeBinaryResultSet(decoded, {
+              rowMode: 'array',
+            });
+            reply({ id, ok: true, result: { binaryResult } });
+            return;
+          }
+          throw new Error(`unknown engine operation: ${op}`);
+        }
+
+        if (op === 'cursorFetch' || op === 'cursorFetchBinary') {
+          const cursorHandle = args[0] as number;
+          const batchSize = args[1] as number;
+          const binaryBlobs = Boolean(op === 'cursorFetch' ? args[3] : args[2]);
+          if (typeof transport.cursorFetchBinary === 'function') {
+            const payload = await transport.cursorFetchBinary(
+              cursorHandle,
+              batchSize,
+              binaryBlobs,
+            );
+            reply({ id, ok: true, result: prepareBinaryPayload(payload) });
+            return;
+          }
+          if (typeof transport.cursorFetch === 'function') {
+            const decoded = await transport.cursorFetch<unknown[]>(
+              cursorHandle,
+              batchSize,
+              'array',
+              binaryBlobs,
+            );
+            const binaryResult = encodeBinaryResultSet(decoded, {
+              rowMode: 'array',
+            });
+            reply({ id, ok: true, result: { binaryResult } });
+            return;
+          }
+          throw new Error(`unknown engine operation: ${op}`);
+        }
+
         // The op names are exactly the transport's method names, so this is a
         // direct dispatch rather than a switch that has to be kept in step.
         const fn = (transport as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>)[op];

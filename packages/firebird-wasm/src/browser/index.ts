@@ -67,6 +67,8 @@ export {
 export {
   decodeBinaryResultSet,
   encodeBinaryResultSet,
+  decodeBinaryResultPayload,
+  isBinaryResultPayload,
   BINARY_RESULT_MAGIC_0,
   BINARY_RESULT_MAGIC_1,
   BINARY_RESULT_MAGIC_2,
@@ -78,7 +80,10 @@ export {
   BINARY_CELL_UTF8,
   BINARY_CELL_BYTES,
 } from './binary-result';
-export type { EncodeBinaryResultOptions } from './binary-result';
+export type {
+  EncodeBinaryResultOptions,
+  BinaryResultPayload,
+} from './binary-result';
 export { extractReferencedTables, liveTableEventName, liveTableTriggerDDL } from './live-tables';
 export type { ScriptStatement } from './sql-script';
 

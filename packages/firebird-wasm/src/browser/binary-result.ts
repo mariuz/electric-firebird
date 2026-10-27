@@ -303,6 +303,78 @@ export interface EncodeBinaryResultOptions {
 }
 
 /**
+ * Envelope transferred across `WorkerTransport` (`postMessage` with transferable
+ * `ArrayBuffer`) and `SharedEngineTransport` (`BroadcastChannel`) for `query`
+ * and `cursorFetch` responses.
+ */
+export interface BinaryResultPayload {
+  /**
+   * Raw `"FBR\x01"` binary result buffer backed by a standalone, transferable
+   * `ArrayBuffer`.
+   */
+  binaryResult: Uint8Array;
+  /**
+   * When `binaryResult` references a cached statement shape ID
+   * (`BINARY_HEADER_HAS_SHAPE_ID`), `shapeId` identifies the shape and
+   * `shapeFields` carries its column descriptors the first time a client sees
+   * that shape ID.
+   */
+  shapeId?: number;
+  shapeFields?: readonly FieldInfo[];
+}
+
+/** Type guard for {@link BinaryResultPayload}. */
+export function isBinaryResultPayload(
+  value: unknown,
+): value is BinaryResultPayload {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    (value as { binaryResult?: unknown }).binaryResult instanceof Uint8Array
+  );
+}
+
+/**
+ * Decode a {@link BinaryResultPayload} (or pass through a pre-decoded
+ * {@link QueryResult}) into `rowMode`, updating `shapeCache` when new
+ * `shapeFields` metadata accompanies a `shapeId`.
+ */
+export function decodeBinaryResultPayload<T = Row>(
+  payload: BinaryResultPayload | QueryResult<T>,
+  rowMode: RowMode = 'object',
+  binaryBlobs = false,
+  shapeCache?: Map<number, readonly FieldInfo[]>,
+): QueryResult<T> {
+  if (!isBinaryResultPayload(payload)) {
+    return payload;
+  }
+  if (
+    typeof payload.shapeId === 'number' &&
+    payload.shapeFields &&
+    shapeCache
+  ) {
+    if (shapeCache.size >= 256) shapeCache.clear();
+    shapeCache.set(payload.shapeId, payload.shapeFields);
+  }
+  const resolveShape = (id: number): readonly FieldInfo[] => {
+    if (payload.shapeId === id && payload.shapeFields) {
+      return payload.shapeFields;
+    }
+    const cached = shapeCache?.get(id);
+    if (cached) return cached;
+    throw new Error(
+      `decodeBinaryResultPayload: unknown shape ID ${id}`,
+    );
+  };
+  return decodeBinaryResultSet<T>(
+    payload.binaryResult,
+    rowMode,
+    binaryBlobs,
+    resolveShape,
+  );
+}
+
+/**
  * Encode a {@link QueryResult} into the binary wire format understood by
  * {@link decodeBinaryResultSet}. Useful for testing and Worker transfers.
  */
