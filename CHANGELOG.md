@@ -4,6 +4,51 @@ All notable changes to `firebird-wasm`. This project follows
 [semantic versioning](https://semver.org/); while the major version is 0 the
 API may still move between minor releases.
 
+## 0.13.0 — 2026-10-27
+
+### Added
+
+- **Prepared statement cursor streaming (`stmt.queryStream(params?, options?)`).**
+  `PreparedStatement` (`db.prepare(sql)` and `tx.prepare(sql)`) on both
+  `FirebirdBrowser` and `FirebirdLite` now exposes `stmt.queryStream(params?, options?)`
+  returning an `AsyncIterableIterator<T>` that streams rows in configurable
+  batches (`batchSize`, `rowMode`) without re-preparing the SQL statement.
+- **Schema introspection & transactional migrations (`db.introspect()` and `migrate()`).**
+  Added `db.introspect()`, `db.migrate(migrations, options?)`, `migrate(db, migrations, options?)`,
+  and `getAppliedMigrations(db, options?)` across `FirebirdBrowser` and
+  `FirebirdLite`, querying Firebird's `RDB$RELATIONS`, `RDB$RELATION_FIELDS`,
+  `RDB$FIELDS`, `RDB$INDICES`, `RDB$RELATION_CONSTRAINTS`, `RDB$REF_CONSTRAINTS`,
+  `RDB$TRIGGERS`, and `RDB$GENERATORS` into typed `DatabaseSchema` metadata
+  (`tables`, `views`, `sequences`) and running ordered transactional SQL/callback
+  migrations tracked in `FB_MIGRATIONS$`.
+- **Database maintenance & garbage-collection sweep (`db.sweep()` and `<firebird-repl>` `Sweep` button).**
+  Exposes `isc_dpb_sweep = isc_dpb_records` via `_fb_sweep` in the WASM C bridge
+  and `db.sweep()` on both `FirebirdBrowser` and `FirebirdLite` (plus a `Sweep`
+  button in `<firebird-repl>`), returning a `SweepResult` with before/after
+  `DatabaseInfo` snapshots, `oitAdvancedBy`, and `reclaimedPages`.
+- **Durable offline write queue for Electric sync (`createWriteQueue` persistence & pre-image rollback).**
+  `createWriteQueue` in `firebird-wasm/electric` now persists pending mutations
+  along with captured `BEFORE_JSON` row pre-images in a local `FB_WRITE_QUEUE$`
+  table inside Firebird, surviving page reloads, automatically restoring local
+  rows when the server rejects a write (`WriteRejected`) or when `discard(id)` /
+  `clear()` is called, and providing `pause()`, `resume()`, `onFlush`, and
+  automatic `online` event flushing.
+- **Segmented BLOB streaming (`db.openBlobStream()` and `db.createBlobStream()`).**
+  Exposes `IBlob::getSegment` and `IBlob::putSegment` through `_fb_blob_create`,
+  `_fb_blob_put_segment`, `_fb_blob_open_id`, `_fb_blob_open_query`,
+  `_fb_blob_get_segment`, and `_fb_blob_close` in the WASM C bridge and Web
+  `ReadableStream<Uint8Array>` / `BlobWritableStream` APIs (`db.openBlobStream()`,
+  `tx.openBlobStream()`, `db.createBlobStream()`, `tx.createBlobStream()`) on
+  both `FirebirdBrowser` and `FirebirdLite`, with direct `BlobHandle` binding in
+  parameterized `INSERT`/`UPDATE` statements.
+- **Packed binary result buffer across the WASM C bridge (`_fb_query_binary` & `_fb_cursor_fetch_binary`).**
+  Added the `"FBR\x01"` binary result wire format (`encodeBinaryResultSet()` and
+  `decodeBinaryResultSet()` in `firebird-wasm/browser`, plus `_fb_query_binary`
+  and `_fb_cursor_fetch_binary` in `fb_wasm_api.cpp`), packing inline column
+  descriptors or compact cached `shapeId` headers, per-row null bitmasks, and
+  tagged `BOOL`, `INT32`, `FLOAT64`, `UTF8`, and `BYTES` cells in WASM linear
+  memory to eliminate `JSON.stringify` / `JSON.parse` and base64 BLOB overhead.
+
 ## 0.12.0 — 2026-10-26
 
 ### Added
