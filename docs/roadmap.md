@@ -1191,7 +1191,7 @@ gaps it ran into, with its numbers, in rough order of what they would buy.
       `UPDATE OR INSERT INTO … MATCHING (…)` upserts, `INSERT`/`UPDATE`/`DELETE … RETURNING`,
       Firebird transaction isolation levels + savepoints, cursor streaming via
       `queryStream`, and bijective lowercase/uppercase identifier mapping.
-- [ ] A Firebird version build matrix. The submodule tracks `master` and the
+- [x] A Firebird version build matrix. The submodule tracks `master` and the
       shipped engine reports `ENGINE_VERSION 6.0.0`, so the recurring "Firebird
       4 & 5 support" line was always mis-stated: what is missing is *testing
       across versions*, not initial support for them. **Half done:** the Node
@@ -1298,10 +1298,54 @@ With M7 shipped in `v0.12.0`, these are the next-horizon milestones for `v0.13.0
       binary wire format in WASM linear memory (packing null bitmasks,
       `Int32`/`BigInt64`/`Float64` primitives, and length-prefixed UTF-8 strings)
       eliminates JSON serialization and parsing overhead on large result sets.
-- [ ] **Firebird 5.0 LTS & 6.0 (`master`) WASM build matrix.**
+- [x] **Firebird 5.0 LTS & 6.0 (`master`) WASM build matrix.**
       Complete the M6 version matrix item by parameterizing `wasm/build.sh` and
       the patch series so CI builds and tests the browser WASM engine against
       both Firebird `v5.0-release` (ODS 13.1) and `master` (Firebird 6.0, ODS 14.0).
+
+### M9 — Zero-Copy Worker Transport, Savepoints, Cancellation, Bulk Streams & Schema Codegen
+
+With M0–M8 complete, these are the next-horizon milestones for `v0.14.0`:
+
+- [ ] **Transferable binary result buffers across `WorkerTransport` & `SharedEngineTransport`.**
+      Extend the `"FBR\x01"` binary result wire format (`_fb_query_binary` and
+      `_fb_cursor_fetch_binary`) so `engine-worker.ts` and `engine-shared-worker.ts`
+      transfer the raw `ArrayBuffer` (via `postMessage(msg, [buffer])`) to the
+      main thread and decode rows directly on the main thread, eliminating
+      structured-cloning overhead of decoded row arrays across worker boundaries.
+- [ ] **Statement handle execution by ID (`_fb_query_stmt` / `_fb_execute_stmt`).**
+      `db.prepare(sql)` currently pins a statement in the C bridge cache via
+      `_fb_prepare`, while `stmt.query()` and `stmt.exec()` still pass the SQL
+      text to `query()` / `execute()` (relying on the LRU cache lookup). Adding
+      `_fb_query_stmt(db, tx, stmtHandle, ...)` and `_fb_execute_stmt(db, tx, stmtHandle, ...)`
+      completes true zero-string-marshalling execution by integer handle.
+- [ ] **Nested transactions / Savepoints (`tx.savepoint(fn)` / `SAVEPOINT`).**
+      Add first-class savepoint helpers on `Transaction` (`await tx.savepoint(async (sp) => { ... })`
+      wrapping `SAVEPOINT sp_N`, `RELEASE SAVEPOINT sp_N ONLY`, and
+      `ROLLBACK TO SAVEPOINT sp_N`) across both `FirebirdBrowser` and `FirebirdLite`.
+- [ ] **Statement cancellation & query timeouts (`AbortSignal` and `timeoutMs` support).**
+      Expose `IAttachment::cancelOperation(status, fb_cancel_raise)` and
+      `IStatement::setTimeout(status, timeoutMs)` in the WASM C bridge (`_fb_cancel_operation`,
+      `_fb_stmt_set_timeout`) and on Node so `db.query(sql, params, { signal, timeoutMs })`
+      can abort long-running queries cleanly.
+- [ ] **Streaming CSV / JSONLines import & export (`db.copyFromStream()` / `db.copyToStream()`).**
+      Combine `executeBatch()` and `queryStream()` with Web `ReadableStream` /
+      `WritableStream` transforms for high-throughput, bounded-memory bulk CSV
+      and NDJSON table import/export in both browser and Node.
+- [ ] **Interactive Schema Inspector & Migration Viewer in `<firebird-repl>`.**
+      Wire `db.introspect()`, `db.sweep()`, and `FB_MIGRATIONS$` into a visual
+      sidebar/tab inside `<firebird-repl>` displaying tables, columns, primary/foreign
+      keys, indexes, sequences, triggers, and applied migration history.
+- [ ] **Drizzle Kit / Kysely Codegen introspection adapter.**
+      Use `db.introspect()` to generate TypeScript `firebirdTable(...)` schema
+      definitions (for `firebird-wasm/drizzle`) and Kysely `Database` interfaces
+      (for `firebird-wasm/kysely`) directly from any live `.fdb` database or SQL
+      schema.
+- [ ] **Conflict resolution strategies in `createWriteQueue` (`onConflict`).**
+      Extend the durable offline write queue (`FB_WRITE_QUEUE$`) with pluggable
+      conflict handlers (`'client-wins'`, `'server-wins'`, or custom merge
+      callbacks inspecting `before` and current server state) when flushing
+      offline mutations after reconnect.
 
 ---
 

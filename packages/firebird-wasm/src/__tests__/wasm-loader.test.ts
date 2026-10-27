@@ -117,5 +117,53 @@ describe('wasm-loader', () => {
       );
       expect(buildIcuSh).toContain('icupkg');
     });
+
+    it('supports the Firebird 5.0 LTS (v5.0-release) and 6.0 (master) WASM build matrix', () => {
+      const buildSh = fs.readFileSync(
+        path.resolve(__dirname, '../../wasm/build.sh'),
+        'utf8',
+      );
+      expect(buildSh).toContain('--firebird-ref');
+      expect(buildSh).toContain('FB_GIT_REF');
+      expect(buildSh).toContain('v5.0-release');
+      expect(buildSh).toContain('FB_MAJOR_VER');
+
+      const cmake = fs.readFileSync(
+        path.resolve(__dirname, '../../wasm/CMakeLists.txt'),
+        'utf8',
+      );
+      expect(cmake).toContain('FB_MAJOR_VERSION');
+      expect(cmake).toContain('set(CMAKE_CXX_STANDARD 17)');
+      expect(cmake).toContain('set(CMAKE_CXX_STANDARD 20)');
+
+      const patch4v5 = fs.readFileSync(
+        path.resolve(__dirname, '../../wasm/patches/v5.0/0004-intl-charsets-match-linked-implementation.patch'),
+        'utf8',
+      );
+      expect(patch4v5).toContain('IntlManager::defaultCharSets');
+
+      const patch7v5 = fs.readFileSync(
+        path.resolve(__dirname, '../../wasm/patches/v5.0/0007-count-metadata-commits-for-bridge.patch'),
+        'utf8',
+      );
+      expect(patch7v5).toContain('DsqlStatementCache::purgeAllAttachments');
+      expect(patch7v5).toContain('fb_wasm_purge_cached_statements');
+
+      const apiCpp = fs.readFileSync(
+        path.resolve(__dirname, '../../wasm/fb_wasm_api.cpp'),
+        'utf8',
+      );
+      expect(apiCpp).toContain('Engine14,Engine13,Engine12');
+      expect(apiCpp).toContain('fb_wasm_purge_cached_statements');
+
+      const workflow = fs.readFileSync(
+        path.resolve(__dirname, '../../../../.github/workflows/build-wasm.yml'),
+        'utf8',
+      );
+      expect(workflow).toContain('build-wasm-v5:');
+      expect(workflow).toContain('FB_GIT_REF: v5.0-release');
+      expect(workflow).toContain("FB_EXPECTED_ENGINE_PREFIX: '5.0.'");
+      expect(workflow).toContain("FB_EXPECTED_ENGINE_PREFIX: '6.0.'");
+    });
   });
 });

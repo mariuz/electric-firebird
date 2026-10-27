@@ -21,6 +21,30 @@ project(firebird-wasm C CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Detect Firebird major version (5 for v5.0-release / ODS 13.1, 6 for master / ODS 14.0).
+# Firebird 6.0 (master) requires C++20 (src/common/classes/init.h uses concepts),
+# while Firebird 5.0 LTS uses C++17 (and dynamic exception specifications `throw()`,
+# which were removed in C++20).
+set(FB_MAJOR_VERSION 6)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/firebird-src/src/misc/writeBuildNum.sh")
+  file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/firebird-src/src/misc/writeBuildNum.sh" _fb_major_line REGEX "^MajorVer=[0-9]+")
+  if(_fb_major_line MATCHES "^MajorVer=([0-9]+)")
+    set(FB_MAJOR_VERSION "${CMAKE_MATCH_1}")
+  endif()
+endif()
+if(DEFINED FIREBIRD_SRC AND EXISTS "${FIREBIRD_SRC}/src/misc/writeBuildNum.sh")
+  file(STRINGS "${FIREBIRD_SRC}/src/misc/writeBuildNum.sh" _fb_major_line REGEX "^MajorVer=[0-9]+")
+  if(_fb_major_line MATCHES "^MajorVer=([0-9]+)")
+    set(FB_MAJOR_VERSION "${CMAKE_MATCH_1}")
+  endif()
+endif()
+if(FB_MAJOR_VERSION LESS 6)
+  set(CMAKE_CXX_STANDARD 17)
+else()
+  set(CMAKE_CXX_STANDARD 20)
+endif()
+message(STATUS "Building Firebird ${FB_MAJOR_VERSION}.x WASM with C++${CMAKE_CXX_STANDARD}")
+
 # ---------------------------------------------------------------------------
 # Firebird source location
 # ---------------------------------------------------------------------------

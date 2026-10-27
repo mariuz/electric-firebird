@@ -4,6 +4,12 @@ on:
   push:
     branches: [main, master]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      firebird_ref:
+        description: 'Firebird git ref (master or v5.0-release)'
+        required: false
+        default: 'master'
 
 jobs:
   build-wasm:
@@ -140,6 +146,8 @@ jobs:
         working-directory: packages/firebird-wasm
         # wasm-integration runs once per build; wasm-single-thread checks what
         # is particular to the build without threads.
+        env:
+          FB_EXPECTED_ENGINE_PREFIX: '6.0.'
         run: npx jest --testPathPattern='wasm-(integration|single-thread)' --forceExit
 
       - name: Install Playwright browsers for WASM browser tests
@@ -239,3 +247,92 @@ jobs:
           name: playwright-report-wasm
           path: e2e/playwright-report-wasm/
           retention-days: 30
+
+  build-wasm-v5:
+    name: Build Firebird 5.0 LTS WASM (v5.0-release)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Read the pinned Emscripten version
+        id: emsdk
+        run: |
+          echo "version=$(tr -d '[:space:]' \
+            < packages/firebird-wasm/wasm/emsdk-version.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache the Emscripten toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            third_party/emsdk/upstream
+            third_party/emsdk/node
+            third_party/emsdk/.emscripten
+          key: emsdk-${{ runner.os }}-${{ steps.emsdk.outputs.version }}
+
+      - name: Set up the vendored Emscripten SDK
+        working-directory: third_party/emsdk
+        run: |
+          set -euo pipefail
+          ./emsdk install "${{ steps.emsdk.outputs.version }}"
+          ./emsdk activate "${{ steps.emsdk.outputs.version }}"
+          source ./emsdk_env.sh
+          echo "PATH=$PATH" >> "$GITHUB_ENV"
+          for var in EMSDK EMSDK_NODE EM_CONFIG EMSDK_PYTHON; do
+            if [ -n "${!var:-}" ]; then
+              echo "$var=${!var}" >> "$GITHUB_ENV"
+            fi
+          done
+
+      - name: Install build tools for Firebird native configure
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake git libicu-dev icu-devtools
+
+      - name: Cache native config (v5.0-release)
+        uses: actions/cache@v4
+        with:
+          path: |
+            packages/firebird-wasm/wasm/build-native-config
+          key: firebird-native-config-v5.0-release-${{ hashFiles('packages/firebird-wasm/wasm/build.sh') }}
+
+      - name: Install root dependencies
+        run: npm install
+
+      - name: Build Firebird 5.0 LTS WASM modules (v5.0-release)
+        env:
+          FB_GIT_REF: v5.0-release
+        run: npm run build:wasm -w packages/firebird-wasm
+
+      - name: Build TypeScript package
+        run: npm run build -w packages/firebird-wasm
+
+      - name: Upload Firebird 5.0 LTS WASM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firebird-wasm-v5.0
+          path: |
+            packages/firebird-wasm/dist/wasm/firebird-embedded.js
+            packages/firebird-wasm/dist/wasm/firebird-embedded.wasm
+            packages/firebird-wasm/dist/wasm/firebird-embedded-st.js
+            packages/firebird-wasm/dist/wasm/firebird-embedded-st.wasm
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Run WASM console (Node.js) integration tests against Firebird 5.0 LTS
+        working-directory: packages/firebird-wasm
+        env:
+          FB_EXPECTED_ENGINE_PREFIX: '5.0.'
+        run: npx jest --testPathPattern='wasm-(integration|single-thread)' --forceExit

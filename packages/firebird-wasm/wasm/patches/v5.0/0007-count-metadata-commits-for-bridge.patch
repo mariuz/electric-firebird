@@ -1,0 +1,51 @@
+From: electric-firebird
+Subject: [PATCH] Under Emscripten, count committed metadata changes for the bridge (Firebird 5.0)
+
+Firebird 5.0 (v5.0-release) counterpart of
+0007-count-metadata-commits-for-bridge.patch.  Firebird 5.0 predates
+CacheVector (MetadataCache) and instead calls
+DsqlStatementCache::purgeAllAttachments(tdbb) from DFW_perform_work() whenever
+a transaction with deferred metadata work (TRA_deferred_meta) commits.
+
+Because Firebird 5.0's Jrd::Statement holds existence references on relations
+and routines (rel_use_count / Routine::addRef) that would cause delete_relation
+or modify_procedure in DFW_perform_work to fail with isc_obj_in_use if an idle
+statement in the WASM bridge cache still referenced the object,
+purgeAllAttachments also invokes fb_wasm_purge_cached_statements() inside an
+EngineCheckout before DFW_perform_work checks object use counts.
+
+diff --git a/src/dsql/DsqlStatementCache.cpp b/src/dsql/DsqlStatementCache.cpp
+index 9f8a6e2..6a3d4e1 100644
+--- a/src/dsql/DsqlStatementCache.cpp
++++ b/src/dsql/DsqlStatementCache.cpp
+@@ -28,9 +28,16 @@
+ #include "../jrd/lck.h"
+ #include "../jrd/lck_proto.h"
+ 
++#ifdef __EMSCRIPTEN__
++#include <atomic>
++#include "../jrd/jrd.h"
++std::atomic<unsigned long long> fb_wasm_metadata_commits{0};
++extern "C" void fb_wasm_purge_cached_statements();
++#endif
++
+ using namespace Firebird;
+ using namespace Jrd;
+ 
+ 
+ // Class DsqlStatementCache
+ 
+@@ -241,6 +248,13 @@ void DsqlStatementCache::purge(thread_db* tdbb, bool releaseLock)
+ 
+ void DsqlStatementCache::purgeAllAttachments(thread_db* tdbb)
+ {
++#ifdef __EMSCRIPTEN__
++	++fb_wasm_metadata_commits;
++	{
++		EngineCheckout cout(tdbb, FB_FUNCTION);
++		fb_wasm_purge_cached_statements();
++	}
++#endif
+ 	purge(tdbb, false);
+ 
+ 	fb_assert(!lock || lock->lck_logical == LCK_SR);

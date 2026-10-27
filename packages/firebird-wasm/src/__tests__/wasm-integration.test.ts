@@ -1166,6 +1166,15 @@ for (const variant of VARIANTS) {
         const count = await ddb.$count(usersTable);
         expect(count).toBe(3);
 
+        const versionRows = await fb.query<{ ver: string }>(
+          "SELECT RDB$GET_CONTEXT('SYSTEM', 'ENGINE_VERSION') AS ver FROM RDB$DATABASE",
+        );
+        const engineVersion = String(versionRows.rows[0]?.ver ?? '');
+        expect(engineVersion).toMatch(/^[56]\.\d+\.\d+$/);
+        if (process.env.FB_EXPECTED_ENGINE_PREFIX) {
+          expect(engineVersion.startsWith(process.env.FB_EXPECTED_ENGINE_PREFIX)).toBe(true);
+        }
+
         await kdb.destroy();
       } finally {
         await fb.close();

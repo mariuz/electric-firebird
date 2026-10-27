@@ -512,6 +512,38 @@ void flushStatements(DbEntry& entry)
 	entry.statements.clear();
 }
 
+bool purgeIdleCachedStatements()
+{
+	bool any = false;
+	for (auto& dbKv : g_databases)
+	{
+		auto& stmts = dbKv.second.statements;
+		for (auto it = stmts.begin(); it != stmts.end(); )
+		{
+			bool inUseByCursor = false;
+			for (auto& curKv : g_cursors)
+			{
+				if (curKv.second.statement == it->statement)
+				{
+					inUseByCursor = true;
+					break;
+				}
+			}
+			if (!it->busy && !it->pinned && !inUseByCursor)
+			{
+				freeStatement(it->statement);
+				it = stmts.erase(it);
+				any = true;
+			}
+			else
+			{
+				++it;
+			}
+		}
+	}
+	return any;
+}
+
 bool cacheableType(unsigned type)
 {
 	switch (type)
@@ -613,6 +645,7 @@ void rememberWriter(DbEntry& entry, const char* sql)
 void forgetMetadata(DbEntry& entry)
 {
 	flushStatements(entry);
+	purgeIdleCachedStatements();
 	endReadTransaction(entry);
 	entry.writers.clear();
 }
@@ -3448,6 +3481,12 @@ const char* fb_shape_columns(unsigned id)
  * double.  A database's kept statements are emptied when it has moved; plain
  * reads and writes never move it.
  */
+FB_WASM_EXPORT
+void fb_wasm_purge_cached_statements()
+{
+	purgeIdleCachedStatements();
+}
+
 FB_WASM_EXPORT
 double fb_metadata_commits()
 {

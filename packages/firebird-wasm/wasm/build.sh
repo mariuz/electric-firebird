@@ -31,6 +31,7 @@ FIREBIRD_SRC="${SCRIPT_DIR}/firebird-src"
 OUTPUT_DIR="${SCRIPT_DIR}/../dist/wasm"
 PATCHES_DIR="${SCRIPT_DIR}/patches"
 VARIANT="all"
+FB_GIT_REF="${FB_GIT_REF:-}"
 
 # ── Parse arguments ──────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -38,8 +39,9 @@ while [[ $# -gt 0 ]]; do
     --firebird-src) FIREBIRD_SRC="$2"; shift 2 ;;
     --output)       OUTPUT_DIR="$2";   shift 2 ;;
     --variant)      VARIANT="$2";      shift 2 ;;
+    --firebird-ref) FB_GIT_REF="$2";   shift 2 ;;
     -h|--help)
-      echo "Usage: $0 [--firebird-src <path>] [--output <dir>] [--variant all|threads|single]"
+      echo "Usage: $0 [--firebird-src <path>] [--firebird-ref <ref>] [--output <dir>] [--variant all|threads|single]"
       exit 0
       ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
@@ -109,6 +111,45 @@ if [[ ! -d "${FIREBIRD_SRC}/src" ]]; then
     packages/firebird-wasm/wasm/firebird-src
 fi
 
+# ── Resolve & checkout optional --firebird-ref / FB_GIT_REF ──────────────────
+# Supports building against either Firebird 6.0 (master, ODS 14.0) or
+# Firebird 5.0 LTS (v5.0-release / B5_0_Release, ODS 13.1).
+if [[ -n "${FB_GIT_REF}" ]]; then
+  case "${FB_GIT_REF}" in
+    5|5.0|v5.0|B5_0_Release|v5.0-release) FB_GIT_REF="v5.0-release" ;;
+    6|6.0|v6.0|master)                    FB_GIT_REF="master" ;;
+  esac
+  LAST_REF_FILE="${FIREBIRD_SRC}/.wasm-firebird-ref"
+  LAST_REF="$(cat "${LAST_REF_FILE}" 2>/dev/null || true)"
+  if [[ "${LAST_REF}" != "${FB_GIT_REF}" ]]; then
+    echo "Switching Firebird source tree to ref '${FB_GIT_REF}'…"
+    rm -f "${FIREBIRD_SRC}/.wasm-patches-applied"
+    git -C "${FIREBIRD_SRC}" checkout -- . 2>/dev/null || true
+    git -C "${FIREBIRD_SRC}" clean -fd 2>/dev/null || true
+    git -C "${FIREBIRD_SRC}" fetch --depth 1 origin "${FB_GIT_REF}"
+    git -C "${FIREBIRD_SRC}" checkout --detach FETCH_HEAD
+    echo "${FB_GIT_REF}" > "${LAST_REF_FILE}"
+  fi
+fi
+
+# Detect Firebird major version (5 for v5.0-release, 6 for master).
+FB_MAJOR_VER="6"
+if [[ -f "${FIREBIRD_SRC}/src/misc/writeBuildNum.sh" ]]; then
+  FB_MAJOR_VER="$(grep -E '^MajorVer=[0-9]+' "${FIREBIRD_SRC}/src/misc/writeBuildNum.sh" | head -1 | cut -d= -f2 || echo 6)"
+fi
+FB_HEAD_SHA="$(git -C "${FIREBIRD_SRC}" rev-parse HEAD 2>/dev/null || echo unknown)"
+echo "Targeting Firebird ${FB_MAJOR_VER}.x (HEAD=${FB_HEAD_SHA})"
+
+# If the checked-out Firebird revision changed since the last build, invalidate
+# native bootstrap and Emscripten object directories so 5.0 and 6.0 artifacts
+# never mix.
+HEAD_STAMP_FILE="${SCRIPT_DIR}/build-native-config/.firebird-head"
+if [[ -f "${HEAD_STAMP_FILE}" && "$(cat "${HEAD_STAMP_FILE}" 2>/dev/null || true)" != "${FB_HEAD_SHA}" ]]; then
+  echo "Firebird HEAD changed ($(cat "${HEAD_STAMP_FILE}") -> ${FB_HEAD_SHA}); cleaning build caches…"
+  rm -rf "${SCRIPT_DIR}/build-native-config" "${SCRIPT_DIR}/build-epp-cache" \
+         "${SCRIPT_DIR}/build" "${SCRIPT_DIR}/build-st"
+fi
+
 # ── Apply WASM / ICU patches ────────────────────────────────────────────────
 # Patches in wasm/patches/ modify the Firebird source so it can be compiled
 # with ICU support and loaded as a static library under Emscripten/WASM.
@@ -143,16 +184,21 @@ if [[ ! -f "${PATCH_MARKER}" ]]; then
   echo "Applying WASM / ICU patches…"
   for p in "${PATCHES_DIR}"/00*.patch; do
     [[ -f "$p" ]] || continue
-    echo "  → $(basename "$p")"
+    patch_file="$p"
+    if [[ -f "${PATCHES_DIR}/v${FB_MAJOR_VER}.0/$(basename "$p")" ]]; then
+      patch_file="${PATCHES_DIR}/v${FB_MAJOR_VER}.0/$(basename "$p")"
+    fi
+    echo "  → $(basename "${patch_file}")"
 
 
-    if git -C "${FIREBIRD_SRC}" apply --whitespace=nowarn "$p" 2>/dev/null; then
+    if git -C "${FIREBIRD_SRC}" apply --whitespace=nowarn "${patch_file}" 2>/dev/null || \
+       git -C "${FIREBIRD_SRC}" apply -C1 --whitespace=nowarn "${patch_file}" 2>/dev/null; then
       continue
     fi
 
     # Already applied?  `git apply --reverse --check` succeeding means the
     # change is present, which is fine on a re-run.
-    if git -C "${FIREBIRD_SRC}" apply --reverse --check -C1 "$p" 2>/dev/null; then
+    if git -C "${FIREBIRD_SRC}" apply --reverse --check -C1 "${patch_file}" 2>/dev/null; then
       echo "    (already applied)"
       continue
     fi
@@ -165,7 +211,7 @@ if [[ ! -f "${PATCH_MARKER}" ]]; then
     echo "       Firebird has moved on; regenerate the patch against the" >&2
     echo "       current submodule revision:" >&2
     echo "         (cd ${FIREBIRD_SRC} && \$EDITOR <file> && git diff <file>)" >&2
-    git -C "${FIREBIRD_SRC}" apply --whitespace=nowarn "$p" >&2 || true
+    git -C "${FIREBIRD_SRC}" apply --whitespace=nowarn "${patch_file}" >&2 || true
     exit 1
   done
   touch "${PATCH_MARKER}"
@@ -232,6 +278,7 @@ fi
 if [[ ! -f "${NATIVE_BUILD_DIR}/CMakeCache.txt" ]]; then
   echo "Configuring native Firebird build (host compiler)…"
   mkdir -p "${NATIVE_BUILD_DIR}"
+  echo "${FB_HEAD_SHA}" > "${HEAD_STAMP_FILE}"
   # engine_common lists dsql/parse.cpp, which the "parse" target generates into the build
   # directory later.  CMake 3.28's Generate step checks the file exists and stops ("Cannot find
   # source file … parse.cpp", "No SOURCES given to target: engine_common"), leaving no Makefile at
