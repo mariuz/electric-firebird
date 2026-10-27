@@ -50,6 +50,14 @@ export {
   ICU_LOCALE_DATA_PATH,
   DEFAULT_ICU_TAILORING_LOCALES,
 } from './icu-locales';
+export {
+  introspect,
+  migrate,
+  getAppliedMigrations,
+  formatFirebirdColumnType,
+  decodeFirebirdTriggerType,
+  DEFAULT_MIGRATIONS_TABLE,
+} from './schema';
 export { extractReferencedTables, liveTableEventName, liveTableTriggerDDL } from './live-tables';
 export type { ScriptStatement } from './sql-script';
 
@@ -104,6 +112,23 @@ export type {
   DatabaseInfo,
   PreparedStatement,
   DataStreamOptions,
+  IntrospectOptions,
+  ColumnSchemaInfo,
+  PrimaryKeySchemaInfo,
+  ForeignKeySchemaInfo,
+  IndexSchemaInfo,
+  SequenceSchemaInfo,
+  TriggerSchemaInfo,
+  TableSchemaInfo,
+  ViewSchemaInfo,
+  SchemaIntrospection,
+  MigrationExecutor,
+  MigratableDatabase,
+  MigrationStep,
+  Migration,
+  AppliedMigration,
+  MigrateOptions,
+  MigrateResult,
   StatementKind,
   RowMode,
   ArrayRow,

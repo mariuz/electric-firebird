@@ -35,6 +35,7 @@ import {
 } from './data-stream';
 import { extractReferencedTables, liveTableTriggerDDL } from './live-tables';
 import { ICU_LOCALE_DATA_PATH, isValidIcuDataPackage } from './icu-locales';
+import { introspect as introspectSchema, migrate as runMigrations } from './schema';
 import { hasTransactionOptions } from './isolation';
 import { applyTypes, applySerializers } from './value-types';
 import type { TypeOptions } from './value-types';
@@ -51,6 +52,11 @@ import type {
   DatabaseInfo,
   PreparedStatement,
   DataStreamOptions,
+  IntrospectOptions,
+  SchemaIntrospection,
+  Migration,
+  MigrateOptions,
+  MigrateResult,
   QueryOptions,
   QueryStreamOptions,
   Row,
@@ -1211,6 +1217,30 @@ export class FirebirdBrowser {
       throw new Error('The configured EngineTransport does not support databaseInfo()');
     }
     return this.engine.databaseInfo(this.dbHandle);
+  }
+
+  /**
+   * Introspect the database catalog (`RDB$RELATIONS`, `RDB$RELATION_FIELDS`,
+   * `RDB$FIELDS`, `RDB$RELATION_CONSTRAINTS`, `RDB$REF_CONSTRAINTS`,
+   * `RDB$INDICES`, `RDB$GENERATORS`, and `RDB$TRIGGERS`) and return typed
+   * metadata (`tables`, `views`, `columns`, `primaryKeys`, `foreignKeys`,
+   * `indexes`, `sequences`, and `triggers`).
+   */
+  async introspect(options: IntrospectOptions = {}): Promise<SchemaIntrospection> {
+    await this.ensureReady();
+    return introspectSchema(this, options);
+  }
+
+  /**
+   * Apply (or revert with `direction: 'down'`) versioned schema migrations
+   * transactionally, recording applied versions in `FB_MIGRATIONS$`.
+   */
+  async migrate(
+    migrations: readonly Migration[],
+    options: MigrateOptions = {},
+  ): Promise<MigrateResult> {
+    await this.ensureReady();
+    return runMigrations(this, migrations, options);
   }
 
   /**

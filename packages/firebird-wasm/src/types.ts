@@ -406,3 +406,300 @@ export interface DataStreamOptions {
    */
   chunkSize?: number;
 }
+
+/**
+ * Options for `db.introspect()` / `introspect(db, options)`.
+ */
+export interface IntrospectOptions {
+  /**
+   * Include Firebird system objects (`RDB$*`, `MON$*`, `SEC$*`, or objects with
+   * `RDB$SYSTEM_FLAG > 0`).
+   *
+   * @default false
+   */
+  includeSystem?: boolean;
+  /**
+   * Include internal helper tables created by `firebird-wasm` (`FB_MIGRATIONS$`,
+   * `ELECTRIC_SHAPES`, `ELECTRIC_WRITES`, `ELECTRIC_SHADOW$*`,
+   * `KYSELY_MIGRATION`, `KYSELY_MIGRATION_LOCK`).
+   *
+   * @default false
+   */
+  includeInternal?: boolean;
+  /**
+   * Optional table or view name filter (matched case-insensitively when
+   * unquoted).
+   */
+  tableName?: string;
+}
+
+/**
+ * Column metadata returned by `db.introspect()`.
+ */
+export interface ColumnSchemaInfo {
+  /** Relation (table or view) name. */
+  tableName: string;
+  /** Column name (`TRIM(RDB$FIELD_NAME)`). */
+  name: string;
+  /** 0-based ordinal position (`RDB$FIELD_POSITION`). */
+  position: number;
+  /** Formatted SQL type expression (e.g. `'INTEGER'`, `'VARCHAR(100)'`, `'NUMERIC(10,2)'`). */
+  typeName: string;
+  /** Canonical Firebird type name (`'INTEGER'`, `'VARYING'`, `'TEXT'`, `'INT64'`, `'BLOB'`, etc.). */
+  dataType: FirebirdTypeName;
+  /** Raw `RDB$FIELD_TYPE` code. */
+  fieldType: number;
+  /** Raw `RDB$FIELD_SUB_TYPE` code. */
+  subType: number;
+  /** Raw `RDB$FIELD_SCALE` (negative for exact numeric scale). */
+  scale: number;
+  /** Numeric precision (`RDB$FIELD_PRECISION`). */
+  precision: number;
+  /** Character length (or byte length for binary types). */
+  length: number;
+  /** Whether the column allows `NULL` values (`RDB$NULL_FLAG === 0`). */
+  nullable: boolean;
+  /** Raw `DEFAULT ...` clause from `RDB$DEFAULT_SOURCE`, or `null` if none. */
+  defaultSource: string | null;
+  /** Whether the column is an identity column (`GENERATED ... AS IDENTITY`). */
+  isIdentity: boolean;
+  /** Whether the column is `COMPUTED BY (...)` (`RDB$COMPUTED_BLR IS NOT NULL`). */
+  isComputed: boolean;
+  /** Whether the column participates in the relation's primary key. */
+  isPrimaryKey: boolean;
+}
+
+/**
+ * Primary key constraint metadata returned by `db.introspect()`.
+ */
+export interface PrimaryKeySchemaInfo {
+  /** Table name (`TRIM(RDB$RELATION_NAME)`). */
+  tableName: string;
+  /** Constraint name (`TRIM(RDB$CONSTRAINT_NAME)`). */
+  constraintName: string;
+  /** Backing index name (`TRIM(RDB$INDEX_NAME)`). */
+  indexName: string;
+  /** Ordered primary key column names. */
+  columns: string[];
+}
+
+/**
+ * Foreign key constraint metadata returned by `db.introspect()`.
+ */
+export interface ForeignKeySchemaInfo {
+  /** Constraint name (`TRIM(RDB$CONSTRAINT_NAME)`). */
+  name: string;
+  /** Referencing table name. */
+  tableName: string;
+  /** Ordered referencing column names. */
+  columns: string[];
+  /** Referenced target table name. */
+  referencedTableName: string;
+  /** Ordered referenced column names on `referencedTableName`. */
+  referencedColumns: string[];
+  /** `ON UPDATE` referential action (`'RESTRICT'`, `'CASCADE'`, `'SET NULL'`, `'SET DEFAULT'`, `'NO ACTION'`). */
+  onUpdate: string;
+  /** `ON DELETE` referential action (`'RESTRICT'`, `'CASCADE'`, `'SET NULL'`, `'SET DEFAULT'`, `'NO ACTION'`). */
+  onDelete: string;
+}
+
+/**
+ * Index metadata returned by `db.introspect()`.
+ */
+export interface IndexSchemaInfo {
+  /** Index name (`TRIM(RDB$INDEX_NAME)`). */
+  name: string;
+  /** Table name (`TRIM(RDB$RELATION_NAME)`). */
+  tableName: string;
+  /** Ordered index segment column names. */
+  columns: string[];
+  /** Whether the index enforces uniqueness (`RDB$UNIQUE_FLAG = 1`). */
+  unique: boolean;
+  /** Whether the index is descending (`RDB$INDEX_TYPE = 1`). */
+  descending: boolean;
+  /** Whether the index is currently inactive (`RDB$INDEX_INACTIVE = 1`). */
+  inactive: boolean;
+}
+
+/**
+ * Sequence / generator metadata (`RDB$GENERATORS`) returned by `db.introspect()`.
+ */
+export interface SequenceSchemaInfo {
+  /** Sequence / generator name (`TRIM(RDB$GENERATOR_NAME)`). */
+  name: string;
+  /** Initial value (`RDB$INITIAL_VALUE`). */
+  initialValue: number;
+  /** Step increment (`RDB$GENERATOR_INCREMENT`). */
+  increment: number;
+}
+
+/**
+ * Trigger metadata (`RDB$TRIGGERS`) returned by `db.introspect()`.
+ */
+export interface TriggerSchemaInfo {
+  /** Trigger name (`TRIM(RDB$TRIGGER_NAME)`). */
+  name: string;
+  /** Relation name, or `null` for database-level triggers. */
+  tableName: string | null;
+  /** Raw `RDB$TRIGGER_TYPE` bitmask. */
+  triggerType: number;
+  /** Trigger timing (`'BEFORE'`, `'AFTER'`, or `'ON CONNECT'` / `'ON TRANSACTION ...'`). */
+  timing: string;
+  /** Triggered DML or database events (e.g. `['INSERT']`, `['INSERT', 'UPDATE']`). */
+  events: string[];
+  /** Execution sequence (`RDB$TRIGGER_SEQUENCE`). */
+  sequence: number;
+  /** Whether the trigger is inactive (`RDB$TRIGGER_INACTIVE = 1`). */
+  inactive: boolean;
+  /** PSQL trigger source (`RDB$TRIGGER_SOURCE`), or `null` if unavailable. */
+  source: string | null;
+}
+
+/**
+ * User table metadata returned by `db.introspect()`.
+ */
+export interface TableSchemaInfo {
+  /** Table name (`TRIM(RDB$RELATION_NAME)`). */
+  name: string;
+  /** Ordered table columns. */
+  columns: ColumnSchemaInfo[];
+  /** Ordered primary key column names (empty if the table has no primary key). */
+  primaryKey: string[];
+  /** Outgoing foreign key constraints defined on this table. */
+  foreignKeys: ForeignKeySchemaInfo[];
+  /** Indexes defined on this table. */
+  indexes: IndexSchemaInfo[];
+  /** Triggers defined on this table. */
+  triggers: TriggerSchemaInfo[];
+}
+
+/**
+ * View metadata returned by `db.introspect()`.
+ */
+export interface ViewSchemaInfo {
+  /** View name (`TRIM(RDB$RELATION_NAME)`). */
+  name: string;
+  /** Ordered view columns. */
+  columns: ColumnSchemaInfo[];
+  /** View SQL definition (`RDB$VIEW_SOURCE`), or `null` if unavailable. */
+  source: string | null;
+}
+
+/**
+ * Complete database schema metadata returned by `db.introspect()`.
+ */
+export interface SchemaIntrospection {
+  /** User tables with nested columns, primaryKey, foreignKeys, indexes, and triggers. */
+  tables: TableSchemaInfo[];
+  /** Views with nested columns and view SQL definition. */
+  views: ViewSchemaInfo[];
+  /** Flat list of all columns across introspected tables and views. */
+  columns: ColumnSchemaInfo[];
+  /** Flat list of all primary key constraints. */
+  primaryKeys: PrimaryKeySchemaInfo[];
+  /** Flat list of all foreign key constraints. */
+  foreignKeys: ForeignKeySchemaInfo[];
+  /** Flat list of all indexes. */
+  indexes: IndexSchemaInfo[];
+  /** Flat list of all sequences / generators (`RDB$GENERATORS`). */
+  sequences: SequenceSchemaInfo[];
+  /** Flat list of all triggers (`RDB$TRIGGERS`). */
+  triggers: TriggerSchemaInfo[];
+}
+
+/**
+ * Minimal query/exec interface required by `introspect()` and migration steps.
+ */
+export interface MigrationExecutor {
+  query<T extends Row = Row>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
+  exec(sql: string, params?: QueryParams): Promise<unknown>;
+}
+
+/**
+ * Database handle accepted by `migrate(db, migrations, options)`.
+ */
+export interface MigratableDatabase extends MigrationExecutor {
+  transaction?<T>(
+    fn: (tx: MigrationExecutor) => Promise<T>,
+    options?: TransactionOptions,
+  ): Promise<T>;
+}
+
+/**
+ * A single migration action (`up` or `down`):
+ * - a SQL string or multi-statement SQL script (supporting `SET TERM`),
+ * - an array of SQL statements, or
+ * - an async callback receiving the active transaction / executor.
+ */
+export type MigrationStep =
+  | string
+  | readonly string[]
+  | ((tx: MigrationExecutor) => Promise<void> | void);
+
+/**
+ * A versioned schema migration definition for `migrate()`.
+ */
+export interface Migration {
+  /** Unique migration version (e.g. `1`, `'001'`, `'20261027_create_users'`). */
+  version: number | string;
+  /** Optional human-readable migration name. */
+  name?: string;
+  /** Forward migration step. */
+  up: MigrationStep;
+  /** Optional rollback migration step for `direction: 'down'`. */
+  down?: MigrationStep;
+}
+
+/**
+ * Record of an applied migration stored in `FB_MIGRATIONS$`.
+ */
+export interface AppliedMigration {
+  /** Version string as stored in `FB_MIGRATIONS$`. */
+  version: string;
+  /** Optional migration name. */
+  name: string | null;
+  /** ISO-8601 timestamp when the migration was applied. */
+  appliedAt: string;
+}
+
+/**
+ * Options for `migrate(db, migrations, options)` / `db.migrate(migrations, options)`.
+ */
+export interface MigrateOptions {
+  /**
+   * Metadata table used to track applied migrations.
+   *
+   * @default 'FB_MIGRATIONS$'
+   */
+  tableName?: string;
+  /**
+   * Migration direction:
+   * - `'up'` (default): applies all unapplied migrations up to `targetVersion`
+   *   (or all migrations if `targetVersion` is omitted).
+   * - `'down'`: reverts applied migrations in reverse order down to (but not
+   *   including) `targetVersion`. If `targetVersion` is omitted when
+   *   `direction === 'down'`, reverts the single most recently applied
+   *   migration (`targetVersion = 0` or `''` reverts all applied migrations).
+   *
+   * @default 'up'
+   */
+  direction?: 'up' | 'down';
+  /**
+   * Optional target version boundary.
+   */
+  targetVersion?: number | string;
+}
+
+/**
+ * Summary returned by `migrate(db, migrations, options)`.
+ */
+export interface MigrateResult {
+  /** Migrations applied during this `migrate()` call. */
+  applied: AppliedMigration[];
+  /** Migrations rolled back during this `migrate()` call (`direction: 'down'`). */
+  reverted: AppliedMigration[];
+  /** Latest applied version remaining in `FB_MIGRATIONS$`, or `null` if none. */
+  currentVersion: string | null;
+  /** Full ordered list of applied migrations currently in `FB_MIGRATIONS$`. */
+  history: AppliedMigration[];
+}

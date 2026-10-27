@@ -19,6 +19,11 @@ import type {
   DatabaseInfo,
   PreparedStatement,
   DataStreamOptions,
+  IntrospectOptions,
+  SchemaIntrospection,
+  Migration,
+  MigrateOptions,
+  MigrateResult,
   QueryResult,
   QueryOptions,
   QueryStreamOptions,
@@ -41,6 +46,7 @@ import {
   normalizeDatabaseInfo,
 } from './browser/engine-transport';
 import { applyTypes, applySerializers } from './browser/value-types';
+import { introspect as introspectSchema, migrate as runMigrations } from './browser/schema';
 import type { TypeOptions } from './browser/value-types';
 import { toStatement, resolveQueryCall, resolveBatchSize } from './sql-tag';
 import { blockParamType, buildBlock, placeholderOffsets } from './batch-block';
@@ -673,6 +679,30 @@ export class FirebirdLite {
       fetches,
       marks,
     });
+  }
+
+  /**
+   * Introspect the database catalog (`RDB$RELATIONS`, `RDB$RELATION_FIELDS`,
+   * `RDB$FIELDS`, `RDB$RELATION_CONSTRAINTS`, `RDB$REF_CONSTRAINTS`,
+   * `RDB$INDICES`, `RDB$GENERATORS`, and `RDB$TRIGGERS`) and return typed
+   * metadata (`tables`, `views`, `columns`, `primaryKeys`, `foreignKeys`,
+   * `indexes`, `sequences`, and `triggers`).
+   */
+  async introspect(options: IntrospectOptions = {}): Promise<SchemaIntrospection> {
+    await this.ensureReady();
+    return introspectSchema(this, options);
+  }
+
+  /**
+   * Apply (or revert with `direction: 'down'`) versioned schema migrations
+   * transactionally, recording applied versions in `FB_MIGRATIONS$`.
+   */
+  async migrate(
+    migrations: readonly Migration[],
+    options: MigrateOptions = {},
+  ): Promise<MigrateResult> {
+    await this.ensureReady();
+    return runMigrations(this, migrations, options);
   }
 
   /**

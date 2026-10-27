@@ -514,6 +514,102 @@ describe('wasmGlueFile', () => {
 
       const jaMatch = await db.query<{ JA: string }>("SELECT ja FROM locale_words WHERE ja = '日本語'");
       expect(jaMatch.rows).toEqual([{ JA: '日本語' }]);
+
+      // Schema migrations & introspection against real Firebird WASM catalog
+      const migResult = await db.migrate([
+        {
+          version: 1,
+          name: 'create_authors',
+          up: 'CREATE TABLE authors (id INTEGER NOT NULL PRIMARY KEY, name VARCHAR(80) NOT NULL)',
+          down: 'DROP TABLE authors',
+        },
+        {
+          version: 2,
+          name: 'create_books_and_seq',
+          up: [
+            'CREATE TABLE books (id INTEGER NOT NULL PRIMARY KEY, author_id INTEGER NOT NULL REFERENCES authors(id) ON DELETE CASCADE, title VARCHAR(120) NOT NULL)',
+            'CREATE UNIQUE INDEX idx_books_title ON books (title)',
+            'CREATE SEQUENCE seq_book_id',
+            'CREATE VIEW v_books AS SELECT id, title FROM books',
+          ],
+          down: [
+            'DROP VIEW v_books',
+            'DROP SEQUENCE seq_book_id',
+            'DROP TABLE books',
+          ],
+        },
+      ]);
+      expect(migResult.applied.map((m) => m.version)).toEqual(['1', '2']);
+      expect(migResult.currentVersion).toBe('2');
+
+      const schema = await db.introspect();
+      const tableNames = schema.tables.map((t) => t.name);
+      expect(tableNames).toContain('AUTHORS');
+      expect(tableNames).toContain('BOOKS');
+      expect(tableNames).not.toContain('FB_MIGRATIONS$');
+
+      const booksTable = schema.tables.find((t) => t.name === 'BOOKS')!;
+      expect(booksTable.primaryKey).toEqual(['ID']);
+      expect(booksTable.foreignKeys).toEqual([
+        expect.objectContaining({
+          tableName: 'BOOKS',
+          columns: ['AUTHOR_ID'],
+          referencedTableName: 'AUTHORS',
+          referencedColumns: ['ID'],
+          onDelete: 'CASCADE',
+        }),
+      ]);
+      expect(booksTable.indexes).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            name: 'IDX_BOOKS_TITLE',
+            tableName: 'BOOKS',
+            columns: ['TITLE'],
+            unique: true,
+          }),
+        ]),
+      );
+      expect(schema.views).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            name: 'V_BOOKS',
+          }),
+        ]),
+      );
+      expect(schema.sequences).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            name: 'SEQ_BOOK_ID',
+          }),
+        ]),
+      );
+
+      // Revert version 2 and verify BOOKS is dropped
+      const downRes = await db.migrate(
+        [
+          {
+            version: 1,
+            name: 'create_authors',
+            up: 'CREATE TABLE authors (id INTEGER NOT NULL PRIMARY KEY, name VARCHAR(80) NOT NULL)',
+            down: 'DROP TABLE authors',
+          },
+          {
+            version: 2,
+            name: 'create_books_and_seq',
+            up: [],
+            down: [
+              'DROP VIEW v_books',
+              'DROP SEQUENCE seq_book_id',
+              'DROP TABLE books',
+            ],
+          },
+        ],
+        { direction: 'down' },
+      );
+      expect(downRes.reverted.map((m) => m.version)).toEqual(['2']);
+      expect(downRes.currentVersion).toBe('1');
+      const afterDown = await db.introspect();
+      expect(afterDown.tables.map((t) => t.name)).not.toContain('BOOKS');
     } finally {
       await db.close();
     }

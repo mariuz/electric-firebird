@@ -1263,7 +1263,7 @@ With M7 shipped in `v0.12.0`, these are the next-horizon milestones for `v0.13.0
       Adding `stmt.queryStream(params?, options?)` on both `FirebirdBrowser` and
       `FirebirdLite` completes the `PreparedStatement` handle so pinned statements
       can stream large result sets in batches without re-preparing.
-- [ ] **Schema introspection & transactional migrations (`db.introspect()` and `migrate()`).**
+- [x] **Schema introspection & transactional migrations (`db.introspect()` and `migrate()`).**
       Expose a backend-agnostic `db.introspect()` API that reads Firebird's
       `RDB$RELATIONS`, `RDB$RELATION_FIELDS`, `RDB$FIELDS`, `RDB$INDICES`,
       `RDB$RELATION_CONSTRAINTS`, `RDB$REF_CONSTRAINTS`, `RDB$TRIGGERS`, and

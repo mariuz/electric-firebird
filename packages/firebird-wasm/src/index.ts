@@ -28,6 +28,14 @@ export {
   ICU_LOCALE_DATA_PATH,
   DEFAULT_ICU_TAILORING_LOCALES,
 } from './browser/icu-locales';
+export {
+  introspect,
+  migrate,
+  getAppliedMigrations,
+  formatFirebirdColumnType,
+  decodeFirebirdTriggerType,
+  DEFAULT_MIGRATIONS_TABLE,
+} from './browser/schema';
 export type { TypeOptions, Parser, Serializer } from './browser/value-types';
 export type { SqlTag, Statement } from './sql-tag';
 
@@ -45,6 +53,23 @@ export type {
   DatabaseInfo,
   PreparedStatement,
   DataStreamOptions,
+  IntrospectOptions,
+  ColumnSchemaInfo,
+  PrimaryKeySchemaInfo,
+  ForeignKeySchemaInfo,
+  IndexSchemaInfo,
+  SequenceSchemaInfo,
+  TriggerSchemaInfo,
+  TableSchemaInfo,
+  ViewSchemaInfo,
+  SchemaIntrospection,
+  MigrationExecutor,
+  MigratableDatabase,
+  MigrationStep,
+  Migration,
+  AppliedMigration,
+  MigrateOptions,
+  MigrateResult,
   StatementKind,
   RowMode,
   ArrayRow,
