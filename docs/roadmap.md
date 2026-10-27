@@ -1252,6 +1252,57 @@ shipped, these are the highest-leverage candidates for upcoming releases:
       packaged as an optional lazy-loaded data bundle registered via a second
       `udata_setCommonData()` slot without increasing the default WASM download.
 
+### M8 — Binary Wire Protocol, Maintenance, Offline Durability & Schema Tooling
+
+With M7 shipped in `v0.12.0`, these are the next-horizon milestones for `v0.13.0`:
+
+- [ ] **Prepared statement cursor streaming (`stmt.queryStream(params?, options?)`).**
+      `PreparedStatement` (`db.prepare(sql)` and `tx.prepare(sql)`) currently
+      exposes `stmt.query()`, `stmt.exec()`, and `stmt.execBatch()`, while
+      batched cursor streaming (`db.queryStream()`) still takes a SQL string.
+      Adding `stmt.queryStream(params?, options?)` on both `FirebirdBrowser` and
+      `FirebirdLite` completes the `PreparedStatement` handle so pinned statements
+      can stream large result sets in batches without re-preparing.
+- [ ] **Schema introspection & transactional migrations (`db.introspect()` and `migrate()`).**
+      Expose a backend-agnostic `db.introspect()` API that reads Firebird's
+      `RDB$RELATIONS`, `RDB$RELATION_FIELDS`, `RDB$FIELDS`, `RDB$INDICES`,
+      `RDB$RELATION_CONSTRAINTS`, `RDB$REF_CONSTRAINTS`, `RDB$TRIGGERS`, and
+      `RDB$GENERATORS` into typed metadata (`tables`, `views`, `columns`,
+      `primaryKeys`, `foreignKeys`, `indexes`, `sequences`, `triggers`), paired
+      with a lightweight transactional migration runner (`migrate(db, migrations)`)
+      recording applied versions in `FB_MIGRATIONS$`.
+- [ ] **Database maintenance & garbage-collection sweep (`db.sweep()`).**
+      Long-running browser databases (`idb://` and `opfs://`) and embedded Node
+      databases accumulate old record versions when `transactionGap` grows.
+      Exposing `db.sweep()` (attaching with `isc_dpb_sweep = isc_dpb_records` in
+      the WASM C bridge and on Node, returning before/after `DatabaseInfo`
+      OIT/OAT counters and reclaimed pages) plus a `Sweep` action in
+      `<firebird-repl>` lets applications trigger immediate garbage collection
+      and advance OIT on demand.
+- [ ] **Durable offline write queue for Electric sync (`createWriteQueue` persistence).**
+      `createWriteQueue` in `firebird-wasm/electric` currently keeps pending
+      optimistic mutations in memory during a single page session. Persisting
+      the pending mutation log in a local `FB_WRITE_QUEUE$` table inside the
+      Firebird database allows optimistic writes made while offline to survive
+      page reloads and flush automatically when connectivity returns.
+- [ ] **Segmented BLOB streaming (`db.openBlobStream()` and `db.createBlobStream()`).**
+      While standard `BLOB` columns bind and decode as `string` or `Uint8Array`,
+      multi-megabyte binary blobs currently materialize whole in memory. Exposing
+      `IBlob::getSegment` and `IBlob::putSegment` as Web `ReadableStream<Uint8Array>`
+      and `WritableStream<Uint8Array>` inside a transaction lets applications
+      stream large files into and out of Firebird `BLOB` columns with bounded
+      memory.
+- [ ] **Binary result buffer across the WASM C bridge (`_fb_query_binary`).**
+      `_fb_query_params` and `_fb_cursor_fetch` currently format every row as
+      UTF-8 JSON in C++ and parse it with `JSON.parse()` in JavaScript. Adding a
+      binary wire format in WASM linear memory (packing null bitmasks,
+      `Int32`/`BigInt64`/`Float64` primitives, and length-prefixed UTF-8 strings)
+      eliminates JSON serialization and parsing overhead on large result sets.
+- [ ] **Firebird 5.0 LTS & 6.0 (`master`) WASM build matrix.**
+      Complete the M6 version matrix item by parameterizing `wasm/build.sh` and
+      the patch series so CI builds and tests the browser WASM engine against
+      both Firebird `v5.0-release` (ODS 13.1) and `master` (Firebird 6.0, ODS 14.0).
+
 ---
 
 ## 5. Test coverage added alongside this review
