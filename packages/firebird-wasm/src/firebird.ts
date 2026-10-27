@@ -300,7 +300,12 @@ export class FirebirdLite {
 
       // After the statement is disposed, as before — the commit is the last
       // thing that happens on the success path.
+      try {
       await transaction.commit();
+    } catch (err) {
+      await transaction.rollback().catch(() => undefined);
+      throw err;
+    }
     } catch (err) {
       await transaction.rollback().catch(() => undefined);
       throw err;
@@ -406,7 +411,12 @@ export class FirebirdLite {
       await toRelease.release(false);
 
       txFinished = true;
+      try {
       await transaction.commit();
+    } catch (err) {
+      await transaction.rollback().catch(() => undefined);
+      throw err;
+    }
     } finally {
       if (lease) {
         await lease.release(engineFailed);
@@ -864,7 +874,12 @@ export class FirebirdLite {
           const rawRows = await withStatement(transaction, (target) =>
             fetchRows(target, transaction, serializedParams, fields, this.types),
           );
-          await transaction.commit();
+          try {
+      await transaction.commit();
+    } catch (err) {
+      await transaction.rollback().catch(() => undefined);
+      throw err;
+    }
           const outFields = fields.map((f) => ({ ...f }));
           return applyTypes(
             { rows: shapeRows<T>(rawRows, outFields, rowMode), fields: outFields },
@@ -949,7 +964,12 @@ export class FirebirdLite {
             }
 
             txFinished = true;
-            await transaction.commit();
+            try {
+      await transaction.commit();
+    } catch (err) {
+      await transaction.rollback().catch(() => undefined);
+      throw err;
+    }
           } finally {
             if (tempStmt) {
               await tempStmt.dispose().catch(() => undefined);
@@ -986,7 +1006,12 @@ export class FirebirdLite {
             );
             return readAffectedRecords(target);
           });
-          await transaction.commit();
+          try {
+      await transaction.commit();
+    } catch (err) {
+      await transaction.rollback().catch(() => undefined);
+      throw err;
+    }
           return { affectedRows };
         } catch (err) {
           await transaction.rollback().catch(() => undefined);
@@ -1025,7 +1050,12 @@ export class FirebirdLite {
             }
             return total;
           });
-          await transaction.commit();
+          try {
+      await transaction.commit();
+    } catch (err) {
+      await transaction.rollback().catch(() => undefined);
+      throw err;
+    }
           return { affectedRows };
         } catch (err) {
           await transaction.rollback().catch(() => undefined);
@@ -1092,7 +1122,12 @@ export class FirebirdLite {
       return result;
     }
 
-    await transaction.commit();
+    try {
+      await transaction.commit();
+    } catch (err) {
+      await transaction.rollback().catch(() => undefined);
+      throw err;
+    }
     return result;
   }
 

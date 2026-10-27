@@ -288,4 +288,46 @@ describe('Binary result wire format (encodeBinaryResultSet / decodeBinaryResultS
     expect(cursorFetchCalls).toEqual([5]);
     expect(cRes.rows).toEqual([{ ID: 202, ACTIVE: false }]);
   });
+
+  test('decodes UTF-8 strings safely from a SharedArrayBuffer-backed view (pthreads WASM heap)', () => {
+    const encoded = encodeBinaryResultSet({
+      fields: sampleFields,
+      rows: [
+        {
+          ID: 7,
+          ACTIVE: true,
+          SCORE: 3.5,
+          TITLE: 'Shared heap text',
+          PAYLOAD: new Uint8Array([1, 2, 3]),
+        },
+      ],
+    });
+    const sab = new SharedArrayBuffer(encoded.byteLength + 16);
+    const sharedView = new Uint8Array(sab, 8, encoded.byteLength);
+    sharedView.set(encoded);
+
+    const origDecode = TextDecoder.prototype.decode;
+    const decodeSpy = jest
+      .spyOn(TextDecoder.prototype, 'decode')
+      .mockImplementation(function (this: TextDecoder, input?: AllowSharedBufferSource, options?: TextDecodeOptions) {
+        if (
+          input &&
+          ArrayBuffer.isView(input) &&
+          input.buffer instanceof SharedArrayBuffer
+        ) {
+          throw new TypeError(
+            "Failed to execute 'decode' on 'TextDecoder': The provided ArrayBufferView value must not be shared.",
+          );
+        }
+        return origDecode.call(this, input as BufferSource, options);
+      });
+
+    try {
+      const decoded = decodeBinaryResultSet(sharedView, 'object', true);
+      expect(decoded.rows[0]?.TITLE).toBe('Shared heap text');
+      expect(decoded.fields[3]?.name).toBe('TITLE');
+    } finally {
+      decodeSpy.mockRestore();
+    }
+  });
 });

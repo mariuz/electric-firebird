@@ -57,6 +57,16 @@ export const BINARY_CELL_BYTES = 5;
 const sharedDecoder = new TextDecoder();
 const sharedEncoder = new TextEncoder();
 
+function decodeUtf8(buffer: Uint8Array, start: number, end: number): string {
+  if (start >= end) return '';
+  const slice =
+    typeof SharedArrayBuffer !== 'undefined' &&
+    buffer.buffer instanceof SharedArrayBuffer
+      ? buffer.slice(start, end)
+      : buffer.subarray(start, end);
+  return sharedDecoder.decode(slice);
+}
+
 const BASE64_CHARS =
   'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 
@@ -178,7 +188,7 @@ export function decodeBinaryResultSet<T = Row>(
       const name =
         nameLen === 0
           ? ''
-          : sharedDecoder.decode(buffer.subarray(pos, pos + nameLen));
+          : decodeUtf8(buffer, pos, pos + nameLen);
       pos += nameLen;
       const type = view.getUint16(pos, true);
       const subType = view.getInt16(pos + 2, true);
@@ -237,7 +247,7 @@ export function decodeBinaryResultSet<T = Row>(
           row[c] =
             byteLen === 0
               ? ''
-              : sharedDecoder.decode(buffer.subarray(pos, pos + byteLen));
+              : decodeUtf8(buffer, pos, pos + byteLen);
           pos += byteLen;
           break;
         }

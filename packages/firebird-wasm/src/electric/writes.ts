@@ -142,6 +142,8 @@ export interface WriteSync {
 
 /** Characters of JSON a write's values may take: the widest UTF-8 VARCHAR a row holds. */
 const MAX_VALUE = 8191;
+/** Kept under 4000 UTF-8 chars (16 KB) so the row stays below Firebird 5's 65,535-byte max record size. */
+const MAX_BEFORE_VALUE = 4000;
 
 interface StoredWrite extends LocalWrite {
   before: Record<string, unknown> | null;
@@ -346,7 +348,7 @@ export async function createWriteQueue(given: WritesDatabase, options: WriteQueu
           const updatedBefore = await snapshotRow(tx, later.table, later.key);
           await applyWrite(tx, later);
           const beforeStr = updatedBefore ? encode(updatedBefore) : null;
-          if (beforeStr === null || beforeStr.length <= MAX_VALUE) {
+          if (beforeStr === null || beforeStr.length <= MAX_BEFORE_VALUE) {
             await tx.exec(
               `UPDATE ${writesQuoted} SET BEFORE_JSON = ? WHERE ID = ?`,
               [beforeStr, later.id],
@@ -379,7 +381,7 @@ export async function createWriteQueue(given: WritesDatabase, options: WriteQueu
       const beforeRow = hasBeforeColumn ? await snapshotRow(tx, table, key) : null;
       const beforeJson = beforeRow ? encode(beforeRow) : null;
       const safeBeforeJson =
-        beforeJson !== null && beforeJson.length <= MAX_VALUE ? beforeJson : null;
+        beforeJson !== null && beforeJson.length <= MAX_BEFORE_VALUE ? beforeJson : null;
 
       const { rows } = await tx.query(`SELECT COALESCE(MAX(ID), 0) + 1 AS N FROM ${writesQuoted}`);
       const w: LocalWrite = { id: Number(rows[0]!['N']), table, operation, key, value };
@@ -591,7 +593,7 @@ async function ensureWritesTable(
             );
             if (colCheck.rows.length === 0) {
               await tx.exec(
-                `ALTER TABLE ${writesQuoted} ADD BEFORE_JSON VARCHAR(${MAX_VALUE}) CHARACTER SET UTF8`,
+                `ALTER TABLE ${writesQuoted} ADD BEFORE_JSON VARCHAR(${MAX_BEFORE_VALUE}) CHARACTER SET UTF8`,
               );
             }
           } catch {
@@ -602,9 +604,9 @@ async function ensureWritesTable(
         await tx.exec(
           `CREATE TABLE ${writesQuoted} (ID INTEGER NOT NULL PRIMARY KEY, TABLE_NAME VARCHAR(255) NOT NULL, ` +
             // Not a BLOB: FirebirdLite reads a BLOB back as a handle, not text.
-            'OP CHAR(1) NOT NULL, KEY_JSON VARCHAR(4000) CHARACTER SET UTF8 NOT NULL, ' +
+            'OP CHAR(1) NOT NULL, KEY_JSON VARCHAR(2000) CHARACTER SET UTF8 NOT NULL, ' +
             `VALUE_JSON VARCHAR(${MAX_VALUE}) CHARACTER SET UTF8, ` +
-            `BEFORE_JSON VARCHAR(${MAX_VALUE}) CHARACTER SET UTF8, ` +
+            `BEFORE_JSON VARCHAR(${MAX_BEFORE_VALUE}) CHARACTER SET UTF8, ` +
             "STATE CHAR(1) DEFAULT 'P' NOT NULL, TXID VARCHAR(40), SENT_AT DOUBLE PRECISION)",
         );
       });
