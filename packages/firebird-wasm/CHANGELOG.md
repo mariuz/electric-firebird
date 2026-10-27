@@ -4,6 +4,38 @@ All notable changes to `firebird-wasm`. This project follows
 [semantic versioning](https://semver.org/); while the major version is 0 the
 API may still move between minor releases.
 
+## 0.14.0 — 2026-10-27
+
+### Added
+
+- **Zero-copy `FBR\x01` binary result buffer transfer across `WorkerTransport` and `SharedEngineTransport`.**
+  - `DirectTransport`, `WorkerTransport`, `SharedEngineTransport`, and `serveEngine`
+    now execute `query` and `cursor_fetch` over the packed `"FBR\x01"` binary
+    wire format (`_fb_query_binary` and `_fb_cursor_fetch_binary`), copying a
+    single contiguous `ArrayBuffer` slice from `HEAPU8`, transferring its
+    ownership zero-copy across `Worker.postMessage` / `MessagePort.postMessage`
+    via the `transfer` list, and decoding on the consumer side with
+    `decodeBinaryResultSet` + `peekBinaryResultShapeId` + lazy `shape_columns`
+    hydration.
+  - Added `patchBinaryResultSetColumns(buffer, columns)` in
+    `firebird-wasm/browser` (`binary-result.ts`) to inline column descriptors
+    into a shape-ID-addressed `"FBR\x01"` buffer when needed.
+- **Firebird 5.0 LTS (`v5.0-release`, ODS 13.1) & Firebird 6.0 (`master`, ODS 14.0) WASM build support.**
+  - `wasm/build.sh` now accepts `--firebird-ref <ref>` (and `FB_GIT_REF`, with
+    shorthands `5` / `5.0` / `v5.0` → `v5.0-release` and `6` / `6.0` / `v6.0` →
+    `master`), detects Firebird's major version, selects version-specific patches
+    under `wasm/patches/v5.0/` when targeting Firebird 5.0, and automatically
+    invalidates native bootstrap and Emscripten build caches when the Firebird
+    `HEAD` commit changes.
+  - `wasm/CMakeLists.txt` adapts source lists across Firebird 5.0 and 6.0 (conditional
+    `Schema.epp` / `Update.cpp`, `StatementMetadata.cpp`, `Savepoint.cpp`,
+    `CharSetContainer.cpp`, `Monitoring.cpp`, and `LocalStatus.h` shim for 5.0).
+  - Added `_fb_wasm_purge_cached_statements` in `fb_wasm_api.cpp` so idle unpinned
+    cached statements are released before DDL / database drop operations.
+  - Added a `build-wasm-v5` job to `.github/workflows/build-wasm.yml` that builds
+    and tests the Firebird 5.0 LTS WASM engine (`firebird-wasm-v5.0` artifact)
+    alongside Firebird 6.0.
+
 ## 0.13.0 — 2026-10-27
 
 ### Added
