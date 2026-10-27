@@ -304,9 +304,39 @@ describe('wasmGlueFile', () => {
         [3, 'gamma'],
       ]);
 
+      // Batched cursor streaming via stmt.queryStream()
+      const streamBatches: Array<Array<{ ID: number; LABEL: string }>> = [];
+      for await (const batch of selectStmt.queryStream<{ ID: number; LABEL: string }>([1], { batchSize: 2 })) {
+        streamBatches.push(batch.rows);
+      }
+      expect(streamBatches).toEqual([
+        [
+          { ID: 1, LABEL: 'alpha' },
+          { ID: 2, LABEL: 'beta' },
+        ],
+        [{ ID: 3, LABEL: 'gamma' }],
+      ]);
+
+      // Early break in stmt.queryStream() closes the cursor cleanly
+      const earlyRows: unknown[] = [];
+      for await (const batch of selectStmt.queryStream([1], { rowMode: 'array', batchSize: 1 })) {
+        earlyRows.push(...batch.rows);
+        break;
+      }
+      expect(earlyRows).toEqual([[1, 'alpha']]);
+
       await selectStmt.close();
+      expect(() => selectStmt.queryStream([1])).toThrow(/PreparedStatement has been closed/);
 
       await db.transaction(async (tx) => {
+        const txSelect = await tx.prepare('SELECT id, label FROM prep_items WHERE id >= ? ORDER BY id');
+        const txBatches: unknown[][] = [];
+        for await (const batch of txSelect.queryStream([2], { rowMode: 'array', batchSize: 1 })) {
+          txBatches.push(batch.rows);
+        }
+        expect(txBatches).toEqual([[[2, 'beta']], [[3, 'gamma']]]);
+        await txSelect.close();
+
         const txStmt = await tx.prepare('UPDATE prep_items SET label = ? WHERE id = ?');
         expect(txStmt.params).toHaveLength(2);
         const upd = await txStmt.exec(['ALPHA', 1]);

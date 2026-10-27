@@ -26,6 +26,7 @@ class MockCursorTransport implements EngineTransport {
   readonly calls: Array<{ op: string; args: unknown[] }> = [];
   readonly cursors = new Map<EngineHandle, MockCursor>();
   rows: unknown[][] = [];
+  params: FieldInfo[] = [];
   fields: FieldInfo[] = [
     { name: 'ID', type: 496, typeName: 'INTEGER', scale: 0 },
     { name: 'NAME', type: 448, typeName: 'VARYING', scale: 0 },
@@ -125,7 +126,7 @@ class MockCursorTransport implements EngineTransport {
     }
   }
   async describe(): Promise<QueryDescription> {
-    return { params: [], fields: this.fields, statementType: 'SELECT', hasResultSet: true };
+    return { params: this.params, fields: this.fields, statementType: 'SELECT', hasResultSet: true };
   }
   async startTransaction(
     dbHandle: EngineHandle,
@@ -591,5 +592,75 @@ describe('queryStream()', () => {
 
     await transport.cursorClose(handle);
     expect(closedCursors).toEqual([77]);
+  });
+
+  it('streams batches from PreparedStatement handles via stmt.queryStream() and tx.prepare().queryStream()', async () => {
+    const transport = new MockCursorTransport();
+    transport.params = [{ name: 'PARAM_0', type: 496, typeName: 'INTEGER', scale: 0, nullable: false }];
+    transport.rows = [
+      [2, 'two'],
+      [3, 'three'],
+      [4, 'four'],
+    ];
+    const db = new FirebirdBrowser('memory://stream-prep', {
+      transport,
+      multiTab: 'allow-unsafe',
+    });
+    try {
+      const stmt = await db.prepare('SELECT id, name FROM items WHERE id >= ? ORDER BY id');
+      expect(typeof stmt.queryStream).toBe('function');
+
+      const objBatches: Array<Array<{ ID: number; NAME: string }>> = [];
+      for await (const batch of stmt.queryStream<{ ID: number; NAME: string }>([2], {
+        batchSize: 2,
+      })) {
+        objBatches.push(batch.rows);
+      }
+      expect(objBatches).toEqual([
+        [
+          { ID: 2, NAME: 'two' },
+          { ID: 3, NAME: 'three' },
+        ],
+        [{ ID: 4, NAME: 'four' }],
+      ]);
+
+      const arrBatches: unknown[][][] = [];
+      for await (const batch of stmt.queryStream([3], { rowMode: 'array', batchSize: 2 })) {
+        arrBatches.push(batch.rows);
+      }
+      expect(arrBatches).toEqual([
+        [
+          [2, 'two'],
+          [3, 'three'],
+        ],
+        [[4, 'four']],
+      ]);
+
+      // Parameter count and batchSize validation rejects before iteration starts
+      expect(() => stmt.queryStream([])).toThrow(/expects 1 parameter/i);
+      expect(() => stmt.queryStream([1], { batchSize: 0 })).toThrow(/batchSize/i);
+
+      await stmt.close();
+      expect(() => stmt.queryStream([1])).toThrow(/closed/i);
+
+      // Transaction-scoped PreparedStatement.queryStream
+      await db.transaction(async (tx) => {
+        const txStmt = await tx.prepare('SELECT id, name FROM items WHERE id <= ? ORDER BY id');
+        const txRows: Array<{ ID: number; NAME: string }> = [];
+        for await (const batch of txStmt.queryStream<{ ID: number; NAME: string }>([2], {
+          batchSize: 2,
+        })) {
+          txRows.push(...batch.rows);
+        }
+        expect(txRows).toEqual([
+          { ID: 2, NAME: 'two' },
+          { ID: 3, NAME: 'three' },
+          { ID: 4, NAME: 'four' },
+        ]);
+        await txStmt.close();
+      });
+    } finally {
+      await db.close();
+    }
   });
 });

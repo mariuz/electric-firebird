@@ -734,6 +734,9 @@ export class FirebirdLite {
           return await fn(nativeStmt);
         } finally {
           busy = false;
+          if (isClosed) {
+            await nativeStmt.dispose().catch(() => undefined);
+          }
         }
       }
       const tempStmt = await attachment.prepare(transaction, sqlText);
@@ -790,6 +793,102 @@ export class FirebirdLite {
           throw err;
         }
       }) as PreparedStatement['query'],
+      queryStream: (<T = Row>(
+        paramsOrOptions: QueryParams | QueryStreamOptions = [],
+        maybeOptions: QueryStreamOptions = {},
+      ): AsyncIterableIterator<QueryResult<T>> => {
+        assertOpen();
+        const callParams = Array.isArray(paramsOrOptions)
+          ? paramsOrOptions
+          : [];
+        const callOptions = Array.isArray(paramsOrOptions)
+          ? maybeOptions
+          : (paramsOrOptions ?? {});
+        checkParamCount(callParams.length);
+        const batchSize = resolveBatchSize(callOptions.batchSize);
+        const rowMode: RowMode = callOptions.rowMode ?? 'object';
+        const serializeParams = () => this.serialize(callParams);
+        const endReadTx = () => this.endReadTransaction();
+        const customTypes = this.types;
+
+        return (async function* (): AsyncIterableIterator<QueryResult<T>> {
+          assertOpen();
+          const serializedParams = serializeParams();
+          await endReadTx();
+          const txOptions = buildTransactionOptions(callOptions);
+          const transaction = await attachment.startTransaction(txOptions);
+
+          let engineFailed = false;
+          let txFinished = false;
+          let claimedPrimary = false;
+          let tempStmt: Statement | undefined;
+
+          try {
+            let target: Statement;
+            if (!busy) {
+              busy = true;
+              claimedPrimary = true;
+              target = nativeStmt;
+            } else {
+              try {
+                tempStmt = await attachment.prepare(transaction, sqlText);
+              } catch (err) {
+                engineFailed = true;
+                throw err;
+              }
+              target = tempStmt;
+            }
+
+            yield* streamRows<T>(
+              target,
+              transaction,
+              serializedParams,
+              fields,
+              rowMode,
+              batchSize,
+              customTypes,
+              () => {
+                engineFailed = true;
+              },
+            );
+
+            if (tempStmt) {
+              const toDispose = tempStmt;
+              tempStmt = undefined;
+              await toDispose.dispose().catch(() => undefined);
+            }
+            if (claimedPrimary) {
+              claimedPrimary = false;
+              busy = false;
+              if (isClosed) {
+                await nativeStmt.dispose().catch(() => undefined);
+              }
+            }
+
+            txFinished = true;
+            await transaction.commit();
+          } finally {
+            if (tempStmt) {
+              await tempStmt.dispose().catch(() => undefined);
+            }
+            if (claimedPrimary) {
+              busy = false;
+              if (isClosed) {
+                await nativeStmt.dispose().catch(() => undefined);
+              }
+            }
+            if (!txFinished) {
+              if (engineFailed) {
+                await transaction.rollback().catch(() => undefined);
+              } else {
+                await transaction
+                  .commit()
+                  .catch(() => transaction.rollback().catch(() => undefined));
+              }
+            }
+          }
+        })();
+      }) as PreparedStatement['queryStream'],
       exec: async (callParams: QueryParams = []) => {
         assertOpen();
         checkParamCount(callParams.length);
@@ -854,7 +953,9 @@ export class FirebirdLite {
         if (isClosed) return;
         isClosed = true;
         this.preparedStatements.delete(stmt);
-        await nativeStmt.dispose().catch(() => undefined);
+        if (!busy) {
+          await nativeStmt.dispose().catch(() => undefined);
+        }
       },
       [Symbol.asyncDispose]: async () => {
         await stmt.close();
@@ -1400,6 +1501,41 @@ export class FirebirdTransaction {
           rowMode,
         );
       }) as PreparedStatement['query'],
+      queryStream: (<T = Row>(
+        paramsOrOptions: QueryParams | QueryStreamOptions = [],
+        maybeOptions: QueryStreamOptions = {},
+      ): AsyncIterableIterator<QueryResult<T>> => {
+        assertOpen();
+        const callParams = Array.isArray(paramsOrOptions)
+          ? paramsOrOptions
+          : [];
+        const callOptions = Array.isArray(paramsOrOptions)
+          ? maybeOptions
+          : (paramsOrOptions ?? {});
+        checkParamCount(callParams.length);
+        const batchSize = resolveBatchSize(callOptions.batchSize);
+        const rowMode: RowMode = callOptions.rowMode ?? 'object';
+        const beforeStmt = () => this.beforeStatement();
+        const serializeParams = () => this.serialize(callParams);
+        const tx = this.transaction;
+        const customTypes = this.types;
+
+        return (async function* (): AsyncIterableIterator<QueryResult<T>> {
+          assertOpen();
+          await beforeStmt();
+          const serializedParams = serializeParams();
+          yield* streamRows<T>(
+            nativeStmt,
+            tx,
+            serializedParams,
+            fields,
+            rowMode,
+            batchSize,
+            customTypes,
+            () => undefined,
+          );
+        })();
+      }) as PreparedStatement['queryStream'],
       exec: async (callParams: QueryParams = []) => {
         assertOpen();
         await this.beforeStatement();

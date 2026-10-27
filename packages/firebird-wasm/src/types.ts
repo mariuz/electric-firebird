@@ -344,6 +344,25 @@ export interface PreparedStatement {
   ): Promise<QueryResult<T>>;
 
   /**
+   * Stream the prepared statement's result set in batches of `batchSize` rows
+   * (default `500`).
+   *
+   * Breaking out of `for await` early closes the cursor immediately without
+   * fetching the rest of the result set.
+   */
+  queryStream(
+    options: QueryStreamOptions & { rowMode: 'array' },
+  ): AsyncIterableIterator<QueryResult<ArrayRow>>;
+  queryStream(
+    params: QueryParams | undefined,
+    options: QueryStreamOptions & { rowMode: 'array' },
+  ): AsyncIterableIterator<QueryResult<ArrayRow>>;
+  queryStream<T extends Row = Row>(
+    params?: QueryParams | QueryStreamOptions,
+    options?: QueryStreamOptions,
+  ): AsyncIterableIterator<QueryResult<T>>;
+
+  /**
    * Execute the prepared statement without returning rows.
    */
   exec(params?: QueryParams): Promise<{ affectedRows: number }>;

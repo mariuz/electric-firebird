@@ -1070,10 +1070,31 @@ describeIfFirebird('FirebirdLite.execBatch in blocks', () => {
       [3, 'gamma'],
     ]);
 
+    const streamBatches: Array<Array<{ ID: number; LABEL: string }>> = [];
+    for await (const batch of selectStmt.queryStream<{ ID: number; LABEL: string }>([1], { batchSize: 2 })) {
+      streamBatches.push(batch.rows);
+    }
+    expect(streamBatches).toEqual([
+      [
+        { ID: 1, LABEL: 'alpha' },
+        { ID: 2, LABEL: 'beta' },
+      ],
+      [{ ID: 3, LABEL: 'gamma' }],
+    ]);
+
     await selectStmt.close();
+    expect(() => selectStmt.queryStream([1])).toThrow(/PreparedStatement has been closed/);
 
     // Transaction-scoped prepare()
     await db.transaction(async (tx) => {
+      const txSelect = await tx.prepare('SELECT id, label FROM prep_items WHERE id >= ? ORDER BY id');
+      const txBatches: unknown[][] = [];
+      for await (const batch of txSelect.queryStream([2], { rowMode: 'array', batchSize: 1 })) {
+        txBatches.push(batch.rows);
+      }
+      expect(txBatches).toEqual([[[2, 'beta']], [[3, 'gamma']]]);
+      await txSelect.close();
+
       const txStmt = await tx.prepare('UPDATE prep_items SET label = ? WHERE id = ?');
       expect(txStmt.params).toHaveLength(2);
       const upd = await txStmt.exec(['ALPHA', 1]);
@@ -1601,12 +1622,36 @@ describe('FirebirdLite (no Firebird installed)', () => {
     expect(execRes).toEqual({ affectedRows: 1 });
     expect(mockAttachment.prepare).toHaveBeenCalledTimes(1);
 
+    // stmt.queryStream() reuses the same prepared native statement
+    let streamFetchCount = 0;
+    fetch.mockImplementation(async () => {
+      streamFetchCount += 1;
+      if (streamFetchCount === 1) return [[1, 'alpha'], [2, 'beta']];
+      if (streamFetchCount === 2) return [[3, 'gamma']];
+      return [];
+    });
+    const streamedBatches: Array<Array<{ ID: number; LABEL: string }>> = [];
+    for await (const batch of stmt.queryStream<{ ID: number; LABEL: string }>([1], { batchSize: 2 })) {
+      streamedBatches.push(batch.rows);
+    }
+    expect(streamedBatches).toEqual([
+      [
+        { ID: 1, LABEL: 'alpha' },
+        { ID: 2, LABEL: 'beta' },
+      ],
+      [{ ID: 3, LABEL: 'gamma' }],
+    ]);
+    expect(mockAttachment.prepare).toHaveBeenCalledTimes(1);
+    expect(() => stmt.queryStream([1], { batchSize: 0 })).toThrow(RangeError);
+    expect(() => stmt.queryStream([1, 2])).toThrow(/expects 1 parameter\(s\) but 2/);
+
     await expect(stmt.query([1, 2])).rejects.toThrow(/expects 1 parameter\(s\) but 2/);
 
     await stmt.close();
     expect(stmt.closed).toBe(true);
     expect(dispose).toHaveBeenCalledTimes(1);
     await expect(stmt.query([1])).rejects.toThrow(/PreparedStatement has been closed/);
+    expect(() => stmt.queryStream([1])).toThrow(/PreparedStatement has been closed/);
   });
 
   it('streams and compresses database dumps via dumpDataStream() and loadDataStream()', async () => {

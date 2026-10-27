@@ -1282,6 +1282,25 @@ export class FirebirdBrowser {
         checkParamCount(callParams.length);
         return this.query(sqlText, callParams, callOptions);
       }) as PreparedStatement['query'],
+      queryStream: ((
+        paramsOrOptions: QueryParams | QueryStreamOptions = [],
+        maybeOptions: QueryStreamOptions = {},
+      ) => {
+        assertOpen();
+        const callParams = Array.isArray(paramsOrOptions)
+          ? paramsOrOptions
+          : [];
+        const callOptions = Array.isArray(paramsOrOptions)
+          ? maybeOptions
+          : (paramsOrOptions ?? {});
+        checkParamCount(callParams.length);
+        resolveBatchSize(callOptions.batchSize);
+        const openStream = () => this.queryStream(sqlText, callParams, callOptions);
+        return (async function* () {
+          assertOpen();
+          yield* openStream();
+        })();
+      }) as PreparedStatement['queryStream'],
       exec: async (callParams: QueryParams = []) => {
         assertOpen();
         checkParamCount(callParams.length);
@@ -2080,6 +2099,29 @@ export class FirebirdBrowserTransaction {
         checkParamCount(callParams.length);
         return this.query(sqlText, callParams, { rowMode: callOptions.rowMode });
       }) as PreparedStatement['query'],
+      queryStream: ((
+        paramsOrOptions: QueryParams | QueryStreamOptions = [],
+        maybeOptions: QueryStreamOptions = {},
+      ) => {
+        assertOpen();
+        const callParams = Array.isArray(paramsOrOptions)
+          ? paramsOrOptions
+          : [];
+        const callOptions = Array.isArray(paramsOrOptions)
+          ? maybeOptions
+          : (paramsOrOptions ?? {});
+        checkParamCount(callParams.length);
+        resolveBatchSize(callOptions.batchSize);
+        const openStream = () =>
+          this.queryStream(sqlText, callParams, {
+            rowMode: callOptions.rowMode,
+            batchSize: callOptions.batchSize,
+          });
+        return (async function* () {
+          assertOpen();
+          yield* openStream();
+        })();
+      }) as PreparedStatement['queryStream'],
       exec: async (callParams: QueryParams = []) => {
         assertOpen();
         checkParamCount(callParams.length);

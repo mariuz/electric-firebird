@@ -1256,7 +1256,7 @@ shipped, these are the highest-leverage candidates for upcoming releases:
 
 With M7 shipped in `v0.12.0`, these are the next-horizon milestones for `v0.13.0`:
 
-- [ ] **Prepared statement cursor streaming (`stmt.queryStream(params?, options?)`).**
+- [x] **Prepared statement cursor streaming (`stmt.queryStream(params?, options?)`).**
       `PreparedStatement` (`db.prepare(sql)` and `tx.prepare(sql)`) currently
       exposes `stmt.query()`, `stmt.exec()`, and `stmt.execBatch()`, while
       batched cursor streaming (`db.queryStream()`) still takes a SQL string.
