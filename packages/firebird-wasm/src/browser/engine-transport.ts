@@ -35,6 +35,8 @@ import type {
 import { isolationCode } from './isolation';
 import { encodeParams, encodeParamRows } from './params';
 import { extractBlobHandle } from './blob-stream';
+import { decodeBinaryResultSet, encodeBinaryResultSet } from './binary-result';
+export { decodeBinaryResultSet, encodeBinaryResultSet };
 import { firebirdTypeName } from './field-types';
 import { statementKind } from '../statement-types';
 import { extractReferencedTables } from './live-tables';
@@ -999,6 +1001,42 @@ export class DirectTransport implements EngineTransport {
     const flags = (binaryBlobs ? BLOB_SIDE_CHANNEL : 0) | SHAPE_IDS;
     return this.withString(sql, (sqlPtr) =>
       this.withParams(params, (paramPtr, paramLen) => {
+      if (typeof mod._fb_query_binary === 'function') {
+        const lenPtr = mod._malloc(4);
+        let binPtr = 0;
+        try {
+          binPtr = mod._fb_query_binary(
+            dbHandle,
+            txHandle,
+            sqlPtr,
+            paramPtr,
+            paramLen,
+            flags,
+            lenPtr,
+          );
+          if (binPtr === 0) {
+            throw engineError(mod, `Firebird query failed for: ${sql}`);
+          }
+          const lenView = new DataView(
+            mod.HEAPU8.buffer,
+            mod.HEAPU8.byteOffset + lenPtr,
+            4,
+          );
+          const byteLen = lenView.getUint32(0, true);
+          const view = mod.HEAPU8.subarray(binPtr, binPtr + byteLen);
+          return decodeBinaryResultSet<T>(
+            view,
+            rowMode,
+            binaryBlobs,
+            this.shapeColumns,
+          );
+        } finally {
+          if (binPtr !== 0) {
+            mod._fb_free_result(binPtr);
+          }
+          mod._free(lenPtr);
+        }
+      }
       const resultPtr =
         params.length === 0
           ? mod._fb_query(dbHandle, txHandle, sqlPtr, flags)
@@ -1072,6 +1110,40 @@ export class DirectTransport implements EngineTransport {
     binaryBlobs = false,
   ): Promise<QueryResult<T>> {
     const mod = this.module;
+    if (typeof mod._fb_cursor_fetch_binary === 'function') {
+      const flags = (binaryBlobs ? BLOB_SIDE_CHANNEL : 0) | SHAPE_IDS;
+      const lenPtr = mod._malloc(4);
+      let binPtr = 0;
+      try {
+        binPtr = mod._fb_cursor_fetch_binary(
+          cursorHandle,
+          batchSize,
+          flags,
+          lenPtr,
+        );
+        if (binPtr === 0) {
+          throw engineError(mod, 'Firebird cursor fetch failed');
+        }
+        const lenView = new DataView(
+          mod.HEAPU8.buffer,
+          mod.HEAPU8.byteOffset + lenPtr,
+          4,
+        );
+        const byteLen = lenView.getUint32(0, true);
+        const view = mod.HEAPU8.subarray(binPtr, binPtr + byteLen);
+        return decodeBinaryResultSet<T>(
+          view,
+          rowMode,
+          binaryBlobs,
+          this.shapeColumns,
+        );
+      } finally {
+        if (binPtr !== 0) {
+          mod._fb_free_result(binPtr);
+        }
+        mod._free(lenPtr);
+      }
+    }
     if (typeof mod._fb_cursor_fetch !== 'function') {
       const entry = this.fallbackCursors.get(cursorHandle);
       if (!entry) {

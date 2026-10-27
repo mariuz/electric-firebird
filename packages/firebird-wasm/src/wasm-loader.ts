@@ -149,6 +149,31 @@ export interface FirebirdWasmModule {
    * Execute a query with bound parameters.  Returns a pointer to the JSON
    * result set, or 0 on failure.  Release it with `_fb_free_result`.
    */
+  /**
+   * Execute a query (with optional packed `paramsPtr`) and return a pointer to
+   * a packed binary result buffer (`FBR\x01`), storing its byte length at
+   * `outByteLengthPtr`. Returns 0 on failure. Release with `_fb_free_result`.
+   */
+  _fb_query_binary?(
+    handle: FbHandle,
+    txHandle: FbHandle,
+    sqlPtr: number,
+    paramsPtr: number,
+    paramsLength: number,
+    flags: number,
+    outByteLengthPtr: number,
+  ): number;
+  /**
+   * Fetch up to `maxRows` rows from an open cursor into a packed binary result
+   * buffer (`FBR\x01`), storing its byte length at `outByteLengthPtr`.
+   * Returns 0 on failure. Release with `_fb_free_result`.
+   */
+  _fb_cursor_fetch_binary?(
+    cursorHandle: FbHandle,
+    maxRows: number,
+    flags: number,
+    outByteLengthPtr: number,
+  ): number;
   _fb_query_params(
     handle: FbHandle,
     txHandle: FbHandle,

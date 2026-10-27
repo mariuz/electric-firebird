@@ -64,6 +64,21 @@ export {
   DEFAULT_BLOB_SEGMENT_SIZE,
   MAX_BLOB_SEGMENT_SIZE,
 } from './blob-stream';
+export {
+  decodeBinaryResultSet,
+  encodeBinaryResultSet,
+  BINARY_RESULT_MAGIC_0,
+  BINARY_RESULT_MAGIC_1,
+  BINARY_RESULT_MAGIC_2,
+  BINARY_RESULT_VERSION,
+  BINARY_HEADER_HAS_SHAPE_ID,
+  BINARY_CELL_BOOL,
+  BINARY_CELL_INT32,
+  BINARY_CELL_FLOAT64,
+  BINARY_CELL_UTF8,
+  BINARY_CELL_BYTES,
+} from './binary-result';
+export type { EncodeBinaryResultOptions } from './binary-result';
 export { extractReferencedTables, liveTableEventName, liveTableTriggerDDL } from './live-tables';
 export type { ScriptStatement } from './sql-script';
 

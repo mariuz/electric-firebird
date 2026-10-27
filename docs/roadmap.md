@@ -1292,7 +1292,7 @@ With M7 shipped in `v0.12.0`, these are the next-horizon milestones for `v0.13.0
       and `WritableStream<Uint8Array>` inside a transaction lets applications
       stream large files into and out of Firebird `BLOB` columns with bounded
       memory.
-- [ ] **Binary result buffer across the WASM C bridge (`_fb_query_binary`).**
+- [x] **Binary result buffer across the WASM C bridge (`_fb_query_binary`).**
       `_fb_query_params` and `_fb_cursor_fetch` currently format every row as
       UTF-8 JSON in C++ and parse it with `JSON.parse()` in JavaScript. Adding a
       binary wire format in WASM linear memory (packing null bitmasks,

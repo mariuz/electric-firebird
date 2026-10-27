@@ -90,6 +90,21 @@ export type {
 // WASM loader (available on all platforms)
 export { loadFirebirdWasm, disposeFirebirdWasm, allocString, wasmGlueFile, hasSharedHeap, cdnArtifacts } from './wasm-loader';
 export type { CdnOptions, CdnArtifacts } from './wasm-loader';
+export {
+  decodeBinaryResultSet,
+  encodeBinaryResultSet,
+  BINARY_RESULT_MAGIC_0,
+  BINARY_RESULT_MAGIC_1,
+  BINARY_RESULT_MAGIC_2,
+  BINARY_RESULT_VERSION,
+  BINARY_HEADER_HAS_SHAPE_ID,
+  BINARY_CELL_BOOL,
+  BINARY_CELL_INT32,
+  BINARY_CELL_FLOAT64,
+  BINARY_CELL_UTF8,
+  BINARY_CELL_BYTES,
+} from './browser/binary-result';
+export type { EncodeBinaryResultOptions } from './browser/binary-result';
 export { VERSION } from './version';
 export type {
   FirebirdWasmModule,

@@ -137,6 +137,8 @@ struct OutputShape
 	std::vector<int> subTypes, scales;
 	std::string header;                     // {"columns":[...],"rows":[
 	std::string idHeader;                   // {"shape":N,"rows":[  (kept shapes only)
+	std::vector<unsigned char> binaryHeader;   // FBR\x01 + flags=0 + column descriptors
+	std::vector<unsigned char> binaryIdHeader; // FBR\x01 + flags=1 + u32 shapeId
 
 	OutputShape() = default;
 	OutputShape(const OutputShape&) = delete;
@@ -1439,6 +1441,391 @@ void appendValue(IAttachment* attachment, ITransaction* transaction,
 }
 
 // ---------------------------------------------------------------------------
+constexpr unsigned char BINARY_CELL_BOOL    = 1;
+constexpr unsigned char BINARY_CELL_INT32   = 2;
+constexpr unsigned char BINARY_CELL_FLOAT64 = 3;
+constexpr unsigned char BINARY_CELL_UTF8    = 4;
+constexpr unsigned char BINARY_CELL_BYTES   = 5;
+
+inline void pushU16LE(std::vector<unsigned char>& out, unsigned v)
+{
+	out.push_back(static_cast<unsigned char>(v & 0xff));
+	out.push_back(static_cast<unsigned char>((v >> 8) & 0xff));
+}
+
+inline void pushI16LE(std::vector<unsigned char>& out, int v)
+{
+	const unsigned u = static_cast<unsigned>(v) & 0xffffu;
+	out.push_back(static_cast<unsigned char>(u & 0xff));
+	out.push_back(static_cast<unsigned char>((u >> 8) & 0xff));
+}
+
+inline void pushU32LE(std::vector<unsigned char>& out, unsigned v)
+{
+	out.push_back(static_cast<unsigned char>(v & 0xff));
+	out.push_back(static_cast<unsigned char>((v >> 8) & 0xff));
+	out.push_back(static_cast<unsigned char>((v >> 16) & 0xff));
+	out.push_back(static_cast<unsigned char>((v >> 24) & 0xff));
+}
+
+inline void pushI32LE(std::vector<unsigned char>& out, int v)
+{
+	pushU32LE(out, static_cast<unsigned>(v));
+}
+
+inline void pushF64LE(std::vector<unsigned char>& out, double v)
+{
+	unsigned char bytes[8];
+	memcpy(bytes, &v, sizeof(bytes));
+	out.insert(out.end(), bytes, bytes + sizeof(bytes));
+}
+
+inline void pushBinaryUtf8(std::vector<unsigned char>& out, const char* str, size_t len)
+{
+	out.push_back(BINARY_CELL_UTF8);
+	pushU32LE(out, static_cast<unsigned>(len));
+	if (len > 0)
+		out.insert(out.end(), reinterpret_cast<const unsigned char*>(str),
+			reinterpret_cast<const unsigned char*>(str) + len);
+}
+
+inline void pushBinaryBytes(std::vector<unsigned char>& out, const unsigned char* bytes, size_t len)
+{
+	out.push_back(BINARY_CELL_BYTES);
+	pushU32LE(out, static_cast<unsigned>(len));
+	if (len > 0)
+		out.insert(out.end(), bytes, bytes + len);
+}
+
+/**
+ * Append one non-null column value in binary wire format to `out`.
+ * Returns `false` if the value could not be represented (e.g. non-finite float
+ * or unreadable BLOB) and the caller should mark the column's null bit instead.
+ */
+bool appendBinaryValue(IAttachment* attachment, ITransaction* transaction,
+	unsigned type, int subType, int scale, unsigned length, unsigned charSet,
+	const unsigned char* data, std::vector<unsigned char>& out)
+{
+	switch (type)
+	{
+		case SQL_TEXT:
+			if ((charSet & 0xff) == CHARSET_OCTETS)
+				pushBinaryBytes(out, data, length);
+			else
+				pushBinaryUtf8(out, reinterpret_cast<const char*>(data),
+					charTextLength(data, length, charSet));
+			return true;
+
+		case SQL_VARYING:
+		{
+			unsigned short varLength = 0;
+			memcpy(&varLength, data, sizeof(varLength));
+			const unsigned char* payload = data + sizeof(varLength);
+			if ((charSet & 0xff) == CHARSET_OCTETS)
+				pushBinaryBytes(out, payload, varLength);
+			else
+				pushBinaryUtf8(out, reinterpret_cast<const char*>(payload), varLength);
+			return true;
+		}
+
+		case SQL_SHORT:
+		{
+			short value = 0;
+			memcpy(&value, data, sizeof(value));
+			if (scale)
+			{
+				std::string s;
+				appendScaledDecimal(value, scale, s);
+				pushBinaryUtf8(out, s.data(), s.size());
+			}
+			else
+			{
+				out.push_back(BINARY_CELL_INT32);
+				pushI32LE(out, static_cast<int>(value));
+			}
+			return true;
+		}
+
+		case SQL_LONG:
+		{
+			ISC_LONG value = 0;
+			memcpy(&value, data, sizeof(value));
+			if (scale)
+			{
+				std::string s;
+				appendScaledDecimal(value, scale, s);
+				pushBinaryUtf8(out, s.data(), s.size());
+			}
+			else
+			{
+				out.push_back(BINARY_CELL_INT32);
+				pushI32LE(out, static_cast<int>(value));
+			}
+			return true;
+		}
+
+		case SQL_INT64:
+		{
+			ISC_INT64 value = 0;
+			memcpy(&value, data, sizeof(value));
+			if (scale)
+			{
+				std::string s;
+				appendScaledDecimal(value, scale, s);
+				pushBinaryUtf8(out, s.data(), s.size());
+			}
+			else if (value >= -2147483648LL && value <= 2147483647LL)
+			{
+				out.push_back(BINARY_CELL_INT32);
+				pushI32LE(out, static_cast<int>(value));
+			}
+			else if (exactlyRepresentableAsDouble(value))
+			{
+				out.push_back(BINARY_CELL_FLOAT64);
+				pushF64LE(out, static_cast<double>(value));
+			}
+			else
+			{
+				std::string s;
+				appendInteger(static_cast<long long>(value), s);
+				pushBinaryUtf8(out, s.data(), s.size());
+			}
+			return true;
+		}
+
+		case SQL_INT128:
+		{
+			Status status;
+			IInt128* int128 = g_util->getInt128(status.ptr());
+			char buf[IInt128::STRING_SIZE];
+			buf[0] = '\0';
+			if (!status.failed() && int128)
+			{
+				int128->toString(status.ptr(), reinterpret_cast<const FB_I128*>(data),
+					scale, sizeof(buf), buf);
+			}
+			if (status.failed() || !buf[0])
+				return false;
+			pushBinaryUtf8(out, buf, strlen(buf));
+			return true;
+		}
+
+		case SQL_FLOAT:
+		{
+			float value = 0;
+			memcpy(&value, data, sizeof(value));
+			if (!std::isfinite(value))
+				return false;
+			out.push_back(BINARY_CELL_FLOAT64);
+			pushF64LE(out, static_cast<double>(value));
+			return true;
+		}
+
+		case SQL_DOUBLE:
+		case SQL_D_FLOAT:
+		{
+			double value = 0;
+			memcpy(&value, data, sizeof(value));
+			if (!std::isfinite(value))
+				return false;
+			out.push_back(BINARY_CELL_FLOAT64);
+			pushF64LE(out, value);
+			return true;
+		}
+
+		case SQL_DEC16:
+		{
+			Status status;
+			IDecFloat16* dec = g_util->getDecFloat16(status.ptr());
+			char buf[IDecFloat16::STRING_SIZE];
+			buf[0] = '\0';
+			if (!status.failed() && dec)
+				dec->toString(status.ptr(), reinterpret_cast<const FB_DEC16*>(data), sizeof(buf), buf);
+			if (status.failed() || !buf[0])
+				return false;
+			pushBinaryUtf8(out, buf, strlen(buf));
+			return true;
+		}
+
+		case SQL_DEC34:
+		{
+			Status status;
+			IDecFloat34* dec = g_util->getDecFloat34(status.ptr());
+			char buf[IDecFloat34::STRING_SIZE];
+			buf[0] = '\0';
+			if (!status.failed() && dec)
+				dec->toString(status.ptr(), reinterpret_cast<const FB_DEC34*>(data), sizeof(buf), buf);
+			if (status.failed() || !buf[0])
+				return false;
+			pushBinaryUtf8(out, buf, strlen(buf));
+			return true;
+		}
+
+		case SQL_BOOLEAN:
+			out.push_back(BINARY_CELL_BOOL);
+			out.push_back(data[0] ? 1 : 0);
+			return true;
+
+		case SQL_TYPE_DATE:
+		{
+			ISC_DATE value = 0;
+			memcpy(&value, data, sizeof(value));
+			unsigned year = 0, month = 0, day = 0;
+			decodeDay(value, year, month, day);
+			std::string s;
+			appendDateText(year, month, day, s);
+			pushBinaryUtf8(out, s.data(), s.size());
+			return true;
+		}
+
+		case SQL_TYPE_TIME:
+		{
+			ISC_TIME value = 0;
+			memcpy(&value, data, sizeof(value));
+			unsigned hours = 0, minutes = 0, seconds = 0, fractions = 0;
+			decodeTimeOfDay(value, hours, minutes, seconds, fractions);
+			std::string s;
+			appendTimeText(hours, minutes, seconds, fractions, s);
+			pushBinaryUtf8(out, s.data(), s.size());
+			return true;
+		}
+
+		case SQL_TIMESTAMP:
+		{
+			ISC_TIMESTAMP value;
+			memcpy(&value, data, sizeof(value));
+			unsigned year = 0, month = 0, day = 0;
+			unsigned hours = 0, minutes = 0, seconds = 0, fractions = 0;
+			decodeDay(value.timestamp_date, year, month, day);
+			decodeTimeOfDay(value.timestamp_time, hours, minutes, seconds, fractions);
+			std::string s;
+			appendDateText(year, month, day, s);
+			s += 'T';
+			appendTimeText(hours, minutes, seconds, fractions, s);
+			pushBinaryUtf8(out, s.data(), s.size());
+			return true;
+		}
+
+		case SQL_TIME_TZ:
+		{
+			ISC_TIME_TZ value;
+			memcpy(&value, data, sizeof(value));
+			unsigned hours = 0, minutes = 0, seconds = 0, fractions = 0;
+			if (value.time_zone <= TZ_MAX_OFFSET_ID)
+			{
+				const int displacement = static_cast<int>(value.time_zone) - static_cast<int>(TZ_ONE_DAY);
+				int localTicks = static_cast<int>(value.utc_time) + displacement * TICKS_PER_MINUTE;
+				if (localTicks < 0)
+					localTicks += TICKS_PER_DAY;
+				else if (localTicks >= TICKS_PER_DAY)
+					localTicks -= TICKS_PER_DAY;
+				decodeTimeOfDay(static_cast<ISC_TIME>(localTicks), hours, minutes, seconds, fractions);
+				std::string s;
+				appendTimeText(hours, minutes, seconds, fractions, s);
+				appendOffsetText(displacement, s);
+				pushBinaryUtf8(out, s.data(), s.size());
+				return true;
+			}
+			Status status;
+			char zone[64] = {0};
+			g_util->decodeTimeTz(status.ptr(), &value, &hours, &minutes, &seconds,
+				&fractions, sizeof(zone), zone);
+			if (status.failed())
+				return false;
+			std::string s;
+			appendTimeText(hours, minutes, seconds, fractions, s);
+			s += ' ';
+			s += zone;
+			pushBinaryUtf8(out, s.data(), s.size());
+			return true;
+		}
+
+		case SQL_TIMESTAMP_TZ:
+		{
+			ISC_TIMESTAMP_TZ value;
+			memcpy(&value, data, sizeof(value));
+			unsigned year = 0, month = 0, day = 0;
+			unsigned hours = 0, minutes = 0, seconds = 0, fractions = 0;
+			if (value.time_zone <= TZ_MAX_OFFSET_ID)
+			{
+				const int displacement = static_cast<int>(value.time_zone) - static_cast<int>(TZ_ONE_DAY);
+				ISC_DATE localDate = value.utc_timestamp.timestamp_date;
+				int localTicks = static_cast<int>(value.utc_timestamp.timestamp_time)
+					+ displacement * TICKS_PER_MINUTE;
+				if (localTicks < 0)
+				{
+					localTicks += TICKS_PER_DAY;
+					--localDate;
+				}
+				else if (localTicks >= TICKS_PER_DAY)
+				{
+					localTicks -= TICKS_PER_DAY;
+					++localDate;
+				}
+				decodeDay(localDate, year, month, day);
+				decodeTimeOfDay(static_cast<ISC_TIME>(localTicks), hours, minutes, seconds, fractions);
+				std::string s;
+				appendDateText(year, month, day, s);
+				s += 'T';
+				appendTimeText(hours, minutes, seconds, fractions, s);
+				appendOffsetText(displacement, s);
+				pushBinaryUtf8(out, s.data(), s.size());
+				return true;
+			}
+			Status status;
+			char zone[64] = {0};
+			g_util->decodeTimeStampTz(status.ptr(), &value, &year, &month, &day,
+				&hours, &minutes, &seconds, &fractions, sizeof(zone), zone);
+			if (status.failed())
+				return false;
+			std::string s;
+			appendDateText(year, month, day, s);
+			s += 'T';
+			appendTimeText(hours, minutes, seconds, fractions, s);
+			s += ' ';
+			s += zone;
+			pushBinaryUtf8(out, s.data(), s.size());
+			return true;
+		}
+
+		case SQL_BLOB:
+		{
+			ISC_QUAD blobId;
+			memcpy(&blobId, data, sizeof(blobId));
+			Status status;
+			IBlob* blob = attachment->openBlob(status.ptr(), transaction, &blobId, 0, nullptr);
+			if (status.failed() || !blob)
+				return false;
+
+			std::vector<unsigned char> bytes;
+			unsigned char segment[16384];
+			for (;;)
+			{
+				unsigned segmentLength = 0;
+				const int rc = blob->getSegment(status.ptr(), sizeof(segment), segment, &segmentLength);
+				if (status.failed())
+					break;
+				if (segmentLength)
+					bytes.insert(bytes.end(), segment, segment + segmentLength);
+				if (rc == IStatus::RESULT_NO_DATA)
+					break;
+			}
+			Status closeStatus;
+			blob->close(closeStatus.ptr());
+			blob->release();
+
+			if (subType == 1)
+				pushBinaryUtf8(out, reinterpret_cast<const char*>(bytes.data()), bytes.size());
+			else
+				pushBinaryBytes(out, bytes.data(), bytes.size());
+			return true;
+		}
+
+		default:
+			return false;
+	}
+}
+
 // Statement parameters
 // ---------------------------------------------------------------------------
 //
@@ -2345,6 +2732,9 @@ std::shared_ptr<OutputShape> describeOutput(IStatement* statement, const char* c
 
 	std::string& json = shape->header;
 	json = "{\"columns\":[";
+	std::vector<unsigned char>& binHdr = shape->binaryHeader;
+	binHdr = {0x46, 0x42, 0x52, 0x01, 0x00};
+	pushU16LE(binHdr, columnCount);
 
 	for (unsigned i = 0; i < columnCount; i++)
 	{
@@ -2376,6 +2766,16 @@ std::shared_ptr<OutputShape> describeOutput(IStatement* statement, const char* c
 		// caller cannot tell a NUMERIC rendered as "20.25" from a VARCHAR
 		// that happens to contain digits — the JSON encoding makes them
 		// identical, and only the declared type separates them.
+		const size_t nameLen = name ? strlen(name) : 0;
+		pushU16LE(binHdr, static_cast<unsigned>(nameLen));
+		if (nameLen > 0)
+			binHdr.insert(binHdr.end(), reinterpret_cast<const unsigned char*>(name),
+				reinterpret_cast<const unsigned char*>(name) + nameLen);
+		pushU16LE(binHdr, shape->types[i]);
+		pushI16LE(binHdr, shape->subTypes[i]);
+		pushI16LE(binHdr, shape->scales[i]);
+		pushU32LE(binHdr, shape->lengths[i]);
+		binHdr.push_back(nullable ? 1 : 0);
 		json += "{\"name\":";
 		jsonEscape(name ? name : "", name ? strlen(name) : 0, json);
 
@@ -2440,6 +2840,8 @@ std::shared_ptr<OutputShape> outputShape(int db_handle, IStatement* statement, b
 	{
 		shape->id = g_nextShapeId++;
 		shape->idHeader = "{\"shape\":" + std::to_string(shape->id) + ",\"rows\":[";
+		shape->binaryIdHeader = {0x46, 0x42, 0x52, 0x01, 0x01};
+		pushU32LE(shape->binaryIdHeader, shape->id);
 		g_shapes[shape->id] = shape.get();
 		kept->shape = shape;
 	}
@@ -2562,6 +2964,121 @@ bool serialiseCursor(IAttachment* attachment, ITransaction* transaction,
 
 	json += "]}";
 	return true;
+}
+
+bool serialiseCursorBinary(IAttachment* attachment, ITransaction* transaction,
+	IStatement* statement, const OutputShape& shape,
+	IMessageMetadata* inMeta, void* inBuffer,
+	IResultSet*& cursor, std::vector<unsigned char>& out, bool shapeIds = false)
+{
+	Status status;
+	const unsigned columnCount = shape.columnCount;
+	const std::vector<unsigned char>& hdr = (shapeIds && shape.id)
+		? shape.binaryIdHeader
+		: shape.binaryHeader;
+
+	out = hdr;
+	const size_t rowCountPos = out.size();
+	pushU32LE(out, 0);
+
+	unsigned rowCount = 0;
+
+	if (!columnCount)
+	{
+		statement->execute(status.ptr(), transaction, inMeta, inBuffer, nullptr, nullptr);
+		if (status.failed())
+		{
+			setErrorFromStatus("could not execute statement", status.ptr());
+			return false;
+		}
+
+		Status affectedStatus;
+		const ISC_UINT64 affected = statement->getAffectedRecords(affectedStatus.ptr());
+		g_lastAffectedRows = affectedStatus.failed()
+			? 0
+			: static_cast<ISC_INT64>(affected);
+	}
+	else
+	{
+		std::vector<unsigned char> buffer(shape.messageLength);
+		const unsigned maskByteLen = (columnCount + 7u) >> 3;
+
+		const auto appendRow = [&]()
+		{
+			++rowCount;
+			const size_t maskPos = out.size();
+			out.insert(out.end(), maskByteLen, 0);
+
+			for (unsigned i = 0; i < columnCount; i++)
+			{
+				short nullFlag = 0;
+				memcpy(&nullFlag, buffer.data() + shape.nullOffsets[i], sizeof(nullFlag));
+
+				if (nullFlag == -1 ||
+					!appendBinaryValue(attachment, transaction, shape.types[i], shape.subTypes[i],
+						shape.scales[i], shape.lengths[i], shape.charSets[i],
+						buffer.data() + shape.offsets[i], out))
+				{
+					out[maskPos + (i >> 3)] |= static_cast<unsigned char>(1u << (i & 7));
+				}
+			}
+		};
+
+		if (!shape.hasCursor)
+		{
+			statement->execute(status.ptr(), transaction, inMeta, inBuffer,
+				shape.metadata, buffer.data());
+			if (status.failed())
+			{
+				setErrorFromStatus("could not execute statement", status.ptr());
+				return false;
+			}
+			appendRow();
+		}
+		else
+		{
+			cursor = statement->openCursor(status.ptr(), transaction, inMeta, inBuffer,
+				shape.metadata, 0);
+			if (status.failed() || !cursor)
+			{
+				setErrorFromStatus("could not open cursor", status.ptr());
+				return false;
+			}
+
+			for (;;)
+			{
+				const int rc = cursor->fetchNext(status.ptr(), buffer.data());
+				if (status.failed())
+				{
+					setErrorFromStatus("fetch failed", status.ptr());
+					return false;
+				}
+				if (rc != IStatus::RESULT_OK)
+					break;
+
+				appendRow();
+			}
+		}
+	}
+
+	out[rowCountPos]     = static_cast<unsigned char>(rowCount & 0xff);
+	out[rowCountPos + 1] = static_cast<unsigned char>((rowCount >> 8) & 0xff);
+	out[rowCountPos + 2] = static_cast<unsigned char>((rowCount >> 16) & 0xff);
+	out[rowCountPos + 3] = static_cast<unsigned char>((rowCount >> 24) & 0xff);
+	return true;
+}
+
+unsigned char* allocBinaryBuffer(const std::vector<unsigned char>& buf, unsigned* out_byte_length)
+{
+	if (out_byte_length)
+		*out_byte_length = static_cast<unsigned>(buf.size());
+	const size_t sz = buf.empty() ? 1 : buf.size();
+	auto* out = static_cast<unsigned char*>(malloc(sz));
+	if (!out)
+		return nullptr;
+	if (!buf.empty())
+		memcpy(out, buf.data(), buf.size());
+	return out;
 }
 
 } // anonymous namespace
@@ -4995,7 +5512,7 @@ FB_WASM_EXPORT
 int fb_blob_create(int db_handle, int tx_handle, unsigned char* out_blob_id)
 {
 	clearError();
-	IAttachment* attachment = lookupDb(db_handle);
+	IAttachment* attachment = lookupAttachment(db_handle);
 	if (!attachment)
 	{
 		setError("fb_blob_create: unknown database handle");
@@ -5006,7 +5523,12 @@ int fb_blob_create(int db_handle, int tx_handle, unsigned char* out_blob_id)
 	bool ownTransaction = false;
 	if (tx_handle != 0)
 	{
-		transaction = lookupTx(tx_handle, db_handle);
+		transaction = lookupTransaction(tx_handle);
+		if (!transaction)
+		{
+			setError("unknown transaction handle");
+			return 0;
+		}
 		if (!transaction)
 			return 0;
 	}
@@ -5102,7 +5624,7 @@ int fb_blob_open_id(int db_handle, int tx_handle, const unsigned char* blob_id_p
 		setError("fb_blob_open_id: null blob_id_ptr");
 		return 0;
 	}
-	IAttachment* attachment = lookupDb(db_handle);
+	IAttachment* attachment = lookupAttachment(db_handle);
 	if (!attachment)
 	{
 		setError("fb_blob_open_id: unknown database handle");
@@ -5113,7 +5635,12 @@ int fb_blob_open_id(int db_handle, int tx_handle, const unsigned char* blob_id_p
 	bool ownTransaction = false;
 	if (tx_handle != 0)
 	{
-		transaction = lookupTx(tx_handle, db_handle);
+		transaction = lookupTransaction(tx_handle);
+		if (!transaction)
+		{
+			setError("unknown transaction handle");
+			return 0;
+		}
 		if (!transaction)
 			return 0;
 	}
@@ -5177,7 +5704,7 @@ int fb_blob_open_query(int db_handle, int tx_handle, const char* sql,
 		setError("fb_blob_open_query: empty SQL");
 		return 0;
 	}
-	IAttachment* attachment = lookupDb(db_handle);
+	IAttachment* attachment = lookupAttachment(db_handle);
 	if (!attachment)
 	{
 		setError("fb_blob_open_query: unknown database handle");
@@ -5195,7 +5722,12 @@ int fb_blob_open_query(int db_handle, int tx_handle, const char* sql,
 	bool ownTransaction = false;
 	if (tx_handle != 0)
 	{
-		transaction = lookupTx(tx_handle, db_handle);
+		transaction = lookupTransaction(tx_handle);
+		if (!transaction)
+		{
+			setError("unknown transaction handle");
+			return 0;
+		}
 		if (!transaction)
 			return 0;
 	}
@@ -5239,7 +5771,7 @@ int fb_blob_open_query(int db_handle, int tx_handle, const char* sql,
 		return 0;
 	}
 
-	std::shared_ptr<OutputShape> shape = shapeForStatement(db_handle, statement, status);
+	std::shared_ptr<OutputShape> shape = outputShape(db_handle, statement, cached, "fb_blob_open_query");
 	if (!shape || shape->columnCount == 0)
 	{
 		releaseStatement(db_handle, statement, cached, true);
@@ -5442,6 +5974,261 @@ int fb_blob_close(int blob_handle, int cancel, unsigned char* out_blob_id)
 	const bool ok = closeBlobEntry(it->second, cancel != 0);
 	g_blobs.erase(it);
 	return ok ? 0 : 2;
+}
+
+/**
+ * Run a parameterised query (`params` may be null/empty) and return a packed
+ * binary result buffer (`FBR\x01`), storing its byte length in `*out_byte_length`.
+ * Returns nullptr on failure. Free the returned buffer with `fb_free_result()`.
+ */
+FB_WASM_EXPORT
+const unsigned char* fb_query_binary(int db_handle, int tx_handle, const char* sql,
+	const unsigned char* params, int params_length, int flags, unsigned* out_byte_length)
+{
+	clearError();
+	if (out_byte_length)
+		*out_byte_length = 0;
+
+	IAttachment* attachment = lookupAttachment(db_handle);
+	if (!attachment)
+	{
+		setError("fb_query_binary: unknown database handle");
+		return nullptr;
+	}
+
+	std::vector<ParamValue> values;
+	if (!parseParams(params, static_cast<unsigned>(params_length < 0 ? 0 : params_length),
+			values))
+	{
+		setError("fb_query_binary: malformed parameter buffer");
+		return nullptr;
+	}
+
+	ITransaction* transaction = nullptr;
+	bool ownTransaction = false;
+	DbEntry* entry = lookupEntry(db_handle);
+	bool shared = false;
+
+	auto startOwnTransaction = [&]()
+	{
+		Status status;
+		transaction = attachment->startTransaction(status.ptr(), 0, nullptr);
+		if (status.failed() || !transaction)
+		{
+			transaction = nullptr;
+			setErrorFromStatus("fb_query_binary: could not start transaction", status.ptr());
+			return false;
+		}
+		ownTransaction = true;
+		return true;
+	};
+
+	if (tx_handle)
+	{
+		transaction = lookupTransaction(tx_handle);
+		if (!transaction)
+		{
+			setError("fb_query_binary: unknown transaction handle");
+			return nullptr;
+		}
+	}
+	else if (wantsSharedRead(entry, sql) && (transaction = sharedReadTransaction(*entry)))
+		shared = true;
+	else if (!startOwnTransaction())
+		return nullptr;
+
+	IResultSet* cursor = nullptr;
+	IStatement* statement = nullptr;
+	bool cached = false;
+
+	auto cleanup = [&](bool commit, bool keep = false)
+	{
+		if (cursor)
+		{
+			Status s;
+			cursor->close(s.ptr());
+			cursor->release();
+		}
+		releaseStatement(db_handle, statement, cached, !commit && !keep);
+		if (ownTransaction && transaction)
+		{
+			Status s;
+			if (commit)
+				transaction->commit(s.ptr());
+			else
+				transaction->rollback(s.ptr());
+		}
+	};
+
+	Status status;
+	unsigned type = 0;
+	statement = acquireStatement(db_handle, attachment, transaction, sql, status, cached, &type);
+	if (status.failed() || !statement)
+	{
+		setErrorFromStatus("fb_query_binary: prepare failed", status.ptr());
+		cleanup(false);
+		return nullptr;
+	}
+
+	if (shared && type != isc_info_sql_stmt_select)
+	{
+		shared = false;
+		transaction = nullptr;
+		if (!startOwnTransaction())
+		{
+			cleanup(false);
+			return nullptr;
+		}
+	}
+
+	InputMessage input;
+	IMessageMetadata* inMeta = nullptr;
+	void* inBuffer = nullptr;
+	if (!values.empty())
+	{
+		input.writeBlobsTo(attachment, transaction);
+		if (!input.build(statement, values))
+		{
+			cleanup(false);
+			return nullptr;
+		}
+		inMeta = input.meta();
+		inBuffer = input.data();
+	}
+
+	const std::shared_ptr<OutputShape> shape = outputShape(db_handle, statement, cached, "fb_query_binary");
+	if (!shape)
+	{
+		cleanup(false);
+		return nullptr;
+	}
+
+	std::vector<unsigned char> binary;
+	if (!serialiseCursorBinary(attachment, transaction, statement, *shape,
+			inMeta, inBuffer, cursor, binary, (flags & FB_QUERY_SHAPE_IDS) != 0))
+	{
+		if (shared && g_lastErrorReadOnly)
+		{
+			rememberWriter(*entry, sql);
+			cleanup(false, true);
+			return fb_query_binary(db_handle, 0, sql, params, params_length, flags, out_byte_length);
+		}
+		cleanup(false);
+		if (shared)
+			endReadTransaction(*entry);
+		return nullptr;
+	}
+
+	cleanup(true);
+	return allocBinaryBuffer(binary, out_byte_length);
+}
+
+/**
+ * Fetch up to `max_rows` rows from an open cursor and return a packed binary
+ * result buffer (`FBR\x01`), storing its byte length in `*out_byte_length`.
+ * Returns nullptr on failure. Free the returned buffer with `fb_free_result()`.
+ */
+FB_WASM_EXPORT
+const unsigned char* fb_cursor_fetch_binary(int cursor_handle, int max_rows, int flags,
+	unsigned* out_byte_length)
+{
+	clearError();
+	if (out_byte_length)
+		*out_byte_length = 0;
+
+	const auto it = g_cursors.find(cursor_handle);
+	if (it == g_cursors.end())
+	{
+		setError("fb_cursor_fetch_binary: unknown cursor handle");
+		return nullptr;
+	}
+
+	if (max_rows <= 0)
+	{
+		setError("fb_cursor_fetch_binary: max_rows must be positive");
+		return nullptr;
+	}
+
+	CursorEntry& entry = it->second;
+	const OutputShape& shape = *entry.shape;
+	const unsigned columnCount = shape.columnCount;
+	const bool shapeIds = (flags & FB_QUERY_SHAPE_IDS) != 0;
+
+	std::vector<unsigned char> out = (shapeIds && shape.id)
+		? shape.binaryIdHeader
+		: shape.binaryHeader;
+	const size_t rowCountPos = out.size();
+	pushU32LE(out, 0);
+
+	unsigned rowCount = 0;
+	const unsigned maskByteLen = (columnCount + 7u) >> 3;
+
+	const auto appendRowFromBuffer = [&](const unsigned char* buf)
+	{
+		++rowCount;
+		const size_t maskPos = out.size();
+		out.insert(out.end(), maskByteLen, 0);
+
+		for (unsigned i = 0; i < columnCount; i++)
+		{
+			short nullFlag = 0;
+			memcpy(&nullFlag, buf + shape.nullOffsets[i], sizeof(nullFlag));
+
+			if (nullFlag == -1 ||
+				!appendBinaryValue(entry.attachment, entry.transaction,
+					shape.types[i], shape.subTypes[i],
+					shape.scales[i], shape.lengths[i], shape.charSets[i],
+					buf + shape.offsets[i], out))
+			{
+				out[maskPos + (i >> 3)] |= static_cast<unsigned char>(1u << (i & 7));
+			}
+		}
+	};
+
+	if (!entry.eof && columnCount > 0)
+	{
+		if (entry.singleRowPending)
+		{
+			entry.singleRowPending = false;
+			entry.eof = true;
+			appendRowFromBuffer(entry.singleRowBuffer.data());
+		}
+		else if (entry.cursor)
+		{
+			std::vector<unsigned char> buffer(shape.messageLength);
+			for (int fetched = 0; fetched < max_rows; ++fetched)
+			{
+				Status status;
+				const int rc = entry.cursor->fetchNext(status.ptr(), buffer.data());
+				if (status.failed())
+				{
+					entry.failed = true;
+					setErrorFromStatus("fb_cursor_fetch_binary: fetch failed", status.ptr());
+					return nullptr;
+				}
+				if (rc != IStatus::RESULT_OK)
+				{
+					entry.eof = true;
+					break;
+				}
+				appendRowFromBuffer(buffer.data());
+			}
+		}
+		else
+		{
+			entry.eof = true;
+		}
+	}
+	else
+	{
+		entry.eof = true;
+	}
+
+	out[rowCountPos]     = static_cast<unsigned char>(rowCount & 0xff);
+	out[rowCountPos + 1] = static_cast<unsigned char>((rowCount >> 8) & 0xff);
+	out[rowCountPos + 2] = static_cast<unsigned char>((rowCount >> 16) & 0xff);
+	out[rowCountPos + 3] = static_cast<unsigned char>((rowCount >> 24) & 0xff);
+	return allocBinaryBuffer(out, out_byte_length);
 }
 
 } /* extern "C" */
