@@ -1319,7 +1319,7 @@ With M0–M8 complete, these are the next-horizon milestones for `v0.14.0`:
       text to `query()` / `execute()` (relying on the LRU cache lookup). Adding
       `_fb_query_stmt(db, tx, stmtHandle, ...)` and `_fb_execute_stmt(db, tx, stmtHandle, ...)`
       completes true zero-string-marshalling execution by integer handle.
-- [ ] **Nested transactions / Savepoints (`tx.savepoint(fn)` / `SAVEPOINT`).**
+- [x] **Nested transactions / Savepoints (`tx.savepoint(fn)` / `SAVEPOINT`).**
       Add first-class savepoint helpers on `Transaction` (`await tx.savepoint(async (sp) => { ... })`
       wrapping `SAVEPOINT sp_N`, `RELEASE SAVEPOINT sp_N ONLY`, and
       `ROLLBACK TO SAVEPOINT sp_N`) across both `FirebirdBrowser` and `FirebirdLite`.

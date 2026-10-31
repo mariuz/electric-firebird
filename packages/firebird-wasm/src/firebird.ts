@@ -1413,12 +1413,24 @@ export class FirebirdLite {
   }
 }
 
+const SAVEPOINT_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_$]{0,62}$/;
+
+function validateSavepointName(name: string): string {
+  if (typeof name !== 'string' || !SAVEPOINT_NAME_PATTERN.test(name)) {
+    throw new Error(
+      `Invalid savepoint name "${String(name)}": must be a valid SQL identifier (1-63 ASCII letters, digits, '_', or '$', starting with a letter or '_')`,
+    );
+  }
+  return name;
+}
+
 /**
- * A handle to an active Firebird transaction, exposed to callers of
- * `FirebirdLite.transaction()`.
+ * A handle to an active Firebird transaction (or nested savepoint), exposed to
+ * callers of `FirebirdLite.transaction()`.
  */
 export class FirebirdTransaction {
   private finished = false;
+  private readonly nextSavepointId: () => number;
 
   constructor(
     private readonly attachment: Attachment,
@@ -1426,34 +1438,143 @@ export class FirebirdTransaction {
     private readonly beforeStatement: () => Promise<void> = async () => undefined,
     private readonly statements: StatementCache = new StatementCache(attachment, 0),
     private readonly types?: TypeOptions,
-  ) {}
+    readonly savepointName?: string,
+    private readonly parent?: FirebirdTransaction,
+    nextSavepointId?: () => number,
+  ) {
+    if (nextSavepointId) {
+      this.nextSavepointId = nextSavepointId;
+    } else {
+      let counter = 0;
+      this.nextSavepointId = () => {
+        counter += 1;
+        return counter;
+      };
+    }
+  }
 
   private serialize(params: QueryParams): QueryParams {
     return applySerializers(params, this.types?.serializers);
   }
 
-  /** Whether this transaction has already been rolled back. */
+  /** Whether this transaction (or savepoint) has already finished or been rolled back. */
   get isFinished(): boolean {
-    return this.finished;
+    return this.finished || (this.parent ? this.parent.isFinished : false);
+  }
+
+  private markFinished(): void {
+    this.finished = true;
   }
 
   /**
-   * Roll this transaction back and stop.
+   * Roll this transaction (or savepoint) back and stop.
    *
-   * The enclosing `transaction()` will not commit afterwards.  Use this to
-   * abandon a transaction deliberately, rather than throwing an error you do
-   * not mean — throwing also rolls back, but it propagates to the caller.
+   * When called on the root transaction, the enclosing `transaction()` will not
+   * commit afterwards. When called on a savepoint handle inside `tx.savepoint()`,
+   * only the work since the savepoint is undone (`ROLLBACK TO SAVEPOINT` +
+   * `RELEASE SAVEPOINT ... ONLY`) and the enclosing transaction remains active.
    */
   async rollback(): Promise<void> {
-    if (this.finished) return;
+    if (this.isFinished) return;
     this.finished = true;
+    if (this.savepointName) {
+      await this.beforeStatement();
+      await this.attachment.execute(
+        this.transaction,
+        `ROLLBACK TO SAVEPOINT ${this.savepointName}`,
+      );
+      await this.attachment.execute(
+        this.transaction,
+        `RELEASE SAVEPOINT ${this.savepointName} ONLY`,
+      );
+      return;
+    }
     await this.transaction.rollback();
   }
 
   private assertUsable(): void {
-    if (this.finished) {
-      throw new Error('Transaction has already been rolled back');
+    if (this.isFinished) {
+      throw new Error(
+        this.savepointName
+          ? `Savepoint "${this.savepointName}" has already finished`
+          : 'Transaction has already been rolled back',
+      );
     }
+  }
+
+  /**
+   * Run `fn` inside a SQL `SAVEPOINT` within this transaction.
+   *
+   * - If `fn` resolves (and `sp.rollback()` was not called), the savepoint is
+   *   released via `RELEASE SAVEPOINT <name> ONLY`.
+   * - If `fn` throws an error, the work inside the savepoint is undone via
+   *   `ROLLBACK TO SAVEPOINT <name>` + `RELEASE SAVEPOINT <name> ONLY` and the
+   *   error is re-thrown while the outer transaction stays active.
+   * - If `await sp.rollback()` is called inside `fn`, the savepoint is rolled
+   *   back and released without throwing, and `fn`'s return value is returned.
+   * - Savepoints can be nested arbitrarily; when `name` is omitted, unique
+   *   names (`sp_1`, `sp_2`, ...) are generated automatically.
+   */
+  savepoint<T>(fn: (sp: FirebirdTransaction) => Promise<T>): Promise<T>;
+  savepoint<T>(
+    name: string,
+    fn: (sp: FirebirdTransaction) => Promise<T>,
+  ): Promise<T>;
+  async savepoint<T>(
+    nameOrFn: string | ((sp: FirebirdTransaction) => Promise<T>),
+    maybeFn?: (sp: FirebirdTransaction) => Promise<T>,
+  ): Promise<T> {
+    this.assertUsable();
+    const name =
+      typeof nameOrFn === 'string'
+        ? validateSavepointName(nameOrFn)
+        : `sp_${this.nextSavepointId()}`;
+    const fn = typeof nameOrFn === 'function' ? nameOrFn : maybeFn;
+    if (typeof fn !== 'function') {
+      throw new TypeError('savepoint requires a callback function');
+    }
+
+    await this.beforeStatement();
+    await this.attachment.execute(this.transaction, `SAVEPOINT ${name}`);
+
+    const sp = new FirebirdTransaction(
+      this.attachment,
+      this.transaction,
+      this.beforeStatement,
+      this.statements,
+      this.types,
+      name,
+      this,
+      this.nextSavepointId,
+    );
+
+    let result: T;
+    try {
+      result = await fn(sp);
+    } catch (err) {
+      if (!sp.isFinished) {
+        sp.markFinished();
+        await this.beforeStatement().catch(() => undefined);
+        await this.attachment
+          .execute(this.transaction, `ROLLBACK TO SAVEPOINT ${name}`)
+          .catch(() => undefined);
+        await this.attachment
+          .execute(this.transaction, `RELEASE SAVEPOINT ${name} ONLY`)
+          .catch(() => undefined);
+      }
+      throw err;
+    }
+
+    if (!sp.isFinished) {
+      sp.markFinished();
+      await this.beforeStatement();
+      await this.attachment.execute(
+        this.transaction,
+        `RELEASE SAVEPOINT ${name} ONLY`,
+      );
+    }
+
+    return result;
   }
 
   /**
@@ -1701,7 +1822,7 @@ export class FirebirdTransaction {
     const statementType = statementKind(type);
     const hasResultSet = nativeStmt.hasResultSet;
     let isClosed = false;
-    const isTxFinished = () => this.finished;
+    const isTxFinished = () => this.isFinished;
 
     const assertOpen = (): void => {
       if (isClosed) {

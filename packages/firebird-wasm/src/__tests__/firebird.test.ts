@@ -402,6 +402,48 @@ describeIfFirebird('FirebirdLite', () => {
     expect(result.rows[0]).toMatchObject({ BALANCE: 1000 });
   });
 
+  it('supports nested savepoints via tx.savepoint()', async () => {
+    await db.exec('CREATE TABLE sp_items (id INTEGER, label VARCHAR(20))');
+
+    await db.transaction(async (tx) => {
+      await tx.exec("INSERT INTO sp_items VALUES (1, 'outer-keep')");
+
+      // Savepoint that throws rolls back only its own work
+      await expect(
+        tx.savepoint(async (sp) => {
+          await sp.exec("INSERT INTO sp_items VALUES (2, 'inner-throw')");
+          throw new Error('revert inner');
+        }),
+      ).rejects.toThrow('revert inner');
+
+      // Savepoint that calls sp.rollback() explicitly returns normally without committing inner work
+      const outcome = await tx.savepoint('custom_sp', async (sp) => {
+        expect(sp.savepointName).toBe('custom_sp');
+        await sp.exec("INSERT INTO sp_items VALUES (3, 'inner-rollback')");
+        await sp.rollback();
+        return 'abandoned-inner';
+      });
+      expect(outcome).toBe('abandoned-inner');
+
+      // Nested savepoints where inner succeeds and outer succeeds
+      await tx.savepoint(async (spOuter) => {
+        await spOuter.exec("INSERT INTO sp_items VALUES (4, 'nested-outer')");
+        await spOuter.savepoint(async (spInner) => {
+          await spInner.exec("INSERT INTO sp_items VALUES (5, 'nested-inner')");
+        });
+      });
+    });
+
+    const { rows } = await db.query<{ ID: number; LABEL: string }>(
+      'SELECT id, label FROM sp_items ORDER BY id',
+    );
+    expect(rows).toEqual([
+      { ID: 1, LABEL: 'outer-keep' },
+      { ID: 4, LABEL: 'nested-outer' },
+      { ID: 5, LABEL: 'nested-inner' },
+    ]);
+  });
+
   it('populates the fields array', async () => {
     await db.exec('CREATE TABLE products (id INTEGER, price NUMERIC(10,2))');
     await db.exec('INSERT INTO products VALUES (1, 9.99)');
@@ -1756,6 +1798,148 @@ describe('FirebirdLite (no Firebird installed)', () => {
       expect(loadedPacks).toHaveLength(2);
     } finally {
       await db.close();
+    }
+  });
+
+  it('manages nested savepoints via tx.savepoint() in FirebirdLite and FirebirdBrowser', async () => {
+    // 1. FirebirdLite (FirebirdTransaction)
+    const liteDb = new FirebirdLite('/nonexistent/db.fdb');
+    (liteDb as unknown as { initialized: boolean }).initialized = true;
+    const liteExecutedSql: string[] = [];
+    const liteCommit = jest.fn(async () => undefined);
+    const liteRollback = jest.fn(async () => undefined);
+    (liteDb as unknown as { attachment: unknown }).attachment = {
+      startTransaction: jest.fn(async () => ({
+        commit: liteCommit,
+        rollback: liteRollback,
+      })),
+      execute: jest.fn(async (_tx: unknown, sqlText: string) => {
+        liteExecutedSql.push(sqlText);
+      }),
+      disconnect: jest.fn(async () => undefined),
+    };
+
+    await liteDb.transaction(async (tx) => {
+      await tx.exec('INSERT INTO t VALUES (1)');
+
+      // Auto-named savepoint that succeeds
+      const r1 = await tx.savepoint(async (sp) => {
+        expect(sp.savepointName).toBe('sp_1');
+        await sp.exec('INSERT INTO t VALUES (2)');
+        // Nested savepoint that throws
+        await expect(
+          sp.savepoint(async (inner) => {
+            expect(inner.savepointName).toBe('sp_2');
+            await inner.exec('INSERT INTO t VALUES (3)');
+            throw new Error('inner boom');
+          }),
+        ).rejects.toThrow('inner boom');
+        return 'ok';
+      });
+      expect(r1).toBe('ok');
+
+      // Custom-named savepoint with explicit sp.rollback()
+      const r2 = await tx.savepoint('my_custom$sp', async (sp) => {
+        expect(sp.savepointName).toBe('my_custom$sp');
+        await sp.exec('INSERT INTO t VALUES (4)');
+        await sp.rollback();
+        expect(sp.isFinished).toBe(true);
+        await expect(sp.exec('INSERT INTO t VALUES (5)')).rejects.toThrow(
+          /Savepoint "my_custom\$sp" has already finished/,
+        );
+        return 'rolled-back';
+      });
+      expect(r2).toBe('rolled-back');
+
+      // Invalid savepoint name rejected
+      await expect(
+        tx.savepoint('bad; DROP TABLE t', async () => undefined),
+      ).rejects.toThrow(/Invalid savepoint name/);
+    });
+
+    expect(liteExecutedSql).toEqual([
+      'INSERT INTO t VALUES (1)',
+      'SAVEPOINT sp_1',
+      'INSERT INTO t VALUES (2)',
+      'SAVEPOINT sp_2',
+      'INSERT INTO t VALUES (3)',
+      'ROLLBACK TO SAVEPOINT sp_2',
+      'RELEASE SAVEPOINT sp_2 ONLY',
+      'RELEASE SAVEPOINT sp_1 ONLY',
+      'SAVEPOINT my_custom$sp',
+      'INSERT INTO t VALUES (4)',
+      'ROLLBACK TO SAVEPOINT my_custom$sp',
+      'RELEASE SAVEPOINT my_custom$sp ONLY',
+    ]);
+    expect(liteCommit).toHaveBeenCalledTimes(1);
+    expect(liteRollback).not.toHaveBeenCalled();
+
+    // 2. FirebirdBrowser (FirebirdBrowserTransaction)
+    const { FirebirdBrowser } = await import('../browser/firebird-browser');
+    const browserExecutedSql: string[] = [];
+    const browserCommit = jest.fn(async () => undefined);
+    const browserRollback = jest.fn(async () => undefined);
+    const mockTransport = {
+      init: jest.fn(async () => undefined),
+      createDatabase: jest.fn(async () => 1),
+      attachDatabase: jest.fn(async () => 1),
+      detachDatabase: jest.fn(async () => undefined),
+      execute: jest.fn(async (_db: number, _tx: number, sqlText: string) => {
+        browserExecutedSql.push(sqlText);
+        return 1;
+      }),
+      executeBatch: jest.fn(async () => 0),
+      query: jest.fn(async () => ({ fields: [], rows: [] })),
+      describe: jest.fn(async () => ({
+        params: [],
+        fields: [],
+        statementType: 'DDL' as const,
+        hasResultSet: false,
+      })),
+      startTransaction: jest.fn(async () => 7),
+      commit: browserCommit,
+      rollback: browserRollback,
+      mkdir: jest.fn(async () => undefined),
+      exists: jest.fn(async () => false),
+      readFile: jest.fn(async () => new Uint8Array(0)),
+      writeFile: jest.fn(async () => undefined),
+      unlink: jest.fn(async () => undefined),
+      eventsSubscribe: jest.fn(async () => 1),
+      eventsPoll: jest.fn(async () => ({})),
+      eventsCancel: jest.fn(async () => undefined),
+      mountOpfs: jest.fn(async () => '/opfs/test.fdb'),
+      dispose: jest.fn(async () => undefined),
+    };
+
+    const browserDb = new FirebirdBrowser('memory://sp-test', {
+      transport: mockTransport,
+    });
+    try {
+      await browserDb.transaction(async (tx) => {
+        await tx.exec('INSERT INTO b VALUES (10)');
+        await tx.savepoint(async (sp1) => {
+          await sp1.exec('INSERT INTO b VALUES (20)');
+          await sp1.savepoint('inner_sp', async (sp2) => {
+            await sp2.exec('INSERT INTO b VALUES (30)');
+            await sp2.rollback();
+          });
+        });
+      });
+
+      expect(browserExecutedSql).toEqual([
+        'INSERT INTO b VALUES (10)',
+        'SAVEPOINT sp_1',
+        'INSERT INTO b VALUES (20)',
+        'SAVEPOINT inner_sp',
+        'INSERT INTO b VALUES (30)',
+        'ROLLBACK TO SAVEPOINT inner_sp',
+        'RELEASE SAVEPOINT inner_sp ONLY',
+        'RELEASE SAVEPOINT sp_1 ONLY',
+      ]);
+      expect(browserCommit).toHaveBeenCalledWith(7);
+      expect(browserRollback).not.toHaveBeenCalled();
+    } finally {
+      await browserDb.close();
     }
   });
 

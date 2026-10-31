@@ -2286,44 +2286,181 @@ export class FirebirdBrowser {
 // Transaction handle
 // ---------------------------------------------------------------------------
 
+const SAVEPOINT_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_$]{0,62}$/;
+
+function validateSavepointName(name: string): string {
+  if (typeof name !== 'string' || !SAVEPOINT_NAME_PATTERN.test(name)) {
+    throw new Error(
+      `Invalid savepoint name "${String(name)}": must be a valid SQL identifier (1-63 ASCII letters, digits, '_', or '$', starting with a letter or '_')`,
+    );
+  }
+  return name;
+}
+
 /**
- * A handle to an active transaction in the browser WASM engine.
+ * A handle to an active transaction (or nested savepoint) in the browser WASM engine.
  *
  * Statements issued here are bound to the transaction handle, so a rollback
  * really does undo them.
  */
 export class FirebirdBrowserTransaction {
   private finished = false;
+  private readonly nextSavepointId: () => number;
 
   constructor(
     private readonly engine: EngineTransport,
     private readonly dbHandle: EngineHandle,
     private readonly txHandle: EngineHandle,
     private readonly types?: TypeOptions,
-  ) {}
+    readonly savepointName?: string,
+    private readonly parent?: FirebirdBrowserTransaction,
+    nextSavepointId?: () => number,
+  ) {
+    if (nextSavepointId) {
+      this.nextSavepointId = nextSavepointId;
+    } else {
+      let counter = 0;
+      this.nextSavepointId = () => {
+        counter += 1;
+        return counter;
+      };
+    }
+  }
 
-  /** Whether this transaction has already been rolled back. */
+  /** Whether this transaction (or savepoint) has already finished or been rolled back. */
   get isFinished(): boolean {
-    return this.finished;
+    return this.finished || (this.parent ? this.parent.isFinished : false);
+  }
+
+  private markFinished(): void {
+    this.finished = true;
   }
 
   /**
-   * Roll this transaction back and stop.
+   * Roll this transaction (or savepoint) back and stop.
    *
-   * The enclosing `transaction()` will not commit afterwards.  Use this to
-   * abandon a transaction deliberately, rather than throwing an error you do
-   * not mean — throwing also rolls back, but it propagates to the caller.
+   * When called on the root transaction, the enclosing `transaction()` will not
+   * commit afterwards. When called on a savepoint handle inside `tx.savepoint()`,
+   * only the work since the savepoint is undone (`ROLLBACK TO SAVEPOINT` +
+   * `RELEASE SAVEPOINT ... ONLY`) and the enclosing transaction remains active.
    */
   async rollback(): Promise<void> {
-    if (this.finished) return;
+    if (this.isFinished) return;
     this.finished = true;
+    if (this.savepointName) {
+      await this.engine.execute(
+        this.dbHandle,
+        this.txHandle,
+        `ROLLBACK TO SAVEPOINT ${this.savepointName}`,
+        [],
+      );
+      await this.engine.execute(
+        this.dbHandle,
+        this.txHandle,
+        `RELEASE SAVEPOINT ${this.savepointName} ONLY`,
+        [],
+      );
+      return;
+    }
     await this.engine.rollback(this.txHandle);
   }
 
   private assertUsable(): void {
-    if (this.finished) {
-      throw new Error('Transaction has already been rolled back');
+    if (this.isFinished) {
+      throw new Error(
+        this.savepointName
+          ? `Savepoint "${this.savepointName}" has already finished`
+          : 'Transaction has already been rolled back',
+      );
     }
+  }
+
+  /**
+   * Run `fn` inside a SQL `SAVEPOINT` within this transaction.
+   *
+   * - If `fn` resolves (and `sp.rollback()` was not called), the savepoint is
+   *   released via `RELEASE SAVEPOINT <name> ONLY`.
+   * - If `fn` throws an error, the work inside the savepoint is undone via
+   *   `ROLLBACK TO SAVEPOINT <name>` + `RELEASE SAVEPOINT <name> ONLY` and the
+   *   error is re-thrown while the outer transaction stays active.
+   * - If `await sp.rollback()` is called inside `fn`, the savepoint is rolled
+   *   back and released without throwing, and `fn`'s return value is returned.
+   * - Savepoints can be nested arbitrarily; when `name` is omitted, unique
+   *   names (`sp_1`, `sp_2`, ...) are generated automatically.
+   */
+  savepoint<T>(fn: (sp: FirebirdBrowserTransaction) => Promise<T>): Promise<T>;
+  savepoint<T>(
+    name: string,
+    fn: (sp: FirebirdBrowserTransaction) => Promise<T>,
+  ): Promise<T>;
+  async savepoint<T>(
+    nameOrFn: string | ((sp: FirebirdBrowserTransaction) => Promise<T>),
+    maybeFn?: (sp: FirebirdBrowserTransaction) => Promise<T>,
+  ): Promise<T> {
+    this.assertUsable();
+    const name =
+      typeof nameOrFn === 'string'
+        ? validateSavepointName(nameOrFn)
+        : `sp_${this.nextSavepointId()}`;
+    const fn = typeof nameOrFn === 'function' ? nameOrFn : maybeFn;
+    if (typeof fn !== 'function') {
+      throw new TypeError('savepoint requires a callback function');
+    }
+
+    await this.engine.execute(
+      this.dbHandle,
+      this.txHandle,
+      `SAVEPOINT ${name}`,
+      [],
+    );
+
+    const sp = new FirebirdBrowserTransaction(
+      this.engine,
+      this.dbHandle,
+      this.txHandle,
+      this.types,
+      name,
+      this,
+      this.nextSavepointId,
+    );
+
+    let result: T;
+    try {
+      result = await fn(sp);
+    } catch (err) {
+      if (!sp.isFinished) {
+        sp.markFinished();
+        await this.engine
+          .execute(
+            this.dbHandle,
+            this.txHandle,
+            `ROLLBACK TO SAVEPOINT ${name}`,
+            [],
+          )
+          .catch(() => undefined);
+        await this.engine
+          .execute(
+            this.dbHandle,
+            this.txHandle,
+            `RELEASE SAVEPOINT ${name} ONLY`,
+            [],
+          )
+          .catch(() => undefined);
+      }
+      throw err;
+    }
+
+    if (!sp.isFinished) {
+      sp.markFinished();
+      await this.engine.execute(
+        this.dbHandle,
+        this.txHandle,
+        `RELEASE SAVEPOINT ${name} ONLY`,
+        [],
+      );
+    }
+
+    return result;
   }
 
   /**
@@ -2452,7 +2589,7 @@ export class FirebirdBrowserTransaction {
       }
     };
 
-    const isTxFinished = () => this.finished;
+    const isTxFinished = () => this.isFinished;
 
     const stmt: PreparedStatement = {
       sql: sqlText,
@@ -2479,6 +2616,21 @@ export class FirebirdBrowserTransaction {
           ? maybeOptions
           : (paramsOrOptions ?? {});
         checkParamCount(callParams.length);
+        if (stmtHandle > 0 && typeof this.engine.queryStmt === 'function') {
+          const rowMode = callOptions.rowMode ?? 'object';
+          return applyTypes(
+            await this.engine.queryStmt(
+              this.dbHandle,
+              this.txHandle,
+              stmtHandle,
+              applySerializers(callParams, this.types?.serializers),
+              rowMode,
+              this.types?.binary === true,
+            ),
+            this.types,
+            rowMode,
+          );
+        }
         return this.query(sqlText, callParams, { rowMode: callOptions.rowMode });
       }) as PreparedStatement['query'],
       queryStream: ((
@@ -2493,12 +2645,19 @@ export class FirebirdBrowserTransaction {
           ? maybeOptions
           : (paramsOrOptions ?? {});
         checkParamCount(callParams.length);
-        resolveBatchSize(callOptions.batchSize);
+        const batchSize = resolveBatchSize(callOptions.batchSize);
         const openStream = () =>
-          this.queryStream(sqlText, callParams, {
-            rowMode: callOptions.rowMode,
-            batchSize: callOptions.batchSize,
-          });
+          stmtHandle > 0
+            ? this.streamQuery(
+                { sql: sqlText, params: callParams },
+                callOptions.rowMode ?? 'object',
+                batchSize,
+                stmtHandle,
+              )
+            : this.queryStream(sqlText, callParams, {
+                rowMode: callOptions.rowMode,
+                batchSize: callOptions.batchSize,
+              });
         return (async function* () {
           assertOpen();
           yield* openStream();
@@ -2507,6 +2666,15 @@ export class FirebirdBrowserTransaction {
       exec: async (callParams: QueryParams = []) => {
         assertOpen();
         checkParamCount(callParams.length);
+        if (stmtHandle > 0 && typeof this.engine.executeStmt === 'function') {
+          const affectedRows = await this.engine.executeStmt(
+            this.dbHandle,
+            this.txHandle,
+            stmtHandle,
+            applySerializers(callParams, this.types?.serializers),
+          );
+          return { affectedRows };
+        }
         return this.exec(sqlText, callParams);
       },
       execBatch: async (rows: QueryParams[]) => {
@@ -2516,6 +2684,18 @@ export class FirebirdBrowserTransaction {
         }
         for (const row of rows) {
           checkParamCount(row.length);
+        }
+        if (
+          stmtHandle > 0 &&
+          typeof this.engine.executeBatchStmt === 'function'
+        ) {
+          const affectedRows = await this.engine.executeBatchStmt(
+            this.dbHandle,
+            this.txHandle,
+            stmtHandle,
+            rows.map((row) => applySerializers(row, this.types?.serializers)),
+          );
+          return { affectedRows };
         }
         return this.execBatch(sqlText, rows);
       },
@@ -2802,6 +2982,7 @@ export class FirebirdBrowserTransaction {
     statement: Statement,
     rowMode: RowMode,
     batchSize: number,
+    stmtHandle?: EngineHandle,
   ): AsyncIterableIterator<QueryResult<T>> {
     this.assertUsable();
 
@@ -2823,12 +3004,23 @@ export class FirebirdBrowserTransaction {
     }
 
     const binaryBlobs = this.types?.binary === true;
-    let cursorHandle = await this.engine.cursorOpen(
-      this.dbHandle,
-      this.txHandle,
-      statement.sql,
-      applySerializers(statement.params, this.types?.serializers),
-    );
+    const serialized = applySerializers(statement.params, this.types?.serializers);
+    let cursorHandle =
+      stmtHandle &&
+      stmtHandle > 0 &&
+      typeof this.engine.cursorOpenStmt === 'function'
+        ? await this.engine.cursorOpenStmt(
+            this.dbHandle,
+            this.txHandle,
+            stmtHandle,
+            serialized,
+          )
+        : await this.engine.cursorOpen(
+            this.dbHandle,
+            this.txHandle,
+            statement.sql,
+            serialized,
+          );
 
     try {
       while (true) {
@@ -2847,7 +3039,7 @@ export class FirebirdBrowserTransaction {
 
       const toClose = cursorHandle;
       cursorHandle = 0;
-      if (!this.finished) {
+      if (!this.isFinished) {
         await this.engine.cursorClose(toClose);
       }
     } finally {
