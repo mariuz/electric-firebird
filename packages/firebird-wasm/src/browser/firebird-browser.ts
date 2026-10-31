@@ -729,6 +729,50 @@ export class FirebirdBrowser {
     }
   }
 
+  private async queryPreparedHandle<T = Row>(
+    stmtHandle: EngineHandle,
+    params: QueryParams,
+    options: QueryOptions = {},
+  ): Promise<QueryResult<T>> {
+    await this.ensureReady();
+
+    const rowMode = options.rowMode ?? 'object';
+    const binaryBlobs = this.options.types?.binary === true;
+    const serialized = this.serialize(params);
+
+    if (!hasTransactionOptions(options)) {
+      return applyTypes(
+        await this.engine.queryStmt!<T>(
+          this.dbHandle,
+          0,
+          stmtHandle,
+          serialized,
+          rowMode,
+          binaryBlobs,
+        ),
+        this.options.types,
+        rowMode,
+      );
+    }
+
+    const txHandle = await this.engine.startTransaction(this.dbHandle, options);
+    try {
+      const result = await this.engine.queryStmt!<T>(
+        this.dbHandle,
+        txHandle,
+        stmtHandle,
+        serialized,
+        rowMode,
+        binaryBlobs,
+      );
+      await this.engine.commit(txHandle);
+      return applyTypes(result, this.options.types, rowMode);
+    } catch (err) {
+      await this.engine.rollback(txHandle).catch(() => undefined);
+      throw err;
+    }
+  }
+
   /**
    * Stream a SQL query's result set in batches of `batchSize` rows (default 500).
    *
@@ -785,23 +829,30 @@ export class FirebirdBrowser {
     statement: Statement,
     options: QueryStreamOptions,
     batchSize: number,
+    stmtHandle: EngineHandle = 0,
   ): AsyncIterableIterator<QueryResult<T>> {
     await this.ensureReady();
 
     const rowMode = options.rowMode ?? 'object';
     const binaryBlobs = this.options.types?.binary === true;
     const serializedParams = this.serialize(statement.params);
+    const useStmtCursor =
+      stmtHandle > 0 && typeof this.engine.cursorOpenStmt === 'function';
 
     if (
-      typeof this.engine.cursorOpen !== 'function' ||
+      (!useStmtCursor && typeof this.engine.cursorOpen !== 'function') ||
       typeof this.engine.cursorFetch !== 'function' ||
       typeof this.engine.cursorClose !== 'function'
     ) {
-      const full = (await this.query(
-        statement.sql,
-        statement.params,
-        options,
-      )) as QueryResult<T>;
+      const full = (
+        stmtHandle > 0 && typeof this.engine.queryStmt === 'function'
+          ? await this.queryPreparedHandle<T>(
+              stmtHandle,
+              statement.params,
+              options,
+            )
+          : await this.query(statement.sql, statement.params, options)
+      ) as QueryResult<T>;
       for (let i = 0; i < full.rows.length; i += batchSize) {
         yield {
           rows: full.rows.slice(i, i + batchSize),
@@ -823,12 +874,19 @@ export class FirebirdBrowser {
       }
 
       try {
-        cursorHandle = await this.engine.cursorOpen(
-          this.dbHandle,
-          txHandle,
-          statement.sql,
-          serializedParams,
-        );
+        cursorHandle = useStmtCursor
+          ? await this.engine.cursorOpenStmt!(
+              this.dbHandle,
+              txHandle,
+              stmtHandle,
+              serializedParams,
+            )
+          : await this.engine.cursorOpen!(
+              this.dbHandle,
+              txHandle,
+              statement.sql,
+              serializedParams,
+            );
       } catch (err) {
         engineFailed = true;
         throw err;
@@ -1361,6 +1419,9 @@ export class FirebirdBrowser {
           ? maybeOptions
           : (paramsOrOptions ?? {});
         checkParamCount(callParams.length);
+        if (stmtHandle > 0 && typeof this.engine.queryStmt === 'function') {
+          return this.queryPreparedHandle(stmtHandle, callParams, callOptions);
+        }
         return this.query(sqlText, callParams, callOptions);
       }) as PreparedStatement['query'],
       queryStream: ((
@@ -1375,8 +1436,16 @@ export class FirebirdBrowser {
           ? maybeOptions
           : (paramsOrOptions ?? {});
         checkParamCount(callParams.length);
-        resolveBatchSize(callOptions.batchSize);
-        const openStream = () => this.queryStream(sqlText, callParams, callOptions);
+        const batchSize = resolveBatchSize(callOptions.batchSize);
+        const openStream = () =>
+          stmtHandle > 0
+            ? this.streamQuery(
+                { sql: sqlText, params: callParams },
+                callOptions,
+                batchSize,
+                stmtHandle,
+              )
+            : this.queryStream(sqlText, callParams, callOptions);
         return (async function* () {
           assertOpen();
           yield* openStream();
@@ -1385,12 +1454,22 @@ export class FirebirdBrowser {
       exec: async (callParams: QueryParams = []) => {
         assertOpen();
         checkParamCount(callParams.length);
-        const affectedRows = await this.engine.execute(
-          this.dbHandle,
-          0,
-          sqlText,
-          this.serialize(callParams),
-        );
+        await this.ensureReady();
+        const serialized = this.serialize(callParams);
+        const affectedRows =
+          stmtHandle > 0 && typeof this.engine.executeStmt === 'function'
+            ? await this.engine.executeStmt(
+                this.dbHandle,
+                0,
+                stmtHandle,
+                serialized,
+              )
+            : await this.engine.execute(
+                this.dbHandle,
+                0,
+                sqlText,
+                serialized,
+              );
         this.markDirty();
         return { affectedRows };
       },
@@ -1401,6 +1480,22 @@ export class FirebirdBrowser {
         }
         for (const row of rows) {
           checkParamCount(row.length);
+        }
+        if (
+          stmtHandle > 0 &&
+          typeof this.engine.executeBatchStmt === 'function'
+        ) {
+          await this.ensureReady();
+          const affectedRows = await this.engine.executeBatchStmt(
+            this.dbHandle,
+            0,
+            stmtHandle,
+            rows.map((row) => this.serialize(row)),
+          );
+          if (rows.length > 0) {
+            this.markDirty();
+          }
+          return { affectedRows };
         }
         return this.execBatch(sqlText, rows);
       },

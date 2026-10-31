@@ -10,6 +10,7 @@ import {
   DirectTransport,
   WorkerTransport,
   SharedEngineTransport,
+  FirebirdBrowser,
   serveEngine,
   isBinaryResultPayload,
 } from '../browser/index';
@@ -734,6 +735,372 @@ describe('Binary result wire format (encodeBinaryResultSet / decodeBinaryResultS
       } else {
         (globalThis as { navigator?: unknown }).navigator = origNavigator;
       }
+    }
+  });
+
+  test('DirectTransport executes prepared statements by integer handle (_fb_*_stmt) with zero SQL string marshalling', async () => {
+    const queryFields = sampleFields.slice(0, 2);
+    const binBuf = encodeBinaryResultSet(
+      { fields: queryFields, rows: [{ ID: 55, ACTIVE: true }] },
+      { shapeId: 21 },
+    );
+
+    const heap = new Uint8Array(65536);
+    let nextAlloc = 2048;
+    const allocBytes = (bytes: Uint8Array): number => {
+      const ptr = nextAlloc;
+      heap.set(bytes, ptr);
+      nextAlloc += Math.ceil((bytes.byteLength + 8) / 8) * 8;
+      return ptr;
+    };
+    const allocUtf8 = (str: string): number => {
+      const bytes = new TextEncoder().encode(str + '\0');
+      return allocBytes(bytes);
+    };
+
+    const stringToUTF8Spy = jest.fn(
+      (str: string, outPtr: number, maxBytes: number) => {
+        const encoded = new TextEncoder().encode(str);
+        const slice = encoded.subarray(0, Math.max(0, maxBytes - 1));
+        heap.set(slice, outPtr);
+        heap[outPtr + slice.byteLength] = 0;
+      },
+    );
+    const executeSqlSpy = jest.fn(() => 0);
+    const executeParamsSqlSpy = jest.fn(() => 0);
+    const executeBatchSqlSpy = jest.fn(() => 0);
+    const queryBinarySqlSpy = jest.fn(() => 0);
+    const cursorOpenSqlSpy = jest.fn(() => 0);
+
+    const executeStmtSpy = jest.fn(() => 0);
+    const executeBatchStmtSpy = jest.fn(() => 0);
+    const queryStmtBinarySpy = jest.fn(
+      (
+        _db: number,
+        _tx: number,
+        _stmt: number,
+        _paramsPtr: number,
+        _paramsLen: number,
+        _flags: number,
+        outLenPtr: number,
+      ) => {
+        const ptr = allocBytes(binBuf);
+        new DataView(heap.buffer, outLenPtr, 4).setUint32(
+          0,
+          binBuf.byteLength,
+          true,
+        );
+        return ptr;
+      },
+    );
+    const cursorOpenStmtSpy = jest.fn(() => 77);
+    const stmtCloseSpy = jest.fn(() => 0);
+
+    const fakeMod = {
+      HEAPU8: heap,
+      _malloc(size: number) {
+        const ptr = nextAlloc;
+        nextAlloc += Math.ceil(size / 8) * 8;
+        return ptr;
+      },
+      _free() {},
+      _fb_free_result() {},
+      _fb_last_error: () => 0,
+      _fb_last_affected_rows: () => 3,
+      _fb_prepare: jest.fn(() =>
+        allocUtf8(
+          JSON.stringify({
+            handle: 42,
+            params: [
+              {
+                name: '',
+                type: 496,
+                subType: 0,
+                scale: 0,
+                length: 4,
+                nullable: false,
+              },
+            ],
+            columns: queryFields.map((f) => ({
+              name: f.name,
+              type: f.type,
+              subType: f.subType,
+              scale: f.scale,
+              length: f.length,
+              nullable: f.nullable,
+            })),
+            statementType: 1,
+          }),
+        ),
+      ),
+      _fb_stmt_close: stmtCloseSpy,
+      _fb_execute: executeSqlSpy,
+      _fb_execute_params: executeParamsSqlSpy,
+      _fb_execute_batch: executeBatchSqlSpy,
+      _fb_query_binary: queryBinarySqlSpy,
+      _fb_cursor_open: cursorOpenSqlSpy,
+      _fb_execute_stmt: executeStmtSpy,
+      _fb_execute_batch_stmt: executeBatchStmtSpy,
+      _fb_query_stmt_binary: queryStmtBinarySpy,
+      _fb_cursor_open_stmt: cursorOpenStmtSpy,
+      _fb_shape_columns(id: number) {
+        if (id !== 21) return 0;
+        return allocUtf8(
+          JSON.stringify({
+            columns: queryFields.map((f) => ({
+              name: f.name,
+              type: f.type,
+              subType: f.subType,
+              scale: f.scale,
+              length: f.length,
+              nullable: f.nullable,
+            })),
+          }),
+        );
+      },
+      lengthBytesUTF8(str: string) {
+        return new TextEncoder().encode(str).byteLength;
+      },
+      stringToUTF8: stringToUTF8Spy,
+      UTF8ToString(ptr: number) {
+        let end = ptr;
+        while (end < heap.length && heap[end] !== 0) end++;
+        return new TextDecoder().decode(heap.subarray(ptr, end));
+      },
+    };
+
+    const transport = new DirectTransport();
+    (transport as unknown as { mod: unknown }).mod = fakeMod;
+
+    // prepare() marshals the SQL string once and returns handle 42
+    const desc = await transport.prepare(
+      1,
+      0,
+      'SELECT ID, ACTIVE FROM T WHERE ID = ?',
+    );
+    expect(desc.handle).toBe(42);
+    expect(stringToUTF8Spy).toHaveBeenCalledTimes(1);
+    stringToUTF8Spy.mockClear();
+
+    // executeStmt, executeBatchStmt, queryStmt, queryStmtBinary, and cursorOpenStmt
+    // all execute by integer handle 42 without calling stringToUTF8 or SQL C exports!
+    const affected1 = await transport.executeStmt(1, 0, 42, [10]);
+    expect(affected1).toBe(3);
+    expect(executeStmtSpy).toHaveBeenCalledTimes(1);
+    expect(executeSqlSpy).not.toHaveBeenCalled();
+    expect(executeParamsSqlSpy).not.toHaveBeenCalled();
+
+    const affectedBatch = await transport.executeBatchStmt(1, 0, 42, [
+      [10],
+      [20],
+      [30],
+    ]);
+    expect(affectedBatch).toBe(3);
+    expect(executeBatchStmtSpy).toHaveBeenCalledTimes(1);
+    expect(executeBatchSqlSpy).not.toHaveBeenCalled();
+
+    const qRes = await transport.queryStmt(1, 0, 42, [55], 'object');
+    expect(qRes.rows).toEqual([{ ID: 55, ACTIVE: true }]);
+    expect(queryStmtBinarySpy).toHaveBeenCalledTimes(1);
+    expect(queryBinarySqlSpy).not.toHaveBeenCalled();
+
+    const qBin = await transport.queryStmtBinary(1, 0, 42, [55], false);
+    expect(qBin.shapeId).toBe(21);
+    expect(queryStmtBinarySpy).toHaveBeenCalledTimes(2);
+
+    const curHandle = await transport.cursorOpenStmt(1, 0, 42, [55]);
+    expect(curHandle).toBe(77);
+    expect(cursorOpenStmtSpy).toHaveBeenCalledTimes(1);
+    expect(cursorOpenSqlSpy).not.toHaveBeenCalled();
+
+    // Zero SQL string allocations occurred across all 5 handle executions!
+    expect(stringToUTF8Spy).not.toHaveBeenCalled();
+
+    await transport.stmtClose(42);
+    expect(stmtCloseSpy).toHaveBeenCalledWith(42);
+  });
+
+  test('FirebirdBrowser.prepare() routes stmt.query, stmt.exec, stmt.execBatch, and stmt.queryStream by integer handle across WorkerTransport', async () => {
+    const queryFields = sampleFields.slice(0, 2);
+    const binBuf = encodeBinaryResultSet(
+      { fields: queryFields, rows: [{ ID: 7, ACTIVE: true }] },
+      { shapeId: 33 },
+    );
+    const cursorBuf1 = encodeBinaryResultSet({
+      fields: queryFields,
+      rows: [
+        { ID: 1, ACTIVE: true },
+        { ID: 2, ACTIVE: false },
+      ],
+    });
+    const cursorBufEmpty = encodeBinaryResultSet({
+      fields: queryFields,
+      rows: [],
+    });
+
+    const recordedRequests: EngineRequest[] = [];
+    const workerScopeListeners: Array<(ev: MessageEvent<EngineRequest>) => void> =
+      [];
+    const clientListeners: Array<(ev: MessageEvent<EngineResponse>) => void> = [];
+
+    const workerScope = {
+      addEventListener(
+        type: 'message',
+        listener: (ev: MessageEvent<EngineRequest>) => void,
+      ) {
+        if (type === 'message') workerScopeListeners.push(listener);
+      },
+      postMessage(message: unknown) {
+        const response = message as EngineResponse;
+        for (const fn of clientListeners) {
+          fn({ data: response } as MessageEvent<EngineResponse>);
+        }
+      },
+    };
+
+    const fakeWorker = {
+      addEventListener(type: string, listener: unknown) {
+        if (type === 'message') {
+          clientListeners.push(
+            listener as (ev: MessageEvent<EngineResponse>) => void,
+          );
+        }
+      },
+      removeEventListener() {},
+      postMessage(request: EngineRequest) {
+        recordedRequests.push(request);
+        for (const fn of workerScopeListeners) {
+          fn({ data: request } as MessageEvent<EngineRequest>);
+        }
+      },
+      terminate() {},
+    } as unknown as Worker;
+
+    let cursorFetches = 0;
+    const backendTransport = {
+      init: jest.fn(async () => undefined),
+      createDatabase: jest.fn(async () => 1),
+      attachDatabase: jest.fn(async () => 1),
+      detachDatabase: jest.fn(async () => undefined),
+      execute: jest.fn(async () => 0),
+      executeBatch: jest.fn(async () => 0),
+      query: jest.fn(),
+      queryBinary: jest.fn(),
+      prepare: jest.fn(async () => ({
+        handle: 101,
+        params: [
+          {
+            name: '',
+            type: 496,
+            typeName: 'INTEGER',
+            subType: 0,
+            scale: 0,
+            length: 4,
+            nullable: false,
+          },
+        ],
+        fields: queryFields,
+        statementType: 'SELECT' as const,
+        hasResultSet: true,
+      })),
+      stmtClose: jest.fn(async () => undefined),
+      executeStmt: jest.fn(async () => 1),
+      executeBatchStmt: jest.fn(async (_db, _tx, _stmt, rows: unknown[]) => rows.length),
+      queryStmtBinary: jest.fn(async () => ({
+        binaryResult: binBuf,
+        shapeId: 33,
+        shapeFields: queryFields,
+      })),
+      cursorOpenStmt: jest.fn(async () => 501),
+      cursorFetchBinary: jest.fn(async () => {
+        cursorFetches += 1;
+        return {
+          binaryResult: cursorFetches === 1 ? cursorBuf1 : cursorBufEmpty,
+        };
+      }),
+      cursorClose: jest.fn(async () => undefined),
+      describe: jest.fn(),
+      startTransaction: jest.fn(async () => 9),
+      commit: jest.fn(async () => undefined),
+      rollback: jest.fn(async () => undefined),
+      mkdir: jest.fn(async () => undefined),
+      exists: jest.fn(async () => false),
+      readFile: jest.fn(async () => new Uint8Array(0)),
+      writeFile: jest.fn(async () => undefined),
+      unlink: jest.fn(async () => undefined),
+      eventsSubscribe: jest.fn(async () => 1),
+      eventsPoll: jest.fn(async () => ({})),
+      eventsCancel: jest.fn(async () => undefined),
+      mountOpfs: jest.fn(async () => '/opfs/test.fdb'),
+      dispose: jest.fn(async () => undefined),
+    };
+
+    serveEngine(workerScope, backendTransport as never);
+    const workerTransport = new WorkerTransport(fakeWorker);
+    const db = new FirebirdBrowser('memory://stmt-handle-test', {
+      transport: workerTransport,
+      autoPersist: false,
+    });
+
+    try {
+      const sqlText = 'SELECT ID, ACTIVE FROM T WHERE ID = ?';
+      const stmt = await db.prepare(sqlText);
+      recordedRequests.length = 0;
+
+      // 1. stmt.query() sends 'queryStmt' with integer handle 101 (no SQL string!)
+      const qRes = await stmt.query([7]);
+      expect(qRes.rows).toEqual([{ ID: 7, ACTIVE: true }]);
+      expect(backendTransport.queryStmtBinary).toHaveBeenCalledWith(
+        1,
+        0,
+        101,
+        [7],
+        false,
+      );
+      expect(backendTransport.query).not.toHaveBeenCalled();
+
+      // 2. stmt.exec() sends 'executeStmt' with integer handle 101
+      const execRes = await stmt.exec([7]);
+      expect(execRes).toEqual({ affectedRows: 1 });
+      expect(backendTransport.executeStmt).toHaveBeenCalledWith(1, 0, 101, [7]);
+      expect(backendTransport.execute).not.toHaveBeenCalled();
+
+      // 3. stmt.execBatch() sends 'executeBatchStmt' with integer handle 101
+      const batchRes = await stmt.execBatch([[1], [2], [3]]);
+      expect(batchRes).toEqual({ affectedRows: 3 });
+      expect(backendTransport.executeBatchStmt).toHaveBeenCalledWith(
+        1,
+        0,
+        101,
+        [[1], [2], [3]],
+      );
+      expect(backendTransport.executeBatch).not.toHaveBeenCalled();
+
+      // 4. stmt.queryStream() sends 'cursorOpenStmt' with integer handle 101
+      const streamed: unknown[] = [];
+      for await (const batch of stmt.queryStream([7], { batchSize: 2 })) {
+        streamed.push(...batch.rows);
+      }
+      expect(streamed).toEqual([
+        { ID: 1, ACTIVE: true },
+        { ID: 2, ACTIVE: false },
+      ]);
+      expect(backendTransport.cursorOpenStmt).toHaveBeenCalledWith(
+        1,
+        0,
+        101,
+        [7],
+      );
+
+      // Verify none of the worker requests after prepare() contained the SQL text!
+      for (const req of recordedRequests) {
+        expect(JSON.stringify(req.args)).not.toContain(sqlText);
+      }
+
+      await stmt.close();
+      expect(backendTransport.stmtClose).toHaveBeenCalledWith(101);
+    } finally {
+      await db.close();
     }
   });
 });

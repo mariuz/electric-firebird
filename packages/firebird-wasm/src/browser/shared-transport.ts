@@ -104,6 +104,8 @@ const REPLAYABLE: ReadonlySet<SharedOp> = new Set<SharedOp>([
   'init',
   'query',
   'queryBinary',
+  'queryStmt',
+  'queryStmtBinary',
   // Prepares a statement and drops it, executing nothing, so re-issuing it is
   // indistinguishable from issuing it once.
   'describe',
@@ -162,6 +164,8 @@ export interface SharedEngineTransportOptions {
 const MUTATING: ReadonlySet<SharedOp> = new Set<SharedOp>([
   'execute',
   'executeBatch',
+  'executeStmt',
+  'executeBatchStmt',
   'commit',
   'createDatabase',
   'writeFile',
@@ -418,6 +422,40 @@ export class SharedEngineTransport implements EngineTransport {
       };
     }
 
+    if (message.op === 'queryStmt' || message.op === 'queryStmtBinary') {
+      const dbHandle = message.args[0] as number;
+      const txHandle = message.args[1] as number;
+      const stmtHandle = message.args[2] as number;
+      const params = (message.args[3] as QueryParams | undefined) ?? [];
+      const binaryBlobs = Boolean(
+        message.op === 'queryStmt' ? message.args[5] : message.args[4],
+      );
+      if (typeof engine.queryStmtBinary === 'function') {
+        const payload = await engine.queryStmtBinary(
+          dbHandle,
+          txHandle,
+          stmtHandle,
+          params,
+          binaryBlobs,
+        );
+        return this.prepareFollowerBinaryPayload(message.from, payload);
+      }
+      if (typeof engine.queryStmt === 'function') {
+        const decoded = await engine.queryStmt<unknown[]>(
+          dbHandle,
+          txHandle,
+          stmtHandle,
+          params,
+          'array',
+          binaryBlobs,
+        );
+        return {
+          binaryResult: encodeBinaryResultSet(decoded, { rowMode: 'array' }),
+        };
+      }
+      throw new Error(`unknown engine operation: ${message.op}`);
+    }
+
     const cursorHandle = message.args[0] as number;
     const batchSize = message.args[1] as number;
     const binaryBlobs = Boolean(
@@ -453,6 +491,8 @@ export class SharedEngineTransport implements EngineTransport {
       const result =
         message.op === 'query' ||
         message.op === 'queryBinary' ||
+        message.op === 'queryStmt' ||
+        message.op === 'queryStmtBinary' ||
         message.op === 'cursorFetch' ||
         message.op === 'cursorFetchBinary'
           ? await this.serveBinary(message)
@@ -507,7 +547,11 @@ export class SharedEngineTransport implements EngineTransport {
 
     const fn = (engine as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>)[op];
     if (typeof fn !== 'function') {
-      if (op === 'queryBinary' || op === 'cursorFetchBinary') {
+      if (
+        op === 'queryBinary' ||
+        op === 'queryStmtBinary' ||
+        op === 'cursorFetchBinary'
+      ) {
         return this.serveBinary({
           kind: 'call',
           from: this.clientId,
@@ -827,6 +871,94 @@ export class SharedEngineTransport implements EngineTransport {
 
   stmtClose(stmtHandle: EngineHandle): Promise<void> {
     return this.call<void>('stmtClose', stmtHandle);
+  }
+
+  executeStmt(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    stmtHandle: EngineHandle,
+    params: QueryParams = [],
+  ): Promise<number> {
+    return this.call<number>(
+      'executeStmt',
+      dbHandle,
+      txHandle,
+      stmtHandle,
+      params,
+    );
+  }
+
+  executeBatchStmt(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    stmtHandle: EngineHandle,
+    rows: QueryParams[],
+  ): Promise<number> {
+    return this.call<number>(
+      'executeBatchStmt',
+      dbHandle,
+      txHandle,
+      stmtHandle,
+      rows,
+    );
+  }
+
+  async queryStmt<T = Row>(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    stmtHandle: EngineHandle,
+    params: QueryParams = [],
+    rowMode: RowMode = 'object',
+    binaryBlobs = false,
+  ): Promise<QueryResult<T>> {
+    const raw = await this.call<BinaryResultPayload | QueryResult<T>>(
+      'queryStmt',
+      dbHandle,
+      txHandle,
+      stmtHandle,
+      params,
+      rowMode,
+      binaryBlobs,
+    );
+    return decodeBinaryResultPayload<T>(
+      raw,
+      rowMode,
+      binaryBlobs,
+      this.shapes,
+    );
+  }
+
+  async queryStmtBinary(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    stmtHandle: EngineHandle,
+    params: QueryParams = [],
+    binaryBlobs = false,
+  ): Promise<BinaryResultPayload> {
+    const raw = await this.call<BinaryResultPayload | QueryResult<unknown[]>>(
+      'queryStmtBinary',
+      dbHandle,
+      txHandle,
+      stmtHandle,
+      params,
+      binaryBlobs,
+    );
+    return this.normalizeBinaryPayload(raw);
+  }
+
+  cursorOpenStmt(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    stmtHandle: EngineHandle,
+    params: QueryParams = [],
+  ): Promise<EngineHandle> {
+    return this.call<EngineHandle>(
+      'cursorOpenStmt',
+      dbHandle,
+      txHandle,
+      stmtHandle,
+      params,
+    );
   }
 
   loadIcuLocaleData(data: Uint8Array): Promise<void> {

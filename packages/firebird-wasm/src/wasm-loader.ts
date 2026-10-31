@@ -265,6 +265,44 @@ export interface FirebirdWasmModule {
     sqlPtr: number,
   ): number;
   _fb_stmt_close?(stmtHandle: FbHandle): number;
+  _fb_execute_stmt?(
+    dbHandle: FbHandle,
+    txHandle: FbHandle,
+    stmtHandle: FbHandle,
+    paramsPtr: number,
+    paramsLength: number,
+  ): number;
+  _fb_execute_batch_stmt?(
+    dbHandle: FbHandle,
+    txHandle: FbHandle,
+    stmtHandle: FbHandle,
+    rowsPtr: number,
+    rowsLength: number,
+  ): number;
+  _fb_query_stmt?(
+    dbHandle: FbHandle,
+    txHandle: FbHandle,
+    stmtHandle: FbHandle,
+    paramsPtr: number,
+    paramsLength: number,
+    flags: number,
+  ): number;
+  _fb_query_stmt_binary?(
+    dbHandle: FbHandle,
+    txHandle: FbHandle,
+    stmtHandle: FbHandle,
+    paramsPtr: number,
+    paramsLength: number,
+    flags: number,
+    outByteLengthPtr: number,
+  ): number;
+  _fb_cursor_open_stmt?(
+    dbHandle: FbHandle,
+    txHandle: FbHandle,
+    stmtHandle: FbHandle,
+    paramsPtr: number,
+    paramsLength: number,
+  ): FbHandle;
   _fb_blob_create?(dbHandle: FbHandle, txHandle: FbHandle, outBlobIdPtr: number): FbHandle;
   _fb_blob_put_segment?(blobHandle: FbHandle, dataPtr: number, length: number): number;
   _fb_blob_open_id?(dbHandle: FbHandle, txHandle: FbHandle, blobIdPtr: number): FbHandle;

@@ -162,6 +162,41 @@ export function serveEngine(
           throw new Error(`unknown engine operation: ${op}`);
         }
 
+        if (op === 'queryStmt' || op === 'queryStmtBinary') {
+          const dbHandle = args[0] as number;
+          const txHandle = args[1] as number;
+          const stmtHandle = args[2] as number;
+          const params = (args[3] as QueryParams | undefined) ?? [];
+          const binaryBlobs = Boolean(op === 'queryStmt' ? args[5] : args[4]);
+          if (typeof transport.queryStmtBinary === 'function') {
+            const payload = await transport.queryStmtBinary(
+              dbHandle,
+              txHandle,
+              stmtHandle,
+              params,
+              binaryBlobs,
+            );
+            reply({ id, ok: true, result: prepareBinaryPayload(payload) });
+            return;
+          }
+          if (typeof transport.queryStmt === 'function') {
+            const decoded = await transport.queryStmt<unknown[]>(
+              dbHandle,
+              txHandle,
+              stmtHandle,
+              params,
+              'array',
+              binaryBlobs,
+            );
+            const binaryResult = encodeBinaryResultSet(decoded, {
+              rowMode: 'array',
+            });
+            reply({ id, ok: true, result: { binaryResult } });
+            return;
+          }
+          throw new Error(`unknown engine operation: ${op}`);
+        }
+
         if (op === 'cursorFetch' || op === 'cursorFetchBinary') {
           const cursorHandle = args[0] as number;
           const batchSize = args[1] as number;

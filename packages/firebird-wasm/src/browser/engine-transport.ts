@@ -192,6 +192,44 @@ export interface EngineTransport {
     sql: string,
   ): Promise<QueryDescription & { handle?: EngineHandle }>;
   stmtClose?(stmtHandle: EngineHandle): Promise<void>;
+  /** Execute a prepared statement handle by integer ID without marshalling SQL text. */
+  executeStmt?(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    stmtHandle: EngineHandle,
+    params?: QueryParams,
+  ): Promise<number>;
+  /** Execute a prepared statement handle once per row of parameters as a single batch. */
+  executeBatchStmt?(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    stmtHandle: EngineHandle,
+    rows: QueryParams[],
+  ): Promise<number>;
+  /** Query a prepared statement handle by integer ID without marshalling SQL text. */
+  queryStmt?<T = Row>(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    stmtHandle: EngineHandle,
+    params?: QueryParams,
+    rowMode?: RowMode,
+    binaryBlobs?: boolean,
+  ): Promise<QueryResult<T>>;
+  /** Query a prepared statement handle and return a packed `FBR\x01` binary result buffer. */
+  queryStmtBinary?(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    stmtHandle: EngineHandle,
+    params?: QueryParams,
+    binaryBlobs?: boolean,
+  ): Promise<BinaryResultPayload>;
+  /** Open a streaming cursor for a prepared statement handle by integer ID. */
+  cursorOpenStmt?(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    stmtHandle: EngineHandle,
+    params?: QueryParams,
+  ): Promise<EngineHandle>;
   explain?(
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
@@ -838,6 +876,11 @@ export class DirectTransport implements EngineTransport {
   >();
   private readonly stagedBlobs = new Map<string, Uint8Array>();
   private nextFallbackBlobHandle = 1;
+  private readonly preparedStatements = new Map<
+    EngineHandle,
+    { dbHandle: EngineHandle; sql: string; native: boolean }
+  >();
+  private nextFallbackStmtHandle = 1_000_000;
 
   /**
    * The fields of shape `id`: remembered, or asked of the engine once. Called
@@ -931,6 +974,11 @@ export class DirectTransport implements EngineTransport {
   }
 
   async detachDatabase(dbHandle: EngineHandle): Promise<void> {
+    for (const [stmtHandle, entry] of this.preparedStatements) {
+      if (entry.dbHandle === dbHandle) {
+        this.preparedStatements.delete(stmtHandle);
+      }
+    }
     this.module._fb_detach_database(dbHandle);
   }
 
@@ -1686,7 +1734,13 @@ export class DirectTransport implements EngineTransport {
     const mod = this.module;
     if (typeof mod._fb_prepare !== 'function') {
       const desc = await this.describe(dbHandle, txHandle, sql);
-      return { ...desc, handle: 0 };
+      const fallbackHandle = this.nextFallbackStmtHandle++;
+      this.preparedStatements.set(fallbackHandle, {
+        dbHandle,
+        sql,
+        native: false,
+      });
+      return { ...desc, handle: fallbackHandle };
     }
     const prepareFn = mod._fb_prepare;
     return this.withString(sql, (sqlPtr) => {
@@ -1697,19 +1751,341 @@ export class DirectTransport implements EngineTransport {
       const json = mod.UTF8ToString(resultPtr);
       mod._fb_free_result(resultPtr);
       const parsed = JSON.parse(json) as { handle?: number };
+      const rawHandle = typeof parsed.handle === 'number' ? parsed.handle : 0;
+      const handle =
+        rawHandle > 0 ? rawHandle : this.nextFallbackStmtHandle++;
+      this.preparedStatements.set(handle, {
+        dbHandle,
+        sql,
+        native: rawHandle > 0,
+      });
       return {
         ...decodeDescription(json),
-        handle: typeof parsed.handle === 'number' ? parsed.handle : 0,
+        handle,
       };
     });
   }
 
   async stmtClose(stmtHandle: EngineHandle): Promise<void> {
     if (stmtHandle <= 0) return;
+    const entry = this.preparedStatements.get(stmtHandle);
+    this.preparedStatements.delete(stmtHandle);
     const mod = this.module;
-    if (typeof mod._fb_stmt_close === 'function') {
+    if (
+      (!entry || entry.native) &&
+      typeof mod._fb_stmt_close === 'function'
+    ) {
       mod._fb_stmt_close(stmtHandle);
     }
+  }
+
+  private lookupPreparedEntry(
+    dbHandle: EngineHandle,
+    stmtHandle: EngineHandle,
+    context: string,
+  ): { dbHandle: EngineHandle; sql: string; native: boolean } {
+    const entry = this.preparedStatements.get(stmtHandle);
+    if (!entry || entry.dbHandle !== dbHandle) {
+      throw new Error(`Firebird ${context} failed: unknown statement handle (${stmtHandle})`);
+    }
+    return entry;
+  }
+
+  async executeStmt(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    stmtHandle: EngineHandle,
+    params: QueryParams = [],
+  ): Promise<number> {
+    const mod = this.module;
+    const entry = this.preparedStatements.get(stmtHandle);
+    if (
+      typeof mod._fb_execute_stmt === 'function' &&
+      (!entry || entry.native)
+    ) {
+      const executeStmtFn = mod._fb_execute_stmt;
+      const rc = this.withParams(params, (paramPtr, paramLen) =>
+        executeStmtFn.call(
+          mod,
+          dbHandle,
+          txHandle,
+          stmtHandle,
+          paramPtr,
+          paramLen,
+        ),
+      );
+      if (rc !== 0) {
+        throw engineError(
+          mod,
+          `Firebird executeStmt failed for statement #${stmtHandle}`,
+          rc,
+        );
+      }
+      return mod._fb_last_affected_rows();
+    }
+
+    const fallback = this.lookupPreparedEntry(
+      dbHandle,
+      stmtHandle,
+      'executeStmt',
+    );
+    return this.execute(dbHandle, txHandle, fallback.sql, params);
+  }
+
+  async executeBatchStmt(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    stmtHandle: EngineHandle,
+    rows: QueryParams[],
+  ): Promise<number> {
+    if (rows.length === 0) return 0;
+    const mod = this.module;
+    const entry = this.preparedStatements.get(stmtHandle);
+    if (
+      typeof mod._fb_execute_batch_stmt === 'function' &&
+      (!entry || entry.native)
+    ) {
+      const executeBatchStmtFn = mod._fb_execute_batch_stmt;
+      const resolvedRows = rows.map((row) => this.resolveStagedBlobParams(row));
+      const packed = encodeParamRows(resolvedRows);
+      const ptr = mod._malloc(packed.length);
+      let rc: number;
+      try {
+        mod.HEAPU8.set(packed, ptr);
+        rc = executeBatchStmtFn.call(
+          mod,
+          dbHandle,
+          txHandle,
+          stmtHandle,
+          ptr,
+          packed.length,
+        );
+      } finally {
+        mod._free(ptr);
+      }
+      if (rc !== 0) {
+        throw engineError(
+          mod,
+          `Firebird executeBatchStmt failed for statement #${stmtHandle}`,
+          rc,
+        );
+      }
+      return mod._fb_last_affected_rows();
+    }
+
+    const fallback = this.lookupPreparedEntry(
+      dbHandle,
+      stmtHandle,
+      'executeBatchStmt',
+    );
+    return this.executeBatch(dbHandle, txHandle, fallback.sql, rows);
+  }
+
+  async queryStmt<T = Row>(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    stmtHandle: EngineHandle,
+    params: QueryParams = [],
+    rowMode: RowMode = 'object',
+    binaryBlobs = false,
+  ): Promise<QueryResult<T>> {
+    const mod = this.module;
+    const entry = this.preparedStatements.get(stmtHandle);
+    const flags = (binaryBlobs ? BLOB_SIDE_CHANNEL : 0) | SHAPE_IDS;
+
+    if (
+      typeof mod._fb_query_stmt_binary === 'function' &&
+      (!entry || entry.native)
+    ) {
+      const queryStmtBinaryFn = mod._fb_query_stmt_binary;
+      return this.withParams(params, (paramPtr, paramLen) => {
+        const lenPtr = mod._malloc(4);
+        let binPtr = 0;
+        try {
+          binPtr = queryStmtBinaryFn.call(
+            mod,
+            dbHandle,
+            txHandle,
+            stmtHandle,
+            paramPtr,
+            paramLen,
+            flags,
+            lenPtr,
+          );
+          if (binPtr === 0) {
+            throw engineError(
+              mod,
+              `Firebird queryStmt failed for statement #${stmtHandle}`,
+            );
+          }
+          const lenView = new DataView(
+            mod.HEAPU8.buffer,
+            mod.HEAPU8.byteOffset + lenPtr,
+            4,
+          );
+          const byteLen = lenView.getUint32(0, true);
+          const view = mod.HEAPU8.subarray(binPtr, binPtr + byteLen);
+          return decodeBinaryResultSet<T>(
+            view,
+            rowMode,
+            binaryBlobs,
+            this.shapeColumns,
+          );
+        } finally {
+          if (binPtr !== 0) {
+            mod._fb_free_result(binPtr);
+          }
+          mod._free(lenPtr);
+        }
+      });
+    }
+
+    if (
+      typeof mod._fb_query_stmt === 'function' &&
+      (!entry || entry.native)
+    ) {
+      const queryStmtFn = mod._fb_query_stmt;
+      return this.withParams(params, (paramPtr, paramLen) => {
+        const resultPtr = queryStmtFn.call(
+          mod,
+          dbHandle,
+          txHandle,
+          stmtHandle,
+          paramPtr,
+          paramLen,
+          flags,
+        );
+        if (resultPtr === 0) {
+          throw engineError(
+            mod,
+            `Firebird queryStmt failed for statement #${stmtHandle}`,
+          );
+        }
+        const json = mod.UTF8ToString(resultPtr);
+        mod._fb_free_result(resultPtr);
+        const blobs = binaryBlobs ? readBlobs(mod) : null;
+        const result = decodeResultSet<T>(json, rowMode, this.shapeColumns);
+        return blobs ? attachBlobs(result, blobs, rowMode) : result;
+      });
+    }
+
+    const fallback = this.lookupPreparedEntry(
+      dbHandle,
+      stmtHandle,
+      'queryStmt',
+    );
+    return this.query<T>(
+      dbHandle,
+      txHandle,
+      fallback.sql,
+      params,
+      rowMode,
+      binaryBlobs,
+    );
+  }
+
+  async queryStmtBinary(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    stmtHandle: EngineHandle,
+    params: QueryParams = [],
+    binaryBlobs = false,
+  ): Promise<BinaryResultPayload> {
+    const mod = this.module;
+    const entry = this.preparedStatements.get(stmtHandle);
+    if (
+      typeof mod._fb_query_stmt_binary === 'function' &&
+      (!entry || entry.native)
+    ) {
+      const queryStmtBinaryFn = mod._fb_query_stmt_binary;
+      const flags = (binaryBlobs ? BLOB_SIDE_CHANNEL : 0) | SHAPE_IDS;
+      return this.withParams(params, (paramPtr, paramLen) => {
+        const lenPtr = mod._malloc(4);
+        let binPtr = 0;
+        try {
+          binPtr = queryStmtBinaryFn.call(
+            mod,
+            dbHandle,
+            txHandle,
+            stmtHandle,
+            paramPtr,
+            paramLen,
+            flags,
+            lenPtr,
+          );
+          if (binPtr === 0) {
+            throw engineError(
+              mod,
+              `Firebird queryStmt failed for statement #${stmtHandle}`,
+            );
+          }
+          const lenView = new DataView(
+            mod.HEAPU8.buffer,
+            mod.HEAPU8.byteOffset + lenPtr,
+            4,
+          );
+          const byteLen = lenView.getUint32(0, true);
+          return this.extractBinaryPayload(mod, binPtr, byteLen);
+        } finally {
+          if (binPtr !== 0) {
+            mod._fb_free_result(binPtr);
+          }
+          mod._free(lenPtr);
+        }
+      });
+    }
+
+    const decoded = await this.queryStmt<unknown[]>(
+      dbHandle,
+      txHandle,
+      stmtHandle,
+      params,
+      'array',
+      binaryBlobs,
+    );
+    return {
+      binaryResult: encodeBinaryResultSet(decoded, { rowMode: 'array' }),
+    };
+  }
+
+  async cursorOpenStmt(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    stmtHandle: EngineHandle,
+    params: QueryParams = [],
+  ): Promise<EngineHandle> {
+    const mod = this.module;
+    const entry = this.preparedStatements.get(stmtHandle);
+    if (
+      typeof mod._fb_cursor_open_stmt === 'function' &&
+      (!entry || entry.native)
+    ) {
+      const openStmtFn = mod._fb_cursor_open_stmt;
+      const handle = this.withParams(params, (paramPtr, paramLen) =>
+        openStmtFn.call(
+          mod,
+          dbHandle,
+          txHandle,
+          stmtHandle,
+          paramPtr,
+          paramLen,
+        ),
+      );
+      if (handle === 0) {
+        throw engineError(
+          mod,
+          `Firebird cursorOpenStmt failed for statement #${stmtHandle}`,
+        );
+      }
+      return handle;
+    }
+
+    const fallback = this.lookupPreparedEntry(
+      dbHandle,
+      stmtHandle,
+      'cursorOpenStmt',
+    );
+    return this.cursorOpen(dbHandle, txHandle, fallback.sql, params);
   }
 
   async explain(
@@ -2157,6 +2533,7 @@ export class DirectTransport implements EngineTransport {
     this.fallbackBlobWrites.clear();
     this.fallbackBlobReaders.clear();
     this.stagedBlobs.clear();
+    this.preparedStatements.clear();
     if (opfs && mod) {
       // The database is detached by now.  The handle is exclusive: left open,
       // it locked the file against the next open until the Worker went.

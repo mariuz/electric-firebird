@@ -223,7 +223,14 @@ std::map<int, DbEntry> g_databases;
 std::map<int, BlobEntry> g_blobs;
 int g_nextBlobHandle = 1;
 std::map<int, TxEntry> g_transactions;
+struct PreparedStmtEntry
+{
+	int db_handle = 0;
+	std::string sql;
+};
+
 std::map<int, CursorEntry> g_cursors;
+std::map<int, PreparedStmtEntry> g_preparedStatements;
 
 int g_nextDbHandle = 1;
 int g_nextTxHandle = 1;
@@ -768,6 +775,72 @@ void releaseStatement(int db_handle, IStatement* statement, bool cached, bool fa
 		}
 	}
 	freeStatement(statement);
+}
+
+const char* lookupPreparedSql(int db_handle, int stmt_handle)
+{
+	if (stmt_handle <= 0)
+		return nullptr;
+	const auto it = g_preparedStatements.find(stmt_handle);
+	if (it != g_preparedStatements.end())
+		return it->second.db_handle == db_handle ? it->second.sql.c_str() : nullptr;
+	DbEntry* entry = lookupEntry(db_handle);
+	if (!entry)
+		return nullptr;
+	for (const auto& c : entry->statements)
+	{
+		if (c.handle == stmt_handle)
+			return c.sql.c_str();
+	}
+	return nullptr;
+}
+
+/**
+ * Look up a pinned prepared statement by its integer `stmt_handle` without
+ * passing SQL text across the WASM boundary.  If the cached `IStatement` was
+ * invalidated by DDL (`noticeMetadataChanges`) or is currently busy in an
+ * overlapping cursor, transparently re-acquires from `g_preparedStatements`.
+ */
+IStatement* acquirePreparedStatement(int db_handle, IAttachment* attachment, ITransaction* transaction,
+	int stmt_handle, Status& status, bool& cached, unsigned* typeOut = nullptr)
+{
+	cached = false;
+	if (typeOut)
+		*typeOut = 0;
+
+	const char* sql = lookupPreparedSql(db_handle, stmt_handle);
+	if (!sql)
+		return nullptr;
+
+	DbEntry* entry = lookupEntry(db_handle);
+	if (entry)
+	{
+		noticeMetadataChanges(*entry);
+		for (auto it = entry->statements.begin(); it != entry->statements.end(); ++it)
+		{
+			if (!it->busy && it->handle == stmt_handle)
+			{
+				entry->statements.splice(entry->statements.begin(), entry->statements, it);
+				entry->statements.front().busy = true;
+				cached = true;
+				if (typeOut)
+					*typeOut = entry->statements.front().type;
+				return entry->statements.front().statement;
+			}
+		}
+	}
+
+	IStatement* statement = acquireStatement(db_handle, attachment, transaction, sql, status, cached, typeOut);
+	if (statement && cached && entry && !entry->statements.empty())
+	{
+		CachedStatement& front = entry->statements.front();
+		if (front.statement == statement && !front.handle)
+		{
+			front.handle = stmt_handle;
+			front.pinned = true;
+		}
+	}
+	return statement;
 }
 
 /** Close an open CursorEntry, releasing its IResultSet, statement, and self-owned transaction. */
@@ -3367,6 +3440,13 @@ int fb_detach_database(int db_handle)
 	// attachment and go before it does.
 	flushStatements(it->second);
 	endReadTransaction(it->second);
+	for (auto prep = g_preparedStatements.begin(); prep != g_preparedStatements.end(); )
+	{
+		if (prep->second.db_handle == db_handle)
+			prep = g_preparedStatements.erase(prep);
+		else
+			++prep;
+	}
 
 	Status status;
 	attachment->detach(status.ptr());
@@ -3782,7 +3862,8 @@ const char* fb_prepare(int db_handle, int tx_handle, const char* sql)
 		}
 	}
 
-	int stmtHandle = 0;
+	const int stmtHandle = g_nextStmtHandle++;
+	g_preparedStatements[stmtHandle] = PreparedStmtEntry{db_handle, sql ? sql : ""};
 	if (entry && cached)
 	{
 		for (auto& c : entry->statements)
@@ -3790,9 +3871,9 @@ const char* fb_prepare(int db_handle, int tx_handle, const char* sql)
 			if (c.statement == statement)
 			{
 				if (!c.handle)
-					c.handle = g_nextStmtHandle++;
+					c.handle = stmtHandle;
 				c.pinned = true;
-				stmtHandle = c.handle;
+				break;
 				break;
 			}
 		}
@@ -3829,11 +3910,33 @@ int fb_stmt_close(int stmt_handle)
 	if (stmt_handle <= 0)
 		return 0;
 
+	int replacementHandle = 0;
+	const auto prepIt = g_preparedStatements.find(stmt_handle);
+	if (prepIt != g_preparedStatements.end())
+	{
+		const int dbHandle = prepIt->second.db_handle;
+		const std::string sqlText = prepIt->second.sql;
+		g_preparedStatements.erase(prepIt);
+		for (const auto& other : g_preparedStatements)
+		{
+			if (other.second.db_handle == dbHandle && other.second.sql == sqlText)
+			{
+				replacementHandle = other.first;
+				break;
+			}
+		}
+	}
 	for (auto& kv : g_databases)
 	{
 		DbEntry& entry = kv.second;
 		for (auto it = entry.statements.begin(); it != entry.statements.end(); ++it)
 		{
+			if (it->handle == stmt_handle && replacementHandle > 0)
+			{
+				it->handle = replacementHandle;
+				it->pinned = true;
+				return 0;
+			}
 			if (it->handle == stmt_handle)
 			{
 				it->pinned = false;
@@ -6268,6 +6371,860 @@ const unsigned char* fb_cursor_fetch_binary(int cursor_handle, int max_rows, int
 	out[rowCountPos + 2] = static_cast<unsigned char>((rowCount >> 16) & 0xff);
 	out[rowCountPos + 3] = static_cast<unsigned char>((rowCount >> 24) & 0xff);
 	return allocBinaryBuffer(out, out_byte_length);
+}
+
+/**
+ * Execute a prepared statement handle (`fb_prepare`) that returns no rows,
+ * binding packed parameters (`params` may be NULL/0).
+ * Returns 0 on success, non-zero on failure.
+ */
+FB_WASM_EXPORT
+int fb_execute_stmt(int db_handle, int tx_handle, int stmt_handle,
+	const unsigned char* params, int params_length)
+{
+	clearError();
+	g_lastAffectedRows = 0;
+
+	IAttachment* attachment = lookupAttachment(db_handle);
+	if (!attachment)
+	{
+		setError("fb_execute_stmt: unknown database handle");
+		return 1;
+	}
+
+	if (!lookupPreparedSql(db_handle, stmt_handle))
+	{
+		setError("fb_execute_stmt: unknown statement handle");
+		return 5;
+	}
+
+	std::vector<ParamValue> values;
+	if (!parseParams(params, static_cast<unsigned>(params_length < 0 ? 0 : params_length),
+			values))
+	{
+		setError("fb_execute_stmt: malformed parameter buffer");
+		return 2;
+	}
+
+	ITransaction* transaction = nullptr;
+	bool ownTransaction = false;
+
+	if (tx_handle)
+	{
+		transaction = lookupTransaction(tx_handle);
+		if (!transaction)
+		{
+			setError("fb_execute_stmt: unknown transaction handle");
+			return 3;
+		}
+	}
+	else
+	{
+		Status status;
+		transaction = attachment->startTransaction(status.ptr(), 0, nullptr);
+		if (status.failed() || !transaction)
+		{
+			setErrorFromStatus("fb_execute_stmt: could not start transaction", status.ptr());
+			return 4;
+		}
+		ownTransaction = true;
+	}
+
+	Status status;
+	bool cached = false;
+	IStatement* statement = acquirePreparedStatement(
+		db_handle, attachment, transaction, stmt_handle, status, cached);
+
+	if (status.failed() || !statement)
+	{
+		if (status.failed())
+			setErrorFromStatus("fb_execute_stmt: prepare failed", status.ptr());
+		else
+			setError("fb_execute_stmt: unknown statement handle");
+		if (ownTransaction)
+		{
+			Status rollbackStatus;
+			transaction->rollback(rollbackStatus.ptr());
+		}
+		return 5;
+	}
+
+	InputMessage input;
+	input.writeBlobsTo(attachment, transaction);
+	const bool bound = input.build(statement, values);
+
+	if (bound)
+	{
+		statement->execute(status.ptr(), transaction, input.meta(), input.data(),
+			nullptr, nullptr);
+
+		if (!status.failed())
+		{
+			Status affectedStatus;
+			const ISC_UINT64 affected = statement->getAffectedRecords(affectedStatus.ptr());
+			g_lastAffectedRows = affectedStatus.failed()
+				? 0
+				: static_cast<ISC_INT64>(affected);
+		}
+	}
+
+	releaseStatement(db_handle, statement, cached, !bound || status.failed());
+
+	if (!bound || status.failed())
+	{
+		if (status.failed())
+			setErrorFromStatus("fb_execute_stmt", status.ptr());
+
+		if (ownTransaction)
+		{
+			Status rollbackStatus;
+			transaction->rollback(rollbackStatus.ptr());
+		}
+		return 6;
+	}
+
+	if (ownTransaction)
+	{
+		Status commitStatus;
+		transaction->commit(commitStatus.ptr());
+		if (commitStatus.failed())
+		{
+			setErrorFromStatus("fb_execute_stmt: commit failed", commitStatus.ptr());
+			return 7;
+		}
+	}
+
+	return 0;
+}
+
+/**
+ * Execute a prepared statement handle (`fb_prepare`) once per row of packed
+ * parameters in a single `IBatch` request.
+ * Returns 0 on success, non-zero on failure.
+ */
+FB_WASM_EXPORT
+int fb_execute_batch_stmt(int db_handle, int tx_handle, int stmt_handle,
+	const unsigned char* rows, int rows_length)
+{
+	clearError();
+	g_lastAffectedRows = 0;
+
+	IAttachment* attachment = lookupAttachment(db_handle);
+	if (!attachment)
+	{
+		setError("fb_execute_batch_stmt: unknown database handle");
+		return 1;
+	}
+
+	if (!lookupPreparedSql(db_handle, stmt_handle))
+	{
+		setError("fb_execute_batch_stmt: unknown statement handle");
+		return 5;
+	}
+
+	const unsigned length = static_cast<unsigned>(rows_length < 0 ? 0 : rows_length);
+	if (!rows || length < 4)
+	{
+		setError("fb_execute_batch_stmt: malformed row buffer");
+		return 2;
+	}
+
+	unsigned pos = 0;
+	const unsigned rowCount = readU32(rows);
+	pos += 4;
+
+	ITransaction* transaction = nullptr;
+	bool ownTransaction = false;
+
+	if (tx_handle)
+	{
+		transaction = lookupTransaction(tx_handle);
+		if (!transaction)
+		{
+			setError("fb_execute_batch_stmt: unknown transaction handle");
+			return 3;
+		}
+	}
+	else
+	{
+		Status status;
+		transaction = attachment->startTransaction(status.ptr(), 0, nullptr);
+		if (status.failed() || !transaction)
+		{
+			setErrorFromStatus("fb_execute_batch_stmt: could not start transaction", status.ptr());
+			return 4;
+		}
+		ownTransaction = true;
+	}
+
+	Status status;
+	bool cached = false;
+	IStatement* statement = acquirePreparedStatement(
+		db_handle, attachment, transaction, stmt_handle, status, cached);
+
+	if (status.failed() || !statement)
+	{
+		if (status.failed())
+			setErrorFromStatus("fb_execute_batch_stmt: prepare failed", status.ptr());
+		else
+			setError("fb_execute_batch_stmt: unknown statement handle");
+		if (ownTransaction)
+		{
+			Status rollbackStatus;
+			transaction->rollback(rollbackStatus.ptr());
+		}
+		return 5;
+	}
+
+	InputMessage input;
+	input.writeBlobsTo(attachment, transaction);
+	bool ok = input.describe(statement);
+	ISC_INT64 total = 0;
+	std::vector<ParamValue> values;
+
+	const unsigned stride = ok ? input.alignedLength() : 0;
+	if (ok && input.parameterCount() > 0 && stride == 0)
+	{
+		setError("fb_execute_batch_stmt: could not size the input message");
+		ok = false;
+	}
+
+	if (ok && input.parameterCount() > 0 && !input.hasBlobParameter())
+	{
+		std::vector<unsigned char> messages;
+		messages.reserve(static_cast<size_t>(stride) * rowCount);
+
+		for (unsigned row = 0; ok && row < rowCount; row++)
+		{
+			if (!parseParamsAt(rows, length, pos, values))
+			{
+				setError("fb_execute_batch_stmt: malformed row buffer");
+				ok = false;
+				break;
+			}
+
+			if (!input.fill(values))
+			{
+				char context[64];
+				snprintf(context, sizeof(context), "fb_execute_batch_stmt: row %u: ", row);
+				setError(context + g_lastError);
+				ok = false;
+				break;
+			}
+
+			const unsigned char* bytes = static_cast<const unsigned char*>(input.data());
+			messages.insert(messages.end(), bytes, bytes + input.size());
+			messages.resize(static_cast<size_t>(stride) * (row + 1), 0);
+		}
+
+		if (ok && rowCount > 0)
+		{
+			const size_t needed = messages.size() + 4096;
+			IXpbBuilder* pb = g_util->getXpbBuilder(status.ptr(), IXpbBuilder::BATCH, nullptr, 0);
+			if (!status.failed() && pb)
+			{
+				pb->insertInt(status.ptr(), IBatch::TAG_RECORD_COUNTS, 1);
+				if (needed > 16u * 1024 * 1024)
+					pb->insertInt(status.ptr(), IBatch::TAG_BUFFER_BYTES_SIZE,
+						static_cast<int>(needed > 256u * 1024 * 1024 ? 256u * 1024 * 1024 : needed));
+			}
+
+			IBatch* batch = (status.failed() || !pb) ? nullptr
+				: statement->createBatch(status.ptr(), input.meta(),
+					pb->getBufferLength(status.ptr()), pb->getBuffer(status.ptr()));
+			if (pb)
+				pb->dispose();
+
+			if (status.failed() || !batch)
+			{
+				setErrorFromStatus("fb_execute_batch_stmt: could not create the batch", status.ptr());
+				ok = false;
+			}
+			else
+			{
+				batch->add(status.ptr(), rowCount, messages.data());
+				IBatchCompletionState* completion = status.failed() ? nullptr
+					: batch->execute(status.ptr(), transaction);
+
+				if (status.failed() || !completion)
+				{
+					setErrorFromStatus("fb_execute_batch_stmt: execute failed", status.ptr());
+					ok = false;
+				}
+				else
+				{
+					Status infoStatus;
+					const unsigned reported = completion->getSize(infoStatus.ptr());
+					for (unsigned i = 0; ok && i < reported; i++)
+					{
+						const int state = completion->getState(infoStatus.ptr(), i);
+						if (state >= 0)
+							total += state;
+						else if (state == IBatchCompletionState::EXECUTE_FAILED)
+						{
+							Status rowStatus;
+							completion->getStatus(infoStatus.ptr(), rowStatus.ptr(), i);
+							char context[64];
+							snprintf(context, sizeof(context), "fb_execute_batch_stmt: row %u", i);
+							setErrorFromStatus(context, rowStatus.ptr());
+							ok = false;
+						}
+					}
+					completion->dispose();
+				}
+
+				Status closeStatus;
+				batch->close(closeStatus.ptr());
+			}
+		}
+	}
+	else
+	{
+		for (unsigned row = 0; ok && row < rowCount; row++)
+		{
+			if (!parseParamsAt(rows, length, pos, values))
+			{
+				setError("fb_execute_batch_stmt: malformed row buffer");
+				ok = false;
+				break;
+			}
+
+			if (!input.fill(values))
+			{
+				char context[64];
+				snprintf(context, sizeof(context), "fb_execute_batch_stmt: row %u: ", row);
+				setError(context + g_lastError);
+				ok = false;
+				break;
+			}
+
+			statement->execute(status.ptr(), transaction, input.meta(), input.data(),
+				nullptr, nullptr);
+
+			if (status.failed())
+			{
+				char context[64];
+				snprintf(context, sizeof(context), "fb_execute_batch_stmt: row %u", row);
+				setErrorFromStatus(context, status.ptr());
+				ok = false;
+				break;
+			}
+
+			Status affectedStatus;
+			const ISC_UINT64 affected = statement->getAffectedRecords(affectedStatus.ptr());
+			if (!affectedStatus.failed())
+				total += static_cast<ISC_INT64>(affected);
+		}
+	}
+
+	releaseStatement(db_handle, statement, cached, !ok);
+
+	if (!ok)
+	{
+		if (ownTransaction)
+		{
+			Status rollbackStatus;
+			transaction->rollback(rollbackStatus.ptr());
+		}
+		return 6;
+	}
+
+	g_lastAffectedRows = total;
+
+	if (ownTransaction)
+	{
+		Status commitStatus;
+		transaction->commit(commitStatus.ptr());
+		if (commitStatus.failed())
+		{
+			setErrorFromStatus("fb_execute_batch_stmt: commit failed", commitStatus.ptr());
+			return 7;
+		}
+	}
+
+	return 0;
+}
+
+/**
+ * Execute a prepared statement handle (`fb_prepare`) with parameters and
+ * return a JSON-encoded result set, or nullptr on failure.
+ * Free the returned string with `fb_free_result()`.
+ */
+FB_WASM_EXPORT
+const char* fb_query_stmt(int db_handle, int tx_handle, int stmt_handle,
+	const unsigned char* params, int params_length, int flags)
+{
+	clearError();
+
+	IAttachment* attachment = lookupAttachment(db_handle);
+	if (!attachment)
+	{
+		setError("fb_query_stmt: unknown database handle");
+		return nullptr;
+	}
+
+	const char* sql = lookupPreparedSql(db_handle, stmt_handle);
+	if (!sql)
+	{
+		setError("fb_query_stmt: unknown statement handle");
+		return nullptr;
+	}
+
+	std::vector<ParamValue> values;
+	if (!parseParams(params, static_cast<unsigned>(params_length < 0 ? 0 : params_length),
+			values))
+	{
+		setError("fb_query_stmt: malformed parameter buffer");
+		return nullptr;
+	}
+
+	ITransaction* transaction = nullptr;
+	bool ownTransaction = false;
+	DbEntry* entry = lookupEntry(db_handle);
+	bool shared = false;
+
+	auto startOwnTransaction = [&]()
+	{
+		Status status;
+		transaction = attachment->startTransaction(status.ptr(), 0, nullptr);
+		if (status.failed() || !transaction)
+		{
+			transaction = nullptr;
+			setErrorFromStatus("fb_query_stmt: could not start transaction", status.ptr());
+			return false;
+		}
+		ownTransaction = true;
+		return true;
+	};
+
+	if (tx_handle)
+	{
+		transaction = lookupTransaction(tx_handle);
+		if (!transaction)
+		{
+			setError("fb_query_stmt: unknown transaction handle");
+			return nullptr;
+		}
+	}
+	else if (wantsSharedRead(entry, sql) && (transaction = sharedReadTransaction(*entry)))
+		shared = true;
+	else if (!startOwnTransaction())
+		return nullptr;
+
+	IResultSet* cursor = nullptr;
+	IStatement* statement = nullptr;
+	bool cached = false;
+
+	auto cleanup = [&](bool commit, bool keep = false)
+	{
+		if (cursor)
+		{
+			Status s;
+			cursor->close(s.ptr());
+			cursor->release();
+		}
+		releaseStatement(db_handle, statement, cached, !commit && !keep);
+		if (ownTransaction && transaction)
+		{
+			Status s;
+			if (commit)
+				transaction->commit(s.ptr());
+			else
+				transaction->rollback(s.ptr());
+		}
+	};
+
+	Status status;
+	unsigned type = 0;
+	statement = acquirePreparedStatement(
+		db_handle, attachment, transaction, stmt_handle, status, cached, &type);
+	if (status.failed() || !statement)
+	{
+		if (status.failed())
+			setErrorFromStatus("fb_query_stmt: prepare failed", status.ptr());
+		else
+			setError("fb_query_stmt: unknown statement handle");
+		cleanup(false);
+		return nullptr;
+	}
+
+	if (shared && type != isc_info_sql_stmt_select)
+	{
+		shared = false;
+		transaction = nullptr;
+		if (!startOwnTransaction())
+		{
+			cleanup(false);
+			return nullptr;
+		}
+	}
+
+	InputMessage input;
+	input.writeBlobsTo(attachment, transaction);
+	if (!input.build(statement, values))
+	{
+		cleanup(false);
+		return nullptr;
+	}
+
+	const std::shared_ptr<OutputShape> shape = outputShape(db_handle, statement, cached, "fb_query_stmt");
+	if (!shape)
+	{
+		cleanup(false);
+		return nullptr;
+	}
+
+	BlobSink sink;
+	sink.enabled = (flags & FB_QUERY_BINARY_BLOBS) != 0;
+
+	std::string json;
+	if (!serialiseCursor(attachment, transaction, statement, *shape,
+			input.meta(), input.data(), cursor, json, &sink, (flags & FB_QUERY_SHAPE_IDS) != 0))
+	{
+		if (shared && g_lastErrorReadOnly)
+		{
+			rememberWriter(*entry, sql);
+			cleanup(false, true);
+			return fb_query_stmt(db_handle, 0, stmt_handle, params, params_length, flags);
+		}
+		cleanup(false);
+		if (shared)
+			endReadTransaction(*entry);
+		return nullptr;
+	}
+
+	cleanup(true);
+	publishBlobs(sink);
+	return allocCString(json);
+}
+
+/**
+ * Execute a prepared statement handle (`fb_prepare`) with parameters and
+ * return a packed binary result buffer (`FBR\x01`), storing its byte length in
+ * `*out_byte_length`.  Returns nullptr on failure.  Free the returned buffer
+ * with `fb_free_result()`.
+ */
+FB_WASM_EXPORT
+const unsigned char* fb_query_stmt_binary(int db_handle, int tx_handle, int stmt_handle,
+	const unsigned char* params, int params_length, int flags, unsigned* out_byte_length)
+{
+	clearError();
+	if (out_byte_length)
+		*out_byte_length = 0;
+
+	IAttachment* attachment = lookupAttachment(db_handle);
+	if (!attachment)
+	{
+		setError("fb_query_stmt_binary: unknown database handle");
+		return nullptr;
+	}
+
+	const char* sql = lookupPreparedSql(db_handle, stmt_handle);
+	if (!sql)
+	{
+		setError("fb_query_stmt_binary: unknown statement handle");
+		return nullptr;
+	}
+
+	std::vector<ParamValue> values;
+	if (!parseParams(params, static_cast<unsigned>(params_length < 0 ? 0 : params_length),
+			values))
+	{
+		setError("fb_query_stmt_binary: malformed parameter buffer");
+		return nullptr;
+	}
+
+	ITransaction* transaction = nullptr;
+	bool ownTransaction = false;
+	DbEntry* entry = lookupEntry(db_handle);
+	bool shared = false;
+
+	auto startOwnTransaction = [&]()
+	{
+		Status status;
+		transaction = attachment->startTransaction(status.ptr(), 0, nullptr);
+		if (status.failed() || !transaction)
+		{
+			transaction = nullptr;
+			setErrorFromStatus("fb_query_stmt_binary: could not start transaction", status.ptr());
+			return false;
+		}
+		ownTransaction = true;
+		return true;
+	};
+
+	if (tx_handle)
+	{
+		transaction = lookupTransaction(tx_handle);
+		if (!transaction)
+		{
+			setError("fb_query_stmt_binary: unknown transaction handle");
+			return nullptr;
+		}
+	}
+	else if (wantsSharedRead(entry, sql) && (transaction = sharedReadTransaction(*entry)))
+		shared = true;
+	else if (!startOwnTransaction())
+		return nullptr;
+
+	IResultSet* cursor = nullptr;
+	IStatement* statement = nullptr;
+	bool cached = false;
+
+	auto cleanup = [&](bool commit, bool keep = false)
+	{
+		if (cursor)
+		{
+			Status s;
+			cursor->close(s.ptr());
+			cursor->release();
+		}
+		releaseStatement(db_handle, statement, cached, !commit && !keep);
+		if (ownTransaction && transaction)
+		{
+			Status s;
+			if (commit)
+				transaction->commit(s.ptr());
+			else
+				transaction->rollback(s.ptr());
+		}
+	};
+
+	Status status;
+	unsigned type = 0;
+	statement = acquirePreparedStatement(
+		db_handle, attachment, transaction, stmt_handle, status, cached, &type);
+	if (status.failed() || !statement)
+	{
+		if (status.failed())
+			setErrorFromStatus("fb_query_stmt_binary: prepare failed", status.ptr());
+		else
+			setError("fb_query_stmt_binary: unknown statement handle");
+		cleanup(false);
+		return nullptr;
+	}
+
+	if (shared && type != isc_info_sql_stmt_select)
+	{
+		shared = false;
+		transaction = nullptr;
+		if (!startOwnTransaction())
+		{
+			cleanup(false);
+			return nullptr;
+		}
+	}
+
+	InputMessage input;
+	IMessageMetadata* inMeta = nullptr;
+	void* inBuffer = nullptr;
+	if (!values.empty())
+	{
+		input.writeBlobsTo(attachment, transaction);
+		if (!input.build(statement, values))
+		{
+			cleanup(false);
+			return nullptr;
+		}
+		inMeta = input.meta();
+		inBuffer = input.data();
+	}
+
+	const std::shared_ptr<OutputShape> shape = outputShape(db_handle, statement, cached, "fb_query_stmt_binary");
+	if (!shape)
+	{
+		cleanup(false);
+		return nullptr;
+	}
+
+	std::vector<unsigned char> binary;
+	if (!serialiseCursorBinary(attachment, transaction, statement, *shape,
+			inMeta, inBuffer, cursor, binary, (flags & FB_QUERY_SHAPE_IDS) != 0))
+	{
+		if (shared && g_lastErrorReadOnly)
+		{
+			rememberWriter(*entry, sql);
+			cleanup(false, true);
+			return fb_query_stmt_binary(db_handle, 0, stmt_handle, params, params_length, flags, out_byte_length);
+		}
+		cleanup(false);
+		if (shared)
+			endReadTransaction(*entry);
+		return nullptr;
+	}
+
+	cleanup(true);
+	return allocBinaryBuffer(binary, out_byte_length);
+}
+
+/**
+ * Open a streaming cursor for a prepared statement handle (`fb_prepare`) with
+ * optional packed `params`.
+ * Returns a cursor handle (>0) on success, or 0 on failure.
+ */
+FB_WASM_EXPORT
+int fb_cursor_open_stmt(int db_handle, int tx_handle, int stmt_handle,
+	const unsigned char* params, int params_length)
+{
+	clearError();
+
+	IAttachment* attachment = lookupAttachment(db_handle);
+	if (!attachment)
+	{
+		setError("fb_cursor_open_stmt: unknown database handle");
+		return 0;
+	}
+
+	if (!lookupPreparedSql(db_handle, stmt_handle))
+	{
+		setError("fb_cursor_open_stmt: unknown statement handle");
+		return 0;
+	}
+
+	std::vector<ParamValue> values;
+	if (!parseParams(params, static_cast<unsigned>(params_length < 0 ? 0 : params_length),
+			values))
+	{
+		setError("fb_cursor_open_stmt: malformed parameter buffer");
+		return 0;
+	}
+
+	ITransaction* transaction = nullptr;
+	bool ownTransaction = false;
+
+	if (tx_handle)
+	{
+		transaction = lookupTransaction(tx_handle);
+		if (!transaction)
+		{
+			setError("fb_cursor_open_stmt: unknown transaction handle");
+			return 0;
+		}
+	}
+	else
+	{
+		Status status;
+		transaction = attachment->startTransaction(status.ptr(), 0, nullptr);
+		if (status.failed() || !transaction)
+		{
+			setErrorFromStatus("fb_cursor_open_stmt: could not start transaction", status.ptr());
+			return 0;
+		}
+		ownTransaction = true;
+	}
+
+	IResultSet* cursor = nullptr;
+	IStatement* statement = nullptr;
+	bool cached = false;
+
+	auto cleanupOnError = [&]()
+	{
+		if (cursor)
+		{
+			Status s;
+			cursor->close(s.ptr());
+			cursor->release();
+		}
+		releaseStatement(db_handle, statement, cached, true);
+		if (ownTransaction && transaction)
+		{
+			Status s;
+			transaction->rollback(s.ptr());
+		}
+	};
+
+	Status status;
+	unsigned type = 0;
+	statement = acquirePreparedStatement(
+		db_handle, attachment, transaction, stmt_handle, status, cached, &type);
+	if (status.failed() || !statement)
+	{
+		if (status.failed())
+			setErrorFromStatus("fb_cursor_open_stmt: prepare failed", status.ptr());
+		else
+			setError("fb_cursor_open_stmt: unknown statement handle");
+		cleanupOnError();
+		return 0;
+	}
+
+	InputMessage input;
+	IMessageMetadata* inMeta = nullptr;
+	void* inBuffer = nullptr;
+	if (params && params_length > 0)
+	{
+		input.writeBlobsTo(attachment, transaction);
+		if (!input.build(statement, values))
+		{
+			cleanupOnError();
+			return 0;
+		}
+		inMeta = input.meta();
+		inBuffer = input.data();
+	}
+
+	const std::shared_ptr<OutputShape> shape = outputShape(db_handle, statement, cached, "fb_cursor_open_stmt");
+	if (!shape)
+	{
+		cleanupOnError();
+		return 0;
+	}
+
+	CursorEntry entry;
+	entry.db_handle = db_handle;
+	entry.tx_handle = tx_handle;
+	entry.attachment = attachment;
+	entry.transaction = transaction;
+	entry.ownTransaction = ownTransaction;
+	entry.statement = statement;
+	entry.cached = cached;
+	entry.shape = shape;
+
+	if (!shape->columnCount)
+	{
+		statement->execute(status.ptr(), transaction, inMeta, inBuffer, nullptr, nullptr);
+		if (status.failed())
+		{
+			setErrorFromStatus("fb_cursor_open_stmt: could not execute statement", status.ptr());
+			cleanupOnError();
+			return 0;
+		}
+
+		Status affectedStatus;
+		const ISC_UINT64 affected = statement->getAffectedRecords(affectedStatus.ptr());
+		g_lastAffectedRows = affectedStatus.failed()
+			? 0
+			: static_cast<ISC_INT64>(affected);
+		entry.eof = true;
+	}
+	else if (!shape->hasCursor)
+	{
+		entry.singleRowBuffer.resize(shape->messageLength);
+		statement->execute(status.ptr(), transaction, inMeta, inBuffer,
+			shape->metadata, entry.singleRowBuffer.data());
+		if (status.failed())
+		{
+			setErrorFromStatus("fb_cursor_open_stmt: could not execute statement", status.ptr());
+			cleanupOnError();
+			return 0;
+		}
+		entry.singleRowPending = true;
+	}
+	else
+	{
+		cursor = statement->openCursor(status.ptr(), transaction, inMeta, inBuffer,
+			shape->metadata, 0);
+		if (status.failed() || !cursor)
+		{
+			setErrorFromStatus("fb_cursor_open_stmt: could not open cursor", status.ptr());
+			cleanupOnError();
+			return 0;
+		}
+		entry.cursor = cursor;
+	}
+
+	const int handle = g_nextCursorHandle++;
+	g_cursors[handle] = std::move(entry);
+	return handle;
 }
 
 } /* extern "C" */

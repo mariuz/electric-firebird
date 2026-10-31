@@ -389,6 +389,94 @@ export class WorkerTransport implements EngineTransport {
     return this.call<void>('stmtClose', stmtHandle);
   }
 
+  executeStmt(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    stmtHandle: EngineHandle,
+    params: QueryParams = [],
+  ): Promise<number> {
+    return this.call<number>(
+      'executeStmt',
+      dbHandle,
+      txHandle,
+      stmtHandle,
+      params,
+    );
+  }
+
+  executeBatchStmt(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    stmtHandle: EngineHandle,
+    rows: QueryParams[],
+  ): Promise<number> {
+    return this.call<number>(
+      'executeBatchStmt',
+      dbHandle,
+      txHandle,
+      stmtHandle,
+      rows,
+    );
+  }
+
+  async queryStmt<T = Row>(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    stmtHandle: EngineHandle,
+    params: QueryParams = [],
+    rowMode: RowMode = 'object',
+    binaryBlobs = false,
+  ): Promise<QueryResult<T>> {
+    const raw = await this.call<BinaryResultPayload | QueryResult<T>>(
+      'queryStmt',
+      dbHandle,
+      txHandle,
+      stmtHandle,
+      params,
+      rowMode,
+      binaryBlobs,
+    );
+    return decodeBinaryResultPayload<T>(
+      raw,
+      rowMode,
+      binaryBlobs,
+      this.shapes,
+    );
+  }
+
+  async queryStmtBinary(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    stmtHandle: EngineHandle,
+    params: QueryParams = [],
+    binaryBlobs = false,
+  ): Promise<BinaryResultPayload> {
+    const raw = await this.call<BinaryResultPayload | QueryResult<unknown[]>>(
+      'queryStmtBinary',
+      dbHandle,
+      txHandle,
+      stmtHandle,
+      params,
+      binaryBlobs,
+    );
+    return this.normalizeBinaryPayload(raw);
+  }
+
+  cursorOpenStmt(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    stmtHandle: EngineHandle,
+    params: QueryParams = [],
+  ): Promise<EngineHandle> {
+    return this.call<EngineHandle>(
+      'cursorOpenStmt',
+      dbHandle,
+      txHandle,
+      stmtHandle,
+      params,
+    );
+  }
+
   loadIcuLocaleData(data: Uint8Array): Promise<void> {
     return this.call<void>('loadIcuLocaleData', data);
   }

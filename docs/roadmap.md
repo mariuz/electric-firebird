@@ -1313,7 +1313,7 @@ With M0–M8 complete, these are the next-horizon milestones for `v0.14.0`:
       transfer the raw `ArrayBuffer` (via `postMessage(msg, [buffer])`) to the
       main thread and decode rows directly on the main thread, eliminating
       structured-cloning overhead of decoded row arrays across worker boundaries.
-- [ ] **Statement handle execution by ID (`_fb_query_stmt` / `_fb_execute_stmt`).**
+- [x] **Statement handle execution by ID (`_fb_query_stmt` / `_fb_execute_stmt`).**
       `db.prepare(sql)` currently pins a statement in the C bridge cache via
       `_fb_prepare`, while `stmt.query()` and `stmt.exec()` still pass the SQL
       text to `query()` / `execute()` (relying on the LRU cache lookup). Adding
