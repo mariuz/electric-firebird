@@ -36,6 +36,8 @@ export type EngineOp =
   | 'sweep'
   | 'prepare'
   | 'stmtClose'
+  | 'stmtSetTimeout'
+  | 'cancelOperation'
   | 'executeStmt'
   | 'executeBatchStmt'
   | 'queryStmt'

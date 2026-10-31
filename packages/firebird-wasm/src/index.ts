@@ -54,6 +54,7 @@ export type {
   FirebirdTypeName,
   QueryOptions,
   QueryStreamOptions,
+  StatementExecutionOptions,
   QueryDescription,
   ExplainOptions,
   DatabaseInfo,

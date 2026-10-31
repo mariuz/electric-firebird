@@ -89,6 +89,9 @@ extern "C" int fb_shutdown(unsigned int timeout, const int reason);   // yvalve/
 #ifndef fb_shutrsn_app_stopped
 #define fb_shutrsn_app_stopped -3   // firebird/impl/consts_pub.h
 #endif
+#ifndef fb_cancel_raise
+#define fb_cancel_raise 3           // firebird/impl/consts_pub.h
+#endif
 
 namespace {
 
@@ -227,10 +230,13 @@ struct PreparedStmtEntry
 {
 	int db_handle = 0;
 	std::string sql;
+	unsigned timeout_ms = 0;
 };
 
 std::map<int, CursorEntry> g_cursors;
 std::map<int, PreparedStmtEntry> g_preparedStatements;
+/** One-shot statement timeout (ms) set via `fb_stmt_set_timeout(0, ms)` for the next statement acquisition. */
+unsigned g_nextCallTimeoutMs = 0;
 
 int g_nextDbHandle = 1;
 int g_nextTxHandle = 1;
@@ -674,12 +680,31 @@ void noticeMetadataChanges(DbEntry& entry)
  * it; pass it to releaseStatement() when done.  On a failed prepare, `status`
  * holds the error and the result is null.
  */
+void applyStatementTimeout(IStatement* statement, unsigned timeout_ms)
+{
+	if (!statement)
+		return;
+	Status timeoutStatus;
+	statement->setTimeout(timeoutStatus.ptr(), timeout_ms);
+}
+
+unsigned lookupPinnedTimeout(int stmt_handle)
+{
+	if (stmt_handle <= 0)
+		return 0;
+	const auto it = g_preparedStatements.find(stmt_handle);
+	return it != g_preparedStatements.end() ? it->second.timeout_ms : 0;
+}
+
 IStatement* acquireStatement(int db_handle, IAttachment* attachment, ITransaction* transaction,
 	const char* sql, Status& status, bool& cached, unsigned* typeOut = nullptr)
 {
 	cached = false;
 	if (typeOut)
 		*typeOut = 0;
+	const unsigned callTimeout = g_nextCallTimeoutMs;
+	g_nextCallTimeoutMs = 0;
+
 	DbEntry* entry = lookupEntry(db_handle);
 
 	if (entry)
@@ -696,6 +721,10 @@ IStatement* acquireStatement(int db_handle, IAttachment* attachment, ITransactio
 				cached = true;
 				if (typeOut)
 					*typeOut = entry->statements.front().type;
+				const unsigned effectiveTimeout = callTimeout > 0
+					? callTimeout
+					: lookupPinnedTimeout(entry->statements.front().handle);
+				applyStatementTimeout(entry->statements.front().statement, effectiveTimeout);
 				return entry->statements.front().statement;
 			}
 		}
@@ -705,6 +734,9 @@ IStatement* acquireStatement(int db_handle, IAttachment* attachment, ITransactio
 		SQL_DIALECT_V6, IStatement::PREPARE_PREFETCH_METADATA);
 	if (status.failed() || !statement)
 		return nullptr;
+
+	if (callTimeout > 0)
+		applyStatementTimeout(statement, callTimeout);
 
 	Status typeStatus;
 	const unsigned type = statement->getType(typeStatus.ptr());
@@ -769,6 +801,7 @@ void releaseStatement(int db_handle, IStatement* statement, bool cached, bool fa
 			}
 			else
 			{
+				applyStatementTimeout(statement, lookupPinnedTimeout(it->handle));
 				it->busy = false;
 			}
 			return;
@@ -810,7 +843,14 @@ IStatement* acquirePreparedStatement(int db_handle, IAttachment* attachment, ITr
 
 	const char* sql = lookupPreparedSql(db_handle, stmt_handle);
 	if (!sql)
+	{
+		g_nextCallTimeoutMs = 0;
 		return nullptr;
+	}
+
+	const unsigned callTimeout = g_nextCallTimeoutMs;
+	const unsigned pinnedTimeout = lookupPinnedTimeout(stmt_handle);
+	const unsigned effectiveTimeout = callTimeout > 0 ? callTimeout : pinnedTimeout;
 
 	DbEntry* entry = lookupEntry(db_handle);
 	if (entry)
@@ -820,24 +860,30 @@ IStatement* acquirePreparedStatement(int db_handle, IAttachment* attachment, ITr
 		{
 			if (!it->busy && it->handle == stmt_handle)
 			{
+				g_nextCallTimeoutMs = 0;
 				entry->statements.splice(entry->statements.begin(), entry->statements, it);
 				entry->statements.front().busy = true;
 				cached = true;
 				if (typeOut)
 					*typeOut = entry->statements.front().type;
+				applyStatementTimeout(entry->statements.front().statement, effectiveTimeout);
 				return entry->statements.front().statement;
 			}
 		}
 	}
 
 	IStatement* statement = acquireStatement(db_handle, attachment, transaction, sql, status, cached, typeOut);
-	if (statement && cached && entry && !entry->statements.empty())
+	if (statement)
 	{
-		CachedStatement& front = entry->statements.front();
-		if (front.statement == statement && !front.handle)
+		applyStatementTimeout(statement, effectiveTimeout);
+		if (cached && entry && !entry->statements.empty())
 		{
-			front.handle = stmt_handle;
-			front.pinned = true;
+			CachedStatement& front = entry->statements.front();
+			if (front.statement == statement && !front.handle)
+			{
+				front.handle = stmt_handle;
+				front.pinned = true;
+			}
 		}
 	}
 	return statement;
@@ -7225,6 +7271,83 @@ int fb_cursor_open_stmt(int db_handle, int tx_handle, int stmt_handle,
 	const int handle = g_nextCursorHandle++;
 	g_cursors[handle] = std::move(entry);
 	return handle;
+}
+
+/**
+ * Cancel the currently running operation on `db_handle` via
+ * `IAttachment::cancelOperation(status, option)`.
+ * When `option <= 0`, defaults to `fb_cancel_raise` (3).
+ * Returns 0 on success, non-zero on failure.
+ */
+FB_WASM_EXPORT
+int fb_cancel_operation(int db_handle, int option)
+{
+	clearError();
+
+	IAttachment* attachment = lookupAttachment(db_handle);
+	if (!attachment)
+	{
+		setError("fb_cancel_operation: unknown database handle");
+		return 1;
+	}
+
+	Status status;
+	attachment->cancelOperation(status.ptr(), option > 0 ? option : fb_cancel_raise);
+	if (status.failed())
+	{
+		setErrorFromStatus("fb_cancel_operation", status.ptr());
+		return 2;
+	}
+	return 0;
+}
+
+/**
+ * Set the statement execution timeout in milliseconds (`IStatement::setTimeout`).
+ *
+ * - When `stmt_handle == 0`, sets a one-shot timeout applied to the very next
+ *   statement acquired by `fb_query*`, `fb_execute*`, or `fb_cursor_open*`.
+ * - When `stmt_handle > 0`, sets the persistent timeout on that prepared
+ *   statement handle (`0` disables the timeout).
+ * Returns 0 on success, non-zero on failure.
+ */
+FB_WASM_EXPORT
+int fb_stmt_set_timeout(int stmt_handle, unsigned timeout_ms)
+{
+	clearError();
+
+	if (stmt_handle == 0)
+	{
+		g_nextCallTimeoutMs = timeout_ms;
+		return 0;
+	}
+
+	const auto prepIt = g_preparedStatements.find(stmt_handle);
+	if (prepIt == g_preparedStatements.end())
+	{
+		setError("fb_stmt_set_timeout: unknown statement handle");
+		return 1;
+	}
+
+	prepIt->second.timeout_ms = timeout_ms;
+	DbEntry* entry = lookupEntry(prepIt->second.db_handle);
+	if (entry)
+	{
+		for (auto& c : entry->statements)
+		{
+			if (c.handle == stmt_handle && c.statement)
+			{
+				Status status;
+				c.statement->setTimeout(status.ptr(), timeout_ms);
+				if (status.failed())
+				{
+					setErrorFromStatus("fb_stmt_set_timeout", status.ptr());
+					return 2;
+				}
+				break;
+			}
+		}
+	}
+	return 0;
 }
 
 } /* extern "C" */

@@ -31,6 +31,7 @@ import type {
   QueryResult,
   QueryOptions,
   QueryStreamOptions,
+  StatementExecutionOptions,
   Row,
   QueryParams,
   RowMode,
@@ -105,6 +106,158 @@ function loadNativeDriver(): NativeDriver {
 type ArrayModeOptions = QueryOptions & { rowMode: 'array' };
 /** `QueryStreamOptions` with the array mode pinned, for the overloads below. */
 type ArrayStreamOptions = QueryStreamOptions & { rowMode: 'array' };
+
+function validateTimeoutMs(timeoutMs?: number): number | undefined {
+  if (timeoutMs === undefined) return undefined;
+  if (
+    typeof timeoutMs !== 'number' ||
+    !Number.isFinite(timeoutMs) ||
+    timeoutMs < 0
+  ) {
+    throw new RangeError('timeoutMs must be a non-negative finite number');
+  }
+  return Math.floor(timeoutMs);
+}
+
+function toAbortError(reason: unknown): Error {
+  if (reason instanceof Error) return reason;
+  const err = new Error(
+    reason !== undefined && reason !== null
+      ? String(reason)
+      : 'The operation was aborted',
+  );
+  err.name = 'AbortError';
+  return err;
+}
+
+function createTimeoutError(timeoutMs: number): Error {
+  const err = new Error(`Statement timed out after ${timeoutMs}ms`);
+  err.name = 'TimeoutError';
+  return err;
+}
+
+function assertNotAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw toAbortError(signal.reason);
+  }
+}
+
+async function runWithCancellation<T>(
+  work: () => Promise<T>,
+  options: StatementExecutionOptions | undefined,
+  onCancel: () => Promise<void>,
+): Promise<T> {
+  const signal = options?.signal;
+  const timeoutMs = validateTimeoutMs(options?.timeoutMs);
+  assertNotAborted(signal);
+
+  if (!signal && (!timeoutMs || timeoutMs <= 0)) {
+    return work();
+  }
+
+  let cleanup = (): void => undefined;
+  const cancelPromise = new Promise<never>((_resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const onAbort = (): void => {
+      void onCancel().catch(() => undefined);
+      reject(toAbortError(signal?.reason));
+    };
+    if (signal) {
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+    if (timeoutMs && timeoutMs > 0) {
+      timer = setTimeout(() => {
+        void onCancel().catch(() => undefined);
+        reject(createTimeoutError(timeoutMs));
+      }, timeoutMs);
+    }
+    cleanup = () => {
+      if (signal) {
+        signal.removeEventListener('abort', onAbort);
+      }
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    };
+  });
+
+  try {
+    const workPromise = work();
+    workPromise.catch(() => undefined);
+    return await Promise.race([workPromise, cancelPromise]);
+  } finally {
+    cleanup();
+  }
+}
+
+async function cancelAttachmentOperation(
+  attachment: Attachment | null,
+  option = 3,
+): Promise<void> {
+  if (!attachment) return;
+  const internal = attachment as unknown as {
+    cancelOperation?: (option?: number) => Promise<void>;
+    attachmentHandle?: {
+      cancelOperationAsync?: (status: unknown, opt: number) => Promise<void>;
+      cancelOperationSync?: (status: unknown, opt: number) => void;
+    };
+    client?: {
+      statusAction?: <T>(fn: (status: unknown) => Promise<T>) => Promise<T>;
+    };
+  };
+  if (typeof internal.cancelOperation === 'function') {
+    await internal.cancelOperation(option);
+    return;
+  }
+  const client = internal.client;
+  const cancelAsync = internal.attachmentHandle?.cancelOperationAsync;
+  const cancelSync = internal.attachmentHandle?.cancelOperationSync;
+  if (typeof client?.statusAction === 'function' && typeof cancelAsync === 'function') {
+    await client.statusAction((status) =>
+      cancelAsync.call(internal.attachmentHandle, status, option),
+    );
+    return;
+  }
+  if (typeof client?.statusAction === 'function' && typeof cancelSync === 'function') {
+    await client.statusAction(async (status) => {
+      cancelSync.call(internal.attachmentHandle, status, option);
+    });
+  }
+}
+
+async function applyStatementHandleTimeout(
+  stmt: Statement,
+  timeoutMs: number | undefined,
+): Promise<void> {
+  if (timeoutMs === undefined) return;
+  const validated = validateTimeoutMs(timeoutMs) ?? 0;
+  const internal = stmt as unknown as NativeStatement & {
+    setTimeout?: (ms: number) => Promise<void> | void;
+  };
+  if (typeof internal.setTimeout === 'function') {
+    await internal.setTimeout(validated);
+    return;
+  }
+  const client = internal.attachment?.client;
+  const setAsync = internal.statementHandle?.setTimeoutAsync;
+  const setSync = internal.statementHandle?.setTimeoutSync;
+  if (typeof client?.statusAction === 'function' && typeof setAsync === 'function') {
+    await client.statusAction((status) =>
+      setAsync.call(internal.statementHandle, status, validated),
+    );
+    return;
+  }
+  if (typeof client?.statusAction === 'function' && typeof setSync === 'function') {
+    await client.statusAction(async (status) => {
+      setSync.call(internal.statementHandle, status, validated);
+    });
+  }
+}
 
 /**
  * FirebirdLite – a PGlite-style wrapper around Firebird Embedded.
@@ -183,6 +336,15 @@ export class FirebirdLite {
   }
 
   /**
+   * Cancel the currently running statement on this database attachment via
+   * `IAttachment::cancelOperation(status, fb_cancel_raise)`.
+   */
+  async cancelOperation(): Promise<void> {
+    await this.ensureReady();
+    await cancelAttachmentOperation(this.attachment);
+  }
+
+  /**
    * Execute a DDL or DML statement that does not return rows.
    *
    * The statement is executed in its own auto-committed transaction.
@@ -190,13 +352,23 @@ export class FirebirdLite {
    * Accepts a `` sql`…` `` fragment in place of a string, in which case its
    * values are bound rather than interpolated.
    */
-  async exec(sql: string | SqlFragment, params: QueryParams = []): Promise<void> {
+  async exec(
+    sql: string | SqlFragment,
+    paramsOrOptions: QueryParams | StatementExecutionOptions = [],
+    maybeOptions: StatementExecutionOptions = {},
+  ): Promise<void> {
+    const params = Array.isArray(paramsOrOptions) ? paramsOrOptions : [];
+    const options = Array.isArray(paramsOrOptions)
+      ? maybeOptions
+      : (paramsOrOptions ?? {});
+    assertNotAborted(options.signal);
+    validateTimeoutMs(options.timeoutMs);
     // Delegated rather than reimplemented: "parameters present → prepare,
     // execute, dispose; otherwise execute directly" is a rule that belongs in
     // one place, and `transaction()` already wraps it in the commit-or-roll-
     // back this needs. Two copies would drift the first time either grows a
     // case.
-    await this.transaction((tx) => tx.exec(sql, params));
+    await this.transaction((tx) => tx.exec(sql, params, options));
   }
 
   /**
@@ -254,15 +426,21 @@ export class FirebirdLite {
     paramsOrOptions: QueryParams | QueryOptions = [],
     maybeOptions: QueryOptions = {},
   ): Promise<QueryResult<T>> {
-    await this.ensureReady();
     const { statement, options } = resolveQueryCall(sql, paramsOrOptions, maybeOptions);
-    const rowMode: RowMode = (options as QueryOptions).rowMode ?? 'object';
+    const queryOpts = options as QueryOptions;
+    assertNotAborted(queryOpts.signal);
+    validateTimeoutMs(queryOpts.timeoutMs);
+
+    await this.ensureReady();
+    const rowMode: RowMode = queryOpts.rowMode ?? 'object';
     const attachment = this.attachment!;
 
     if (
       this.sharedReads &&
-      options.isolationLevel === undefined &&
-      options.readOnly === undefined &&
+      queryOpts.isolationLevel === undefined &&
+      queryOpts.readOnly === undefined &&
+      queryOpts.signal === undefined &&
+      queryOpts.timeoutMs === undefined &&
       !this.ownTransaction.has(statement.sql)
     ) {
       const shared = await this.sharedRead<T>(statement.sql, statement.params, rowMode);
@@ -271,7 +449,7 @@ export class FirebirdLite {
     await this.endReadTransaction();
 
     const serializedParams = this.serialize(statement.params);
-    const txOptions = buildTransactionOptions(options);
+    const txOptions = buildTransactionOptions(queryOpts);
     const transaction = await attachment.startTransaction(txOptions);
 
     let rows: T[];
@@ -287,14 +465,21 @@ export class FirebirdLite {
       let failed = true;
       try {
         fields = await outputFields(stmt);
+        if (queryOpts.timeoutMs !== undefined && queryOpts.timeoutMs > 0) {
+          await applyStatementHandleTimeout(stmt, queryOpts.timeoutMs);
+        }
 
-        rows = shapeRows<T>(
-          await fetchRows(stmt, transaction, serializedParams, fields, this.types),
-          fields,
-          rowMode,
+        const rawRows = await runWithCancellation(
+          () => fetchRows(stmt, transaction, serializedParams, fields, this.types),
+          queryOpts,
+          () => this.cancelOperation(),
         );
+        rows = shapeRows<T>(rawRows, fields, rowMode);
         failed = false;
       } finally {
+        if (queryOpts.timeoutMs !== undefined && queryOpts.timeoutMs > 0 && !failed) {
+          await applyStatementHandleTimeout(stmt, 0).catch(() => undefined);
+        }
         await lease.release(failed);
       }
 
@@ -354,6 +539,7 @@ export class FirebirdLite {
       paramsOrOptions,
       maybeOptions,
     );
+    validateTimeoutMs(options.timeoutMs);
     const batchSize = resolveBatchSize(options.batchSize);
     return this.streamQuery<T>(statement, options, batchSize);
   }
@@ -363,6 +549,19 @@ export class FirebirdLite {
     options: QueryStreamOptions,
     batchSize: number,
   ): AsyncIterableIterator<QueryResult<T>> {
+    assertNotAborted(options.signal);
+    const totalTimeoutMs = validateTimeoutMs(options.timeoutMs);
+    const deadline =
+      totalTimeoutMs && totalTimeoutMs > 0
+        ? Date.now() + totalTimeoutMs
+        : undefined;
+    const checkStreamDeadline = (): void => {
+      assertNotAborted(options.signal);
+      if (deadline !== undefined && Date.now() >= deadline) {
+        throw createTimeoutError(totalTimeoutMs!);
+      }
+    };
+
     await this.ensureReady();
     const rowMode: RowMode = options.rowMode ?? 'object';
     const attachment = this.attachment!;
@@ -388,12 +587,15 @@ export class FirebirdLite {
       let fields: FieldInfo[];
       try {
         fields = await outputFields(stmt);
+        if (totalTimeoutMs !== undefined && totalTimeoutMs > 0) {
+          await applyStatementHandleTimeout(stmt, totalTimeoutMs);
+        }
       } catch (err) {
         engineFailed = true;
         throw err;
       }
 
-      yield* streamRows<T>(
+      for await (const batch of streamRows<T>(
         stmt,
         transaction,
         serializedParams,
@@ -404,8 +606,15 @@ export class FirebirdLite {
         () => {
           engineFailed = true;
         },
-      );
+      )) {
+        checkStreamDeadline();
+        yield batch;
+        checkStreamDeadline();
+      }
 
+      if (totalTimeoutMs !== undefined && totalTimeoutMs > 0) {
+        await applyStatementHandleTimeout(stmt, 0).catch(() => undefined);
+      }
       const toRelease = lease;
       lease = undefined;
       await toRelease.release(false);
@@ -801,6 +1010,7 @@ export class FirebirdLite {
     const hasResultSet = nativeStmt.hasResultSet;
     let isClosed = false;
     let busy = false;
+    let currentTimeoutMs = 0;
     const isDbClosed = () => this.closed;
 
     const assertOpen = (): void => {
@@ -834,6 +1044,9 @@ export class FirebirdLite {
       }
       const tempStmt = await attachment.prepare(transaction, sqlText);
       try {
+        if (currentTimeoutMs > 0) {
+          await applyStatementHandleTimeout(tempStmt, currentTimeoutMs);
+        }
         return await fn(tempStmt);
       } finally {
         await tempStmt.dispose().catch(() => undefined);
@@ -853,6 +1066,15 @@ export class FirebirdLite {
       get closed() {
         return isClosed || isDbClosed();
       },
+      get timeoutMs() {
+        return currentTimeoutMs;
+      },
+      setTimeout: async (timeoutMs: number) => {
+        assertOpen();
+        const validated = validateTimeoutMs(timeoutMs) ?? 0;
+        currentTimeoutMs = validated;
+        await applyStatementHandleTimeout(nativeStmt, validated);
+      },
       query: (async <T = Row>(
         paramsOrOptions: QueryParams | QueryOptions = [],
         maybeOptions: QueryOptions = {},
@@ -861,19 +1083,40 @@ export class FirebirdLite {
         const callParams = Array.isArray(paramsOrOptions)
           ? paramsOrOptions
           : [];
-        const callOptions = Array.isArray(paramsOrOptions)
+        const rawOptions = Array.isArray(paramsOrOptions)
           ? maybeOptions
           : (paramsOrOptions ?? {});
+        const callOptions: QueryOptions =
+          rawOptions.timeoutMs === undefined && currentTimeoutMs > 0
+            ? { ...rawOptions, timeoutMs: currentTimeoutMs }
+            : rawOptions;
         checkParamCount(callParams.length);
+        assertNotAborted(callOptions.signal);
+        validateTimeoutMs(callOptions.timeoutMs);
         const rowMode: RowMode = callOptions.rowMode ?? 'object';
         const serializedParams = this.serialize(callParams);
         await this.endReadTransaction();
         const txOptions = buildTransactionOptions(callOptions);
         const transaction = await attachment.startTransaction(txOptions);
         try {
-          const rawRows = await withStatement(transaction, (target) =>
-            fetchRows(target, transaction, serializedParams, fields, this.types),
-          );
+          const rawRows = await withStatement(transaction, async (target) => {
+            const hasPerCallTimeout =
+              rawOptions.timeoutMs !== undefined && rawOptions.timeoutMs !== currentTimeoutMs;
+            if (hasPerCallTimeout) {
+              await applyStatementHandleTimeout(target, rawOptions.timeoutMs);
+            }
+            try {
+              return await runWithCancellation(
+                () => fetchRows(target, transaction, serializedParams, fields, this.types),
+                callOptions,
+                () => this.cancelOperation(),
+              );
+            } finally {
+              if (hasPerCallTimeout && target === nativeStmt) {
+                await applyStatementHandleTimeout(target, currentTimeoutMs).catch(() => undefined);
+              }
+            }
+          });
           try {
       await transaction.commit();
     } catch (err) {
@@ -899,10 +1142,15 @@ export class FirebirdLite {
         const callParams = Array.isArray(paramsOrOptions)
           ? paramsOrOptions
           : [];
-        const callOptions = Array.isArray(paramsOrOptions)
+        const rawOptions = Array.isArray(paramsOrOptions)
           ? maybeOptions
           : (paramsOrOptions ?? {});
+        const callOptions: QueryStreamOptions =
+          rawOptions.timeoutMs === undefined && currentTimeoutMs > 0
+            ? { ...rawOptions, timeoutMs: currentTimeoutMs }
+            : rawOptions;
         checkParamCount(callParams.length);
+        validateTimeoutMs(callOptions.timeoutMs);
         const batchSize = resolveBatchSize(callOptions.batchSize);
         const rowMode: RowMode = callOptions.rowMode ?? 'object';
         const serializeParams = () => this.serialize(callParams);
@@ -911,6 +1159,19 @@ export class FirebirdLite {
 
         return (async function* (): AsyncIterableIterator<QueryResult<T>> {
           assertOpen();
+          assertNotAborted(callOptions.signal);
+          const totalTimeoutMs = validateTimeoutMs(callOptions.timeoutMs);
+          const deadline =
+            totalTimeoutMs && totalTimeoutMs > 0
+              ? Date.now() + totalTimeoutMs
+              : undefined;
+          const checkStreamDeadline = (): void => {
+            assertNotAborted(callOptions.signal);
+            if (deadline !== undefined && Date.now() >= deadline) {
+              throw createTimeoutError(totalTimeoutMs!);
+            }
+          };
+
           const serializedParams = serializeParams();
           await endReadTx();
           const txOptions = buildTransactionOptions(callOptions);
@@ -937,7 +1198,11 @@ export class FirebirdLite {
               target = tempStmt;
             }
 
-            yield* streamRows<T>(
+            if (totalTimeoutMs !== undefined && totalTimeoutMs > 0) {
+              await applyStatementHandleTimeout(target, totalTimeoutMs);
+            }
+
+            for await (const batch of streamRows<T>(
               target,
               transaction,
               serializedParams,
@@ -948,7 +1213,15 @@ export class FirebirdLite {
               () => {
                 engineFailed = true;
               },
-            );
+            )) {
+              checkStreamDeadline();
+              yield batch;
+              checkStreamDeadline();
+            }
+
+            if (claimedPrimary && totalTimeoutMs !== undefined && totalTimeoutMs !== currentTimeoutMs) {
+              await applyStatementHandleTimeout(nativeStmt, currentTimeoutMs).catch(() => undefined);
+            }
 
             if (tempStmt) {
               const toDispose = tempStmt;
@@ -992,19 +1265,45 @@ export class FirebirdLite {
           }
         })();
       }) as PreparedStatement['queryStream'],
-      exec: async (callParams: QueryParams = []) => {
+      exec: async (
+        callParams: QueryParams = [],
+        execOptions: StatementExecutionOptions = {},
+      ) => {
         assertOpen();
         checkParamCount(callParams.length);
+        const effectiveOptions: StatementExecutionOptions =
+          execOptions.timeoutMs === undefined && currentTimeoutMs > 0
+            ? { ...execOptions, timeoutMs: currentTimeoutMs }
+            : execOptions;
+        assertNotAborted(effectiveOptions.signal);
+        validateTimeoutMs(effectiveOptions.timeoutMs);
         const serializedParams = this.serialize(callParams);
         await this.endReadTransaction();
         const transaction = await attachment.startTransaction();
         try {
           const affectedRows = await withStatement(transaction, async (target) => {
-            await target.execute(
-              transaction,
-              await bindParams(target, transaction, serializedParams),
-            );
-            return readAffectedRecords(target);
+            const hasPerCallTimeout =
+              execOptions.timeoutMs !== undefined && execOptions.timeoutMs !== currentTimeoutMs;
+            if (hasPerCallTimeout) {
+              await applyStatementHandleTimeout(target, execOptions.timeoutMs);
+            }
+            try {
+              await runWithCancellation(
+                async () => {
+                  await target.execute(
+                    transaction,
+                    await bindParams(target, transaction, serializedParams),
+                  );
+                },
+                effectiveOptions,
+                () => this.cancelOperation(),
+              );
+              return readAffectedRecords(target);
+            } finally {
+              if (hasPerCallTimeout && target === nativeStmt) {
+                await applyStatementHandleTimeout(target, currentTimeoutMs).catch(() => undefined);
+              }
+            }
           });
           try {
       await transaction.commit();
@@ -1578,27 +1877,66 @@ export class FirebirdTransaction {
   }
 
   /**
+   * Cancel the currently running statement on this database attachment via
+   * `IAttachment::cancelOperation(status, fb_cancel_raise)`.
+   */
+  async cancelOperation(): Promise<void> {
+    this.assertUsable();
+    await cancelAttachmentOperation(this.attachment);
+  }
+
+  /**
    * Execute a DDL or DML statement inside this transaction.
    */
-  async exec(sql: string | SqlFragment, params: QueryParams = []): Promise<void> {
+  async exec(
+    sql: string | SqlFragment,
+    paramsOrOptions: QueryParams | StatementExecutionOptions = [],
+    maybeOptions: StatementExecutionOptions = {},
+  ): Promise<void> {
     this.assertUsable();
+    const params = Array.isArray(paramsOrOptions) ? paramsOrOptions : [];
+    const options = Array.isArray(paramsOrOptions)
+      ? maybeOptions
+      : (paramsOrOptions ?? {});
+    assertNotAborted(options.signal);
+    validateTimeoutMs(options.timeoutMs);
     await this.beforeStatement();
     const statement = toStatement(sql, params);
     const serialized = this.serialize(statement.params);
+    const hasTimeout = options.timeoutMs !== undefined && options.timeoutMs > 0;
     // With the cache off, a statement without parameters runs as it always
     // did. With it on, every statement goes through the cache, which is also
     // what sees DDL coming and empties itself first.
-    if (serialized.length > 0 || this.statements.enabled) {
+    if (serialized.length > 0 || this.statements.enabled || hasTimeout) {
       const lease = await this.statements.acquire(this.transaction, statement.sql);
       let failed = true;
       try {
-        await lease.stmt.execute(this.transaction, await bindParams(lease.stmt, this.transaction, serialized));
+        if (hasTimeout) {
+          await applyStatementHandleTimeout(lease.stmt, options.timeoutMs);
+        }
+        await runWithCancellation(
+          async () => {
+            await lease.stmt.execute(
+              this.transaction,
+              await bindParams(lease.stmt, this.transaction, serialized),
+            );
+          },
+          options,
+          () => cancelAttachmentOperation(this.attachment),
+        );
         failed = false;
       } finally {
+        if (hasTimeout && !failed) {
+          await applyStatementHandleTimeout(lease.stmt, 0).catch(() => undefined);
+        }
         await lease.release(failed);
       }
     } else {
-      await this.attachment.execute(this.transaction, statement.sql);
+      await runWithCancellation(
+        () => this.attachment.execute(this.transaction, statement.sql),
+        options,
+        () => cancelAttachmentOperation(this.attachment),
+      );
     }
   }
 
@@ -1727,14 +2065,16 @@ export class FirebirdTransaction {
   async query<T extends Row = Row>(
     sql: string | SqlFragment,
     params?: QueryParams,
-    options?: { rowMode?: RowMode },
+    options?: { rowMode?: RowMode } & StatementExecutionOptions,
   ): Promise<QueryResult<T>>;
   async query<T = Row>(
     sql: string | SqlFragment,
     params: QueryParams = [],
-    options: { rowMode?: RowMode } = {},
+    options: { rowMode?: RowMode } & StatementExecutionOptions = {},
   ): Promise<QueryResult<T>> {
     this.assertUsable();
+    assertNotAborted(options.signal);
+    validateTimeoutMs(options.timeoutMs);
     await this.beforeStatement();
     const statement = toStatement(sql, params);
     const serialized = this.serialize(statement.params);
@@ -1750,9 +2090,19 @@ export class FirebirdTransaction {
     let rawRows: unknown[][];
     try {
       fields = await outputFields(stmt);
-      rawRows = await fetchRows(stmt, this.transaction, serialized, fields, this.types);
+      if (options.timeoutMs !== undefined && options.timeoutMs > 0) {
+        await applyStatementHandleTimeout(stmt, options.timeoutMs);
+      }
+      rawRows = await runWithCancellation(
+        () => fetchRows(stmt, this.transaction, serialized, fields, this.types),
+        options,
+        () => cancelAttachmentOperation(this.attachment),
+      );
       failed = false;
     } finally {
+      if (options.timeoutMs !== undefined && options.timeoutMs > 0 && !failed) {
+        await applyStatementHandleTimeout(stmt, 0).catch(() => undefined);
+      }
       await lease.release(failed);
     }
     return applyTypes({ rows: shapeRows<T>(rawRows, fields, rowMode), fields }, this.types, rowMode);
@@ -1763,37 +2113,40 @@ export class FirebirdTransaction {
    */
   queryStream(
     sql: SqlFragment,
-    options: { rowMode: 'array'; batchSize?: number },
+    options: { rowMode: 'array'; batchSize?: number } & StatementExecutionOptions,
   ): AsyncIterableIterator<QueryResult<ArrayRow>>;
   queryStream(
     sql: string | SqlFragment,
     params: QueryParams | undefined,
-    options: { rowMode: 'array'; batchSize?: number },
+    options: { rowMode: 'array'; batchSize?: number } & StatementExecutionOptions,
   ): AsyncIterableIterator<QueryResult<ArrayRow>>;
   queryStream<T extends Row = Row>(
     sql: SqlFragment,
-    options?: { rowMode?: RowMode; batchSize?: number },
+    options?: { rowMode?: RowMode; batchSize?: number } & StatementExecutionOptions,
   ): AsyncIterableIterator<QueryResult<T>>;
   queryStream<T extends Row = Row>(
     sql: string | SqlFragment,
     params?: QueryParams,
-    options?: { rowMode?: RowMode; batchSize?: number },
+    options?: { rowMode?: RowMode; batchSize?: number } & StatementExecutionOptions,
   ): AsyncIterableIterator<QueryResult<T>>;
   queryStream<T = Row>(
     sql: string | SqlFragment,
-    paramsOrOptions: QueryParams | { rowMode?: RowMode; batchSize?: number } = [],
-    maybeOptions: { rowMode?: RowMode; batchSize?: number } = {},
+    paramsOrOptions:
+      | QueryParams
+      | ({ rowMode?: RowMode; batchSize?: number } & StatementExecutionOptions) = [],
+    maybeOptions: { rowMode?: RowMode; batchSize?: number } & StatementExecutionOptions = {},
   ): AsyncIterableIterator<QueryResult<T>> {
     this.assertUsable();
-    const { statement, options } = resolveQueryCall<{
-      rowMode?: RowMode;
-      batchSize?: number;
-    }>(sql, paramsOrOptions, maybeOptions);
+    const { statement, options } = resolveQueryCall<
+      { rowMode?: RowMode; batchSize?: number } & StatementExecutionOptions
+    >(sql, paramsOrOptions, maybeOptions);
+    validateTimeoutMs(options.timeoutMs);
     const batchSize = resolveBatchSize(options.batchSize);
     return this.streamQuery<T>(
       statement,
       options.rowMode ?? 'object',
       batchSize,
+      options,
     );
   }
 
@@ -1822,6 +2175,7 @@ export class FirebirdTransaction {
     const statementType = statementKind(type);
     const hasResultSet = nativeStmt.hasResultSet;
     let isClosed = false;
+    let currentTimeoutMs = 0;
     const isTxFinished = () => this.isFinished;
 
     const assertOpen = (): void => {
@@ -1852,27 +2206,59 @@ export class FirebirdTransaction {
       get closed() {
         return isClosed || isTxFinished();
       },
+      get timeoutMs() {
+        return currentTimeoutMs;
+      },
+      setTimeout: async (timeoutMs: number) => {
+        assertOpen();
+        const validated = validateTimeoutMs(timeoutMs) ?? 0;
+        currentTimeoutMs = validated;
+        await applyStatementHandleTimeout(nativeStmt, validated);
+      },
       query: (async <T = Row>(
         paramsOrOptions: QueryParams | QueryOptions = [],
         maybeOptions: QueryOptions = {},
       ): Promise<QueryResult<T>> => {
         assertOpen();
-        await this.beforeStatement();
         const callParams = Array.isArray(paramsOrOptions)
           ? paramsOrOptions
           : [];
-        const callOptions = Array.isArray(paramsOrOptions)
+        const rawOptions = Array.isArray(paramsOrOptions)
           ? maybeOptions
           : (paramsOrOptions ?? {});
+        const callOptions: QueryOptions =
+          rawOptions.timeoutMs === undefined && currentTimeoutMs > 0
+            ? { ...rawOptions, timeoutMs: currentTimeoutMs }
+            : rawOptions;
         checkParamCount(callParams.length);
+        assertNotAborted(callOptions.signal);
+        validateTimeoutMs(callOptions.timeoutMs);
+        await this.beforeStatement();
         const rowMode: RowMode = callOptions.rowMode ?? 'object';
-        const rawRows = await fetchRows(
-          nativeStmt,
-          this.transaction,
-          this.serialize(callParams),
-          fields,
-          this.types,
-        );
+        const hasPerCallTimeout =
+          rawOptions.timeoutMs !== undefined && rawOptions.timeoutMs !== currentTimeoutMs;
+        if (hasPerCallTimeout) {
+          await applyStatementHandleTimeout(nativeStmt, rawOptions.timeoutMs);
+        }
+        let rawRows: unknown[][];
+        try {
+          rawRows = await runWithCancellation(
+            () =>
+              fetchRows(
+                nativeStmt,
+                this.transaction,
+                this.serialize(callParams),
+                fields,
+                this.types,
+              ),
+            callOptions,
+            () => cancelAttachmentOperation(this.attachment),
+          );
+        } finally {
+          if (hasPerCallTimeout) {
+            await applyStatementHandleTimeout(nativeStmt, currentTimeoutMs).catch(() => undefined);
+          }
+        }
         const outFields = fields.map((f) => ({ ...f }));
         return applyTypes(
           { rows: shapeRows<T>(rawRows, outFields, rowMode), fields: outFields },
@@ -1888,10 +2274,15 @@ export class FirebirdTransaction {
         const callParams = Array.isArray(paramsOrOptions)
           ? paramsOrOptions
           : [];
-        const callOptions = Array.isArray(paramsOrOptions)
+        const rawOptions = Array.isArray(paramsOrOptions)
           ? maybeOptions
           : (paramsOrOptions ?? {});
+        const callOptions: QueryStreamOptions =
+          rawOptions.timeoutMs === undefined && currentTimeoutMs > 0
+            ? { ...rawOptions, timeoutMs: currentTimeoutMs }
+            : rawOptions;
         checkParamCount(callParams.length);
+        validateTimeoutMs(callOptions.timeoutMs);
         const batchSize = resolveBatchSize(callOptions.batchSize);
         const rowMode: RowMode = callOptions.rowMode ?? 'object';
         const beforeStmt = () => this.beforeStatement();
@@ -1901,30 +2292,83 @@ export class FirebirdTransaction {
 
         return (async function* (): AsyncIterableIterator<QueryResult<T>> {
           assertOpen();
+          assertNotAborted(callOptions.signal);
+          const totalTimeoutMs = validateTimeoutMs(callOptions.timeoutMs);
+          const deadline =
+            totalTimeoutMs && totalTimeoutMs > 0
+              ? Date.now() + totalTimeoutMs
+              : undefined;
+          const checkStreamDeadline = (): void => {
+            assertNotAborted(callOptions.signal);
+            if (deadline !== undefined && Date.now() >= deadline) {
+              throw createTimeoutError(totalTimeoutMs!);
+            }
+          };
           await beforeStmt();
           const serializedParams = serializeParams();
-          yield* streamRows<T>(
-            nativeStmt,
-            tx,
-            serializedParams,
-            fields,
-            rowMode,
-            batchSize,
-            customTypes,
-            () => undefined,
-          );
+          const hasPerCallTimeout =
+            rawOptions.timeoutMs !== undefined && rawOptions.timeoutMs !== currentTimeoutMs;
+          if (hasPerCallTimeout) {
+            await applyStatementHandleTimeout(nativeStmt, rawOptions.timeoutMs);
+          }
+          try {
+            for await (const batch of streamRows<T>(
+              nativeStmt,
+              tx,
+              serializedParams,
+              fields,
+              rowMode,
+              batchSize,
+              customTypes,
+              () => undefined,
+            )) {
+              checkStreamDeadline();
+              yield batch;
+              checkStreamDeadline();
+            }
+          } finally {
+            if (hasPerCallTimeout) {
+              await applyStatementHandleTimeout(nativeStmt, currentTimeoutMs).catch(() => undefined);
+            }
+          }
         })();
       }) as PreparedStatement['queryStream'],
-      exec: async (callParams: QueryParams = []) => {
+      exec: async (
+        callParams: QueryParams = [],
+        execOptions: StatementExecutionOptions = {},
+      ) => {
         assertOpen();
-        await this.beforeStatement();
         checkParamCount(callParams.length);
-        await nativeStmt.execute(
-          this.transaction,
-          await bindParams(nativeStmt, this.transaction, this.serialize(callParams)),
-        );
-        const affectedRows = await readAffectedRecords(nativeStmt);
-        return { affectedRows };
+        const effectiveOptions: StatementExecutionOptions =
+          execOptions.timeoutMs === undefined && currentTimeoutMs > 0
+            ? { ...execOptions, timeoutMs: currentTimeoutMs }
+            : execOptions;
+        assertNotAborted(effectiveOptions.signal);
+        validateTimeoutMs(effectiveOptions.timeoutMs);
+        await this.beforeStatement();
+        const hasPerCallTimeout =
+          execOptions.timeoutMs !== undefined && execOptions.timeoutMs !== currentTimeoutMs;
+        if (hasPerCallTimeout) {
+          await applyStatementHandleTimeout(nativeStmt, execOptions.timeoutMs);
+        }
+        try {
+          await runWithCancellation(
+            async () => {
+              await nativeStmt.execute(
+                this.transaction,
+                await bindParams(nativeStmt, this.transaction, this.serialize(callParams)),
+              );
+            },
+            effectiveOptions,
+            () => cancelAttachmentOperation(this.attachment),
+          );
+          const affectedRows = await readAffectedRecords(nativeStmt);
+          return { affectedRows };
+        } finally {
+          if (hasPerCallTimeout) {
+            await applyStatementHandleTimeout(nativeStmt, currentTimeoutMs).catch(() => undefined);
+          }
+        }
       },
       execBatch: async (rows: QueryParams[]) => {
         assertOpen();
@@ -2178,8 +2622,21 @@ export class FirebirdTransaction {
     statement: ParsedStatement,
     rowMode: RowMode,
     batchSize: number,
+    options: StatementExecutionOptions = {},
   ): AsyncIterableIterator<QueryResult<T>> {
     this.assertUsable();
+    assertNotAborted(options.signal);
+    const totalTimeoutMs = validateTimeoutMs(options.timeoutMs);
+    const deadline =
+      totalTimeoutMs && totalTimeoutMs > 0
+        ? Date.now() + totalTimeoutMs
+        : undefined;
+    const checkStreamDeadline = (): void => {
+      assertNotAborted(options.signal);
+      if (deadline !== undefined && Date.now() >= deadline) {
+        throw createTimeoutError(totalTimeoutMs!);
+      }
+    };
     await this.beforeStatement();
 
     const serialized = this.serialize(statement.params);
@@ -2191,12 +2648,15 @@ export class FirebirdTransaction {
       let fields: FieldInfo[];
       try {
         fields = await outputFields(stmt);
+        if (totalTimeoutMs !== undefined && totalTimeoutMs > 0) {
+          await applyStatementHandleTimeout(stmt, totalTimeoutMs);
+        }
       } catch (err) {
         engineFailed = true;
         throw err;
       }
 
-      yield* streamRows<T>(
+      for await (const batch of streamRows<T>(
         stmt,
         this.transaction,
         serialized,
@@ -2207,8 +2667,15 @@ export class FirebirdTransaction {
         () => {
           engineFailed = true;
         },
-      );
+      )) {
+        checkStreamDeadline();
+        yield batch;
+        checkStreamDeadline();
+      }
     } finally {
+      if (totalTimeoutMs !== undefined && totalTimeoutMs > 0 && !engineFailed) {
+        await applyStatementHandleTimeout(stmt, 0).catch(() => undefined);
+      }
       await lease.release(engineFailed);
     }
   }
@@ -2304,6 +2771,8 @@ type NativeStatement = Partial<InputMessage> &
       getAffectedRecordsAsync?: (status: unknown) => Promise<number>;
       getAffectedRecordsSync?: (status: unknown) => number;
       getPlanSync?: (status: unknown, detailed: boolean) => string | undefined;
+      setTimeoutAsync?: (status: unknown, timeOut: number) => Promise<void>;
+      setTimeoutSync?: (status: unknown, timeOut: number) => void;
       createBatchAsync?: (
         status: unknown,
         inMetadata: NativeMetadata | undefined,

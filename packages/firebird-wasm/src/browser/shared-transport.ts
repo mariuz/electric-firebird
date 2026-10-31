@@ -873,6 +873,14 @@ export class SharedEngineTransport implements EngineTransport {
     return this.call<void>('stmtClose', stmtHandle);
   }
 
+  stmtSetTimeout(stmtHandle: EngineHandle, timeoutMs: number): Promise<void> {
+    return this.call<void>('stmtSetTimeout', stmtHandle, timeoutMs);
+  }
+
+  cancelOperation(dbHandle: EngineHandle, option = 3): Promise<void> {
+    return this.call<void>('cancelOperation', dbHandle, option);
+  }
+
   executeStmt(
     dbHandle: EngineHandle,
     txHandle: EngineHandle,

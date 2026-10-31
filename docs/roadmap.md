@@ -1323,7 +1323,7 @@ With M0–M8 complete, these are the next-horizon milestones for `v0.14.0`:
       Add first-class savepoint helpers on `Transaction` (`await tx.savepoint(async (sp) => { ... })`
       wrapping `SAVEPOINT sp_N`, `RELEASE SAVEPOINT sp_N ONLY`, and
       `ROLLBACK TO SAVEPOINT sp_N`) across both `FirebirdBrowser` and `FirebirdLite`.
-- [ ] **Statement cancellation & query timeouts (`AbortSignal` and `timeoutMs` support).**
+- [x] **Statement cancellation & query timeouts (`AbortSignal` and `timeoutMs` support).**
       Expose `IAttachment::cancelOperation(status, fb_cancel_raise)` and
       `IStatement::setTimeout(status, timeoutMs)` in the WASM C bridge (`_fb_cancel_operation`,
       `_fb_stmt_set_timeout`) and on Node so `db.query(sql, params, { signal, timeoutMs })`

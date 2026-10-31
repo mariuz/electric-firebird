@@ -1943,6 +1943,93 @@ describe('FirebirdLite (no Firebird installed)', () => {
     }
   });
 
+  it('supports AbortSignal, timeoutMs, stmt.setTimeout(), and cancelOperation() on FirebirdLite', async () => {
+    const liteDb = new FirebirdLite('/nonexistent/db.fdb');
+    const setTimeouts: number[] = [];
+    const cancelOptions: number[] = [];
+    let resolveSlowFetch: ((rows: unknown[][]) => void) | null = null;
+
+    const fakeStmt = {
+      type: Promise.resolve(1),
+      hasResultSet: true,
+      columnLabels: Promise.resolve(['VAL']),
+      setTimeout: jest.fn(async (ms: number) => {
+        setTimeouts.push(ms);
+      }),
+      executeQuery: jest.fn(async () => ({
+        fetch: jest.fn(
+          () =>
+            new Promise<unknown[][]>((resolve) => {
+              if (resolveSlowFetch === null) {
+                resolve([[42]]);
+              } else {
+                resolveSlowFetch = resolve;
+              }
+            }),
+        ),
+        close: jest.fn(async () => undefined),
+      })),
+      dispose: jest.fn(async () => undefined),
+    };
+
+    const fakeAttachment = {
+      cancelOperation: jest.fn(async (option = 3) => {
+        cancelOptions.push(option);
+        resolveSlowFetch?.([]);
+      }),
+      startTransaction: jest.fn(async () => ({
+        commit: jest.fn(async () => undefined),
+        rollback: jest.fn(async () => undefined),
+      })),
+      prepare: jest.fn(async () => fakeStmt),
+      execute: jest.fn(async () => undefined),
+      disconnect: jest.fn(async () => undefined),
+    };
+
+    (liteDb as unknown as { attachment: unknown }).attachment = fakeAttachment;
+    (liteDb as unknown as { statements: unknown }).statements = {
+      enabled: false,
+      acquire: jest.fn(async () => ({
+        stmt: fakeStmt,
+        release: jest.fn(async () => undefined),
+      })),
+      flush: jest.fn(async () => undefined),
+    };
+
+    // 1. Pre-aborted signal rejects before acquiring a statement
+    const preAborted = new AbortController();
+    preAborted.abort(new Error('abort-before-start'));
+    await expect(
+      liteDb.query('SELECT 42 FROM RDB$DATABASE', [], { signal: preAborted.signal }),
+    ).rejects.toThrow('abort-before-start');
+
+    // 2. Per-call timeoutMs sets statement timeout and resets it after execution
+    const res = await liteDb.query('SELECT 42 FROM RDB$DATABASE', [], {
+      timeoutMs: 300,
+    });
+    expect(res.rows).toEqual([{ VAL: 42 }]);
+    expect(setTimeouts).toEqual([300, 0]);
+
+    // 3. PreparedStatement.setTimeout() configures statement timeout
+    setTimeouts.length = 0;
+    const stmt = await liteDb.prepare('SELECT 42 FROM RDB$DATABASE');
+    expect(stmt.timeoutMs).toBe(0);
+    await stmt.setTimeout!(750);
+    expect(stmt.timeoutMs).toBe(750);
+    expect(setTimeouts).toEqual([750]);
+    await stmt.close();
+
+    // 4. In-flight AbortSignal calls cancelOperation and rejects
+    resolveSlowFetch = () => undefined;
+    const inFlight = new AbortController();
+    const slowPromise = liteDb.query('SELECT 42 FROM RDB$DATABASE', [], {
+      signal: inFlight.signal,
+    });
+    setTimeout(() => inFlight.abort(), 10);
+    await expect(slowPromise).rejects.toThrow(/aborted/i);
+    expect(cancelOptions).toEqual([3]);
+  });
+
   it('exports FirebirdLite class', async () => {
     const { FirebirdLite: FB } = await import('../index');
     expect(typeof FB).toBe('function');

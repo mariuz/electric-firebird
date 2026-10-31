@@ -192,6 +192,10 @@ export interface EngineTransport {
     sql: string,
   ): Promise<QueryDescription & { handle?: EngineHandle }>;
   stmtClose?(stmtHandle: EngineHandle): Promise<void>;
+  /** Set the statement execution timeout in milliseconds (`IStatement::setTimeout`). `0` disables the timeout. */
+  stmtSetTimeout?(stmtHandle: EngineHandle, timeoutMs: number): Promise<void>;
+  /** Cancel the currently running operation on `dbHandle` (`IAttachment::cancelOperation`). */
+  cancelOperation?(dbHandle: EngineHandle, option?: number): Promise<void>;
   /** Execute a prepared statement handle by integer ID without marshalling SQL text. */
   executeStmt?(
     dbHandle: EngineHandle,
@@ -2086,6 +2090,46 @@ export class DirectTransport implements EngineTransport {
       'cursorOpenStmt',
     );
     return this.cursorOpen(dbHandle, txHandle, fallback.sql, params);
+  }
+
+  async stmtSetTimeout(
+    stmtHandle: EngineHandle,
+    timeoutMs: number,
+  ): Promise<void> {
+    if (
+      typeof timeoutMs !== 'number' ||
+      !Number.isFinite(timeoutMs) ||
+      timeoutMs < 0
+    ) {
+      throw new RangeError('timeoutMs must be a non-negative finite number');
+    }
+    const mod = this.module;
+    if (typeof mod._fb_stmt_set_timeout === 'function') {
+      const rc = mod._fb_stmt_set_timeout(
+        stmtHandle,
+        Math.floor(timeoutMs) >>> 0,
+      );
+      if (rc !== 0) {
+        throw engineError(
+          mod,
+          `Firebird stmtSetTimeout failed for statement #${stmtHandle}`,
+          rc,
+        );
+      }
+    }
+  }
+
+  async cancelOperation(
+    dbHandle: EngineHandle,
+    option = 3,
+  ): Promise<void> {
+    const mod = this.module;
+    if (typeof mod._fb_cancel_operation === 'function') {
+      const rc = mod._fb_cancel_operation(dbHandle, option);
+      if (rc !== 0) {
+        throw engineError(mod, 'Firebird cancelOperation failed', rc);
+      }
+    }
   }
 
   async explain(

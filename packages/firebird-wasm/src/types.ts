@@ -167,12 +167,33 @@ export interface TransactionOptions {
 export type RowMode = 'object' | 'array';
 
 /**
+ * Cancellation and timeout options accepted by statement execution methods
+ * (`query`, `queryStream`, `exec`, `PreparedStatement`).
+ */
+export interface StatementExecutionOptions {
+  /**
+   * An `AbortSignal` to cancel an in-flight statement via
+   * `IAttachment::cancelOperation(status, fb_cancel_raise)`.
+   *
+   * If `signal.aborted` is already `true` before the call begins, the
+   * returned promise rejects immediately with the signal's abort reason.
+   */
+  signal?: AbortSignal;
+  /**
+   * Statement execution timeout in milliseconds (`IStatement::setTimeout`).
+   * `0` disables the statement timeout.
+   */
+  timeoutMs?: number;
+}
+
+/**
  * Options accepted by `query()`.
  *
- * A superset of {@link TransactionOptions}: a query may start a transaction of
- * its own, and it decides the shape of what comes back.
+ * A superset of {@link TransactionOptions} and {@link StatementExecutionOptions}:
+ * a query may start a transaction of its own, and it decides the shape of what
+ * comes back.
  */
-export interface QueryOptions extends TransactionOptions {
+export interface QueryOptions extends TransactionOptions, StatementExecutionOptions {
   /**
    * How to shape each row.
    *
@@ -345,6 +366,14 @@ export interface PreparedStatement {
   readonly hasResultSet: boolean;
   /** Whether `close()` has been called on this handle. */
   readonly closed: boolean;
+  /** Statement execution timeout in milliseconds (`IStatement::setTimeout`), or `0` when disabled. */
+  readonly timeoutMs?: number;
+
+  /**
+   * Set the statement execution timeout in milliseconds (`IStatement::setTimeout`).
+   * Pass `0` to disable the timeout.
+   */
+  setTimeout?(timeoutMs: number): Promise<void>;
 
   /**
    * Execute the prepared statement and return its result rows.
@@ -383,7 +412,10 @@ export interface PreparedStatement {
   /**
    * Execute the prepared statement without returning rows.
    */
-  exec(params?: QueryParams): Promise<{ affectedRows: number }>;
+  exec(
+    params?: QueryParams,
+    options?: StatementExecutionOptions,
+  ): Promise<{ affectedRows: number }>;
 
   /**
    * Execute the prepared statement once per row of parameters in a single

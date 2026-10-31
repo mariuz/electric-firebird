@@ -73,6 +73,7 @@ import type {
   MigrateResult,
   QueryOptions,
   QueryStreamOptions,
+  StatementExecutionOptions,
   Row,
   QueryParams,
   RowMode,
@@ -83,6 +84,94 @@ import type {
 type ArrayModeOptions = QueryOptions & { rowMode: 'array' };
 /** `QueryStreamOptions` with the array mode pinned, for the overloads below. */
 type ArrayStreamOptions = QueryStreamOptions & { rowMode: 'array' };
+
+function validateTimeoutMs(timeoutMs?: number): number | undefined {
+  if (timeoutMs === undefined) return undefined;
+  if (
+    typeof timeoutMs !== 'number' ||
+    !Number.isFinite(timeoutMs) ||
+    timeoutMs < 0
+  ) {
+    throw new RangeError('timeoutMs must be a non-negative finite number');
+  }
+  return Math.floor(timeoutMs);
+}
+
+function toAbortError(reason: unknown): Error {
+  if (reason instanceof Error) return reason;
+  const err = new Error(
+    reason !== undefined && reason !== null
+      ? String(reason)
+      : 'The operation was aborted',
+  );
+  err.name = 'AbortError';
+  return err;
+}
+
+function createTimeoutError(timeoutMs: number): Error {
+  const err = new Error(`Statement timed out after ${timeoutMs}ms`);
+  err.name = 'TimeoutError';
+  return err;
+}
+
+function assertNotAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw toAbortError(signal.reason);
+  }
+}
+
+async function runWithCancellation<T>(
+  work: () => Promise<T>,
+  options: StatementExecutionOptions | undefined,
+  onCancel: () => Promise<void>,
+): Promise<T> {
+  const signal = options?.signal;
+  const timeoutMs = validateTimeoutMs(options?.timeoutMs);
+  assertNotAborted(signal);
+
+  if (!signal && (!timeoutMs || timeoutMs <= 0)) {
+    return work();
+  }
+
+  let cleanup = (): void => undefined;
+  const cancelPromise = new Promise<never>((_resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const onAbort = (): void => {
+      void onCancel().catch(() => undefined);
+      reject(toAbortError(signal?.reason));
+    };
+    if (signal) {
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+    if (timeoutMs && timeoutMs > 0) {
+      timer = setTimeout(() => {
+        void onCancel().catch(() => undefined);
+        reject(createTimeoutError(timeoutMs));
+      }, timeoutMs);
+    }
+    cleanup = () => {
+      if (signal) {
+        signal.removeEventListener('abort', onAbort);
+      }
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    };
+  });
+
+  try {
+    const workPromise = work();
+    workPromise.catch(() => undefined);
+    return await Promise.race([workPromise, cancelPromise]);
+  } finally {
+    cleanup();
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -553,10 +642,40 @@ export class FirebirdBrowser {
    *
    * @returns one result per statement, in order.
    */
+  /**
+   * Cancel the currently running statement on this database attachment via
+   * `IAttachment::cancelOperation(status, fb_cancel_raise)`.
+   */
+  async cancelOperation(): Promise<void> {
+    await this.ensureReady();
+    if (typeof this.engine.cancelOperation === 'function') {
+      await this.engine.cancelOperation(this.dbHandle);
+    }
+  }
+
+  private async applyOneShotTimeout(timeoutMs?: number): Promise<void> {
+    const validated = validateTimeoutMs(timeoutMs);
+    if (
+      validated !== undefined &&
+      validated > 0 &&
+      typeof this.engine.stmtSetTimeout === 'function'
+    ) {
+      await this.engine.stmtSetTimeout(0, validated);
+    }
+  }
+
   async exec(
     sql: string | SqlFragment,
-    params: QueryParams = [],
+    paramsOrOptions: QueryParams | StatementExecutionOptions = [],
+    maybeOptions: StatementExecutionOptions = {},
   ): Promise<ExecResult[]> {
+    const params = Array.isArray(paramsOrOptions) ? paramsOrOptions : [];
+    const options = Array.isArray(paramsOrOptions)
+      ? maybeOptions
+      : (paramsOrOptions ?? {});
+    assertNotAborted(options.signal);
+    validateTimeoutMs(options.timeoutMs);
+
     await this.ensureReady();
 
     const script = toStatement(sql, params);
@@ -572,14 +691,22 @@ export class FirebirdBrowser {
     const results: ExecResult[] = [];
 
     for (const statement of statements) {
+      assertNotAborted(options.signal);
       if (/^\s*(DROP|RECREATE)\b/i.test(statement.sql)) {
         this.liveTriggerPromises.clear();
       }
-      const affectedRows = await this.engine.execute(
-        this.dbHandle,
-        0,
-        statement.sql,
-        this.serialize(script.params),
+      const affectedRows = await runWithCancellation(
+        async () => {
+          await this.applyOneShotTimeout(options.timeoutMs);
+          return this.engine.execute(
+            this.dbHandle,
+            0,
+            statement.sql,
+            this.serialize(script.params),
+          );
+        },
+        options,
+        () => this.cancelOperation(),
       );
       results.push({ affectedRows });
     }
@@ -677,47 +804,61 @@ export class FirebirdBrowser {
     paramsOrOptions: QueryParams | QueryOptions = [],
     maybeOptions: QueryOptions = {},
   ): Promise<QueryResult<T>> {
-    await this.ensureReady();
-
     const { statement, options } = resolveQueryCall(
       sql,
       paramsOrOptions,
       maybeOptions,
     );
+    const queryOpts = options as QueryOptions;
+    assertNotAborted(queryOpts.signal);
+    validateTimeoutMs(queryOpts.timeoutMs);
+
+    await this.ensureReady();
 
     // Without options the engine's own auto-commit transaction is used, which
     // is one fewer round trip to the Worker.  With them, the statement has to
     // run inside a transaction that carries them — matching the Node backend,
     // which starts one for every query.
-    const rowMode = (options as QueryOptions).rowMode ?? 'object';
+    const rowMode = queryOpts.rowMode ?? 'object';
     // `types.binary` asks for Uint8Array values; the side channel is how they
     // travel. Same result for the caller, without the base64 round trip.
     const binaryBlobs = this.options.types?.binary === true;
 
-    if (!hasTransactionOptions(options)) {
-      return applyTypes(
-        await this.engine.query<T>(
-          this.dbHandle,
-          0,
-          statement.sql,
-          this.serialize(statement.params),
-          rowMode,
-          binaryBlobs,
-        ),
-        this.options.types,
-        rowMode,
+    if (!hasTransactionOptions(queryOpts)) {
+      const raw = await runWithCancellation(
+        async () => {
+          await this.applyOneShotTimeout(queryOpts.timeoutMs);
+          return this.engine.query<T>(
+            this.dbHandle,
+            0,
+            statement.sql,
+            this.serialize(statement.params),
+            rowMode,
+            binaryBlobs,
+          );
+        },
+        queryOpts,
+        () => this.cancelOperation(),
       );
+      return applyTypes(raw, this.options.types, rowMode);
     }
 
-    const txHandle = await this.engine.startTransaction(this.dbHandle, options);
+    const txHandle = await this.engine.startTransaction(this.dbHandle, queryOpts);
     try {
-      const result = await this.engine.query<T>(
-        this.dbHandle,
-        txHandle,
-        statement.sql,
-        this.serialize(statement.params),
-        rowMode,
-        binaryBlobs,
+      const result = await runWithCancellation(
+        async () => {
+          await this.applyOneShotTimeout(queryOpts.timeoutMs);
+          return this.engine.query<T>(
+            this.dbHandle,
+            txHandle,
+            statement.sql,
+            this.serialize(statement.params),
+            rowMode,
+            binaryBlobs,
+          );
+        },
+        queryOpts,
+        () => this.cancelOperation(),
       );
       await this.engine.commit(txHandle);
       return applyTypes(result, this.options.types, rowMode);
@@ -734,6 +875,8 @@ export class FirebirdBrowser {
     params: QueryParams,
     options: QueryOptions = {},
   ): Promise<QueryResult<T>> {
+    assertNotAborted(options.signal);
+    validateTimeoutMs(options.timeoutMs);
     await this.ensureReady();
 
     const rowMode = options.rowMode ?? 'object';
@@ -741,29 +884,40 @@ export class FirebirdBrowser {
     const serialized = this.serialize(params);
 
     if (!hasTransactionOptions(options)) {
-      return applyTypes(
-        await this.engine.queryStmt!<T>(
-          this.dbHandle,
-          0,
-          stmtHandle,
-          serialized,
-          rowMode,
-          binaryBlobs,
-        ),
-        this.options.types,
-        rowMode,
+      const raw = await runWithCancellation(
+        async () => {
+          await this.applyOneShotTimeout(options.timeoutMs);
+          return this.engine.queryStmt!<T>(
+            this.dbHandle,
+            0,
+            stmtHandle,
+            serialized,
+            rowMode,
+            binaryBlobs,
+          );
+        },
+        options,
+        () => this.cancelOperation(),
       );
+      return applyTypes(raw, this.options.types, rowMode);
     }
 
     const txHandle = await this.engine.startTransaction(this.dbHandle, options);
     try {
-      const result = await this.engine.queryStmt!<T>(
-        this.dbHandle,
-        txHandle,
-        stmtHandle,
-        serialized,
-        rowMode,
-        binaryBlobs,
+      const result = await runWithCancellation(
+        async () => {
+          await this.applyOneShotTimeout(options.timeoutMs);
+          return this.engine.queryStmt!<T>(
+            this.dbHandle,
+            txHandle,
+            stmtHandle,
+            serialized,
+            rowMode,
+            binaryBlobs,
+          );
+        },
+        options,
+        () => this.cancelOperation(),
       );
       await this.engine.commit(txHandle);
       return applyTypes(result, this.options.types, rowMode);
@@ -821,6 +975,7 @@ export class FirebirdBrowser {
       paramsOrOptions,
       maybeOptions,
     );
+    validateTimeoutMs(options.timeoutMs);
     const batchSize = resolveBatchSize(options.batchSize);
     return this.streamQuery<T>(statement, options, batchSize);
   }
@@ -831,6 +986,18 @@ export class FirebirdBrowser {
     batchSize: number,
     stmtHandle: EngineHandle = 0,
   ): AsyncIterableIterator<QueryResult<T>> {
+    assertNotAborted(options.signal);
+    const totalTimeoutMs = validateTimeoutMs(options.timeoutMs);
+    const deadline =
+      totalTimeoutMs && totalTimeoutMs > 0
+        ? Date.now() + totalTimeoutMs
+        : undefined;
+    const stepOptions = (): StatementExecutionOptions => ({
+      signal: options.signal,
+      timeoutMs:
+        deadline !== undefined ? Math.max(1, deadline - Date.now()) : undefined,
+    });
+
     await this.ensureReady();
 
     const rowMode = options.rowMode ?? 'object';
@@ -854,6 +1021,10 @@ export class FirebirdBrowser {
           : await this.query(statement.sql, statement.params, options)
       ) as QueryResult<T>;
       for (let i = 0; i < full.rows.length; i += batchSize) {
+        assertNotAborted(options.signal);
+        if (deadline !== undefined && Date.now() >= deadline) {
+          throw createTimeoutError(totalTimeoutMs!);
+        }
         yield {
           rows: full.rows.slice(i, i + batchSize),
           fields: full.fields.map((f) => ({ ...f })),
@@ -874,32 +1045,49 @@ export class FirebirdBrowser {
       }
 
       try {
-        cursorHandle = useStmtCursor
-          ? await this.engine.cursorOpenStmt!(
-              this.dbHandle,
-              txHandle,
-              stmtHandle,
-              serializedParams,
-            )
-          : await this.engine.cursorOpen!(
-              this.dbHandle,
-              txHandle,
-              statement.sql,
-              serializedParams,
-            );
+        cursorHandle = await runWithCancellation(
+          async () => {
+            await this.applyOneShotTimeout(totalTimeoutMs);
+            return useStmtCursor
+              ? this.engine.cursorOpenStmt!(
+                  this.dbHandle,
+                  txHandle,
+                  stmtHandle,
+                  serializedParams,
+                )
+              : this.engine.cursorOpen!(
+                  this.dbHandle,
+                  txHandle,
+                  statement.sql,
+                  serializedParams,
+                );
+          },
+          stepOptions(),
+          () => this.cancelOperation(),
+        );
       } catch (err) {
         engineFailed = true;
         throw err;
       }
 
       while (true) {
+        assertNotAborted(options.signal);
+        if (deadline !== undefined && Date.now() >= deadline) {
+          engineFailed = true;
+          throw createTimeoutError(totalTimeoutMs!);
+        }
         let batch: QueryResult<T>;
         try {
-          batch = await this.engine.cursorFetch<T>(
-            cursorHandle,
-            batchSize,
-            rowMode,
-            binaryBlobs,
+          batch = await runWithCancellation(
+            () =>
+              this.engine.cursorFetch!<T>(
+                cursorHandle,
+                batchSize,
+                rowMode,
+                binaryBlobs,
+              ),
+            stepOptions(),
+            () => this.cancelOperation(),
           );
         } catch (err) {
           engineFailed = true;
@@ -1377,6 +1565,7 @@ export class FirebirdBrowser {
     const fields = desc.fields.map((f) => ({ ...f }));
     const stmtHandle = desc.handle ?? 0;
     let isClosed = false;
+    let currentTimeoutMs = 0;
 
     const assertOpen = (): void => {
       if (isClosed || this.closed) {
@@ -1407,6 +1596,17 @@ export class FirebirdBrowser {
       get closed() {
         return isClosed || isDbClosed();
       },
+      get timeoutMs() {
+        return currentTimeoutMs;
+      },
+      setTimeout: async (timeoutMs: number) => {
+        assertOpen();
+        const validated = validateTimeoutMs(timeoutMs) ?? 0;
+        currentTimeoutMs = validated;
+        if (stmtHandle > 0 && typeof this.engine.stmtSetTimeout === 'function') {
+          await this.engine.stmtSetTimeout(stmtHandle, validated);
+        }
+      },
       query: (async (
         paramsOrOptions: QueryParams | QueryOptions = [],
         maybeOptions: QueryOptions = {},
@@ -1415,9 +1615,13 @@ export class FirebirdBrowser {
         const callParams = Array.isArray(paramsOrOptions)
           ? paramsOrOptions
           : [];
-        const callOptions = Array.isArray(paramsOrOptions)
+        const rawOptions = Array.isArray(paramsOrOptions)
           ? maybeOptions
           : (paramsOrOptions ?? {});
+        const callOptions: QueryOptions =
+          rawOptions.timeoutMs === undefined && currentTimeoutMs > 0
+            ? { ...rawOptions, timeoutMs: currentTimeoutMs }
+            : rawOptions;
         checkParamCount(callParams.length);
         if (stmtHandle > 0 && typeof this.engine.queryStmt === 'function') {
           return this.queryPreparedHandle(stmtHandle, callParams, callOptions);
@@ -1432,10 +1636,15 @@ export class FirebirdBrowser {
         const callParams = Array.isArray(paramsOrOptions)
           ? paramsOrOptions
           : [];
-        const callOptions = Array.isArray(paramsOrOptions)
+        const rawOptions = Array.isArray(paramsOrOptions)
           ? maybeOptions
           : (paramsOrOptions ?? {});
+        const callOptions: QueryStreamOptions =
+          rawOptions.timeoutMs === undefined && currentTimeoutMs > 0
+            ? { ...rawOptions, timeoutMs: currentTimeoutMs }
+            : rawOptions;
         checkParamCount(callParams.length);
+        validateTimeoutMs(callOptions.timeoutMs);
         const batchSize = resolveBatchSize(callOptions.batchSize);
         const openStream = () =>
           stmtHandle > 0
@@ -1451,25 +1660,40 @@ export class FirebirdBrowser {
           yield* openStream();
         })();
       }) as PreparedStatement['queryStream'],
-      exec: async (callParams: QueryParams = []) => {
+      exec: async (
+        callParams: QueryParams = [],
+        execOptions: StatementExecutionOptions = {},
+      ) => {
         assertOpen();
         checkParamCount(callParams.length);
+        const effectiveOptions: StatementExecutionOptions =
+          execOptions.timeoutMs === undefined && currentTimeoutMs > 0
+            ? { ...execOptions, timeoutMs: currentTimeoutMs }
+            : execOptions;
+        assertNotAborted(effectiveOptions.signal);
+        validateTimeoutMs(effectiveOptions.timeoutMs);
         await this.ensureReady();
         const serialized = this.serialize(callParams);
-        const affectedRows =
-          stmtHandle > 0 && typeof this.engine.executeStmt === 'function'
-            ? await this.engine.executeStmt(
-                this.dbHandle,
-                0,
-                stmtHandle,
-                serialized,
-              )
-            : await this.engine.execute(
-                this.dbHandle,
-                0,
-                sqlText,
-                serialized,
-              );
+        const affectedRows = await runWithCancellation(
+          async () => {
+            await this.applyOneShotTimeout(effectiveOptions.timeoutMs);
+            return stmtHandle > 0 && typeof this.engine.executeStmt === 'function'
+              ? this.engine.executeStmt(
+                  this.dbHandle,
+                  0,
+                  stmtHandle,
+                  serialized,
+                )
+              : this.engine.execute(
+                  this.dbHandle,
+                  0,
+                  sqlText,
+                  serialized,
+                );
+          },
+          effectiveOptions,
+          () => this.cancelOperation(),
+        );
         this.markDirty();
         return { affectedRows };
       },
@@ -2464,21 +2688,56 @@ export class FirebirdBrowserTransaction {
   }
 
   /**
+   * Cancel the currently running statement on this transaction's database
+   * attachment via `IAttachment::cancelOperation(status, fb_cancel_raise)`.
+   */
+  async cancelOperation(): Promise<void> {
+    if (typeof this.engine.cancelOperation === 'function') {
+      await this.engine.cancelOperation(this.dbHandle);
+    }
+  }
+
+  private async applyOneShotTimeout(timeoutMs?: number): Promise<void> {
+    const validated = validateTimeoutMs(timeoutMs);
+    if (
+      validated !== undefined &&
+      validated > 0 &&
+      typeof this.engine.stmtSetTimeout === 'function'
+    ) {
+      await this.engine.stmtSetTimeout(0, validated);
+    }
+  }
+
+  /**
    * Execute a DDL/DML statement inside this transaction.
    *
    * @returns the number of rows affected.
    */
   async exec(
     sql: string | SqlFragment,
-    params: QueryParams = [],
+    paramsOrOptions: QueryParams | StatementExecutionOptions = [],
+    maybeOptions: StatementExecutionOptions = {},
   ): Promise<ExecResult> {
     this.assertUsable();
+    const params = Array.isArray(paramsOrOptions) ? paramsOrOptions : [];
+    const options = Array.isArray(paramsOrOptions)
+      ? maybeOptions
+      : (paramsOrOptions ?? {});
+    assertNotAborted(options.signal);
+    validateTimeoutMs(options.timeoutMs);
     const statement = toStatement(sql, params);
-    const affectedRows = await this.engine.execute(
-      this.dbHandle,
-      this.txHandle,
-      statement.sql,
-      applySerializers(statement.params, this.types?.serializers),
+    const affectedRows = await runWithCancellation(
+      async () => {
+        await this.applyOneShotTimeout(options.timeoutMs);
+        return this.engine.execute(
+          this.dbHandle,
+          this.txHandle,
+          statement.sql,
+          applySerializers(statement.params, this.types?.serializers),
+        );
+      },
+      options,
+      () => this.cancelOperation(),
     );
     return { affectedRows };
   }
@@ -2513,28 +2772,34 @@ export class FirebirdBrowserTransaction {
   async query<T extends Row = Row>(
     sql: string | SqlFragment,
     params?: QueryParams,
-    options?: { rowMode?: RowMode },
+    options?: { rowMode?: RowMode } & StatementExecutionOptions,
   ): Promise<QueryResult<T>>;
   async query<T = Row>(
     sql: string | SqlFragment,
     params: QueryParams = [],
-    options: { rowMode?: RowMode } = {},
+    options: { rowMode?: RowMode } & StatementExecutionOptions = {},
   ): Promise<QueryResult<T>> {
     this.assertUsable();
+    assertNotAborted(options.signal);
+    validateTimeoutMs(options.timeoutMs);
     const statement = toStatement(sql, params);
     const rowMode = options.rowMode ?? 'object';
-    return applyTypes(
-      await this.engine.query<T>(
-        this.dbHandle,
-        this.txHandle,
-        statement.sql,
-        applySerializers(statement.params, this.types?.serializers),
-        rowMode,
-        this.types?.binary === true,
-      ),
-      this.types,
-      rowMode,
+    const raw = await runWithCancellation(
+      async () => {
+        await this.applyOneShotTimeout(options.timeoutMs);
+        return this.engine.query<T>(
+          this.dbHandle,
+          this.txHandle,
+          statement.sql,
+          applySerializers(statement.params, this.types?.serializers),
+          rowMode,
+          this.types?.binary === true,
+        );
+      },
+      options,
+      () => this.cancelOperation(),
     );
+    return applyTypes(raw, this.types, rowMode);
   }
 
   /**
@@ -2573,6 +2838,7 @@ export class FirebirdBrowserTransaction {
     const fields = desc.fields.map((f) => ({ ...f }));
     const stmtHandle = desc.handle ?? 0;
     let isClosed = false;
+    let currentTimeoutMs = 0;
 
     const assertOpen = (): void => {
       if (isClosed) {
@@ -2604,6 +2870,17 @@ export class FirebirdBrowserTransaction {
       get closed() {
         return isClosed || isTxFinished();
       },
+      get timeoutMs() {
+        return currentTimeoutMs;
+      },
+      setTimeout: async (timeoutMs: number) => {
+        assertOpen();
+        const validated = validateTimeoutMs(timeoutMs) ?? 0;
+        currentTimeoutMs = validated;
+        if (stmtHandle > 0 && typeof this.engine.stmtSetTimeout === 'function') {
+          await this.engine.stmtSetTimeout(stmtHandle, validated);
+        }
+      },
       query: (async (
         paramsOrOptions: QueryParams | QueryOptions = [],
         maybeOptions: QueryOptions = {},
@@ -2612,26 +2889,40 @@ export class FirebirdBrowserTransaction {
         const callParams = Array.isArray(paramsOrOptions)
           ? paramsOrOptions
           : [];
-        const callOptions = Array.isArray(paramsOrOptions)
+        const rawOptions = Array.isArray(paramsOrOptions)
           ? maybeOptions
           : (paramsOrOptions ?? {});
+        const callOptions: QueryOptions =
+          rawOptions.timeoutMs === undefined && currentTimeoutMs > 0
+            ? { ...rawOptions, timeoutMs: currentTimeoutMs }
+            : rawOptions;
         checkParamCount(callParams.length);
         if (stmtHandle > 0 && typeof this.engine.queryStmt === 'function') {
+          assertNotAborted(callOptions.signal);
+          validateTimeoutMs(callOptions.timeoutMs);
           const rowMode = callOptions.rowMode ?? 'object';
-          return applyTypes(
-            await this.engine.queryStmt(
-              this.dbHandle,
-              this.txHandle,
-              stmtHandle,
-              applySerializers(callParams, this.types?.serializers),
-              rowMode,
-              this.types?.binary === true,
-            ),
-            this.types,
-            rowMode,
+          const raw = await runWithCancellation(
+            async () => {
+              await this.applyOneShotTimeout(callOptions.timeoutMs);
+              return this.engine.queryStmt!(
+                this.dbHandle,
+                this.txHandle,
+                stmtHandle,
+                applySerializers(callParams, this.types?.serializers),
+                rowMode,
+                this.types?.binary === true,
+              );
+            },
+            callOptions,
+            () => this.cancelOperation(),
           );
+          return applyTypes(raw, this.types, rowMode);
         }
-        return this.query(sqlText, callParams, { rowMode: callOptions.rowMode });
+        return this.query(sqlText, callParams, {
+          rowMode: callOptions.rowMode,
+          signal: callOptions.signal,
+          timeoutMs: callOptions.timeoutMs,
+        });
       }) as PreparedStatement['query'],
       queryStream: ((
         paramsOrOptions: QueryParams | QueryStreamOptions = [],
@@ -2641,10 +2932,15 @@ export class FirebirdBrowserTransaction {
         const callParams = Array.isArray(paramsOrOptions)
           ? paramsOrOptions
           : [];
-        const callOptions = Array.isArray(paramsOrOptions)
+        const rawOptions = Array.isArray(paramsOrOptions)
           ? maybeOptions
           : (paramsOrOptions ?? {});
+        const callOptions: QueryStreamOptions =
+          rawOptions.timeoutMs === undefined && currentTimeoutMs > 0
+            ? { ...rawOptions, timeoutMs: currentTimeoutMs }
+            : rawOptions;
         checkParamCount(callParams.length);
+        validateTimeoutMs(callOptions.timeoutMs);
         const batchSize = resolveBatchSize(callOptions.batchSize);
         const openStream = () =>
           stmtHandle > 0
@@ -2653,29 +2949,48 @@ export class FirebirdBrowserTransaction {
                 callOptions.rowMode ?? 'object',
                 batchSize,
                 stmtHandle,
+                callOptions,
               )
             : this.queryStream(sqlText, callParams, {
                 rowMode: callOptions.rowMode,
                 batchSize: callOptions.batchSize,
+                signal: callOptions.signal,
+                timeoutMs: callOptions.timeoutMs,
               });
         return (async function* () {
           assertOpen();
           yield* openStream();
         })();
       }) as PreparedStatement['queryStream'],
-      exec: async (callParams: QueryParams = []) => {
+      exec: async (
+        callParams: QueryParams = [],
+        execOptions: StatementExecutionOptions = {},
+      ) => {
         assertOpen();
         checkParamCount(callParams.length);
+        const effectiveOptions: StatementExecutionOptions =
+          execOptions.timeoutMs === undefined && currentTimeoutMs > 0
+            ? { ...execOptions, timeoutMs: currentTimeoutMs }
+            : execOptions;
         if (stmtHandle > 0 && typeof this.engine.executeStmt === 'function') {
-          const affectedRows = await this.engine.executeStmt(
-            this.dbHandle,
-            this.txHandle,
-            stmtHandle,
-            applySerializers(callParams, this.types?.serializers),
+          assertNotAborted(effectiveOptions.signal);
+          validateTimeoutMs(effectiveOptions.timeoutMs);
+          const affectedRows = await runWithCancellation(
+            async () => {
+              await this.applyOneShotTimeout(effectiveOptions.timeoutMs);
+              return this.engine.executeStmt!(
+                this.dbHandle,
+                this.txHandle,
+                stmtHandle,
+                applySerializers(callParams, this.types?.serializers),
+              );
+            },
+            effectiveOptions,
+            () => this.cancelOperation(),
           );
           return { affectedRows };
         }
-        return this.exec(sqlText, callParams);
+        return this.exec(sqlText, callParams, effectiveOptions);
       },
       execBatch: async (rows: QueryParams[]) => {
         assertOpen();
@@ -2944,37 +3259,39 @@ export class FirebirdBrowserTransaction {
   /** Stream a SELECT inside this transaction in batches of `batchSize` rows. */
   queryStream(
     sql: SqlFragment,
-    options: { rowMode: 'array'; batchSize?: number },
+    options: { rowMode: 'array'; batchSize?: number } & StatementExecutionOptions,
   ): AsyncIterableIterator<QueryResult<ArrayRow>>;
   queryStream(
     sql: string | SqlFragment,
     params: QueryParams | undefined,
-    options: { rowMode: 'array'; batchSize?: number },
+    options: { rowMode: 'array'; batchSize?: number } & StatementExecutionOptions,
   ): AsyncIterableIterator<QueryResult<ArrayRow>>;
   queryStream<T extends Row = Row>(
     sql: SqlFragment,
-    options?: { rowMode?: RowMode; batchSize?: number },
+    options?: { rowMode?: RowMode; batchSize?: number } & StatementExecutionOptions,
   ): AsyncIterableIterator<QueryResult<T>>;
   queryStream<T extends Row = Row>(
     sql: string | SqlFragment,
     params?: QueryParams,
-    options?: { rowMode?: RowMode; batchSize?: number },
+    options?: { rowMode?: RowMode; batchSize?: number } & StatementExecutionOptions,
   ): AsyncIterableIterator<QueryResult<T>>;
   queryStream<T = Row>(
     sql: string | SqlFragment,
-    paramsOrOptions: QueryParams | { rowMode?: RowMode; batchSize?: number } = [],
-    maybeOptions: { rowMode?: RowMode; batchSize?: number } = {},
+    paramsOrOptions: QueryParams | ({ rowMode?: RowMode; batchSize?: number } & StatementExecutionOptions) = [],
+    maybeOptions: { rowMode?: RowMode; batchSize?: number } & StatementExecutionOptions = {},
   ): AsyncIterableIterator<QueryResult<T>> {
     this.assertUsable();
-    const { statement, options } = resolveQueryCall<{
-      rowMode?: RowMode;
-      batchSize?: number;
-    }>(sql, paramsOrOptions, maybeOptions);
+    const { statement, options } = resolveQueryCall<
+      { rowMode?: RowMode; batchSize?: number } & StatementExecutionOptions
+    >(sql, paramsOrOptions, maybeOptions);
+    validateTimeoutMs(options.timeoutMs);
     const batchSize = resolveBatchSize(options.batchSize);
     return this.streamQuery<T>(
       statement,
       options.rowMode ?? 'object',
       batchSize,
+      undefined,
+      options,
     );
   }
 
@@ -2983,8 +3300,20 @@ export class FirebirdBrowserTransaction {
     rowMode: RowMode,
     batchSize: number,
     stmtHandle?: EngineHandle,
+    execOptions: StatementExecutionOptions = {},
   ): AsyncIterableIterator<QueryResult<T>> {
     this.assertUsable();
+    assertNotAborted(execOptions.signal);
+    const totalTimeoutMs = validateTimeoutMs(execOptions.timeoutMs);
+    const deadline =
+      totalTimeoutMs && totalTimeoutMs > 0
+        ? Date.now() + totalTimeoutMs
+        : undefined;
+    const stepOptions = (): StatementExecutionOptions => ({
+      signal: execOptions.signal,
+      timeoutMs:
+        deadline !== undefined ? Math.max(1, deadline - Date.now()) : undefined,
+    });
 
     if (
       typeof this.engine.cursorOpen !== 'function' ||
@@ -2993,8 +3322,14 @@ export class FirebirdBrowserTransaction {
     ) {
       const full = (await this.query(statement.sql, statement.params, {
         rowMode,
+        signal: execOptions.signal,
+        timeoutMs: execOptions.timeoutMs,
       })) as QueryResult<T>;
       for (let i = 0; i < full.rows.length; i += batchSize) {
+        assertNotAborted(execOptions.signal);
+        if (deadline !== undefined && Date.now() >= deadline) {
+          throw createTimeoutError(totalTimeoutMs!);
+        }
         yield {
           rows: full.rows.slice(i, i + batchSize),
           fields: full.fields.map((f) => ({ ...f })),
@@ -3005,31 +3340,46 @@ export class FirebirdBrowserTransaction {
 
     const binaryBlobs = this.types?.binary === true;
     const serialized = applySerializers(statement.params, this.types?.serializers);
-    let cursorHandle =
-      stmtHandle &&
-      stmtHandle > 0 &&
-      typeof this.engine.cursorOpenStmt === 'function'
-        ? await this.engine.cursorOpenStmt(
-            this.dbHandle,
-            this.txHandle,
-            stmtHandle,
-            serialized,
-          )
-        : await this.engine.cursorOpen(
-            this.dbHandle,
-            this.txHandle,
-            statement.sql,
-            serialized,
-          );
+    let cursorHandle = await runWithCancellation(
+      async () => {
+        await this.applyOneShotTimeout(totalTimeoutMs);
+        return stmtHandle &&
+          stmtHandle > 0 &&
+          typeof this.engine.cursorOpenStmt === 'function'
+          ? this.engine.cursorOpenStmt(
+              this.dbHandle,
+              this.txHandle,
+              stmtHandle,
+              serialized,
+            )
+          : this.engine.cursorOpen!(
+              this.dbHandle,
+              this.txHandle,
+              statement.sql,
+              serialized,
+            );
+      },
+      stepOptions(),
+      () => this.cancelOperation(),
+    );
 
     try {
       while (true) {
         this.assertUsable();
-        const batch = await this.engine.cursorFetch<T>(
-          cursorHandle,
-          batchSize,
-          rowMode,
-          binaryBlobs,
+        assertNotAborted(execOptions.signal);
+        if (deadline !== undefined && Date.now() >= deadline) {
+          throw createTimeoutError(totalTimeoutMs!);
+        }
+        const batch = await runWithCancellation(
+          () =>
+            this.engine.cursorFetch!<T>(
+              cursorHandle,
+              batchSize,
+              rowMode,
+              binaryBlobs,
+            ),
+          stepOptions(),
+          () => this.cancelOperation(),
         );
         if (batch.rows.length === 0) {
           break;

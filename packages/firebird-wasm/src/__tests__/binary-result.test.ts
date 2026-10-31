@@ -1103,4 +1103,128 @@ describe('Binary result wire format (encodeBinaryResultSet / decodeBinaryResultS
       await db.close();
     }
   });
+
+  it('supports statement cancellation (AbortSignal) and query timeouts (timeoutMs & stmt.setTimeout) across DirectTransport, WorkerTransport, and FirebirdBrowser', async () => {
+    const timeoutCalls: Array<{ stmt: number; ms: number }> = [];
+    const cancelCalls: Array<{ db: number; option: number }> = [];
+
+    const mockMod = {
+      HEAPU8: new Uint8Array(256),
+      _malloc: () => 16,
+      _free() {},
+      _fb_free_result() {},
+      _fb_last_error: () => 0,
+      lengthBytesUTF8: (str: string) => str.length,
+      stringToUTF8() {},
+      UTF8ToString: () => '',
+      _fb_stmt_set_timeout(stmtHandle: number, timeoutMs: number) {
+        timeoutCalls.push({ stmt: stmtHandle, ms: timeoutMs });
+        return 0;
+      },
+      _fb_cancel_operation(dbHandle: number, option: number) {
+        cancelCalls.push({ db: dbHandle, option });
+        return 0;
+      },
+    };
+
+    const direct = new DirectTransport();
+    (direct as unknown as { mod: unknown }).mod = mockMod;
+
+    await direct.stmtSetTimeout(42, 1500);
+    await direct.cancelOperation(7, 3);
+    expect(timeoutCalls).toEqual([{ stmt: 42, ms: 1500 }]);
+    expect(cancelCalls).toEqual([{ db: 7, option: 3 }]);
+
+    let resolveSlowQuery: ((val: { fields: never[]; rows: never[] }) => void) | null = null;
+    const mockTransport = {
+      init: jest.fn(async () => undefined),
+      createDatabase: jest.fn(async () => 1),
+      attachDatabase: jest.fn(async () => 1),
+      detachDatabase: jest.fn(async () => undefined),
+      execute: jest.fn(async () => 1),
+      executeStmt: jest.fn(async () => 1),
+      executeBatch: jest.fn(async () => 0),
+      query: jest.fn(
+        (_db: number, _tx: number, sqlText: string) =>
+          sqlText === 'SELECT SLOW'
+            ? new Promise<{ fields: never[]; rows: never[] }>((resolve) => {
+                resolveSlowQuery = resolve;
+              })
+            : Promise.resolve({ fields: [], rows: [] }),
+      ),
+      queryStmt: jest.fn(async () => ({ fields: [], rows: [] })),
+      prepare: jest.fn(async () => ({
+        handle: 55,
+        params: [],
+        fields: [],
+        statementType: 'SELECT' as const,
+        hasResultSet: true,
+      })),
+      stmtClose: jest.fn(async () => undefined),
+      stmtSetTimeout: jest.fn(async () => undefined),
+      cancelOperation: jest.fn(async () => {
+        resolveSlowQuery?.({ fields: [], rows: [] });
+      }),
+      describe: jest.fn(async () => ({
+        params: [],
+        fields: [],
+        statementType: 'SELECT' as const,
+        hasResultSet: true,
+      })),
+      startTransaction: jest.fn(async () => 3),
+      commit: jest.fn(async () => undefined),
+      rollback: jest.fn(async () => undefined),
+      mkdir: jest.fn(async () => undefined),
+      exists: jest.fn(async () => false),
+      readFile: jest.fn(async () => new Uint8Array(0)),
+      writeFile: jest.fn(async () => undefined),
+      unlink: jest.fn(async () => undefined),
+      eventsSubscribe: jest.fn(async () => 1),
+      eventsPoll: jest.fn(async () => ({})),
+      eventsCancel: jest.fn(async () => undefined),
+      mountOpfs: jest.fn(async () => '/opfs/test.fdb'),
+      dispose: jest.fn(async () => undefined),
+    };
+
+    const db = new FirebirdBrowser('memory://cancel-timeout-test', {
+      transport: mockTransport,
+      autoPersist: false,
+    });
+
+    try {
+      // 1. Pre-aborted AbortSignal rejects immediately without calling engine.query
+      const preAborted = new AbortController();
+      preAborted.abort(new Error('already cancelled'));
+      await expect(
+        db.query('SELECT 1', [], { signal: preAborted.signal }),
+      ).rejects.toThrow('already cancelled');
+      expect(mockTransport.query).not.toHaveBeenCalled();
+
+      // 2. Negative or NaN timeoutMs throws RangeError
+      await expect(
+        db.query('SELECT 1', [], { timeoutMs: -5 }),
+      ).rejects.toThrow(RangeError);
+
+      // 3. One-shot timeoutMs forwards stmtSetTimeout(0, ms) before executing
+      await db.query('SELECT FAST', [], { timeoutMs: 250 });
+      expect(mockTransport.stmtSetTimeout).toHaveBeenCalledWith(0, 250);
+
+      // 4. In-flight AbortSignal triggers cancelOperation and rejects with AbortError
+      const inFlight = new AbortController();
+      const pending = db.query('SELECT SLOW', [], { signal: inFlight.signal });
+      setTimeout(() => inFlight.abort(), 10);
+      await expect(pending).rejects.toThrow(/aborted/i);
+      expect(mockTransport.cancelOperation).toHaveBeenCalledWith(1);
+
+      // 5. PreparedStatement.setTimeout sets handle timeout and default per-call timeout
+      const stmt = await db.prepare('SELECT FAST');
+      expect(stmt.timeoutMs).toBe(0);
+      await stmt.setTimeout!(500);
+      expect(stmt.timeoutMs).toBe(500);
+      expect(mockTransport.stmtSetTimeout).toHaveBeenCalledWith(55, 500);
+      await stmt.close();
+    } finally {
+      await db.close();
+    }
+  });
 });

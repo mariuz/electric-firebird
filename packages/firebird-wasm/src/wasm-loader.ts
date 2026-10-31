@@ -265,6 +265,8 @@ export interface FirebirdWasmModule {
     sqlPtr: number,
   ): number;
   _fb_stmt_close?(stmtHandle: FbHandle): number;
+  _fb_stmt_set_timeout?(stmtHandle: FbHandle, timeoutMs: number): number;
+  _fb_cancel_operation?(dbHandle: FbHandle, option: number): number;
   _fb_execute_stmt?(
     dbHandle: FbHandle,
     txHandle: FbHandle,
