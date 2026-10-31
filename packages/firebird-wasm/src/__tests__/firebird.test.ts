@@ -2030,6 +2030,161 @@ describe('FirebirdLite (no Firebird installed)', () => {
     expect(cancelOptions).toEqual([3]);
   });
 
+  it('streams CSV and JSONLines (NDJSON) import & export via copyFromStream() and copyToStream()', async () => {
+    const { FirebirdBrowser } = await import('../browser/firebird-browser');
+    const insertedBatches: Array<{ sql: string; rows: unknown[][] }> = [];
+    const storedRows: Array<[unknown, unknown, unknown]> = [];
+
+    const fields = [
+      { name: 'ID', type: 496, typeName: 'INTEGER' as const },
+      { name: 'NAME', type: 448, typeName: 'VARYING' as const },
+      { name: 'NOTE', type: 448, typeName: 'VARYING' as const },
+    ];
+
+    const mockTransport = {
+      init: jest.fn(async () => undefined),
+      createDatabase: jest.fn(async () => 1),
+      attachDatabase: jest.fn(async () => 1),
+      detachDatabase: jest.fn(async () => undefined),
+      execute: jest.fn(async () => 1),
+      executeBatch: jest.fn(async (_db: number, _tx: number, sqlText: string, rows: unknown[][]) => {
+        insertedBatches.push({ sql: sqlText, rows });
+        for (const r of rows) {
+          storedRows.push([r[0], r[1], r[2]]);
+        }
+        return rows.length;
+      }),
+      query: jest.fn(async () => ({
+        fields,
+        rows: storedRows.map((r) => [...r]) as never,
+      })),
+      describe: jest.fn(async () => ({
+        params: [],
+        fields,
+        statementType: 'SELECT' as const,
+        hasResultSet: true,
+      })),
+      startTransaction: jest.fn(async () => 11),
+      commit: jest.fn(async () => undefined),
+      rollback: jest.fn(async () => undefined),
+      mkdir: jest.fn(async () => undefined),
+      exists: jest.fn(async () => false),
+      readFile: jest.fn(async () => new Uint8Array(0)),
+      writeFile: jest.fn(async () => undefined),
+      unlink: jest.fn(async () => undefined),
+      eventsSubscribe: jest.fn(async () => 1),
+      eventsPoll: jest.fn(async () => ({})),
+      eventsCancel: jest.fn(async () => undefined),
+      mountOpfs: jest.fn(async () => '/opfs/test.fdb'),
+      dispose: jest.fn(async () => undefined),
+    };
+
+    const db = new FirebirdBrowser('memory://copy-stream-test', {
+      transport: mockTransport,
+      autoPersist: false,
+    });
+
+    const readStreamText = async (stream: ReadableStream<Uint8Array>): Promise<string> => {
+      const reader = stream.getReader();
+      const decoder = new TextDecoder();
+      let out = '';
+      for (let step = await reader.read(); !step.done; step = await reader.read()) {
+        if (step.value) out += decoder.decode(step.value, { stream: true });
+      }
+      out += decoder.decode();
+      return out;
+    };
+
+    try {
+      // 1. Streaming CSV import split across tiny arbitrary chunks (handling quotes, multiline, empty string vs NULL)
+      const csvInput =
+        'ID,NAME,NOTE\r\n' +
+        '1,"Alice, Jr.",\r\n' +
+        '2,"Bob ""The Builder""","line1\nline2"\r\n' +
+        '3,Charlie,""\r\n';
+      const csvBytes = new TextEncoder().encode(csvInput);
+      const tinyChunks = new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (let i = 0; i < csvBytes.length; i += 5) {
+            controller.enqueue(csvBytes.slice(i, i + 5));
+          }
+          controller.close();
+        },
+      });
+
+      const csvRes = await db.copyFromStream('ITEMS', tinyChunks, {
+        batchSize: 2,
+      });
+      expect(csvRes).toEqual({
+        rowsCopied: 3,
+        batches: 2,
+        columns: ['ID', 'NAME', 'NOTE'],
+      });
+      expect(insertedBatches).toHaveLength(2);
+      expect(insertedBatches[0]!.sql).toBe(
+        'INSERT INTO ITEMS (ID, NAME, NOTE) VALUES (?, ?, ?)',
+      );
+      expect(storedRows).toEqual([
+        ['1', 'Alice, Jr.', null],
+        ['2', 'Bob "The Builder"', 'line1\nline2'],
+        ['3', 'Charlie', ''],
+      ]);
+
+      // 2. Streaming CSV export via copyToStream('ITEMS')
+      const exportedCsv = await readStreamText(
+        db.copyToStream('ITEMS', { batchSize: 2 }),
+      );
+      expect(exportedCsv).toBe(
+        'ID,NAME,NOTE\n' +
+          '1,"Alice, Jr.",\n' +
+          '2,"Bob ""The Builder""","line1\nline2"\n' +
+          '3,Charlie,""\n',
+      );
+
+      // 3. Streaming JSONLines export via copyToStream(..., { format: 'jsonl' })
+      const exportedJsonl = await readStreamText(
+        db.copyToStream('ITEMS', { format: 'jsonl', batchSize: 2 }),
+      );
+      const jsonlLines = exportedJsonl.trim().split('\n');
+      expect(jsonlLines.map((l) => JSON.parse(l))).toEqual([
+        { ID: '1', NAME: 'Alice, Jr.', NOTE: null },
+        { ID: '2', NAME: 'Bob "The Builder"', NOTE: 'line1\nline2' },
+        { ID: '3', NAME: 'Charlie', NOTE: '' },
+      ]);
+
+      // 4. Streaming JSONLines import with transform/filter hook
+      storedRows.length = 0;
+      insertedBatches.length = 0;
+      const jsonlRes = await db.copyFromStream(
+        'ITEMS',
+        (async function* () {
+          yield exportedJsonl.slice(0, 25);
+          yield exportedJsonl.slice(25);
+        })(),
+        {
+          format: 'jsonl',
+          batchSize: 2,
+          transform: (row, idx) => {
+            if (idx === 1) return null; // skip Bob
+            const rec = row as Record<string, unknown>;
+            return { ...rec, ID: Number(rec['ID']) * 10 };
+          },
+        },
+      );
+      expect(jsonlRes).toEqual({
+        rowsCopied: 2,
+        batches: 1,
+        columns: ['ID', 'NAME', 'NOTE'],
+      });
+      expect(storedRows).toEqual([
+        [10, 'Alice, Jr.', null],
+        [30, 'Charlie', ''],
+      ]);
+    } finally {
+      await db.close();
+    }
+  });
+
   it('exports FirebirdLite class', async () => {
     const { FirebirdLite: FB } = await import('../index');
     expect(typeof FB).toBe('function');

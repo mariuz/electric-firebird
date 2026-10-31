@@ -42,6 +42,13 @@ export {
   DEFAULT_BLOB_SEGMENT_SIZE,
   MAX_BLOB_SEGMENT_SIZE,
 } from './browser/blob-stream';
+export {
+  buildCopyToStream,
+  executeCopyFromStream,
+  encodeCsvRow,
+  encodeJsonlRow,
+  formatCopyIdentifier,
+} from './browser/copy-stream';
 export type { TypeOptions, Parser, Serializer } from './browser/value-types';
 export type { SqlTag, Statement } from './sql-tag';
 
@@ -61,6 +68,11 @@ export type {
   SweepResult,
   PreparedStatement,
   DataStreamOptions,
+  CopyFormat,
+  CopyOptionsBase,
+  CopyFromOptions,
+  CopyToOptions,
+  CopyResult,
   IntrospectOptions,
   ColumnSchemaInfo,
   PrimaryKeySchemaInfo,

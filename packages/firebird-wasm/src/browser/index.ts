@@ -65,6 +65,13 @@ export {
   MAX_BLOB_SEGMENT_SIZE,
 } from './blob-stream';
 export {
+  buildCopyToStream,
+  executeCopyFromStream,
+  encodeCsvRow,
+  encodeJsonlRow,
+  formatCopyIdentifier,
+} from './copy-stream';
+export {
   decodeBinaryResultSet,
   encodeBinaryResultSet,
   decodeBinaryResultPayload,
@@ -140,6 +147,11 @@ export type {
   SweepResult,
   PreparedStatement,
   DataStreamOptions,
+  CopyFormat,
+  CopyOptionsBase,
+  CopyFromOptions,
+  CopyToOptions,
+  CopyResult,
   IntrospectOptions,
   ColumnSchemaInfo,
   PrimaryKeySchemaInfo,

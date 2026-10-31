@@ -1328,7 +1328,7 @@ With M0–M8 complete, these are the next-horizon milestones for `v0.14.0`:
       `IStatement::setTimeout(status, timeoutMs)` in the WASM C bridge (`_fb_cancel_operation`,
       `_fb_stmt_set_timeout`) and on Node so `db.query(sql, params, { signal, timeoutMs })`
       can abort long-running queries cleanly.
-- [ ] **Streaming CSV / JSONLines import & export (`db.copyFromStream()` / `db.copyToStream()`).**
+- [x] **Streaming CSV / JSONLines import & export (`db.copyFromStream()` / `db.copyToStream()`).**
       Combine `executeBatch()` and `queryStream()` with Web `ReadableStream` /
       `WritableStream` transforms for high-throughput, bounded-memory bulk CSV
       and NDJSON table import/export in both browser and Node.

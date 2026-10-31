@@ -46,6 +46,7 @@ import {
   resolveBlobColumnIndex,
   resolveBlobSegmentSize,
 } from './blob-stream';
+import { buildCopyToStream, executeCopyFromStream } from './copy-stream';
 import { hasTransactionOptions } from './isolation';
 import { applyTypes, applySerializers } from './value-types';
 import type { TypeOptions } from './value-types';
@@ -63,6 +64,9 @@ import type {
   SweepResult,
   PreparedStatement,
   DataStreamOptions,
+  CopyFromOptions,
+  CopyToOptions,
+  CopyResult,
   IntrospectOptions,
   SchemaIntrospection,
   Migration,
@@ -2108,6 +2112,52 @@ export class FirebirdBrowser {
     this.markDirty();
   }
 
+  /**
+   * Bulk-import CSV or JSONLines (`'jsonl'` / `'ndjson'`) records from a
+   * `ReadableStream` or `AsyncIterable` into `tableName` in bounded-memory
+   * batches of `options.batchSize` (default 500) inside a single transaction.
+   */
+  async copyFromStream(
+    tableName: string,
+    stream:
+      | ReadableStream<Uint8Array | string>
+      | AsyncIterable<Uint8Array | string>,
+    options: CopyFromOptions = {},
+  ): Promise<CopyResult> {
+    assertNotAborted(options.signal);
+    validateTimeoutMs(options.timeoutMs);
+    await this.ensureReady();
+    return this.transaction((tx) =>
+      tx.copyFromStream(tableName, stream, options),
+    );
+  }
+
+  /**
+   * Stream a table or `SELECT` query as UTF-8 CSV or JSONLines (`'jsonl'` /
+   * `'ndjson'`) in bounded-memory cursor batches of `options.batchSize`
+   * (default 500).
+   */
+  copyToStream(
+    sql: SqlFragment,
+    options?: CopyToOptions,
+  ): ReadableStream<Uint8Array>;
+  copyToStream(
+    tableOrQuery: string,
+    options?: CopyToOptions,
+  ): ReadableStream<Uint8Array>;
+  copyToStream(
+    sql: string | SqlFragment,
+    params?: QueryParams,
+    options?: CopyToOptions,
+  ): ReadableStream<Uint8Array>;
+  copyToStream(
+    tableOrQuery: string | SqlFragment,
+    paramsOrOptions: QueryParams | CopyToOptions = [],
+    maybeOptions: CopyToOptions = {},
+  ): ReadableStream<Uint8Array> {
+    return buildCopyToStream(this, tableOrQuery, paramsOrOptions, maybeOptions);
+  }
+
   private async writeStreamToDbPath(
     stream: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array>,
     options: DataStreamOptions = {},
@@ -3035,6 +3085,49 @@ export class FirebirdBrowserTransaction {
   async describeQuery(sql: string | SqlFragment): Promise<QueryDescription> {
     this.assertUsable();
     return this.engine.describe(this.dbHandle, this.txHandle, toStatement(sql).sql);
+  }
+
+  /**
+   * Bulk-import CSV or JSONLines (`'jsonl'` / `'ndjson'`) records from a
+   * `ReadableStream` or `AsyncIterable` into `tableName` inside this transaction.
+   */
+  async copyFromStream(
+    tableName: string,
+    stream:
+      | ReadableStream<Uint8Array | string>
+      | AsyncIterable<Uint8Array | string>,
+    options: CopyFromOptions = {},
+  ): Promise<CopyResult> {
+    this.assertUsable();
+    assertNotAborted(options.signal);
+    validateTimeoutMs(options.timeoutMs);
+    return executeCopyFromStream(this, tableName, stream, options);
+  }
+
+  /**
+   * Stream a table or `SELECT` query inside this transaction as UTF-8 CSV or
+   * JSONLines (`'jsonl'` / `'ndjson'`).
+   */
+  copyToStream(
+    sql: SqlFragment,
+    options?: CopyToOptions,
+  ): ReadableStream<Uint8Array>;
+  copyToStream(
+    tableOrQuery: string,
+    options?: CopyToOptions,
+  ): ReadableStream<Uint8Array>;
+  copyToStream(
+    sql: string | SqlFragment,
+    params?: QueryParams,
+    options?: CopyToOptions,
+  ): ReadableStream<Uint8Array>;
+  copyToStream(
+    tableOrQuery: string | SqlFragment,
+    paramsOrOptions: QueryParams | CopyToOptions = [],
+    maybeOptions: CopyToOptions = {},
+  ): ReadableStream<Uint8Array> {
+    this.assertUsable();
+    return buildCopyToStream(this, tableOrQuery, paramsOrOptions, maybeOptions);
   }
 
   /**

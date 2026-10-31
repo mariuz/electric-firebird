@@ -813,3 +813,115 @@ export interface BlobWritableStream extends WritableStream<Uint8Array> {
   /** Close the writer and return the finalized {@link BlobHandle}. */
   finish(): Promise<BlobHandle>;
 }
+
+/**
+ * Wire format for `copyFromStream()` and `copyToStream()`.
+ *
+ * - `'csv'`: RFC 4180 comma-separated values (with configurable `delimiter`,
+ *   `quote`, `header`, and `nullString`).
+ * - `'jsonl'` / `'ndjson'`: Newline-delimited JSON objects (or arrays).
+ */
+export type CopyFormat = 'csv' | 'jsonl' | 'ndjson';
+
+/**
+ * Shared options for `copyFromStream()` and `copyToStream()`.
+ */
+export interface CopyOptionsBase extends StatementExecutionOptions {
+  /**
+   * Stream format: `'csv'` (default) or `'jsonl'` / `'ndjson'`.
+   *
+   * @default 'csv'
+   */
+  format?: CopyFormat;
+  /**
+   * Explicit column list.
+   *
+   * - In `copyFromStream()`: target table columns. When omitted in `'csv'` mode
+   *   with `header: true` (the default), column names are read from the first
+   *   CSV header row. When omitted in `'jsonl'`/`'ndjson'` mode, column names
+   *   are inferred from the keys of the first JSON object record.
+   * - In `copyToStream()`: when the first argument is a table name, selects
+   *   only these columns in the specified order.
+   */
+  columns?: readonly string[];
+  /**
+   * Whether the CSV stream starts with a header row of column names.
+   * Ignored for `'jsonl'` / `'ndjson'`.
+   *
+   * @default true
+   */
+  header?: boolean;
+  /**
+   * Field delimiter character for `'csv'` format. Must be a single ASCII character.
+   *
+   * @default ','
+   */
+  delimiter?: string;
+  /**
+   * Quote character for `'csv'` format. Must be a single ASCII character.
+   *
+   * @default '"'
+   */
+  quote?: string;
+  /**
+   * String representation of `NULL` in `'csv'` format.
+   *
+   * - In `copyFromStream()`: an unquoted field equal to `nullString` is bound
+   *   as SQL `NULL` (quoted `""` is bound as the empty string `''` when
+   *   `nullString === ''`).
+   * - In `copyToStream()`: `null` / `undefined` column values are formatted as
+   *   `nullString`.
+   *
+   * @default ''
+   */
+  nullString?: string;
+  /**
+   * Number of rows per batch (`execBatch` chunk size on import, `queryStream`
+   * fetch size on export).
+   *
+   * @default 500
+   */
+  batchSize?: number;
+  /**
+   * Optional gzip compression (`'gzip'`) or uncompressed (`'none'`).
+   * On `copyFromStream()`, gzip-compressed byte streams (`0x1f 0x8b`) are also
+   * decompressed automatically when `compression` is omitted.
+   */
+  compression?: DataStreamOptions['compression'];
+}
+
+/**
+ * Options for `db.copyFromStream(tableName, stream, options)` and
+ * `tx.copyFromStream(tableName, stream, options)`.
+ */
+export interface CopyFromOptions extends CopyOptionsBase {
+  /**
+   * Optional per-row transform or filter hook called before binding each row.
+   *
+   * - Return a `QueryParams` array (in `columns` order) or a `Record<string, unknown>`
+   *   keyed by column name to insert the transformed row.
+   * - Return `null` or `undefined` to skip the row.
+   */
+  transform?: (
+    row: Record<string, unknown> | unknown[],
+    rowIndex: number,
+  ) => QueryParams | Record<string, unknown> | null | undefined;
+}
+
+/**
+ * Options for `db.copyToStream(tableOrQuery, ...)` and
+ * `tx.copyToStream(tableOrQuery, ...)`.
+ */
+export interface CopyToOptions extends CopyOptionsBase, TransactionOptions {}
+
+/**
+ * Summary returned by `copyFromStream()`.
+ */
+export interface CopyResult {
+  /** Total number of rows inserted. */
+  rowsCopied: number;
+  /** Number of `execBatch` batches executed. */
+  batches: number;
+  /** Resolved target column names in insertion order. */
+  columns: string[];
+}
