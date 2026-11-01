@@ -1332,7 +1332,7 @@ With M0–M8 complete, these are the next-horizon milestones for `v0.14.0`:
       Combine `executeBatch()` and `queryStream()` with Web `ReadableStream` /
       `WritableStream` transforms for high-throughput, bounded-memory bulk CSV
       and NDJSON table import/export in both browser and Node.
-- [ ] **Interactive Schema Inspector & Migration Viewer in `<firebird-repl>`.**
+- [x] **Interactive Schema Inspector & Migration Viewer in `<firebird-repl>`.**
       Wire `db.introspect()`, `db.sweep()`, and `FB_MIGRATIONS$` into a visual
       sidebar/tab inside `<firebird-repl>` displaying tables, columns, primary/foreign
       keys, indexes, sequences, triggers, and applied migration history.

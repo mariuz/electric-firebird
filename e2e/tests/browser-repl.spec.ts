@@ -194,6 +194,38 @@ test.describe('<firebird-repl>', () => {
     expect(sweep.durationMs).toBeGreaterThanOrEqual(0);
   });
 
+  test('opens the interactive Schema Inspector & Migration Viewer with Schema and Migrations buttons', async ({ page }) => {
+    const repl = await openRepl(page, 'memory://repl-schema-inspector');
+    await repl.evaluate(async (el: any) => {
+      await el.db.migrate([
+        {
+          version: 1,
+          name: 'create_authors',
+          up: 'CREATE TABLE authors (id INTEGER NOT NULL PRIMARY KEY, name VARCHAR(60) NOT NULL)',
+        },
+        {
+          version: 2,
+          name: 'add_author_idx',
+          up: 'CREATE INDEX idx_authors_name ON authors (name)',
+        },
+      ]);
+    });
+
+    await repl.locator('button.schema').click();
+    await expect(repl.locator('.inspector')).toBeVisible();
+    await expect(repl.locator('.inspector .schema-table-name')).toHaveText(['AUTHORS']);
+    await expect(repl.locator('.inspector .schema-indexes')).toContainText('IDX_AUTHORS_NAME');
+
+    await repl.locator('.inspector button.schema-query-btn').click();
+    await expect(repl.locator('textarea')).toHaveValue('SELECT * FROM AUTHORS;');
+
+    await repl.locator('button.migrations').click();
+    await expect(repl.locator('.inspector .inspector-migrations')).toContainText('Current version: 2 · 2 applied');
+    await expect(repl.locator('.inspector .migration-item')).toHaveCount(2);
+    await expect(repl.locator('.inspector .migration-item').nth(0)).toContainText('create_authors');
+    await expect(repl.locator('.inspector .migration-item').nth(1)).toContainText('add_author_idx');
+  });
+
   test('takes a db property set before it was defined, and reports runs', async ({ page }) => {
     await page.goto('/no-isolation/browser-harness-frameworks-st');
     await page.waitForFunction(() => Boolean((window as any).FB && (window as any).Frameworks));
