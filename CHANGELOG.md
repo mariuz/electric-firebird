@@ -4,6 +4,35 @@ All notable changes to `firebird-wasm`. This project follows
 [semantic versioning](https://semver.org/); while the major version is 0 the
 API may still move between minor releases.
 
+## 0.16.0 — 2026-11-02
+
+### Added
+
+- **JavaScript User-Defined Functions & Procedures (`db.registerFunction()` & `db.registerProcedure()`).**
+  - Added `db.registerFunction(name, options, fn)` and `db.registerProcedure(name, options, fn)` on both `FirebirdBrowser` and `FirebirdLite`, plus a static C++ `"JS"` `IExternalEngine` UDR plugin (`JsExternalEngine` in `fb_wasm_api.cpp`) and a transparent PSQL catalog stub + JS expression bridge (`UdrManager`) supporting scalar functions in `SELECT`, `WHERE`, and `COMPUTED BY` columns as well as selectable table-valued procedures (`SELECT * FROM proc(...)`) and `EXECUTE PROCEDURE`.
+- **Client-side vector similarity & hybrid RAG search (`firebird-wasm/vector`).**
+  - Added the `firebird-wasm/vector` subpath export with `encodeVector`, `decodeVector`, `formatVectorText`, `vectorColumnType`, `cosineDistance`, `cosineSimilarity`, `l2Distance`, `squaredL2Distance`, `dotProduct`, `innerProductDistance`, `vectorNorm`, `normalizeVector`, `registerVectorFunctions(db)`, and hybrid SQL + KNN `vectorSearch(db, options)`.
+- **Direct page-level OPFS VFS (`OPFSVFS` & `SyncAccessHandle` PIO).**
+  - Added `OPFSVFS` (`firebird-wasm/browser`) mounting an Emscripten filesystem node backed directly by `FileSystemSyncAccessHandle.read(buf, { at })` and `.write(buf, { at })` for zero-MEMFS-copy page-level I/O (`readPage`, `writePage`, `importDatabase`, `exportDatabase`).
+- **WebCrypto AES-256-GCM page encryption at rest (`encryptionKey` & `encryptionPassword`).**
+  - Added transparent page-level AES-256-GCM encryption at rest (`encryptPage`, `decryptPage`, `deriveEncryptionKey`, `generateEncryptionKey`, `exportEncryptionKey`, `importEncryptionKey`) across `IndexedDBVFS`, `OPFSVFS`, and `FirebirdBrowserOptions` (`encryptionKey`, `encryptionPassword`, `encryptionSalt`) with per-page IVs and AAD binding page numbers to prevent page-swapping attacks.
+- **Point-in-time Copy-on-Write snapshots & database branching (`db.snapshot()`, `db.restoreSnapshot()`, `db.branch()`).**
+  - Added content-addressable FNV-1a Copy-on-Write page snapshots (`SnapshotStore`, `db.snapshot()`, `db.restoreSnapshot()`, `db.listSnapshots()`, `db.deleteSnapshot()`, and `db.branch()`) on `FirebirdBrowser` and `FirebirdLite` for instant O(changed pages) rollback and isolated database branches.
+- **Cross-tab reactive live queries (`BroadcastChannel` invalidation).**
+  - Extended `createLiveQuery` (`firebird-wasm/browser`, `firebird-wasm/react`, `firebird-wasm/vue`, `firebird-wasm/svelte`, `firebird-wasm/solid`) with automatic cross-tab `BroadcastChannel` table invalidation (`crossTab`, `channelName`, `notifyTablesChanged`) so writes in one browser tab immediately refresh subscribed queries in sibling tabs.
+- **Multi-table transactional Electric shape sync (`syncShapes`).**
+  - Added `syncShapes(db, options)` (`firebird-wasm/electric`) coordinating multiple Electric shapes with topological foreign-key ordering (`resolveShapeTableOrder`) and shared atomic batch transactions across parent and child tables.
+- **Pushed-down `WHERE` join filtering & batched delta queries in `firebird-wasm/electric-server`.**
+  - `createShapeServer` now pushes `where` predicates into a single `ELECTRIC_CHANGES LEFT JOIN <table>` SQL query during incremental delta syncs, batches primary-key lookups (`IN (...)`), and exposes `server.applyWrite()` and `replica=full` old-value diffs.
+- **Query profiler & `MON$` telemetry (`db.onQuery()`, `db.monitorStats()`, and `<firebird-repl>` Profiler tab).**
+  - Added `QueryProfiler`, `db.onQuery(listener)`, `db.monitorStats()`, `db.resetMonitorStats()` (combining `MON$IO_STATS`, `MON$MEMORY_USAGE`, `MON$TRANSACTIONS`, `MON$STATEMENTS`, and prepare-cache hit rates), and an interactive **Profiler** tab in `<firebird-repl>`.
+- **Svelte 5 & SolidJS reactive adapters (`firebird-wasm/svelte` & `firebird-wasm/solid`).**
+  - Added `firebird-wasm/svelte` (`createFirebirdStore`, `createLiveQueryStore`, `createQueryStore`) and `firebird-wasm/solid` (`createFirebirdResource`, `createLiveQuerySignal`).
+
+### Changed
+
+- Migrated the unit and WASM console integration test suite from Jest (`ts-jest`) to **Vitest**.
+
 ## 0.15.0 — 2026-11-02
 
 ### Added
