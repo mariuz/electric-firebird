@@ -1351,7 +1351,7 @@ With M0–M8 complete, these are the next-horizon milestones for `v0.14.0`:
 
 Next-horizon milestones for `v0.15.0`:
 
-- [ ] **JavaScript User-Defined Functions & Procedures (`db.registerFunction` / `db.registerProcedure`).**
+- [x] **JavaScript User-Defined Functions & Procedures (`db.registerFunction` / `db.registerProcedure`).**
       Register a static `"JS"` `IExternalEngine` plugin in `fb_wasm_api.cpp` so
       applications can register JavaScript functions and procedures callable
       directly inside SQL `SELECT`, `WHERE`, and `COMPUTED BY` expressions.

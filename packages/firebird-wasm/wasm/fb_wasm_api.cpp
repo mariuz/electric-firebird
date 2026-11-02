@@ -2780,6 +2780,623 @@ IProvider* locateProvider()
 	return g_master->getDispatcher();
 }
 
+// ---------------------------------------------------------------------------
+// JavaScript External Engine ("JS" IExternalEngine UDR plugin)
+// ---------------------------------------------------------------------------
+
+struct UdrField
+{
+	unsigned type = 0;
+	int      subType = 0;
+	int      scale = 0;
+	unsigned length = 0;
+	unsigned offset = 0;
+	unsigned nullOffset = 0;
+	unsigned charSet = 0;
+};
+
+struct UdrCell
+{
+	bool        isNull = true;
+	std::string text;
+};
+
+void setUdrStatusError(CheckStatusWrapper* status, const char* msg)
+{
+	if (!status)
+		return;
+	const ISC_STATUS vec[] = {
+		isc_arg_gds, isc_random,
+		isc_arg_string, reinterpret_cast<ISC_STATUS>(msg ? msg : "JS UDR error"),
+		isc_arg_end
+	};
+	status->setErrors(vec);
+}
+
+bool describeUdrMetadata(IMessageMetadata* meta, std::vector<UdrField>& out)
+{
+	out.clear();
+	if (!meta)
+		return true;
+
+	Status status;
+	const unsigned count = meta->getCount(status.ptr());
+	if (status.failed())
+	{
+		meta->release();
+		return false;
+	}
+
+	out.resize(count);
+	for (unsigned i = 0; i < count; ++i)
+	{
+		out[i].type       = meta->getType(status.ptr(), i) & ~1u;
+		out[i].subType    = meta->getSubType(status.ptr(), i);
+		out[i].scale      = meta->getScale(status.ptr(), i);
+		out[i].length     = meta->getLength(status.ptr(), i);
+		out[i].offset     = meta->getOffset(status.ptr(), i);
+		out[i].nullOffset = meta->getNullOffset(status.ptr(), i);
+		out[i].charSet    = meta->getCharSet(status.ptr(), i);
+		if (status.failed())
+		{
+			meta->release();
+			return false;
+		}
+	}
+
+	meta->release();
+	return true;
+}
+
+void encodeUdrArgsJson(IExternalContext* context, const std::vector<UdrField>& fields,
+	const void* inMsg, std::string& argsJson)
+{
+	argsJson = "[";
+	if (inMsg && !fields.empty())
+	{
+		bool needsBlob = false;
+		for (const UdrField& f : fields)
+		{
+			if (f.type == SQL_BLOB)
+			{
+				needsBlob = true;
+				break;
+			}
+		}
+
+		Status status;
+		IAttachment* att = (needsBlob && context) ? context->getAttachment(status.ptr()) : nullptr;
+		ITransaction* tra = (needsBlob && context) ? context->getTransaction(status.ptr()) : nullptr;
+		const auto* bytes = static_cast<const unsigned char*>(inMsg);
+
+		for (size_t i = 0; i < fields.size(); ++i)
+		{
+			if (i > 0)
+				argsJson += ',';
+			const UdrField& f = fields[i];
+			short nullFlag = 0;
+			memcpy(&nullFlag, bytes + f.nullOffset, sizeof(nullFlag));
+			if (nullFlag != 0)
+				argsJson += "null";
+			else
+				appendValue(att, tra, f.type, f.subType, f.scale, f.length, f.charSet,
+					bytes + f.offset, argsJson, nullptr);
+		}
+
+		if (tra)
+			tra->release();
+		if (att)
+			att->release();
+	}
+	argsJson += ']';
+}
+
+bool writeUdrFieldValue(CheckStatusWrapper* status, IExternalContext* context,
+	const UdrField& f, const UdrCell& cell, unsigned char* outBytes, std::string& errHolder)
+{
+	const short nullFlag = cell.isNull ? -1 : 0;
+	memcpy(outBytes + f.nullOffset, &nullFlag, sizeof(nullFlag));
+	if (cell.isNull)
+		return true;
+
+	if (f.type == SQL_BOOLEAN)
+	{
+		const bool b = (cell.text == "true" || cell.text == "TRUE" || cell.text == "1");
+		outBytes[f.offset] = b ? 1 : 0;
+		return true;
+	}
+
+	if (f.type == SQL_BLOB)
+	{
+		if (!context)
+		{
+			errHolder = "JS UDR cannot write BLOB without an external context";
+			setUdrStatusError(status, errHolder.c_str());
+			return false;
+		}
+		IAttachment* att = context->getAttachment(status);
+		ITransaction* tra = context->getTransaction(status);
+		if (!att || !tra)
+		{
+			if (tra) tra->release();
+			if (att) att->release();
+			errHolder = "JS UDR could not acquire attachment/transaction for BLOB output";
+			setUdrStatusError(status, errHolder.c_str());
+			return false;
+		}
+		ISC_QUAD blobId = {0, 0};
+		IBlob* blob = att->createBlob(status, tra, &blobId, 0, nullptr);
+		if (!blob || (status->getState() & IStatus::STATE_ERRORS))
+		{
+			tra->release();
+			att->release();
+			return false;
+		}
+		const char* ptr = cell.text.data();
+		size_t remaining = cell.text.size();
+		while (remaining > 0)
+		{
+			const unsigned chunk = remaining > 32768 ? 32768u : static_cast<unsigned>(remaining);
+			blob->putSegment(status, chunk, ptr);
+			if (status->getState() & IStatus::STATE_ERRORS)
+				break;
+			ptr += chunk;
+			remaining -= chunk;
+		}
+		blob->close(status);
+		blob->release();
+		tra->release();
+		att->release();
+		memcpy(outBytes + f.offset, &blobId, sizeof(blobId));
+		return (status->getState() & IStatus::STATE_ERRORS) == 0;
+	}
+
+	if (cell.text.size() > 0xFFFF)
+	{
+		errHolder = "JS UDR return value exceeds maximum VARCHAR conversion length (65535 bytes)";
+		setUdrStatusError(status, errHolder.c_str());
+		return false;
+	}
+
+	std::vector<unsigned char> source(sizeof(unsigned short) + cell.text.size());
+	const unsigned short textLen = static_cast<unsigned short>(cell.text.size());
+	memcpy(source.data(), &textLen, sizeof(textLen));
+	if (textLen > 0)
+		memcpy(source.data() + sizeof(textLen), cell.text.data(), textLen);
+
+	g_util->convert(status,
+		SQL_VARYING, 0,
+		static_cast<unsigned>(source.size()), source.data(),
+		f.type, f.scale, f.length, outBytes + f.offset);
+
+	return (status->getState() & IStatus::STATE_ERRORS) == 0;
+}
+
+#ifdef __EMSCRIPTEN__
+EM_JS(char*, fb_wasm_invoke_js_udr, (int isProcedure, const char* entryPointPtr, const char* routineNamePtr, const char* argsJsonPtr), {
+	var entryPoint = UTF8ToString(entryPointPtr);
+	var routineName = UTF8ToString(routineNamePtr);
+	var argsJson = UTF8ToString(argsJsonPtr);
+	var handler = typeof globalThis !== "undefined" ? globalThis.__fbJsUdrInvoke : null;
+	var wire = "";
+	if (typeof handler !== "function") {
+		wire = "E:JavaScript UDR runtime handler (__fbJsUdrInvoke) is not registered";
+	} else {
+		try {
+			var res = handler(isProcedure, entryPoint, routineName, argsJson);
+			if (!res || res.ok === false) {
+				wire = "E:" + (res && res.error ? String(res.error) : "JS UDR execution failed");
+			} else if (!isProcedure) {
+				var v = res.value;
+				if (v === null || v === undefined) {
+					wire = "N";
+				} else {
+					var s = typeof v === "boolean" ? (v ? "true" : "false") : String(v);
+					wire = "V:" + s;
+				}
+			} else {
+				var rows = Array.isArray(res.rows) ? res.rows : [];
+				var parts = ["R:" + rows.length + "\n"];
+				for (var r = 0; r < rows.length; r++) {
+					var row = Array.isArray(rows[r]) ? rows[r] : [rows[r]];
+					for (var c = 0; c < row.length; c++) {
+						var cell = row[c];
+						if (cell === null || cell === undefined) {
+							parts.push("N\n");
+						} else {
+							var cs = typeof cell === "boolean" ? (cell ? "true" : "false") : String(cell);
+							var blen = lengthBytesUTF8(cs);
+							parts.push("V:" + blen + ":" + cs + "\n");
+						}
+					}
+				}
+				wire = parts.join("");
+			}
+		} catch (err) {
+			wire = "E:" + (err && err.message ? err.message : String(err));
+		}
+	}
+	var total = lengthBytesUTF8(wire) + 1;
+	var ptr = _malloc(total);
+	if (ptr) {
+		stringToUTF8(wire, ptr, total);
+	}
+	return ptr;
+});
+#else
+char* fb_wasm_invoke_js_udr(int, const char*, const char*, const char*)
+{
+	return allocCString("E:JavaScript UDR engine is only supported in WebAssembly builds");
+}
+#endif
+
+class JsExternalFunction final :
+	public IExternalFunctionImpl<JsExternalFunction, CheckStatusWrapper>
+{
+public:
+	JsExternalFunction(std::string name, std::string entryPoint,
+		std::vector<UdrField> inFields, std::vector<UdrField> outFields)
+		: m_name(std::move(name)),
+		  m_entryPoint(std::move(entryPoint)),
+		  m_inFields(std::move(inFields)),
+		  m_outFields(std::move(outFields))
+	{
+	}
+
+	void dispose() override
+	{
+		delete this;
+	}
+
+	void getCharSet(CheckStatusWrapper* status, IExternalContext* context,
+		char* name, unsigned nameSize) override
+	{
+		(void) status;
+		(void) context;
+		if (name && nameSize > 0)
+		{
+			strncpy(name, "UTF8", nameSize - 1);
+			name[nameSize - 1] = '\0';
+		}
+	}
+
+	void execute(CheckStatusWrapper* status, IExternalContext* context,
+		void* inMsg, void* outMsg) override
+	{
+		std::string argsJson;
+		encodeUdrArgsJson(context, m_inFields, inMsg, argsJson);
+
+		char* raw = fb_wasm_invoke_js_udr(0, m_entryPoint.c_str(), m_name.c_str(), argsJson.c_str());
+		std::string resp(raw ? raw : "E:Out of memory invoking JS function");
+		free(raw);
+
+		if (resp.rfind("E:", 0) == 0)
+		{
+			m_lastError = resp.substr(2);
+			setUdrStatusError(status, m_lastError.c_str());
+			return;
+		}
+
+		if (!m_outFields.empty() && outMsg)
+		{
+			UdrCell cell;
+			if (resp == "N")
+				cell.isNull = true;
+			else if (resp.rfind("V:", 0) == 0)
+			{
+				cell.isNull = false;
+				cell.text = resp.substr(2);
+			}
+			writeUdrFieldValue(status, context, m_outFields[0], cell,
+				static_cast<unsigned char*>(outMsg), m_lastError);
+		}
+	}
+
+private:
+	std::string           m_name;
+	std::string           m_entryPoint;
+	std::vector<UdrField> m_inFields;
+	std::vector<UdrField> m_outFields;
+	std::string           m_lastError;
+};
+
+class JsExternalResultSet final :
+	public IExternalResultSetImpl<JsExternalResultSet, CheckStatusWrapper>
+{
+public:
+	JsExternalResultSet(const std::vector<UdrField>& outFields, void* outMsg,
+		std::vector<std::vector<UdrCell>> rows, IExternalContext* context)
+		: m_outFields(outFields),
+		  m_outMsg(static_cast<unsigned char*>(outMsg)),
+		  m_rows(std::move(rows)),
+		  m_context(context)
+	{
+	}
+
+	void dispose() override
+	{
+		delete this;
+	}
+
+	FB_BOOLEAN fetch(CheckStatusWrapper* status) override
+	{
+		if (m_rowIndex >= m_rows.size())
+			return FB_FALSE;
+
+		const std::vector<UdrCell>& row = m_rows[m_rowIndex++];
+		if (m_outMsg)
+		{
+			for (size_t c = 0; c < m_outFields.size(); ++c)
+			{
+				const UdrCell cell = c < row.size() ? row[c] : UdrCell{true, ""};
+				if (!writeUdrFieldValue(status, m_context, m_outFields[c], cell, m_outMsg, m_lastError))
+					return FB_FALSE;
+			}
+		}
+		return FB_TRUE;
+	}
+
+private:
+	const std::vector<UdrField>&      m_outFields;
+	unsigned char*                    m_outMsg = nullptr;
+	std::vector<std::vector<UdrCell>> m_rows;
+	IExternalContext*                 m_context = nullptr;
+	size_t                            m_rowIndex = 0;
+	std::string                       m_lastError;
+};
+
+class JsExternalProcedure final :
+	public IExternalProcedureImpl<JsExternalProcedure, CheckStatusWrapper>
+{
+public:
+	JsExternalProcedure(std::string name, std::string entryPoint,
+		std::vector<UdrField> inFields, std::vector<UdrField> outFields)
+		: m_name(std::move(name)),
+		  m_entryPoint(std::move(entryPoint)),
+		  m_inFields(std::move(inFields)),
+		  m_outFields(std::move(outFields))
+	{
+	}
+
+	void dispose() override
+	{
+		delete this;
+	}
+
+	void getCharSet(CheckStatusWrapper* status, IExternalContext* context,
+		char* name, unsigned nameSize) override
+	{
+		(void) status;
+		(void) context;
+		if (name && nameSize > 0)
+		{
+			strncpy(name, "UTF8", nameSize - 1);
+			name[nameSize - 1] = '\0';
+		}
+	}
+
+	IExternalResultSet* open(CheckStatusWrapper* status, IExternalContext* context,
+		void* inMsg, void* outMsg) override
+	{
+		if (outMsg)
+		{
+			auto* outBytes = static_cast<unsigned char*>(outMsg);
+			const short nullFlag = -1;
+			for (const UdrField& f : m_outFields)
+				memcpy(outBytes + f.nullOffset, &nullFlag, sizeof(nullFlag));
+		}
+
+		std::string argsJson;
+		encodeUdrArgsJson(context, m_inFields, inMsg, argsJson);
+
+		char* raw = fb_wasm_invoke_js_udr(1, m_entryPoint.c_str(), m_name.c_str(), argsJson.c_str());
+		std::string resp(raw ? raw : "E:Out of memory invoking JS procedure");
+		free(raw);
+
+		if (resp.rfind("E:", 0) == 0)
+		{
+			m_lastError = resp.substr(2);
+			setUdrStatusError(status, m_lastError.c_str());
+			return nullptr;
+		}
+
+		std::vector<std::vector<UdrCell>> rows;
+		if (resp.rfind("R:", 0) == 0)
+		{
+			size_t nl = resp.find('\n', 2);
+			if (nl != std::string::npos)
+			{
+				const unsigned long rowCount = std::strtoul(resp.substr(2, nl - 2).c_str(), nullptr, 10);
+				size_t pos = nl + 1;
+				const size_t colCount = m_outFields.size();
+				rows.reserve(rowCount);
+				for (unsigned long r = 0; r < rowCount; ++r)
+				{
+					std::vector<UdrCell> row(colCount);
+					for (size_t c = 0; c < colCount && pos < resp.size(); ++c)
+					{
+						if (resp.compare(pos, 2, "N\n") == 0)
+						{
+							row[c].isNull = true;
+							pos += 2;
+						}
+						else if (resp.compare(pos, 2, "V:") == 0)
+						{
+							const size_t colon = resp.find(':', pos + 2);
+							if (colon == std::string::npos)
+								break;
+							const unsigned long blen = std::strtoul(resp.substr(pos + 2, colon - (pos + 2)).c_str(), nullptr, 10);
+							const size_t valStart = colon + 1;
+							if (valStart + blen > resp.size())
+								break;
+							row[c].isNull = false;
+							row[c].text = resp.substr(valStart, blen);
+							pos = valStart + blen;
+							if (pos < resp.size() && resp[pos] == '\n')
+								++pos;
+						}
+						else
+						{
+							break;
+						}
+					}
+					rows.push_back(std::move(row));
+				}
+			}
+		}
+
+		return new JsExternalResultSet(m_outFields, outMsg, std::move(rows), context);
+	}
+
+private:
+	std::string           m_name;
+	std::string           m_entryPoint;
+	std::vector<UdrField> m_inFields;
+	std::vector<UdrField> m_outFields;
+	std::string           m_lastError;
+};
+
+class JsExternalEngine final :
+	public IExternalEngineImpl<JsExternalEngine, CheckStatusWrapper>
+{
+public:
+	void addRef() override
+	{
+		++m_refs;
+	}
+
+	int release() override
+	{
+		return --m_refs;
+	}
+
+	void setOwner(IReferenceCounted* r) override
+	{
+		m_owner = r;
+	}
+
+	IReferenceCounted* getOwner() override
+	{
+		return m_owner;
+	}
+
+	void open(CheckStatusWrapper* status, IExternalContext* context,
+		char* charSet, unsigned charSetSize) override
+	{
+		(void) status;
+		(void) context;
+		if (charSet && charSetSize > 0)
+		{
+			strncpy(charSet, "UTF8", charSetSize - 1);
+			charSet[charSetSize - 1] = '\0';
+		}
+	}
+
+	void openAttachment(CheckStatusWrapper* status, IExternalContext* context) override
+	{
+		(void) status;
+		(void) context;
+	}
+
+	void closeAttachment(CheckStatusWrapper* status, IExternalContext* context) override
+	{
+		(void) status;
+		(void) context;
+	}
+
+	IExternalFunction* makeFunction(CheckStatusWrapper* status, IExternalContext* context,
+		IRoutineMetadata* metadata, IMetadataBuilder* inBuilder, IMetadataBuilder* outBuilder) override
+	{
+		(void) context;
+		(void) inBuilder;
+		(void) outBuilder;
+
+		const char* rawName = metadata->getName(status);
+		const char* rawEntry = metadata->getEntryPoint(status);
+		std::string name = rawName ? rawName : "";
+		std::string entry = rawEntry ? rawEntry : name;
+
+		std::vector<UdrField> inFields, outFields;
+		if (!describeUdrMetadata(metadata->getInputMetadata(status), inFields) ||
+		    !describeUdrMetadata(metadata->getOutputMetadata(status), outFields))
+		{
+			setUdrStatusError(status, "JS UDR engine failed to read function metadata");
+			return nullptr;
+		}
+
+		return new JsExternalFunction(std::move(name), std::move(entry),
+			std::move(inFields), std::move(outFields));
+	}
+
+	IExternalProcedure* makeProcedure(CheckStatusWrapper* status, IExternalContext* context,
+		IRoutineMetadata* metadata, IMetadataBuilder* inBuilder, IMetadataBuilder* outBuilder) override
+	{
+		(void) context;
+		(void) inBuilder;
+		(void) outBuilder;
+
+		const char* rawName = metadata->getName(status);
+		const char* rawEntry = metadata->getEntryPoint(status);
+		std::string name = rawName ? rawName : "";
+		std::string entry = rawEntry ? rawEntry : name;
+
+		std::vector<UdrField> inFields, outFields;
+		if (!describeUdrMetadata(metadata->getInputMetadata(status), inFields) ||
+		    !describeUdrMetadata(metadata->getOutputMetadata(status), outFields))
+		{
+			setUdrStatusError(status, "JS UDR engine failed to read procedure metadata");
+			return nullptr;
+		}
+
+		return new JsExternalProcedure(std::move(name), std::move(entry),
+			std::move(inFields), std::move(outFields));
+	}
+
+	IExternalTrigger* makeTrigger(CheckStatusWrapper* status, IExternalContext* context,
+		IRoutineMetadata* metadata, IMetadataBuilder* fieldsBuilder) override
+	{
+		(void) context;
+		(void) metadata;
+		(void) fieldsBuilder;
+		setUdrStatusError(status, "JS UDR triggers are not supported");
+		return nullptr;
+	}
+
+private:
+	std::atomic<int>   m_refs{1};
+	IReferenceCounted* m_owner = nullptr;
+};
+
+JsExternalEngine g_jsExternalEngine;
+
+class JsExternalEngineFactory final :
+	public IPluginFactoryImpl<JsExternalEngineFactory, CheckStatusWrapper>
+{
+public:
+	IPluginBase* createPlugin(CheckStatusWrapper* status, IPluginConfig* factoryParameter) override
+	{
+		(void) status;
+		(void) factoryParameter;
+		g_jsExternalEngine.addRef();
+		return &g_jsExternalEngine;
+	}
+};
+
+JsExternalEngineFactory g_jsExternalEngineFactory;
+
+void registerJsExternalEngine()
+{
+	if (!g_master)
+		return;
+	IPluginManager* pm = g_master->getPluginManager();
+	if (pm)
+	{
+		pm->registerPluginFactory(
+			IPluginManager::TYPE_EXTERNAL_ENGINE, "JS", &g_jsExternalEngineFactory);
+	}
+	return;
+}
+
 /**
  * Read a prepared statement's result set and serialise it to JSON.
  *
@@ -3292,6 +3909,7 @@ int fb_init(void)
 	// is the plugin's own entry point, called directly rather than by the
 	// plugin loader; no Firebird source change is involved.
 	FB_PLUGIN_ENTRY_POINT(g_master);
+	registerJsExternalEngine();
 
 	g_provider = locateProvider();
 	if (!g_provider)

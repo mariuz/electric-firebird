@@ -887,4 +887,83 @@ describe('wasmGlueFile', () => {
       await db.close();
     }
   });
+
+  it('registers and executes JavaScript user-defined functions (db.registerFunction) and procedures (db.registerProcedure)', async () => {
+    const db = new FirebirdBrowser('memory://st-js-udr', {
+      transport: new DirectTransport({ threads: false }),
+    });
+    try {
+      const slugifyRoutine = await db.registerFunction(
+        'SLUGIFY',
+        { args: ['VARCHAR(200)'], returns: 'VARCHAR(200)', deterministic: true },
+        (s: unknown) =>
+          typeof s === 'string'
+            ? s
+                .toLowerCase()
+                .replace(/[^a-z0-9]+/g, '-')
+                .replace(/^-|-$/g, '')
+            : null,
+      );
+      expect(slugifyRoutine.name).toBe('SLUGIFY');
+      expect(slugifyRoutine.kind).toBe('function');
+
+      // 1. Direct scalar call in SELECT FROM RDB$DATABASE
+      const rdbRes = await db.query<{ SLUG: string }>(
+        "SELECT SLUGIFY('Hello Firebird WASM!') AS SLUG FROM RDB$DATABASE",
+      );
+      expect(rdbRes.rows).toEqual([{ SLUG: 'hello-firebird-wasm' }]);
+
+      // 2. Table with COMPUTED BY expression referencing the JS function
+      await db.exec(
+        'CREATE TABLE blog_posts (id INTEGER NOT NULL PRIMARY KEY, title VARCHAR(200), slug COMPUTED BY (SLUGIFY(title)))',
+      );
+      await db.exec("INSERT INTO blog_posts (id, title) VALUES (1, 'First Post: Hello World!')");
+      await db.exec("INSERT INTO blog_posts (id, title) VALUES (2, 'JavaScript UDRs in Firebird 5.0')");
+
+      // 3. SELECT & WHERE using both the COMPUTED BY column and direct SLUGIFY(title) calls
+      const postRes = await db.query<{ ID: number; TITLE: string; SLUG: string }>(
+        "SELECT id, title, slug FROM blog_posts WHERE SLUGIFY(title) = 'javascript-udrs-in-firebird-5-0'",
+      );
+      expect(postRes.rows).toEqual([
+        {
+          ID: 2,
+          TITLE: 'JavaScript UDRs in Firebird 5.0',
+          SLUG: 'javascript-udrs-in-firebird-5-0',
+        },
+      ]);
+
+      // 4. Selectable table-valued JS procedure via db.registerProcedure
+      const splitRoutine = await db.registerProcedure(
+        'SPLIT_CSV',
+        {
+          args: ['VARCHAR(200)'],
+          returns: [
+            { name: 'IDX', type: 'INTEGER' },
+            { name: 'PART', type: 'VARCHAR(100)' },
+          ],
+        },
+        (csv: unknown) =>
+          String(csv ?? '')
+            .split(',')
+            .map((part, idx) => ({ IDX: idx + 1, PART: part.trim() })),
+      );
+      expect(splitRoutine.name).toBe('SPLIT_CSV');
+      expect(splitRoutine.kind).toBe('procedure');
+
+      const procRows = await db.query<{ IDX: number; PART: string }>(
+        "SELECT IDX, PART FROM SPLIT_CSV('alpha, beta, gamma') WHERE IDX >= 2 ORDER BY IDX",
+      );
+      expect(procRows.rows).toEqual([
+        { IDX: 2, PART: 'beta' },
+        { IDX: 3, PART: 'gamma' },
+      ]);
+
+      // 5. Unregister routines cleanly
+      await db.exec('DROP TABLE blog_posts');
+      await slugifyRoutine.unregister();
+      await splitRoutine.unregister();
+    } finally {
+      await db.close();
+    }
+  });
 });

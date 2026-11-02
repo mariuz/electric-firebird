@@ -925,3 +925,141 @@ export interface CopyResult {
   /** Resolved target column names in insertion order. */
   columns: string[];
 }
+
+/**
+ * Input parameter definition for a JavaScript UDR function or procedure
+ * (`db.registerFunction` / `db.registerProcedure`).
+ *
+ * May be passed as a SQL type string (e.g. `'VARCHAR(200)'`, `'INTEGER'`) or
+ * as an object `{ name?: string; type: string }`.
+ */
+export type JsUdrArgDefinition =
+  | string
+  | {
+      /** Parameter name in DDL (defaults to `P1`, `P2`, ...). */
+      name?: string;
+      /** SQL type declaration (e.g. `'VARCHAR(200)'`, `'INTEGER'`, `'DOUBLE PRECISION'`). */
+      type: string;
+    };
+
+/**
+ * Output column definition for a JavaScript UDR procedure (`RETURNS (...)`).
+ *
+ * May be passed as a SQL type string (e.g. `'VARCHAR(200)'`, `'INTEGER'`) or
+ * as an object `{ name?: string; type: string }`.
+ */
+export type JsUdrOutputColumnDefinition =
+  | string
+  | {
+      /** Output column name in DDL (defaults to `OUT1`, `OUT2`, ...). */
+      name?: string;
+      /** SQL type declaration (e.g. `'VARCHAR(200)'`, `'INTEGER'`). */
+      type: string;
+    };
+
+/**
+ * Options for `db.registerFunction(name, options, fn)`.
+ */
+export interface RegisterFunctionOptions {
+  /**
+   * SQL argument types (e.g. `['VARCHAR(200)', 'INTEGER']` or
+   * `[{ name: 'input', type: 'VARCHAR(200)' }]`).
+   *
+   * When omitted, defaults to `fn.length` parameters of type `'VARCHAR(4096)'`.
+   */
+  args?: readonly JsUdrArgDefinition[];
+  /**
+   * SQL return type (e.g. `'VARCHAR(200)'`, `'INTEGER'`, `'DOUBLE PRECISION'`, `'BOOLEAN'`).
+   *
+   * @default 'VARCHAR(4096)'
+   */
+  returns?: string;
+  /**
+   * Mark the function as `DETERMINISTIC` in Firebird DDL.
+   *
+   * @default false
+   */
+  deterministic?: boolean;
+  /**
+   * Replace an existing function of the same name (`CREATE OR ALTER FUNCTION`).
+   *
+   * @default true
+   */
+  replace?: boolean;
+  /**
+   * Optional custom `EXTERNAL NAME` entry point identifier.
+   * Defaults to the normalized function name.
+   */
+  entryPoint?: string;
+}
+
+/**
+ * Options for `db.registerProcedure(name, options, fn)`.
+ */
+export interface RegisterProcedureOptions {
+  /**
+   * SQL input parameter definitions (e.g. `['INTEGER', 'VARCHAR(100)']` or
+   * `[{ name: 'limit_n', type: 'INTEGER' }]`).
+   *
+   * When omitted, defaults to `fn.length` parameters of type `'VARCHAR(4096)'`.
+   */
+  args?: readonly JsUdrArgDefinition[];
+  /**
+   * SQL output column definitions for selectable or executable procedures
+   * (e.g. `[{ name: 'ID', type: 'INTEGER' }, { name: 'TOKEN', type: 'VARCHAR(100)' }]`
+   * or `['INTEGER', 'VARCHAR(100)']`).
+   *
+   * Defaults to `[]` (void executable procedure).
+   */
+  returns?: readonly JsUdrOutputColumnDefinition[];
+  /**
+   * Replace an existing procedure of the same name (`CREATE OR ALTER PROCEDURE`).
+   *
+   * @default true
+   */
+  replace?: boolean;
+  /**
+   * Optional custom `EXTERNAL NAME` entry point identifier.
+   * Defaults to the normalized procedure name.
+   */
+  entryPoint?: string;
+}
+
+/**
+ * Callback signature for a JavaScript user-defined scalar function.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type JsFunctionHandler = (...args: any[]) => unknown;
+
+/**
+ * Callback signature for a JavaScript user-defined procedure.
+ *
+ * May return:
+ * - `void` / `undefined` / `null` (0 output rows),
+ * - an array or iterable of row objects (`Record<string, unknown>`) or positional tuples (`unknown[]`), or
+ * - a single row object (`Record<string, unknown>`).
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type JsProcedureHandler = (...args: any[]) => unknown;
+
+/**
+ * Handle returned by `db.registerFunction()` and `db.registerProcedure()`.
+ */
+export interface RegisteredRoutine {
+  /** Normalized SQL routine name. */
+  readonly name: string;
+  /** Routine kind (`'function'` or `'procedure'`). */
+  readonly kind: 'function' | 'procedure';
+  /** External entry point identifier. */
+  readonly entryPoint: string;
+  /**
+   * Execution mode:
+   * - `'wasm-js'`: executed natively inside Firebird's C++ `"JS"` `IExternalEngine` plugin.
+   * - `'psql-bridge'`: cataloged as a PSQL routine and evaluated by the JS SQL bridge.
+   */
+  readonly engine: 'wasm-js' | 'psql-bridge';
+  /** Drop the routine from the database catalog and unregister its JavaScript callback. */
+  unregister(): Promise<void>;
+  /** Alias for `unregister()` supporting `await using`. */
+  [Symbol.asyncDispose](): Promise<void>;
+}

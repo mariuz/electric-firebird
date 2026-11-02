@@ -57,6 +57,14 @@ import {
 import { applyTypes, applySerializers } from './browser/value-types';
 import { buildCopyToStream, executeCopyFromStream } from './browser/copy-stream';
 import { introspect as introspectSchema, migrate as runMigrations } from './browser/schema';
+import { UdrManager } from './browser/udr';
+import type {
+  JsFunctionHandler,
+  JsProcedureHandler,
+  RegisterFunctionOptions,
+  RegisterProcedureOptions,
+  RegisteredRoutine,
+} from './types';
 import {
   BLOB_INTERNAL_DATA,
   type InternalBlobHandle,
@@ -295,6 +303,7 @@ export class FirebirdLite {
   /** Statements kept prepared by their SQL text, once connected (`statementCache`). */
   private statements: StatementCache | null = null;
   private readonly preparedStatements = new Set<PreparedStatement>();
+  private readonly udr = new UdrManager();
   private readonly types: TypeOptions | undefined;
 
   constructor(dbPath: string, options: FirebirdLiteOptions = {}) {
@@ -437,6 +446,23 @@ export class FirebirdLite {
 
     await this.ensureReady();
     const rowMode: RowMode = queryOpts.rowMode ?? 'object';
+    if (this.udr.hasBridgeRoutines) {
+      const rewritten = await this.udr.rewriteStatement(
+        statement.sql,
+        this.serialize(statement.params),
+      );
+      statement.sql = rewritten.sql;
+      statement.params = rewritten.params;
+      const intercepted = await this.udr.queryIfIntercepted<T>(
+        statement.sql,
+        statement.params,
+        rowMode,
+        this.createUdrExecutor(),
+      );
+      if (intercepted) {
+        return applyTypes(intercepted, this.types, rowMode);
+      }
+    }
     const attachment = this.attachment!;
 
     if (
@@ -945,6 +971,94 @@ export class FirebirdLite {
   }
 
   /**
+   * Register a JavaScript scalar User-Defined Function (UDF) in Firebird.
+   */
+  registerFunction(
+    name: string,
+    fn: JsFunctionHandler,
+  ): Promise<RegisteredRoutine>;
+  registerFunction(
+    name: string,
+    options: RegisterFunctionOptions,
+    fn: JsFunctionHandler,
+  ): Promise<RegisteredRoutine>;
+  async registerFunction(
+    name: string,
+    optionsOrFn: RegisterFunctionOptions | JsFunctionHandler,
+    maybeFn?: JsFunctionHandler,
+  ): Promise<RegisteredRoutine> {
+    await this.ensureReady();
+    if (typeof optionsOrFn !== 'function' && typeof maybeFn !== 'function') {
+      throw new TypeError('registerFunction requires a callback function');
+    }
+    return this.udr.registerFunction(
+      name,
+      optionsOrFn,
+      maybeFn,
+      this.createUdrExecutor(),
+    );
+  }
+
+  /**
+   * Unregister a previously registered JavaScript scalar function.
+   */
+  async unregisterFunction(name: string): Promise<void> {
+    if (this.closed) return;
+    await this.ensureReady();
+    await this.udr.unregisterFunction(name, this.createUdrExecutor());
+  }
+
+  /**
+   * Register a JavaScript User-Defined Procedure (UDP) in Firebird.
+   */
+  registerProcedure(
+    name: string,
+    fn: JsProcedureHandler,
+  ): Promise<RegisteredRoutine>;
+  registerProcedure(
+    name: string,
+    options: RegisterProcedureOptions,
+    fn: JsProcedureHandler,
+  ): Promise<RegisteredRoutine>;
+  async registerProcedure(
+    name: string,
+    optionsOrFn: RegisterProcedureOptions | JsProcedureHandler,
+    maybeFn?: JsProcedureHandler,
+  ): Promise<RegisteredRoutine> {
+    await this.ensureReady();
+    if (typeof optionsOrFn !== 'function' && typeof maybeFn !== 'function') {
+      throw new TypeError('registerProcedure requires a callback function');
+    }
+    return this.udr.registerProcedure(
+      name,
+      optionsOrFn,
+      maybeFn,
+      this.createUdrExecutor(),
+    );
+  }
+
+  /**
+   * Unregister a previously registered JavaScript stored procedure.
+   */
+  async unregisterProcedure(name: string): Promise<void> {
+    if (this.closed) return;
+    await this.ensureReady();
+    await this.udr.unregisterProcedure(name, this.createUdrExecutor());
+  }
+
+  private createUdrExecutor() {
+    return {
+      isDirect: false,
+      exec: (sql: string, params: QueryParams = []) => this.exec(sql, params),
+      query: <R extends Row = Row>(
+        sql: string,
+        params: QueryParams = [],
+        opts?: { rowMode?: RowMode },
+      ) => this.query<R>(sql, params, opts),
+    };
+  }
+
+  /**
    * Trigger an immediate database garbage-collection sweep, scanning user
    * tables to collect old record versions and advancing OIT/OAT counters.
    */
@@ -1406,6 +1520,9 @@ export class FirebirdLite {
       () => this.endReadTransaction(),
       this.statements ?? undefined,
       this.types,
+      undefined,
+      undefined,
+      this.udr,
     );
 
     let result: T;
@@ -1744,6 +1861,7 @@ export class FirebirdLite {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    this.udr.clear();
 
     await this.endReadTransaction();
     for (const stmt of [...this.preparedStatements]) {
@@ -1789,6 +1907,7 @@ export class FirebirdTransaction {
     private readonly types?: TypeOptions,
     readonly savepointName?: string,
     private readonly parent?: FirebirdTransaction,
+    private readonly udr?: UdrManager,
     nextSavepointId?: () => number,
   ) {
     if (nextSavepointId) {
@@ -1894,6 +2013,7 @@ export class FirebirdTransaction {
       this.types,
       name,
       this,
+      this.udr,
       this.nextSavepointId,
     );
 
@@ -1954,6 +2074,16 @@ export class FirebirdTransaction {
     const statement = toStatement(sql, params);
     const serialized = this.serialize(statement.params);
     const hasTimeout = options.timeoutMs !== undefined && options.timeoutMs > 0;
+    this.udr?.inspectDdl(statement.sql);
+    if (this.udr?.hasBridgeRoutines) {
+      const intercepted = await this.udr.executeIfIntercepted(statement.sql, serialized);
+      if (intercepted.intercepted) {
+        return;
+      }
+      const rewritten = await this.udr.rewriteStatement(statement.sql, serialized);
+      statement.sql = rewritten.sql;
+      serialized.splice(0, serialized.length, ...rewritten.params);
+    }
     // With the cache off, a statement without parameters runs as it always
     // did. With it on, every statement goes through the cache, which is also
     // what sees DDL coming and empties itself first.
@@ -2129,6 +2259,28 @@ export class FirebirdTransaction {
     const statement = toStatement(sql, params);
     const serialized = this.serialize(statement.params);
     const rowMode = options.rowMode ?? 'object';
+    if (this.udr?.hasBridgeRoutines) {
+      const rewritten = await this.udr.rewriteStatement(statement.sql, serialized);
+      statement.sql = rewritten.sql;
+      serialized.splice(0, serialized.length, ...rewritten.params);
+      const intercepted = await this.udr.queryIfIntercepted<T>(
+        statement.sql,
+        serialized,
+        rowMode,
+        {
+          isDirect: false,
+          exec: (s: string, p: QueryParams = []) => this.exec(s, p),
+          query: <R extends Row = Row>(
+            s: string,
+            p: QueryParams = [],
+            o?: { rowMode?: RowMode },
+          ) => this.query<R>(s, p, { ...options, rowMode: o?.rowMode ?? 'object' }),
+        },
+      );
+      if (intercepted) {
+        return applyTypes(intercepted, this.types, rowMode);
+      }
+    }
 
     const lease = await this.statements.acquire(this.transaction, statement.sql);
     const stmt = lease.stmt;

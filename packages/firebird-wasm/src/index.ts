@@ -43,6 +43,19 @@ export {
   generateKyselyTypesFromCatalog,
   resolveSchemaIntrospection,
 } from './browser/codegen';
+export {
+  UdrManager,
+  invokeGlobalJsUdr,
+  normalizeRoutineIdentifier,
+  normalizeSqlTypeDeclaration,
+  sqlTypeToFieldInfo,
+  coerceValueToSqlType,
+  buildFunctionExternalDdl,
+  buildFunctionPsqlStubDdl,
+  buildProcedureExternalDdl,
+  buildProcedurePsqlStubDdl,
+} from './browser/udr';
+export type { UdrSqlExecutor } from './browser/udr';
 export type {
   CodegenIdentifierCase,
   DrizzleCodegenOptions,
@@ -111,6 +124,13 @@ export type {
   ArrayRow,
   TransactionOptions,
   IsolationLevel,
+  JsUdrArgDefinition,
+  JsUdrOutputColumnDefinition,
+  RegisterFunctionOptions,
+  RegisterProcedureOptions,
+  JsFunctionHandler,
+  JsProcedureHandler,
+  RegisteredRoutine,
 } from './types';
 
 // WASM loader (available on all platforms)

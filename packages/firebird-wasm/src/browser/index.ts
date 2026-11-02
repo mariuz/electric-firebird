@@ -65,6 +65,19 @@ export {
   generateKyselyTypesFromCatalog,
   resolveSchemaIntrospection,
 } from './codegen';
+export {
+  UdrManager,
+  invokeGlobalJsUdr,
+  normalizeRoutineIdentifier,
+  normalizeSqlTypeDeclaration,
+  sqlTypeToFieldInfo,
+  coerceValueToSqlType,
+  buildFunctionExternalDdl,
+  buildFunctionPsqlStubDdl,
+  buildProcedureExternalDdl,
+  buildProcedurePsqlStubDdl,
+} from './udr';
+export type { UdrSqlExecutor } from './udr';
 export type {
   CodegenIdentifierCase,
   DrizzleCodegenOptions,
@@ -190,4 +203,11 @@ export type {
   ArrayRow,
   TransactionOptions,
   IsolationLevel,
+  JsUdrArgDefinition,
+  JsUdrOutputColumnDefinition,
+  RegisterFunctionOptions,
+  RegisterProcedureOptions,
+  JsFunctionHandler,
+  JsProcedureHandler,
+  RegisteredRoutine,
 } from '../types';

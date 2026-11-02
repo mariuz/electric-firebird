@@ -55,6 +55,7 @@ import { SharedEngineTransport } from './shared-transport';
 import type { DatabaseLock } from './db-lock';
 import { toStatement, resolveQueryCall, resolveBatchSize } from '../sql-tag';
 import type { SqlFragment, Statement } from '../sql-tag';
+import { UdrManager } from './udr';
 import type {
   ArrayRow,
   QueryResult,
@@ -75,6 +76,11 @@ import type {
   BlobHandle,
   BlobWritableStream,
   MigrateResult,
+  JsFunctionHandler,
+  JsProcedureHandler,
+  RegisterFunctionOptions,
+  RegisterProcedureOptions,
+  RegisteredRoutine,
   QueryOptions,
   QueryStreamOptions,
   StatementExecutionOptions,
@@ -519,6 +525,8 @@ export class FirebirdBrowser {
   private readonly preparedStatements = new Set<PreparedStatement>();
   /** Per-table auto-installed live trigger promises (table -> event name). */
   private readonly liveTriggerPromises = new Map<string, Promise<string>>();
+  /** JavaScript user-defined functions & procedures registry. */
+  private readonly udr = new UdrManager();
   /** Set only in shared mode; owns the election and the channel. */
   private shared: SharedEngineTransport | null = null;
 
@@ -695,6 +703,23 @@ export class FirebirdBrowser {
     const results: ExecResult[] = [];
 
     for (const statement of statements) {
+      this.udr.inspectDdl(statement.sql);
+      if (this.udr.hasBridgeRoutines) {
+        const intercepted = await this.udr.executeIfIntercepted(
+          statement.sql,
+          script.params,
+        );
+        if (intercepted.intercepted) {
+          results.push({ affectedRows: intercepted.affectedRows });
+          continue;
+        }
+        const rewritten = await this.udr.rewriteStatement(
+          statement.sql,
+          script.params,
+        );
+        statement.sql = rewritten.sql;
+        script.params = rewritten.params;
+      }
       assertNotAborted(options.signal);
       if (/^\s*(DROP|RECREATE)\b/i.test(statement.sql)) {
         this.liveTriggerPromises.clear();
@@ -828,6 +853,23 @@ export class FirebirdBrowser {
     // travel. Same result for the caller, without the base64 round trip.
     const binaryBlobs = this.options.types?.binary === true;
 
+    if (this.udr.hasBridgeRoutines) {
+      const rewritten = await this.udr.rewriteStatement(
+        statement.sql,
+        statement.params,
+      );
+      statement.sql = rewritten.sql;
+      statement.params = rewritten.params;
+      const intercepted = await this.udr.queryIfIntercepted<T>(
+        statement.sql,
+        statement.params,
+        rowMode,
+        this.createUdrExecutor(0),
+      );
+      if (intercepted) {
+        return applyTypes(intercepted, this.options.types, rowMode);
+      }
+    }
     if (!hasTransactionOptions(queryOpts)) {
       const raw = await runWithCancellation(
         async () => {
@@ -1545,6 +1587,126 @@ export class FirebirdBrowser {
   }
 
   /**
+   * Register a JavaScript scalar function callable inside SQL `SELECT`,
+   * `WHERE`, and `COMPUTED BY` expressions.
+   *
+   * ```ts
+   * await db.registerFunction(
+   *   'SLUGIFY',
+   *   { args: ['VARCHAR(200)'], returns: 'VARCHAR(200)' },
+   *   (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, ''),
+   * );
+   * const res = await db.query("SELECT SLUGIFY('Hello World!') AS SLUG FROM RDB$DATABASE");
+   * ```
+   */
+  async registerFunction(
+    name: string,
+    fn: JsFunctionHandler,
+  ): Promise<RegisteredRoutine>;
+  async registerFunction(
+    name: string,
+    options: RegisterFunctionOptions,
+    fn: JsFunctionHandler,
+  ): Promise<RegisteredRoutine>;
+  async registerFunction(
+    name: string,
+    optionsOrFn: RegisterFunctionOptions | JsFunctionHandler,
+    maybeFn?: JsFunctionHandler,
+  ): Promise<RegisteredRoutine> {
+    if (this.closed) {
+      throw new Error('FirebirdBrowser instance has been closed');
+    }
+    await this.ensureReady();
+    const handle = await this.udr.registerFunction(
+      name,
+      optionsOrFn,
+      maybeFn,
+      this.createUdrExecutor(0),
+    );
+    this.markDirty();
+    return handle;
+  }
+
+  /**
+   * Register a JavaScript table-valued or executable procedure callable inside
+   * SQL `SELECT * FROM <name>(...)` and `EXECUTE PROCEDURE <name>(...)`.
+   */
+  async registerProcedure(
+    name: string,
+    fn: JsProcedureHandler,
+  ): Promise<RegisteredRoutine>;
+  async registerProcedure(
+    name: string,
+    options: RegisterProcedureOptions,
+    fn: JsProcedureHandler,
+  ): Promise<RegisteredRoutine>;
+  async registerProcedure(
+    name: string,
+    optionsOrFn: RegisterProcedureOptions | JsProcedureHandler,
+    maybeFn?: JsProcedureHandler,
+  ): Promise<RegisteredRoutine> {
+    if (this.closed) {
+      throw new Error('FirebirdBrowser instance has been closed');
+    }
+    await this.ensureReady();
+    const handle = await this.udr.registerProcedure(
+      name,
+      optionsOrFn,
+      maybeFn,
+      this.createUdrExecutor(0),
+    );
+    this.markDirty();
+    return handle;
+  }
+
+  /**
+   * Unregister a JavaScript user-defined function and drop it from the catalog.
+   */
+  async unregisterFunction(name: string): Promise<void> {
+    if (this.closed) return;
+    await this.ensureReady();
+    await this.udr.unregisterFunction(name, this.createUdrExecutor(0));
+    this.markDirty();
+  }
+
+  /**
+   * Unregister a JavaScript user-defined procedure and drop it from the catalog.
+   */
+  async unregisterProcedure(name: string): Promise<void> {
+    if (this.closed) return;
+    await this.ensureReady();
+    await this.udr.unregisterProcedure(name, this.createUdrExecutor(0));
+    this.markDirty();
+  }
+
+  private createUdrExecutor(txHandle: EngineHandle) {
+    const binaryBlobs = this.options.types?.binary === true;
+    return {
+      isDirect: this.engine instanceof DirectTransport,
+      query: <T extends Row = Row>(
+        sql: string,
+        params: QueryParams = [],
+        opts?: { rowMode?: RowMode },
+      ) =>
+        this.engine.query<T>(
+          this.dbHandle,
+          txHandle,
+          sql,
+          this.serialize(params),
+          opts?.rowMode ?? 'object',
+          binaryBlobs,
+        ),
+      exec: (sql: string, params: QueryParams = []) =>
+        this.engine.execute(
+          this.dbHandle,
+          txHandle,
+          sql,
+          this.serialize(params),
+        ),
+    };
+  }
+
+  /**
    * Prepare a SQL statement explicitly and return a reusable
    * {@link PreparedStatement} handle exposing `fields`, `params`, `query()`,
    * `exec()`, `execBatch()`, and `close()`.
@@ -1760,6 +1922,10 @@ export class FirebirdBrowser {
       this.dbHandle,
       txHandle,
       this.options.types,
+      undefined,
+      undefined,
+      undefined,
+      this.udr,
     );
 
     let result: T;
@@ -2289,6 +2455,8 @@ export class FirebirdBrowser {
 
     this.closed = true;
     this.liveTriggerPromises.clear();
+    this.udr.clear();
+    this.liveTriggerPromises.clear();
 
     if (this.dbHandle) {
       // Persist before closing.
@@ -2589,6 +2757,7 @@ export class FirebirdBrowserTransaction {
     readonly savepointName?: string,
     private readonly parent?: FirebirdBrowserTransaction,
     nextSavepointId?: () => number,
+    private readonly udr?: UdrManager,
   ) {
     if (nextSavepointId) {
       this.nextSavepointId = nextSavepointId;
@@ -2696,6 +2865,7 @@ export class FirebirdBrowserTransaction {
       name,
       this,
       this.nextSavepointId,
+      this.udr,
     );
 
     let result: T;
@@ -2769,6 +2939,37 @@ export class FirebirdBrowserTransaction {
     maybeOptions: StatementExecutionOptions = {},
   ): Promise<ExecResult> {
     this.assertUsable();
+    const rawParams = Array.isArray(paramsOrOptions) ? paramsOrOptions : [];
+    const execOpts = Array.isArray(paramsOrOptions)
+      ? maybeOptions
+      : (paramsOrOptions ?? {});
+    const stmt = toStatement(sql, rawParams);
+    if (this.udr) {
+      this.udr.inspectDdl(stmt.sql);
+      if (this.udr.hasBridgeRoutines) {
+        const intercepted = await this.udr.executeIfIntercepted(
+          stmt.sql,
+          stmt.params,
+        );
+        if (intercepted.intercepted) {
+          return { affectedRows: intercepted.affectedRows };
+        }
+        const rewritten = await this.udr.rewriteStatement(
+          stmt.sql,
+          stmt.params,
+        );
+        return this.finishTxExec(rewritten.sql, rewritten.params, execOpts);
+      }
+    }
+    return this.finishTxExec(stmt.sql, stmt.params, execOpts);
+  }
+
+  private async finishTxExec(
+    sql: string | SqlFragment,
+    paramsOrOptions: QueryParams | StatementExecutionOptions = [],
+    maybeOptions: StatementExecutionOptions = {},
+  ): Promise<ExecResult> {
+    this.assertUsable();
     const params = Array.isArray(paramsOrOptions) ? paramsOrOptions : [];
     const options = Array.isArray(paramsOrOptions)
       ? maybeOptions
@@ -2825,6 +3026,58 @@ export class FirebirdBrowserTransaction {
     options?: { rowMode?: RowMode } & StatementExecutionOptions,
   ): Promise<QueryResult<T>>;
   async query<T = Row>(
+    sql: string | SqlFragment,
+    params: QueryParams = [],
+    options: { rowMode?: RowMode } & StatementExecutionOptions = {},
+  ): Promise<QueryResult<T>> {
+    this.assertUsable();
+    assertNotAborted(options.signal);
+    validateTimeoutMs(options.timeoutMs);
+    const statement = toStatement(sql, params);
+    const rowMode = options.rowMode ?? 'object';
+    if (this.udr && this.udr.hasBridgeRoutines) {
+      const rewritten = await this.udr.rewriteStatement(
+        statement.sql,
+        statement.params,
+      );
+      statement.sql = rewritten.sql;
+      statement.params = rewritten.params;
+      const intercepted = await this.udr.queryIfIntercepted<T>(
+        statement.sql,
+        statement.params,
+        rowMode,
+        {
+          isDirect: this.engine instanceof DirectTransport,
+          query: <R extends Row = Row>(
+            s: string,
+            p: QueryParams = [],
+            o?: { rowMode?: RowMode },
+          ) =>
+            this.engine.query<R>(
+              this.dbHandle,
+              this.txHandle,
+              s,
+              applySerializers(p, this.types?.serializers),
+              o?.rowMode ?? 'object',
+              this.types?.binary === true,
+            ),
+          exec: (s: string, p: QueryParams = []) =>
+            this.engine.execute(
+              this.dbHandle,
+              this.txHandle,
+              s,
+              applySerializers(p, this.types?.serializers),
+            ),
+        },
+      );
+      if (intercepted) {
+        return applyTypes(intercepted, this.types, rowMode);
+      }
+    }
+    return this.finishTxQuery<T>(statement.sql, statement.params, options);
+  }
+
+  private async finishTxQuery<T = Row>(
     sql: string | SqlFragment,
     params: QueryParams = [],
     options: { rowMode?: RowMode } & StatementExecutionOptions = {},
