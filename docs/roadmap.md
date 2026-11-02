@@ -1355,7 +1355,7 @@ Next-horizon milestones for `v0.15.0`:
       Register a static `"JS"` `IExternalEngine` plugin in `fb_wasm_api.cpp` so
       applications can register JavaScript functions and procedures callable
       directly inside SQL `SELECT`, `WHERE`, and `COMPUTED BY` expressions.
-- [ ] **Client-Side Vector Similarity & Hybrid Search (`firebird-wasm/vector`).**
+- [x] **Client-Side Vector Similarity & Hybrid Search (`firebird-wasm/vector`).**
       Provide `cosineDistance`, `l2Distance`, and `dotProduct` over packed
       `Float32Array` embeddings stored in `BINARY(N)` / `BLOB` columns for
       local semantic search and RAG in the browser and Node.

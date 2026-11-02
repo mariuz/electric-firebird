@@ -56,6 +56,30 @@ export {
   buildProcedurePsqlStubDdl,
 } from './browser/udr';
 export type { UdrSqlExecutor } from './browser/udr';
+export {
+  encodeVector,
+  decodeVector,
+  formatVectorText,
+  vectorColumnType,
+  vectorNorm,
+  normalizeVector,
+  dotProduct,
+  innerProductDistance,
+  squaredL2Distance,
+  l2Distance,
+  cosineSimilarity,
+  cosineDistance,
+  registerVectorFunctions,
+  vectorSearch,
+} from './vector';
+export type {
+  VectorDistanceMetric,
+  VectorInput,
+  VectorDatabaseExecutor,
+  RegisterVectorFunctionsOptions,
+  VectorSearchOptions,
+  VectorSearchRow,
+} from './vector';
 export type {
   CodegenIdentifierCase,
   DrizzleCodegenOptions,

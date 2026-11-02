@@ -21,6 +21,12 @@ import { DirectTransport } from '../browser/engine-transport';
 import { buildIcuLocalePack, ICU_LOCALE_DATA_PATH } from '../browser/icu-locales';
 import { compressGzipStream, createChunkedByteStream } from '../browser/data-stream';
 import { createWriteQueue, WriteRejected, DEFAULT_WRITE_QUEUE_TABLE } from '../electric';
+import {
+  encodeVector,
+  formatVectorText,
+  registerVectorFunctions,
+  vectorSearch,
+} from '../vector';
 
 const ST_JS_PATH = path.resolve(__dirname, '../../dist/wasm/firebird-embedded-st.js');
 const hasSingleThread = fs.existsSync(ST_JS_PATH);
@@ -962,6 +968,69 @@ describe('wasmGlueFile', () => {
       await db.exec('DROP TABLE blog_posts');
       await slugifyRoutine.unregister();
       await splitRoutine.unregister();
+    } finally {
+      await db.close();
+    }
+  });
+
+  it('performs client-side vector similarity & hybrid RAG search (firebird-wasm/vector) over VARBINARY/BLOB embeddings', async () => {
+    const db = new FirebirdBrowser('memory://st-vector-search', {
+      transport: new DirectTransport({ threads: false }),
+    });
+    try {
+      const routines = await registerVectorFunctions(db);
+      expect(routines.length).toBeGreaterThanOrEqual(7);
+
+      await db.exec(
+        'CREATE TABLE rag_chunks (id INTEGER NOT NULL PRIMARY KEY, topic VARCHAR(40), title VARCHAR(200), embedding VARBINARY(12))',
+      );
+      await db.exec('INSERT INTO rag_chunks VALUES (?, ?, ?, ?)', [
+        1,
+        'wasm',
+        'Firebird Embedded in WebAssembly',
+        encodeVector([1, 0, 0]),
+      ]);
+      await db.exec('INSERT INTO rag_chunks VALUES (?, ?, ?, ?)', [
+        2,
+        'wasm',
+        'IndexedDB VFS and OPFS Persistence',
+        encodeVector([0.8, 0.6, 0]),
+      ]);
+      await db.exec('INSERT INTO rag_chunks VALUES (?, ?, ?, ?)', [
+        3,
+        'sql',
+        'PSQL Stored Procedures and Triggers',
+        encodeVector([0, 1, 0]),
+      ]);
+
+      // 1. High-level hybrid vectorSearch() with SQL WHERE pre-filtering
+      const hits = await vectorSearch<{ ID: number; TOPIC: string; TITLE: string }>(db, {
+        table: 'rag_chunks',
+        column: 'embedding',
+        query: [1, 0, 0],
+        metric: 'cosine',
+        where: "topic = ?",
+        params: ['wasm'],
+        limit: 2,
+      });
+
+      expect(hits).toHaveLength(2);
+      expect(hits[0]!.ID).toBe(1);
+      expect(hits[0]!.DISTANCE).toBeCloseTo(0, 5);
+      expect(hits[0]!.SIMILARITY).toBeCloseTo(1, 5);
+      expect(hits[1]!.ID).toBe(2);
+      expect(hits[1]!.DISTANCE).toBeCloseTo(0.2, 5);
+      expect(hits[1]!.SIMILARITY).toBeCloseTo(0.8, 5);
+
+      // 2. Direct SQL COSINE_DISTANCE / L2_DISTANCE / DOT_PRODUCT function calls
+      const qText = formatVectorText([1, 0, 0]);
+      const sqlRes = await db.query<{ ID: number; TITLE: string; DIST: number }>(
+        `SELECT id, title, COSINE_DISTANCE(embedding, '${qText}') AS dist FROM rag_chunks ORDER BY dist ASC`,
+      );
+      expect(sqlRes.rows.map((r) => r.ID)).toEqual([1, 2, 3]);
+      expect(Number(sqlRes.rows[0]!.DIST)).toBeCloseTo(0, 5);
+      expect(Number(sqlRes.rows[1]!.DIST)).toBeCloseTo(0.2, 5);
+      expect(Number(sqlRes.rows[2]!.DIST)).toBeCloseTo(1, 5);
     } finally {
       await db.close();
     }
