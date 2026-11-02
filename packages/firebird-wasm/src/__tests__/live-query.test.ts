@@ -9,7 +9,12 @@
  * subscription's baseline is in.
  */
 import { FirebirdBrowser } from '../browser/firebird-browser';
-import { extractReferencedTables, liveTableEventName } from '../browser/live-tables';
+import {
+  extractReferencedTables,
+  extractMutatedTables,
+  liveTableEventName,
+  CrossTabLiveBridge,
+} from '../browser/live-tables';
 import type { EngineTransport } from '../browser/engine-transport';
 
 interface Gate {
@@ -301,5 +306,92 @@ describe('extractReferencedTables()', () => {
     expect(
       extractReferencedTables('SELECT * FROM "MixedCase" JOIN my_proc(1, 2) ON 1=1 FROM RDB$DATABASE'),
     ).toEqual(['MixedCase']);
+
+    // DML target extraction
+    expect(extractMutatedTables("INSERT INTO todos (id, title) VALUES (1, 'buy milk')")).toEqual(['TODOS']);
+    expect(extractMutatedTables('UPDATE OR INSERT INTO "MyNotes" (id) VALUES (1) MATCHING (id)')).toEqual(['MyNotes']);
+    expect(extractMutatedTables('UPDATE items SET done = TRUE WHERE id = 1')).toEqual(['ITEMS']);
+    expect(extractMutatedTables('DELETE FROM categories WHERE id = 2')).toEqual(['CATEGORIES']);
+    expect(extractMutatedTables('MERGE INTO inventory i USING staging s ON (i.id = s.id) WHEN MATCHED THEN DELETE')).toEqual(['INVENTORY']);
+    expect(extractMutatedTables('SELECT * FROM todos')).toEqual([]);
+  });
+});
+
+describe('cross-tab reactive live queries (BroadcastChannel + POST_EVENT bridge)', () => {
+  it('re-runs live queries in Tab B when Tab A executes DML or notify() on the same persistent DB', async () => {
+    const engineA = new ScriptedEngine();
+    const engineB = new ScriptedEngine();
+
+    const dbA = new FirebirdBrowser('memory://shared-todos.fdb', {
+      transport: engineA.transport(),
+      autoPersist: false,
+      crossTabLive: true,
+    });
+    const dbB = new FirebirdBrowser('memory://shared-todos.fdb', {
+      transport: engineB.transport(),
+      autoPersist: false,
+      crossTabLive: true,
+    });
+    opened.push(dbA, dbB);
+
+    const seenB: number[] = [];
+    const liveB = await dbB.live(
+      'SELECT id FROM items',
+      { pollIntervalMs: 5000 }, // long poll interval to prove BroadcastChannel wakes it up immediately
+      (rows) => seenB.push(rows.length),
+    );
+    expect(seenB).toEqual([0]);
+
+    // Simulate Tab A committing a row (which also updates the shared backend state seen by B)
+    engineB.committed = 1;
+    await dbA.exec("INSERT INTO items (id) VALUES (1)");
+
+    await until(() => liveB.rows.length === 1);
+    expect(seenB).toEqual([0, 1]);
+
+    // Also test explicit custom event notification across tabs
+    const customSeen: number[] = [];
+    const liveCustom = await dbB.live(
+      'SELECT id FROM items',
+      { events: ['custom_sync_done'], pollIntervalMs: 5000 },
+      (rows) => customSeen.push(rows.length),
+    );
+    expect(customSeen).toEqual([1]);
+
+    engineB.committed = 2;
+    await dbA.notify('custom_sync_done');
+
+    await until(() => liveCustom.rows.length === 2);
+    expect(customSeen).toEqual([1, 2]);
+
+    await liveB.unsubscribe();
+    await liveCustom.unsubscribe();
+    await dbA.close();
+    await dbB.close();
+  });
+
+  it('ignores loopbacks from the same tab and isolates different channels', async () => {
+    const bridgeA1 = new CrossTabLiveBridge({ dbName: 'idb://db1.fdb' });
+    const bridgeA2 = new CrossTabLiveBridge({ dbName: 'idb://db1.fdb' });
+    const bridgeOtherDb = new CrossTabLiveBridge({ dbName: 'idb://db2.fdb' });
+
+    const receivedA1: string[] = [];
+    const receivedA2: string[] = [];
+    const receivedOther: string[] = [];
+
+    bridgeA1.subscribe([liveTableEventName('TODOS')], (counts) => receivedA1.push(...Object.keys(counts)));
+    bridgeA2.subscribe([liveTableEventName('TODOS')], (counts) => receivedA2.push(...Object.keys(counts)));
+    bridgeOtherDb.subscribe([liveTableEventName('TODOS')], (counts) => receivedOther.push(...Object.keys(counts)));
+
+    bridgeA1.broadcastTables(['TODOS']);
+    await sleep(10);
+
+    expect(receivedA1).toEqual([]);
+    expect(receivedA2).toEqual([liveTableEventName('TODOS')]);
+    expect(receivedOther).toEqual([]);
+
+    bridgeA1.close();
+    bridgeA2.close();
+    bridgeOtherDb.close();
   });
 });

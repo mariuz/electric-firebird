@@ -17,6 +17,7 @@ export type {
   LiveQueryOptions,
   EventSubscription,
   ListenOptions,
+  BranchOptions,
 } from './firebird-browser';
 
 export { sql, SqlFragment, RawSql, isSqlFragment, toStatement } from '../sql-tag';
@@ -141,7 +142,24 @@ export type {
   EncodeBinaryResultOptions,
   BinaryResultPayload,
 } from './binary-result';
-export { extractReferencedTables, liveTableEventName, liveTableTriggerDDL } from './live-tables';
+export {
+  extractReferencedTables,
+  extractMutatedTables,
+  liveTableEventName,
+  liveTableTriggerDDL,
+  liveBroadcastChannelName,
+  CrossTabLiveBridge,
+} from './live-tables';
+export type {
+  CrossTabLiveMessage,
+  CrossTabLiveBridgeOptions,
+} from './live-tables';
+export { CowSnapshotStore } from './snapshots';
+export type {
+  SnapshotOptions,
+  DatabaseSnapshotInfo,
+  DatabaseSnapshot,
+} from './snapshots';
 export type { ScriptStatement } from './sql-script';
 
 export { DirectTransport } from './engine-transport';

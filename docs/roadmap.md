@@ -1368,11 +1368,11 @@ Next-horizon milestones for `v0.15.0`:
       Add an optional `encryptionKey: CryptoKey | Uint8Array` option to
       `IndexedDBVFS` and `OPFSVFS` that encrypts 8 KB database pages with
       AES-256-GCM before persisting to IndexedDB or OPFS.
-- [ ] **Point-in-Time Snapshots & Branching (`db.snapshot()` / `db.restoreSnapshot()`).**
+- [x] **Point-in-Time Snapshots & Branching (`db.snapshot()` / `db.restoreSnapshot()`).**
       Allow taking lightweight copy-on-write page snapshots in `IndexedDBVFS` /
       `OPFSVFS` so browser sessions and tests can checkpoint database state,
       run migrations or previews, and roll back instantaneously.
-- [ ] **Cross-Tab Reactive Live Queries (`BroadcastChannel` + `POST_EVENT` bridge).**
+- [x] **Cross-Tab Reactive Live Queries (`BroadcastChannel` + `POST_EVENT` bridge).**
       Automatically broadcast table-level `FB_LIVE$<table>` invalidations across
       same-origin browser tabs so `useLiveQuery()` updates across all open tabs
       when any tab commits writes.

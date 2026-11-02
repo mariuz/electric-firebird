@@ -359,3 +359,328 @@ export function liveTableTriggerDDL(table: string): { eventName: string; ddl: st
     `AS BEGIN POST_EVENT '${eventName}'; END`;
   return { eventName, ddl };
 }
+
+/**
+ * Extract the deduplicated list of user table names mutated by a DML or DDL
+ * statement (`INSERT INTO`, `UPDATE`, `UPDATE OR INSERT INTO`, `MERGE INTO`,
+ * `DELETE FROM`, `CREATE TABLE`, `RECREATE TABLE`, `ALTER TABLE`, `DROP TABLE`,
+ * `TRUNCATE TABLE`).
+ */
+export function extractMutatedTables(sql: string): string[] {
+  const tokens = tokenizeSql(sql);
+  const tables: string[] = [];
+  const seen = new Set<string>();
+
+  const addTable = (name: string): void => {
+    if (!name || isSystemTable(name) || seen.has(name)) return;
+    seen.add(name);
+    tables.push(name);
+  };
+
+  const readTableAt = (idx: number): void => {
+    if (idx >= tokens.length) return;
+    let tok = tokens[idx]!;
+    if (tok.type !== 'word' && tok.type !== 'quoted') return;
+    if (tok.type === 'word' && FROM_CLAUSE_END.has(tok.value)) return;
+    if (
+      idx + 2 < tokens.length &&
+      tokens[idx + 1]!.type === 'punct' &&
+      tokens[idx + 1]!.value === '.' &&
+      (tokens[idx + 2]!.type === 'word' || tokens[idx + 2]!.type === 'quoted')
+    ) {
+      tok = tokens[idx + 2]!;
+    }
+    addTable(tok.value);
+  };
+
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i]!;
+    if (tok.type !== 'word') continue;
+
+    // INSERT INTO <table> / UPDATE OR INSERT INTO <table> / MERGE INTO <table>
+    if (
+      (tok.value === 'INSERT' || tok.value === 'MERGE') &&
+      i + 1 < tokens.length &&
+      tokens[i + 1]!.type === 'word' &&
+      tokens[i + 1]!.value === 'INTO'
+    ) {
+      readTableAt(i + 2);
+      continue;
+    }
+
+    // UPDATE <table> SET ... (excluding UPDATE OR INSERT which is handled at INSERT INTO)
+    if (tok.value === 'UPDATE') {
+      const next = tokens[i + 1];
+      if (next && next.type === 'word' && next.value === 'OR') {
+        continue;
+      }
+      readTableAt(i + 1);
+      continue;
+    }
+
+    // DELETE FROM <table>
+    if (tok.value === 'DELETE') {
+      const next = tokens[i + 1];
+      if (next && next.type === 'word' && next.value === 'FROM') {
+        readTableAt(i + 2);
+      } else {
+        readTableAt(i + 1);
+      }
+      continue;
+    }
+
+    // CREATE / RECREATE / ALTER / DROP / TRUNCATE [GLOBAL TEMPORARY] TABLE [IF EXISTS] <table>
+    if (
+      tok.value === 'TABLE' &&
+      i > 0 &&
+      tokens[i - 1]!.type === 'word' &&
+      (tokens[i - 1]!.value === 'CREATE' ||
+        tokens[i - 1]!.value === 'RECREATE' ||
+        tokens[i - 1]!.value === 'ALTER' ||
+        tokens[i - 1]!.value === 'DROP' ||
+        tokens[i - 1]!.value === 'TRUNCATE' ||
+        tokens[i - 1]!.value === 'TEMPORARY')
+    ) {
+      let targetIdx = i + 1;
+      if (
+        targetIdx + 1 < tokens.length &&
+        tokens[targetIdx]!.type === 'word' &&
+        tokens[targetIdx]!.value === 'IF'
+      ) {
+        targetIdx += 2; // skip IF [NOT] EXISTS
+        if (
+          targetIdx < tokens.length &&
+          tokens[targetIdx]!.type === 'word' &&
+          tokens[targetIdx]!.value === 'EXISTS'
+        ) {
+          targetIdx += 1;
+        }
+      }
+      readTableAt(targetIdx);
+    }
+  }
+
+  return tables;
+}
+
+// ---------------------------------------------------------------------------
+// Cross-Tab Reactive Live Query Bridge (BroadcastChannel + POST_EVENT)
+// ---------------------------------------------------------------------------
+
+/** Payload broadcast across tabs when tables or events fire. */
+export interface CrossTabLiveMessage {
+  type: 'firebird-live-events';
+  senderId: string;
+  realmId?: string;
+  dbName: string;
+  events: Record<string, number>;
+  tables: string[];
+  timestamp: number;
+}
+
+/** Deterministic `BroadcastChannel` name for a database's live invalidations. */
+export function liveBroadcastChannelName(dbName: string): string {
+  const normalized = dbName.trim().replace(/^(idb|opfs|memory):\/\//i, '') || 'default';
+  return `firebird-live:${normalized}`;
+}
+
+type InProcessListener = (msg: CrossTabLiveMessage) => void;
+const inProcessChannels = new Map<string, Set<InProcessListener>>();
+const CURRENT_REALM_ID = `realm-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
+let nextBridgeInstanceId = 0;
+
+/** Options for {@link CrossTabLiveBridge}. */
+export interface CrossTabLiveBridgeOptions {
+  /** Logical database name. */
+  dbName: string;
+  /** Whether cross-tab broadcasting is enabled (`true` by default for non-ephemeral DBs). */
+  enabled?: boolean;
+  /** Optional custom `BroadcastChannel` factory for testing. */
+  createChannel?: (channelName: string) => BroadcastChannel | null;
+}
+
+/**
+ * Bridges Firebird `POST_EVENT` notifications and table-level `FB_LIVE$<table>`
+ * invalidations across same-origin browser tabs (via `BroadcastChannel`) and
+ * across independent database instances in the same context.
+ */
+export class CrossTabLiveBridge {
+  readonly instanceId: string;
+  readonly channelName: string;
+  private readonly dbName: string;
+  private readonly enabled: boolean;
+  private channel: BroadcastChannel | null = null;
+  private readonly inProcessListener: InProcessListener;
+  private readonly subscribers = new Set<{
+    watchedUpper: Map<string, string>;
+    onEvents: (counts: Record<string, number>, msg: CrossTabLiveMessage) => void;
+  }>();
+  private closed = false;
+
+  constructor(options: CrossTabLiveBridgeOptions) {
+    nextBridgeInstanceId += 1;
+    this.instanceId = `fb-live-${Date.now()}-${nextBridgeInstanceId}`;
+    this.dbName = options.dbName;
+    this.channelName = liveBroadcastChannelName(options.dbName);
+    this.enabled = options.enabled ?? true;
+
+    this.inProcessListener = (msg: CrossTabLiveMessage) => {
+      this.handleIncoming(msg);
+    };
+
+    if (this.enabled) {
+      let bus = inProcessChannels.get(this.channelName);
+      if (!bus) {
+        bus = new Set();
+        inProcessChannels.set(this.channelName, bus);
+      }
+      bus.add(this.inProcessListener);
+
+      if (options.createChannel) {
+        this.channel = options.createChannel(this.channelName);
+      } else if (typeof BroadcastChannel !== 'undefined') {
+        try {
+          this.channel = new BroadcastChannel(this.channelName);
+        } catch {
+          this.channel = null;
+        }
+      }
+
+      if (this.channel) {
+        (this.channel as unknown as { unref?: () => void }).unref?.();
+        const customChannel = Boolean(options.createChannel);
+        this.channel.onmessage = (ev: MessageEvent) => {
+          const data = ev.data as CrossTabLiveMessage | undefined;
+          if (
+            data &&
+            data.type === 'firebird-live-events' &&
+            data.senderId !== this.instanceId &&
+            (customChannel || data.realmId !== CURRENT_REALM_ID)
+          ) {
+            this.handleIncoming(data);
+          }
+        };
+      }
+    }
+  }
+
+  /**
+   * Broadcast table-level `FB_LIVE$<table>` invalidations to all other open
+   * tabs / instances attached to the same database.
+   */
+  broadcastTables(tables: readonly string[]): void {
+    if (!this.enabled || this.closed || tables.length === 0) return;
+    const events: Record<string, number> = {};
+    const uniqueTables: string[] = [];
+    for (const rawTable of tables) {
+      const table = rawTable.trim();
+      if (!table) continue;
+      uniqueTables.push(table);
+      const liveEvent = liveTableEventName(table);
+      events[liveEvent] = (events[liveEvent] ?? 0) + 1;
+      events[table] = (events[table] ?? 0) + 1;
+    }
+    if (uniqueTables.length === 0) return;
+    this.broadcastEvents(events, uniqueTables);
+  }
+
+  /**
+   * Broadcast named Firebird events (`POST_EVENT` / `notify()`) across tabs.
+   */
+  broadcastEvents(
+    events: Record<string, number>,
+    tables: readonly string[] = [],
+  ): void {
+    if (!this.enabled || this.closed) return;
+    const keys = Object.keys(events);
+    if (keys.length === 0) return;
+
+    const msg: CrossTabLiveMessage = {
+      type: 'firebird-live-events',
+      senderId: this.instanceId,
+      realmId: CURRENT_REALM_ID,
+      dbName: this.dbName,
+      events: { ...events },
+      tables: [...tables],
+      timestamp: Date.now(),
+    };
+
+    const bus = inProcessChannels.get(this.channelName);
+    if (bus) {
+      for (const listener of [...bus]) {
+        if (listener !== this.inProcessListener) {
+          queueMicrotask(() => listener(msg));
+        }
+      }
+    }
+
+    if (this.channel) {
+      try {
+        this.channel.postMessage(msg);
+      } catch {
+        // Ignore postMessage errors if channel is closing.
+      }
+    }
+  }
+
+  /**
+   * Subscribe to cross-tab events matching `eventNames`.
+   * Returns an unsubscribe callback.
+   */
+  subscribe(
+    eventNames: readonly string[],
+    onEvents: (counts: Record<string, number>, msg: CrossTabLiveMessage) => void,
+  ): () => void {
+    const watchedUpper = new Map<string, string>();
+    for (const name of eventNames) {
+      watchedUpper.set(name.toUpperCase(), name);
+      // Also allow matching by `liveTableEventName(name)` if caller passed a table name
+      watchedUpper.set(liveTableEventName(name.toUpperCase()).toUpperCase(), name);
+    }
+    const entry = { watchedUpper, onEvents };
+    this.subscribers.add(entry);
+    return () => {
+      this.subscribers.delete(entry);
+    };
+  }
+
+  /** Close the `BroadcastChannel` and remove all listeners. */
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.subscribers.clear();
+    const bus = inProcessChannels.get(this.channelName);
+    if (bus) {
+      bus.delete(this.inProcessListener);
+      if (bus.size === 0) {
+        inProcessChannels.delete(this.channelName);
+      }
+    }
+    if (this.channel) {
+      try {
+        this.channel.close();
+      } catch {
+        // Ignore close errors.
+      }
+      this.channel = null;
+    }
+  }
+
+  private handleIncoming(msg: CrossTabLiveMessage): void {
+    if (this.closed || msg.senderId === this.instanceId) return;
+    for (const sub of [...this.subscribers]) {
+      const matched: Record<string, number> = {};
+      for (const [evtName, count] of Object.entries(msg.events)) {
+        if (count <= 0) continue;
+        const originalName = sub.watchedUpper.get(evtName.toUpperCase());
+        if (originalName !== undefined) {
+          matched[originalName] = (matched[originalName] ?? 0) + count;
+        }
+      }
+      if (Object.keys(matched).length > 0) {
+        sub.onEvents(matched, msg);
+      }
+    }
+  }
+}

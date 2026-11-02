@@ -29,6 +29,12 @@ import {
   isEncryptedPageBuffer,
   resolveCryptoKey,
 } from './page-crypto';
+import {
+  CowSnapshotStore,
+  type DatabaseSnapshot,
+  type DatabaseSnapshotInfo,
+  type SnapshotOptions,
+} from './snapshots';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -124,12 +130,15 @@ export class IndexedDBVFS {
   private dbName = '';
   /** Cached plaintext pages for encrypted mode so unchanged pages are not re-encrypted on persist. */
   private readonly plainPageCache = new Map<number, Uint8Array>();
+  /** Copy-on-write page snapshot store for this VFS. */
+  private readonly snapshotStore: CowSnapshotStore;
 
   constructor(options: IndexedDBVFSOptions = {}) {
     this.pageSize = options.pageSize ?? DEFAULT_PAGE_SIZE;
     this.prefix = options.prefix ?? DEFAULT_PREFIX;
     this.encryptionKey = options.encryptionKey;
     this.idbFactory = options.indexedDB;
+    this.snapshotStore = new CowSnapshotStore(this.pageSize);
   }
 
   /** Whether this VFS instance is configured to encrypt pages at rest. */
@@ -408,6 +417,41 @@ export class IndexedDBVFS {
     const record = await this.idbGet<{ data: ArrayBuffer }>(pageNumber);
     if (!record) return null;
     return new Uint8Array(record.data.slice(0));
+  }
+
+  /**
+   * Capture a lightweight copy-on-write page snapshot of the current database
+   * state stored in IndexedDB.
+   */
+  async snapshot(
+    labelOrOptions?: string | SnapshotOptions,
+  ): Promise<DatabaseSnapshot> {
+    const image = await this.exportDatabase();
+    return this.snapshotStore.createSnapshot(image, labelOrOptions);
+  }
+
+  /**
+   * Restore the IndexedDB store to a previously captured point-in-time
+   * {@link DatabaseSnapshot} (by snapshot object, `id`, `label`, or raw bytes).
+   */
+  async restoreSnapshot(
+    snapshotOrId: DatabaseSnapshot | string | Uint8Array,
+  ): Promise<void> {
+    const bytes =
+      snapshotOrId instanceof Uint8Array
+        ? snapshotOrId
+        : this.snapshotStore.getSnapshot(snapshotOrId).toUint8Array();
+    await this.importDatabase(bytes);
+  }
+
+  /** List metadata for all copy-on-write snapshots held by this VFS instance. */
+  listSnapshots(): DatabaseSnapshotInfo[] {
+    return this.snapshotStore.listSnapshots();
+  }
+
+  /** Delete a stored copy-on-write snapshot by `id`, `label`, or reference. */
+  deleteSnapshot(snapshotOrId: DatabaseSnapshot | string): boolean {
+    return this.snapshotStore.deleteSnapshot(snapshotOrId);
   }
 
   /**

@@ -1166,4 +1166,66 @@ describe('wasmGlueFile', () => {
       await db2.close();
     }
   });
+
+  it('captures point-in-time CoW snapshots, branches databases, and rolls back migrations instantaneously', async () => {
+    const db = new FirebirdBrowser('memory://st-snapshots', {
+      transport: new DirectTransport({ threads: false }),
+    });
+    try {
+      await db.exec(
+        'CREATE TABLE accounts (id INTEGER NOT NULL PRIMARY KEY, owner VARCHAR(60), balance INTEGER)',
+      );
+      await db.exec("INSERT INTO accounts VALUES (1, 'Alice', 1000)");
+      await db.exec("INSERT INTO accounts VALUES (2, 'Bob', 500)");
+
+      // 1. Capture baseline snapshot 'v1'
+      const snap1 = await db.snapshot('v1');
+      expect(snap1.id).toBe('v1');
+      expect(snap1.pageCount).toBeGreaterThan(10);
+
+      // 2. Make a small change and capture 'v2' -> verify Copy-on-Write page sharing
+      await db.exec('UPDATE accounts SET balance = 1200 WHERE id = 1');
+      const snap2 = await db.snapshot('v2');
+      expect(snap2.parentId).toBe('v1');
+      expect(snap2.sharedPages).toBeGreaterThan(snap2.uniquePages);
+      expect(db.listSnapshots().map((s) => s.id)).toEqual(['v1', 'v2']);
+
+      // 3. Create an isolated branch from 'v1' and run a destructive migration on the branch
+      const previewBranch = await db.branch('memory://st-branch-preview', {
+        fromSnapshot: 'v1',
+      });
+      try {
+        await previewBranch.exec('DELETE FROM accounts WHERE id = 2');
+        const branchRows = await previewBranch.query<{ ID: number; BALANCE: number }>(
+          'SELECT id, balance FROM accounts ORDER BY id',
+        );
+        expect(branchRows.rows).toEqual([{ ID: 1, BALANCE: 1000 }]);
+      } finally {
+        await previewBranch.close();
+      }
+
+      // Parent database is unaffected by the branch
+      const mainRowsBeforeRestore = await db.query<{ ID: number; BALANCE: number }>(
+        'SELECT id, balance FROM accounts ORDER BY id',
+      );
+      expect(mainRowsBeforeRestore.rows).toEqual([
+        { ID: 1, BALANCE: 1200 },
+        { ID: 2, BALANCE: 500 },
+      ]);
+
+      // 4. Perform destructive changes on main, then restoreSnapshot('v1') instantaneously
+      await db.exec('DROP TABLE accounts');
+      await db.restoreSnapshot('v1');
+
+      const restoredRows = await db.query<{ ID: number; OWNER: string; BALANCE: number }>(
+        'SELECT id, owner, balance FROM accounts ORDER BY id',
+      );
+      expect(restoredRows.rows).toEqual([
+        { ID: 1, OWNER: 'Alice', BALANCE: 1000 },
+        { ID: 2, OWNER: 'Bob', BALANCE: 500 },
+      ]);
+    } finally {
+      await db.close();
+    }
+  });
 });

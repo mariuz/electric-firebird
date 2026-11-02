@@ -34,7 +34,18 @@ import {
   readDatabaseStreamChunks,
   resolveStreamChunkSize,
 } from './data-stream';
-import { extractReferencedTables, liveTableTriggerDDL } from './live-tables';
+import {
+  extractReferencedTables,
+  extractMutatedTables,
+  liveTableTriggerDDL,
+  CrossTabLiveBridge,
+} from './live-tables';
+import {
+  CowSnapshotStore,
+  type DatabaseSnapshot,
+  type DatabaseSnapshotInfo,
+  type SnapshotOptions,
+} from './snapshots';
 import { ICU_LOCALE_DATA_PATH, isValidIcuDataPackage } from './icu-locales';
 import { introspect as introspectSchema, migrate as runMigrations } from './schema';
 import {
@@ -269,12 +280,24 @@ export interface ExecResult {
   affectedRows: number;
 }
 
+export interface BranchOptions extends Partial<FirebirdBrowserOptions> {
+  /** Optional snapshot (or snapshot ID/label) to branch from. Defaults to taking a fresh snapshot of current state. */
+  fromSnapshot?: DatabaseSnapshot | string;
+}
+
 /** Options for creating a {@link FirebirdBrowser} instance. */
 export interface FirebirdBrowserOptions {
   /** Options forwarded to the IndexedDB VFS layer. */
   vfs?: IndexedDBVFSOptions;
   /** Optional WebCrypto AES-GCM key (`CryptoKey` or 16/32-byte `Uint8Array` / `ArrayBuffer`) used to encrypt 8 KB database pages at rest. */
   encryptionKey?: PageEncryptionKey;
+  /**
+   * Broadcast table-level `FB_LIVE$<table>` and `POST_EVENT` invalidations across
+   * same-origin browser tabs via `BroadcastChannel` (`true` by default for
+   * persistent databases; set `true` on `memory://` databases to share live
+   * invalidations across instances with the same name).
+   */
+  crossTabLive?: boolean;
   /**
    * URL or `ArrayBuffer` of the `firebird-embedded.wasm` binary.
    * Passed through to the engine loader.
@@ -530,6 +553,10 @@ export class FirebirdBrowser {
   private readonly liveTriggerPromises = new Map<string, Promise<string>>();
   /** JavaScript user-defined functions & procedures registry. */
   private readonly udr = new UdrManager();
+  /** Copy-on-write point-in-time page snapshot store. */
+  private readonly snapshotStore: CowSnapshotStore;
+  /** Cross-tab BroadcastChannel + POST_EVENT live query invalidation bridge. */
+  private readonly liveBridge: CrossTabLiveBridge;
   /** Set only in shared mode; owns the election and the channel. */
   private shared: SharedEngineTransport | null = null;
 
@@ -553,6 +580,11 @@ export class FirebirdBrowser {
       ...(options.encryptionKey !== undefined
         ? { encryptionKey: options.encryptionKey }
         : {}),
+    });
+    this.snapshotStore = new CowSnapshotStore(options.vfs?.pageSize ?? 8192);
+    this.liveBridge = new CrossTabLiveBridge({
+      dbName,
+      enabled: options.crossTabLive ?? !this.ephemeral,
     });
 
     // An ephemeral database is private to this instance and never stored, so
@@ -745,7 +777,8 @@ export class FirebirdBrowser {
         options,
         () => this.cancelOperation(),
       );
-      results.push({ affectedRows });
+        this.liveBridge.broadcastTables(extractMutatedTables(statement.sql));
+        results.push({ affectedRows });
     }
 
     if (results.length > 0) {
@@ -792,6 +825,7 @@ export class FirebirdBrowser {
 
     if (rows.length > 0) {
       this.markDirty();
+      this.liveBridge.broadcastTables(extractMutatedTables(statements[0].sql));
     }
 
     return { affectedRows };
@@ -1247,7 +1281,10 @@ export class FirebirdBrowser {
         const fired = Object.fromEntries(
           Object.entries(counts).filter(([, count]) => count > 0),
         );
-        if (Object.keys(fired).length > 0 && !stopped) onEvent(fired);
+        if (Object.keys(fired).length > 0 && !stopped) {
+          this.liveBridge.broadcastEvents(fired);
+          onEvent(fired);
+        }
       } catch (err) {
         if (!stopped) onError(err instanceof Error ? err : new Error(String(err)));
       } finally {
@@ -1259,6 +1296,7 @@ export class FirebirdBrowser {
       unsubscribe: async () => {
         if (stopped) return;
         stopped = true;
+        unsubCrossTab();
         if (timer !== null) clearInterval(timer);
         this.liveQueries.delete(subscription);
         // Best effort: the engine may already be gone if the database was
@@ -1268,6 +1306,9 @@ export class FirebirdBrowser {
       },
     };
 
+    const unsubCrossTab = this.liveBridge.subscribe(watched, (fired) => {
+      if (!stopped) onEvent(fired);
+    });
     timer = setInterval(() => void tick(), pollIntervalMs);
     this.liveQueries.add(subscription);
 
@@ -1297,6 +1338,7 @@ export class FirebirdBrowser {
       'EXECUTE BLOCK (event_name VARCHAR(31) = ?) AS BEGIN POST_EVENT :event_name; END',
       [name],
     );
+    this.liveBridge.broadcastEvents({ [name]: 1 });
   }
 
   async live<T extends Row = Row>(
@@ -1869,6 +1911,7 @@ export class FirebirdBrowser {
           () => this.cancelOperation(),
         );
         this.markDirty();
+        this.liveBridge.broadcastTables(extractMutatedTables(sqlText));
         return { affectedRows };
       },
       execBatch: async (rows: QueryParams[]) => {
@@ -1892,6 +1935,7 @@ export class FirebirdBrowser {
           );
           if (rows.length > 0) {
             this.markDirty();
+            this.liveBridge.broadcastTables(extractMutatedTables(sqlText));
           }
           return { affectedRows };
         }
@@ -1957,6 +2001,9 @@ export class FirebirdBrowser {
     // to roll back here.
     await this.engine.commit(txHandle);
     this.markDirty();
+    if (tx.committedTables.length > 0) {
+      this.liveBridge.broadcastTables(tx.committedTables);
+    }
     return result;
   }
 
@@ -2186,6 +2233,126 @@ export class FirebirdBrowser {
       },
       options,
     );
+  }
+
+  /**
+   * Capture a lightweight copy-on-write point-in-time page snapshot of the
+   * database.
+   *
+   * Flushes all dirty pages by detaching and re-attaching the database handle,
+   * then stores an 8 KB page-deduplicated {@link DatabaseSnapshot} sharing
+   * unchanged pages with earlier snapshots.
+   */
+  async snapshot(
+    labelOrOptions?: string | SnapshotOptions,
+  ): Promise<DatabaseSnapshot> {
+    if (this.closed) {
+      throw new Error('FirebirdBrowser instance has been closed');
+    }
+    await this.ensureReady();
+    if (this.dbHandle) {
+      await this.engine.detachDatabase(this.dbHandle);
+      this.dbHandle = 0;
+    }
+    try {
+      const image = await this.engine.readFile(this.dbPath);
+      return this.snapshotStore.createSnapshot(image, labelOrOptions);
+    } finally {
+      this.dbHandle = await this.engine.attachDatabase(this.dbPath);
+      if (this.options.sharedReads) {
+        await this.engine.setSharedReads!(this.dbHandle, true);
+      }
+    }
+  }
+
+  /**
+   * Restore the database instantaneously to a previously captured
+   * {@link DatabaseSnapshot} (by snapshot object, `id`, `label`, or raw `.fdb`
+   * bytes), rolling back any schema or data changes made since the snapshot.
+   */
+  async restoreSnapshot(
+    snapshotOrId: DatabaseSnapshot | string | Uint8Array,
+  ): Promise<void> {
+    if (this.closed) {
+      throw new Error('FirebirdBrowser instance has been closed');
+    }
+    await this.ensureReady();
+    const bytes =
+      snapshotOrId instanceof Uint8Array
+        ? snapshotOrId
+        : this.snapshotStore.getSnapshot(snapshotOrId).toUint8Array();
+
+    this.cancelScheduledPersist();
+    for (const stmt of [...this.preparedStatements]) {
+      await stmt.close().catch(() => undefined);
+    }
+    this.liveTriggerPromises.clear();
+
+    if (this.dbHandle) {
+      await this.engine.detachDatabase(this.dbHandle);
+      this.dbHandle = 0;
+    }
+
+    await this.engine.writeFile(this.dbPath, bytes);
+    this.dbHandle = await this.engine.attachDatabase(this.dbPath);
+    if (this.options.sharedReads) {
+      await this.engine.setSharedReads!(this.dbHandle, true);
+    }
+    this.markDirty();
+
+    for (const live of [...this.liveQueries]) {
+      const refreshable = live as { refresh?: () => Promise<void> };
+      if (typeof refreshable.refresh === 'function') {
+        await refreshable.refresh().catch(() => undefined);
+      }
+    }
+  }
+
+  /** List metadata for all copy-on-write snapshots captured on this database. */
+  listSnapshots(): DatabaseSnapshotInfo[] {
+    return this.snapshotStore.listSnapshots();
+  }
+
+  /** Delete a stored copy-on-write snapshot by `id`, `label`, or reference. */
+  deleteSnapshot(snapshotOrId: DatabaseSnapshot | string): boolean {
+    return this.snapshotStore.deleteSnapshot(snapshotOrId);
+  }
+
+  /**
+   * Create an isolated copy-on-write branch of this database as a new
+   * {@link FirebirdBrowser} instance seeded with a point-in-time snapshot.
+   *
+   * Ideal for running migration previews, speculative transactions, or isolated
+   * test cases without modifying the parent database.
+   */
+  async branch(
+    branchName?: string,
+    options: BranchOptions = {},
+  ): Promise<FirebirdBrowser> {
+    const { fromSnapshot, ...browserOpts } = options;
+    const snap = fromSnapshot
+      ? this.snapshotStore.getSnapshot(fromSnapshot)
+      : await this.snapshot();
+    const targetName =
+      branchName?.trim() || `memory://branch-${this.fileName}-${snap.id}`;
+    const branchTransport =
+      browserOpts.transport !== undefined
+        ? browserOpts.transport
+        : this.options.transport
+          ? new Proxy(this.options.transport, {
+              get(target, prop, receiver) {
+                if (prop === 'dispose') return async () => undefined;
+                const value = Reflect.get(target, prop, receiver);
+                return typeof value === 'function' ? value.bind(target) : value;
+              },
+            })
+          : undefined;
+    return new FirebirdBrowser(targetName, {
+      ...this.options,
+      ...browserOpts,
+      ...(branchTransport ? { transport: branchTransport } : {}),
+      loadDataDir: snap.toUint8Array(),
+    });
   }
 
   async dumpDataDir(): Promise<Uint8Array> {
@@ -2464,6 +2631,8 @@ export class FirebirdBrowser {
     this.closed = true;
     this.liveTriggerPromises.clear();
     this.udr.clear();
+    this.snapshotStore.clear();
+    this.liveBridge.close();
     this.liveTriggerPromises.clear();
 
     if (this.dbHandle) {
@@ -2756,6 +2925,18 @@ function validateSavepointName(name: string): string {
 export class FirebirdBrowserTransaction {
   private finished = false;
   private readonly nextSavepointId: () => number;
+  private readonly mutatedTablesSet = new Set<string>();
+
+  /** Tables modified inside this transaction (and released savepoints). */
+  get committedTables(): string[] {
+    return Array.from(this.mutatedTablesSet);
+  }
+
+  private recordMutatedTables(sqlText: string): void {
+    for (const table of extractMutatedTables(sqlText)) {
+      this.mutatedTablesSet.add(table);
+    }
+  }
 
   constructor(
     private readonly engine: EngineTransport,
@@ -2904,6 +3085,9 @@ export class FirebirdBrowserTransaction {
 
     if (!sp.isFinished) {
       sp.markFinished();
+      for (const table of sp.committedTables) {
+        this.mutatedTablesSet.add(table);
+      }
       await this.engine.execute(
         this.dbHandle,
         this.txHandle,
@@ -2998,6 +3182,7 @@ export class FirebirdBrowserTransaction {
       options,
       () => this.cancelOperation(),
     );
+    this.recordMutatedTables(statement.sql);
     return { affectedRows };
   }
 
@@ -3019,6 +3204,9 @@ export class FirebirdBrowserTransaction {
       sql,
       rows.map((row) => applySerializers(row, this.types?.serializers)),
     );
+    if (rows.length > 0) {
+      this.recordMutatedTables(sql);
+    }
     return { affectedRows };
   }
 

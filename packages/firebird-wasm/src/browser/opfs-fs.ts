@@ -38,6 +38,12 @@ import {
   isEncryptedPageBuffer,
   resolveCryptoKey,
 } from './page-crypto';
+import {
+  CowSnapshotStore,
+  type DatabaseSnapshot,
+  type DatabaseSnapshotInfo,
+  type SnapshotOptions,
+} from './snapshots';
 
 // ---------------------------------------------------------------------------
 // The subset of OPFS this needs
@@ -642,6 +648,7 @@ export class OPFSVFS {
   private ownsHandle = false;
   private currentDbName: string | null = null;
   private readonly stats: OpfsMountStats = createOpfsMountStats();
+  private readonly snapshotStore: CowSnapshotStore;
 
   constructor(options: OPFSVFSOptions = {}) {
     this.directoryName = options.directoryName ?? OPFS_DIRECTORY;
@@ -649,6 +656,7 @@ export class OPFSVFS {
     this.providedHandle = options.handle;
     this.getDirectory = options.getDirectory;
     this.encryptionKey = options.encryptionKey;
+    this.snapshotStore = new CowSnapshotStore(this.configuredPageSize);
   }
 
   /** Whether this VFS instance is configured to encrypt pages at rest. */
@@ -1019,6 +1027,41 @@ export class OPFSVFS {
   /** Return a snapshot of cumulative I/O statistics for this VFS instance. */
   getStats(): OpfsMountStats {
     return { ...this.stats };
+  }
+
+  /**
+   * Capture a lightweight copy-on-write page snapshot of the current database
+   * state stored in OPFS.
+   */
+  async snapshot(
+    labelOrOptions?: string | SnapshotOptions,
+  ): Promise<DatabaseSnapshot> {
+    const image = await this.exportDatabase();
+    return this.snapshotStore.createSnapshot(image, labelOrOptions);
+  }
+
+  /**
+   * Restore the OPFS database to a previously captured point-in-time
+   * {@link DatabaseSnapshot} (by snapshot object, `id`, `label`, or raw bytes).
+   */
+  async restoreSnapshot(
+    snapshotOrId: DatabaseSnapshot | string | Uint8Array,
+  ): Promise<void> {
+    const bytes =
+      snapshotOrId instanceof Uint8Array
+        ? snapshotOrId
+        : this.snapshotStore.getSnapshot(snapshotOrId).toUint8Array();
+    await this.importDatabase(bytes);
+  }
+
+  /** List metadata for all copy-on-write snapshots held by this VFS instance. */
+  listSnapshots(): DatabaseSnapshotInfo[] {
+    return this.snapshotStore.listSnapshots();
+  }
+
+  /** Delete a stored copy-on-write snapshot by `id`, `label`, or reference. */
+  deleteSnapshot(snapshotOrId: DatabaseSnapshot | string): boolean {
+    return this.snapshotStore.deleteSnapshot(snapshotOrId);
   }
 
   private requireHandle(): SyncAccessHandle {

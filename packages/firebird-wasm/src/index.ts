@@ -180,7 +180,26 @@ export type {
   EncodeBinaryResultOptions,
   BinaryResultPayload,
 } from './browser/binary-result';
+export type { BranchOptions } from './browser/firebird-browser';
 export { VERSION } from './version';
+export {
+  extractReferencedTables,
+  extractMutatedTables,
+  liveTableEventName,
+  liveTableTriggerDDL,
+  liveBroadcastChannelName,
+  CrossTabLiveBridge,
+} from './browser/live-tables';
+export type {
+  CrossTabLiveMessage,
+  CrossTabLiveBridgeOptions,
+} from './browser/live-tables';
+export { CowSnapshotStore } from './browser/snapshots';
+export type {
+  SnapshotOptions,
+  DatabaseSnapshotInfo,
+  DatabaseSnapshot,
+} from './browser/snapshots';
 export {
   ENCRYPTED_PAGE_MAGIC,
   AES_GCM_IV_LENGTH,

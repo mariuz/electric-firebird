@@ -58,6 +58,12 @@ import { applyTypes, applySerializers } from './browser/value-types';
 import { buildCopyToStream, executeCopyFromStream } from './browser/copy-stream';
 import { introspect as introspectSchema, migrate as runMigrations } from './browser/schema';
 import { UdrManager } from './browser/udr';
+import {
+  CowSnapshotStore,
+  type DatabaseSnapshot,
+  type DatabaseSnapshotInfo,
+  type SnapshotOptions,
+} from './browser/snapshots';
 import type {
   JsFunctionHandler,
   JsProcedureHandler,
@@ -304,6 +310,7 @@ export class FirebirdLite {
   private statements: StatementCache | null = null;
   private readonly preparedStatements = new Set<PreparedStatement>();
   private readonly udr = new UdrManager();
+  private readonly snapshotStore = new CowSnapshotStore(8192);
   private readonly types: TypeOptions | undefined;
 
   constructor(dbPath: string, options: FirebirdLiteOptions = {}) {
@@ -1694,6 +1701,92 @@ export class FirebirdLite {
     }
   }
 
+  /**
+   * Capture a lightweight copy-on-write point-in-time page snapshot of the
+   * database file.
+   */
+  async snapshot(
+    labelOrOptions?: string | SnapshotOptions,
+  ): Promise<DatabaseSnapshot> {
+    if (this.closed) {
+      throw new Error('FirebirdLite instance has been closed');
+    }
+    await this.ensureReady();
+    await this.endReadTransaction();
+    for (const stmt of [...this.preparedStatements]) {
+      await stmt.close().catch(() => undefined);
+    }
+    await this.statements?.flush();
+    this.statements = null;
+    if (this.attachment) {
+      await this.attachment.disconnect().catch(() => undefined);
+      this.attachment = null;
+    }
+
+    try {
+      const buf = await fs.promises.readFile(this.dbPath);
+      const image = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+      return this.snapshotStore.createSnapshot(image, labelOrOptions);
+    } finally {
+      this.attachment = await this.client!.connect(
+        this.dbPath,
+        this.connectOptions,
+      );
+      this.statements = new StatementCache(
+        this.attachment,
+        this.statementCacheSize,
+      );
+    }
+  }
+
+  /**
+   * Restore the database file to a previously captured {@link DatabaseSnapshot}
+   * (by snapshot object, `id`, `label`, or raw `.fdb` bytes).
+   */
+  async restoreSnapshot(
+    snapshotOrId: DatabaseSnapshot | string | Uint8Array,
+  ): Promise<void> {
+    if (this.closed) {
+      throw new Error('FirebirdLite instance has been closed');
+    }
+    await this.ensureReady();
+    const bytes =
+      snapshotOrId instanceof Uint8Array
+        ? snapshotOrId
+        : this.snapshotStore.getSnapshot(snapshotOrId).toUint8Array();
+
+    await this.endReadTransaction();
+    for (const stmt of [...this.preparedStatements]) {
+      await stmt.close().catch(() => undefined);
+    }
+    await this.statements?.flush();
+    this.statements = null;
+    if (this.attachment) {
+      await this.attachment.disconnect().catch(() => undefined);
+      this.attachment = null;
+    }
+
+    await fs.promises.writeFile(this.dbPath, bytes);
+    this.attachment = await this.client!.connect(
+      this.dbPath,
+      this.connectOptions,
+    );
+    this.statements = new StatementCache(
+      this.attachment,
+      this.statementCacheSize,
+    );
+  }
+
+  /** List metadata for all copy-on-write snapshots captured on this database. */
+  listSnapshots(): DatabaseSnapshotInfo[] {
+    return this.snapshotStore.listSnapshots();
+  }
+
+  /** Delete a stored copy-on-write snapshot by `id`, `label`, or reference. */
+  deleteSnapshot(snapshotOrId: DatabaseSnapshot | string): boolean {
+    return this.snapshotStore.deleteSnapshot(snapshotOrId);
+  }
+
   async dumpDataDir(): Promise<Uint8Array> {
     await this.ensureReady();
     const buf = await fs.promises.readFile(this.dbPath);
@@ -1862,6 +1955,7 @@ export class FirebirdLite {
     if (this.closed) return;
     this.closed = true;
     this.udr.clear();
+    this.snapshotStore.clear();
 
     await this.endReadTransaction();
     for (const stmt of [...this.preparedStatements]) {
