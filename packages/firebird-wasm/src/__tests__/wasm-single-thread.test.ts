@@ -27,6 +27,7 @@ import {
   registerVectorFunctions,
   vectorSearch,
 } from '../vector';
+import { OPFSVFS, createMemorySyncAccessHandle } from '../browser/opfs-fs';
 
 const ST_JS_PATH = path.resolve(__dirname, '../../dist/wasm/firebird-embedded-st.js');
 const hasSingleThread = fs.existsSync(ST_JS_PATH);
@@ -1033,6 +1034,64 @@ describe('wasmGlueFile', () => {
       expect(Number(sqlRes.rows[2]!.DIST)).toBeCloseTo(1, 5);
     } finally {
       await db.close();
+    }
+  });
+
+  it('executes direct page-level PIO against OPFSVFS (SyncAccessHandle) without MEMFS buffering', async () => {
+    const handle = createMemorySyncAccessHandle();
+    const vfs = new OPFSVFS({ pageSize: 8192, handle });
+    await vfs.open('opfs://direct_pio');
+
+    const { dbPath } = vfs.mount(mod, '/opfs_pio');
+    expect(dbPath).toBe('/opfs_pio/direct_pio.fdb');
+
+    // Create database directly on the OPFS mount
+    const pathPtr = allocString(mod, dbPath);
+    const db = mod._fb_create_database(pathPtr);
+    mod._free(pathPtr);
+    expect(db).toBeGreaterThan(0);
+
+    try {
+      // Execute DDL and DML; pages are written directly through SyncAccessHandle.write(buf, { at })
+      exec(
+        db,
+        'CREATE TABLE opfs_items (id INTEGER NOT NULL PRIMARY KEY, label VARCHAR(100))',
+      );
+      exec(
+        db,
+        "INSERT INTO opfs_items (id, label) VALUES (1, 'page-level-opfs')",
+      );
+
+      // Detach so Firebird flushes all dirty pages to the OPFS handle
+      expect(mod._fb_detach_database(db)).toBe(0);
+
+      const statsAfterCreate = vfs.getStats();
+      expect(statsAfterCreate.writes).toBeGreaterThan(100);
+      expect(statsAfterCreate.bytesWritten).toBeGreaterThan(500_000);
+      expect(handle.getSize()).toBeGreaterThan(500_000);
+
+      // Re-attach to the existing OPFS-backed database and query back
+      const attachPtr = allocString(mod, dbPath);
+      const reattached = mod._fb_attach_database(attachPtr);
+      mod._free(attachPtr);
+      expect(reattached).toBeGreaterThan(0);
+
+      try {
+        expect(query(reattached, 'SELECT id, label FROM opfs_items')).toEqual([
+          [1, 'page-level-opfs'],
+        ]);
+      } finally {
+        mod._fb_detach_database(reattached);
+      }
+
+      // Verify page 0 (Firebird ODS header page) can be read directly via OPFSVFS.readPage(0)
+      const headerPage = await vfs.readPage(0);
+      expect(headerPage).not.toBeNull();
+      expect(headerPage!.byteLength).toBe(8192);
+      // Page type 1 = database header page in Firebird ODS
+      expect(headerPage![0]).toBe(1);
+    } finally {
+      await vfs.close();
     }
   });
 });

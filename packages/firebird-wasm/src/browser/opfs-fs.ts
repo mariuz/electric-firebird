@@ -1,5 +1,6 @@
 /**
- * opfs-fs.ts – an Emscripten filesystem backed by OPFS sync access handles.
+ * opfs-fs.ts – an Emscripten filesystem and page-level VFS backed by OPFS
+ * `FileSystemSyncAccessHandle`.
  *
  * The IndexedDB path keeps the whole database in memory and copies the image
  * out on every persist. That is a durability strategy bolted beside the engine.
@@ -28,6 +29,7 @@
  */
 
 import type { FirebirdWasmModule } from '../wasm-loader';
+import type { VFSMetadata } from './indexeddb-vfs';
 
 // ---------------------------------------------------------------------------
 // The subset of OPFS this needs
@@ -38,9 +40,9 @@ import type { FirebirdWasmModule } from '../wasm-loader';
  *
  * Declared rather than imported: the DOM lib in this project's TypeScript
  * target does not carry it, and a hand-written interface says exactly which
- * four methods this depends on.
+ * methods this depends on.
  */
-interface SyncAccessHandle {
+export interface SyncAccessHandle {
   read(buffer: ArrayBufferView, options?: { at?: number }): number;
   write(buffer: ArrayBufferView, options?: { at?: number }): number;
   truncate(size: number): void;
@@ -49,7 +51,7 @@ interface SyncAccessHandle {
   close(): void;
 }
 
-interface OpfsDirectoryHandle {
+export interface OpfsDirectoryHandle {
   getFileHandle(name: string, options?: { create?: boolean }): Promise<OpfsFileHandle>;
   getDirectoryHandle(
     name: string,
@@ -58,8 +60,149 @@ interface OpfsDirectoryHandle {
   removeEntry(name: string, options?: { recursive?: boolean }): Promise<void>;
 }
 
-interface OpfsFileHandle {
+export interface OpfsFileHandle {
   createSyncAccessHandle(): Promise<SyncAccessHandle>;
+}
+
+/** I/O counters recorded by an OPFS mount or {@link OPFSVFS} instance. */
+export interface OpfsMountStats {
+  reads: number;
+  writes: number;
+  flushes: number;
+  truncates: number;
+  bytesRead: number;
+  bytesWritten: number;
+}
+
+/** Optional hooks and telemetry for {@link mountOpfs}. */
+export interface MountOpfsOptions {
+  /**
+   * Optional synchronous transform applied in-place after reading bytes from
+   * the underlying `SyncAccessHandle` (e.g., for page decryption or checksums).
+   */
+  transformRead?: (data: Uint8Array, offset: number, fileName: string) => void;
+  /**
+   * Optional synchronous transform applied before writing bytes to the
+   * underlying `SyncAccessHandle` (e.g., for page encryption).
+   */
+  transformWrite?: (data: Uint8Array, offset: number, fileName: string) => Uint8Array;
+  /** Optional stats object updated in-place on every read, write, flush, or truncate. */
+  stats?: OpfsMountStats;
+  /** Whether to invoke `handle.flush()` on every `stream_ops.close()`. @default false */
+  flushOnClose?: boolean;
+}
+
+/** Configuration options for {@link OPFSVFS}. */
+export interface OPFSVFSOptions {
+  /** Directory under the OPFS root holding database files. @default 'firebird' */
+  directoryName?: string;
+  /** Database page size in bytes. @default 8192 */
+  pageSize?: number;
+  /** Optional pre-opened `SyncAccessHandle` (useful for tests or custom worker hosts). */
+  handle?: SyncAccessHandle;
+  /** Optional custom OPFS root directory provider (defaults to `navigator.storage.getDirectory()`). */
+  getDirectory?: () => Promise<OpfsDirectoryHandle>;
+}
+
+/** In-memory `SyncAccessHandle` implementation for testing and non-OPFS environments. */
+export interface MemorySyncAccessHandle extends SyncAccessHandle {
+  /** Return a copy of the current file contents as a `Uint8Array`. */
+  toUint8Array(): Uint8Array;
+  /** True after `close()` has been called. */
+  readonly closed: boolean;
+  /** Number of times `flush()` has been called. */
+  readonly flushCount: number;
+}
+
+/**
+ * Create a growable, byte-accurate in-memory {@link SyncAccessHandle}.
+ *
+ * Useful for testing direct page-level PIO (`mountOpfs` and {@link OPFSVFS})
+ * in Node.js or main-thread test environments where browser Worker OPFS is
+ * not present.
+ */
+export function createMemorySyncAccessHandle(
+  initialBytes?: Uint8Array,
+): MemorySyncAccessHandle {
+  let capacity = Math.max(65536, initialBytes ? initialBytes.byteLength * 2 : 65536);
+  let storage = new Uint8Array(capacity);
+  let size = initialBytes ? initialBytes.byteLength : 0;
+  if (initialBytes && size > 0) {
+    storage.set(initialBytes, 0);
+  }
+  let isClosed = false;
+  let flushes = 0;
+
+  const ensureCapacity = (required: number): void => {
+    if (required <= capacity) return;
+    while (capacity < required) {
+      capacity *= 2;
+    }
+    const next = new Uint8Array(capacity);
+    if (size > 0) {
+      next.set(storage.subarray(0, size), 0);
+    }
+    storage = next;
+  };
+
+  return {
+    get closed(): boolean {
+      return isClosed;
+    },
+    get flushCount(): number {
+      return flushes;
+    },
+    read(buffer: ArrayBufferView, options?: { at?: number }): number {
+      const pos = Math.max(0, Math.floor(options?.at ?? 0));
+      if (pos >= size || buffer.byteLength === 0) return 0;
+      const available = Math.min(buffer.byteLength, size - pos);
+      const target = new Uint8Array(
+        buffer.buffer,
+        buffer.byteOffset,
+        available,
+      );
+      target.set(storage.subarray(pos, pos + available), 0);
+      return available;
+    },
+    write(buffer: ArrayBufferView, options?: { at?: number }): number {
+      const pos = Math.max(0, Math.floor(options?.at ?? 0));
+      const len = buffer.byteLength;
+      if (len === 0) return 0;
+      const end = pos + len;
+      ensureCapacity(end);
+      if (pos > size) {
+        storage.fill(0, size, pos);
+      }
+      const source = new Uint8Array(buffer.buffer, buffer.byteOffset, len);
+      storage.set(source, pos);
+      if (end > size) {
+        size = end;
+      }
+      return len;
+    },
+    truncate(newSize: number): void {
+      const targetSize = Math.max(0, Math.floor(newSize));
+      ensureCapacity(targetSize);
+      if (targetSize > size) {
+        storage.fill(0, size, targetSize);
+      } else if (targetSize < size) {
+        storage.fill(0, targetSize, size);
+      }
+      size = targetSize;
+    },
+    getSize(): number {
+      return size;
+    },
+    flush(): void {
+      flushes += 1;
+    },
+    close(): void {
+      isClosed = true;
+    },
+    toUint8Array(): Uint8Array {
+      return storage.slice(0, size);
+    },
+  };
 }
 
 /** True where OPFS sync access handles can actually be used. */
@@ -88,6 +231,11 @@ export function opfsAvailable(): boolean {
 /** Directory under the OPFS root holding this library's databases. */
 const OPFS_DIRECTORY = 'firebird';
 
+function normalizeOpfsFileName(name: string): string {
+  const trimmed = name.trim().replace(/^opfs:\/\//i, '');
+  return trimmed.endsWith('.fdb') ? trimmed : `${trimmed}.fdb`;
+}
+
 /**
  * Open — creating if needed — the sync access handle for one database.
  *
@@ -96,18 +244,30 @@ const OPFS_DIRECTORY = 'firebird';
  *   Web Lock the IndexedDB path uses: two tabs cannot both hold the file, and
  *   the second one is told so by the platform rather than by a convention.
  */
-export async function openDatabaseHandle(name: string): Promise<SyncAccessHandle> {
-  const root = (await navigator.storage.getDirectory()) as unknown as OpfsDirectoryHandle;
-  const dir = await root.getDirectoryHandle(OPFS_DIRECTORY, { create: true });
-  const file = await dir.getFileHandle(`${name}.fdb`, { create: true });
+export async function openDatabaseHandle(
+  name: string,
+  directoryName = OPFS_DIRECTORY,
+  getDirectory?: () => Promise<OpfsDirectoryHandle>,
+): Promise<SyncAccessHandle> {
+  const root = getDirectory
+    ? await getDirectory()
+    : ((await navigator.storage.getDirectory()) as unknown as OpfsDirectoryHandle);
+  const dir = await root.getDirectoryHandle(directoryName, { create: true });
+  const file = await dir.getFileHandle(normalizeOpfsFileName(name), { create: true });
   return file.createSyncAccessHandle();
 }
 
 /** Delete a database's file.  Fails silently when there is nothing to delete. */
-export async function removeDatabaseFile(name: string): Promise<void> {
-  const root = (await navigator.storage.getDirectory()) as unknown as OpfsDirectoryHandle;
-  const dir = await root.getDirectoryHandle(OPFS_DIRECTORY, { create: true });
-  await dir.removeEntry(`${name}.fdb`).catch(() => undefined);
+export async function removeDatabaseFile(
+  name: string,
+  directoryName = OPFS_DIRECTORY,
+  getDirectory?: () => Promise<OpfsDirectoryHandle>,
+): Promise<void> {
+  const root = getDirectory
+    ? await getDirectory()
+    : ((await navigator.storage.getDirectory()) as unknown as OpfsDirectoryHandle);
+  const dir = await root.getDirectoryHandle(directoryName, { create: true });
+  await dir.removeEntry(normalizeOpfsFileName(name)).catch(() => undefined);
 }
 
 // ---------------------------------------------------------------------------
@@ -120,6 +280,7 @@ interface EmscriptenFSInternals {
   isDir(mode: number): boolean;
   ErrnoError: new (errno: number) => Error;
   mount(type: unknown, opts: unknown, mountpoint: string): void;
+  unmount?(mountpoint: string): void;
   mkdir(path: string): void;
   analyzePath(path: string): { exists: boolean };
 }
@@ -147,6 +308,18 @@ const S_IFREG = 0o100000;
 const ENOENT = 44;
 const EPERM = 63;
 
+/** Create a zeroed {@link OpfsMountStats} counter object. */
+export function createOpfsMountStats(): OpfsMountStats {
+  return {
+    reads: 0,
+    writes: 0,
+    flushes: 0,
+    truncates: 0,
+    bytesRead: 0,
+    bytesWritten: 0,
+  };
+}
+
 /**
  * Mount a filesystem at `mountpoint` whose files are OPFS sync access handles.
  *
@@ -159,8 +332,13 @@ export function mountOpfs(
   mod: FirebirdWasmModule,
   mountpoint: string,
   files: Map<string, SyncAccessHandle>,
-): void {
+  options: MountOpfsOptions = {},
+): OpfsMountStats {
   const FS = mod.FS as unknown as EmscriptenFSInternals;
+  const stats = options.stats ?? createOpfsMountStats();
+  const transformRead = options.transformRead;
+  const transformWrite = options.transformWrite;
+  const flushOnClose = options.flushOnClose === true;
 
   // A scratch buffer for the threaded build, whose WASM heap is a
   // SharedArrayBuffer that OPFS refuses views onto. Grown as needed and
@@ -198,11 +376,25 @@ export function mountOpfs(
     open(): void {
       /* The handle is already open; there is nothing per-stream to do. */
     },
-    close(): void {
+    close(stream?: FSStream): void {
       // Deliberately not closed here. The handle outlives any single open —
       // Firebird opens and closes the database repeatedly within one session,
       // and reopening a sync access handle is both async and exclusive, so a
       // close here would make the next open fail.
+      if (flushOnClose && stream?.node?.handle) {
+        stream.node.handle.flush();
+        stats.flushes += 1;
+      }
+    },
+    fsync(stream: FSStream): number {
+      stream.node.handle!.flush();
+      stats.flushes += 1;
+      return 0;
+    },
+    msync(stream: FSStream): number {
+      stream.node.handle!.flush();
+      stats.flushes += 1;
+      return 0;
     },
     llseek(stream: FSStream, offset: number, whence: number): number {
       let position = offset;
@@ -218,13 +410,28 @@ export function mountOpfs(
       length: number,
       position: number,
     ): number {
+      if (length <= 0) return 0;
       const handle = stream.node.handle!;
+      let read: number;
       if (!isShared(buffer)) {
-        return handle.read(buffer.subarray(offset, offset + length), { at: position });
+        const slice = buffer.subarray(offset, offset + length);
+        read = handle.read(slice, { at: position });
+        if (read > 0 && transformRead) {
+          transformRead(slice.subarray(0, read), position, stream.node.name);
+        }
+      } else {
+        const target = scratchFor(length);
+        read = handle.read(target, { at: position });
+        if (read > 0) {
+          const readSlice = target.subarray(0, read);
+          if (transformRead) {
+            transformRead(readSlice, position, stream.node.name);
+          }
+          buffer.set(readSlice, offset);
+        }
       }
-      const target = scratchFor(length);
-      const read = handle.read(target, { at: position });
-      if (read > 0) buffer.set(target.subarray(0, read), offset);
+      stats.reads += 1;
+      if (read > 0) stats.bytesRead += read;
       return read;
     },
     write(
@@ -234,15 +441,35 @@ export function mountOpfs(
       length: number,
       position: number,
     ): number {
+      if (length <= 0) return 0;
       const handle = stream.node.handle!;
       const view = buffer.subarray(offset, offset + length);
-      if (!isShared(buffer)) {
-        return handle.write(view, { at: position });
+      let written: number;
+      if (transformWrite) {
+        const transformed = transformWrite(view, position, stream.node.name);
+        if (!isShared(transformed)) {
+          written = handle.write(transformed, { at: position });
+        } else {
+          const source = scratchFor(transformed.byteLength);
+          source.set(transformed);
+          written = handle.write(source, { at: position });
+        }
+      } else if (!isShared(buffer)) {
+        written = handle.write(view, { at: position });
+      } else {
+        const source = scratchFor(length);
+        source.set(view);
+        written = handle.write(source, { at: position });
       }
-      const source = scratchFor(length);
-      source.set(view);
-      return handle.write(source, { at: position });
+      stats.writes += 1;
+      if (written > 0) stats.bytesWritten += written;
+      nodeTouch(stream.node);
+      return written;
     },
+  };
+
+  const nodeTouch = (node: FSNode): void => {
+    node.timestamp = Date.now();
   };
 
   const fileOps = {
@@ -252,7 +479,10 @@ export function mountOpfs(
     setattr(node: FSNode, attr: { mode?: number; timestamp?: number; size?: number }) {
       if (attr.mode !== undefined) node.mode = attr.mode;
       if (attr.timestamp !== undefined) node.timestamp = attr.timestamp;
-      if (attr.size !== undefined) node.handle!.truncate(attr.size);
+      if (attr.size !== undefined) {
+        node.handle!.truncate(attr.size);
+        stats.truncates += 1;
+      }
     },
   };
 
@@ -314,14 +544,31 @@ export function mountOpfs(
     rename(): void {
       throw new FS.ErrnoError(EPERM);
     },
-    unlink(): void {
-      throw new FS.ErrnoError(EPERM);
+    unlink(parent: FSNode, name: string): void {
+      const handle = files.get(name);
+      if (!handle) throw new FS.ErrnoError(EPERM);
+      handle.truncate(0);
+      handle.flush();
+      stats.truncates += 1;
+      stats.flushes += 1;
+      if (parent.contents) {
+        delete parent.contents[name];
+      }
     },
     rmdir(): void {
       throw new FS.ErrnoError(EPERM);
     },
     readdir(node: FSNode): string[] {
-      return ['.', '..', ...Object.keys(node.contents ?? {})];
+      const entries = new Set<string>(['.', '..']);
+      for (const name of Object.keys(node.contents ?? {})) {
+        entries.add(name);
+      }
+      for (const [name, handle] of files.entries()) {
+        if (handle.getSize() > 0) {
+          entries.add(name);
+        }
+      }
+      return Array.from(entries);
     },
     symlink(): void {
       throw new FS.ErrnoError(EPERM);
@@ -343,6 +590,282 @@ export function mountOpfs(
 
   if (!FS.analyzePath(mountpoint).exists) {
     FS.mkdir(mountpoint);
+  } else if (typeof FS.unmount === 'function') {
+    try {
+      FS.unmount(mountpoint);
+    } catch {
+      // Not previously mounted; ignore.
+    }
   }
   FS.mount(filesystem, {}, mountpoint);
+  return stats;
+}
+
+// ---------------------------------------------------------------------------
+// Direct Page-Level OPFSVFS
+// ---------------------------------------------------------------------------
+
+const DEFAULT_PAGE_SIZE = 8192;
+
+/**
+ * Direct page-level Origin Private File System (OPFS) Virtual File System.
+ *
+ * Unlike `IndexedDBVFS` — which stores pages in IndexedDB object stores and
+ * exports/imports the entire `.fdb` image into Emscripten `MEMFS` — `OPFSVFS`
+ * wraps a synchronous `FileSystemSyncAccessHandle` so both Firebird's native
+ * PIO (`mount()`) and page-level JavaScript operations (`readPage`, `writePage`,
+ * `readRange`, `writeRange`, `exportDatabase`, `importDatabase`) read and write
+ * directly at byte offset `pageNumber * pageSize` without holding the full
+ * database in WASM RAM.
+ */
+export class OPFSVFS {
+  private readonly directoryName: string;
+  private readonly configuredPageSize: number;
+  private readonly providedHandle?: SyncAccessHandle;
+  private readonly getDirectory?: () => Promise<OpfsDirectoryHandle>;
+
+  private syncHandle: SyncAccessHandle | null = null;
+  private ownsHandle = false;
+  private currentDbName: string | null = null;
+  private readonly stats: OpfsMountStats = createOpfsMountStats();
+
+  constructor(options: OPFSVFSOptions = {}) {
+    this.directoryName = options.directoryName ?? OPFS_DIRECTORY;
+    this.configuredPageSize = options.pageSize ?? DEFAULT_PAGE_SIZE;
+    this.providedHandle = options.handle;
+    this.getDirectory = options.getDirectory;
+  }
+
+  /** Whether a `SyncAccessHandle` is currently open. */
+  get isOpen(): boolean {
+    return this.syncHandle !== null;
+  }
+
+  /** Configured database page size in bytes (default `8192`). */
+  get pageSize(): number {
+    return this.configuredPageSize;
+  }
+
+  /** The underlying `SyncAccessHandle`, or `null` if not yet opened. */
+  get handle(): SyncAccessHandle | null {
+    return this.syncHandle;
+  }
+
+  /** Logical database name passed to `open()`, or `null` if not yet opened. */
+  get dbName(): string | null {
+    return this.currentDbName;
+  }
+
+  /**
+   * Open (or create) the OPFS file for `dbName` and acquire its exclusive
+   * `FileSystemSyncAccessHandle`.
+   */
+  async open(dbName: string): Promise<VFSMetadata> {
+    if (this.syncHandle) {
+      return (await this.getMetadata())!;
+    }
+
+    const cleanName = dbName.trim().replace(/^opfs:\/\//i, '').replace(/\.fdb$/i, '') || 'database';
+    if (this.providedHandle) {
+      this.syncHandle = this.providedHandle;
+      this.ownsHandle = false;
+    } else {
+      this.syncHandle = await openDatabaseHandle(
+        cleanName,
+        this.directoryName,
+        this.getDirectory,
+      );
+      this.ownsHandle = true;
+    }
+
+    this.currentDbName = cleanName;
+    return (await this.getMetadata())!;
+  }
+
+  /** Flush and close the underlying `SyncAccessHandle`. */
+  async close(): Promise<void> {
+    const handle = this.syncHandle;
+    this.syncHandle = null;
+    if (!handle) return;
+    try {
+      handle.flush();
+      this.stats.flushes += 1;
+    } catch {
+      // Ignore flush errors on close.
+    }
+    if (this.ownsHandle) {
+      try {
+        handle.close();
+      } catch {
+        // Ignore close errors if already closed.
+      }
+    }
+  }
+
+  /** Return metadata describing the currently open OPFS database file. */
+  async getMetadata(): Promise<VFSMetadata | null> {
+    if (!this.syncHandle || !this.currentDbName) return null;
+    const size = this.syncHandle.getSize();
+    return {
+      pageSize: this.configuredPageSize,
+      pageCount: Math.ceil(size / this.configuredPageSize),
+    };
+  }
+
+  /**
+   * Read a single database page (`pageNumber * pageSize`) directly from the
+   * underlying `SyncAccessHandle`. Returns `null` if the page is beyond EOF.
+   */
+  async readPage(pageNumber: number): Promise<Uint8Array | null> {
+    const handle = this.requireHandle();
+    if (!Number.isInteger(pageNumber) || pageNumber < 0) {
+      throw new RangeError(`Invalid pageNumber: ${pageNumber}`);
+    }
+    const offset = pageNumber * this.configuredPageSize;
+    const size = handle.getSize();
+    if (offset >= size) return null;
+
+    const buf = new Uint8Array(this.configuredPageSize);
+    const n = handle.read(buf, { at: offset });
+    this.stats.reads += 1;
+    if (n <= 0) return null;
+    this.stats.bytesRead += n;
+    return buf;
+  }
+
+  /**
+   * Write a single database page at byte offset `pageNumber * pageSize`.
+   */
+  async writePage(pageNumber: number, data: Uint8Array): Promise<void> {
+    const handle = this.requireHandle();
+    if (!Number.isInteger(pageNumber) || pageNumber < 0) {
+      throw new RangeError(`Invalid pageNumber: ${pageNumber}`);
+    }
+    if (data.byteLength !== this.configuredPageSize) {
+      throw new RangeError(
+        `Page data length (${data.byteLength}) does not match VFS pageSize (${this.configuredPageSize})`,
+      );
+    }
+    const offset = pageNumber * this.configuredPageSize;
+    const written = handle.write(data, { at: offset });
+    this.stats.writes += 1;
+    if (written > 0) this.stats.bytesWritten += written;
+  }
+
+  /** Read a byte range `[offset, offset + length)` directly from OPFS. */
+  async readRange(offset: number, length: number): Promise<Uint8Array> {
+    const handle = this.requireHandle();
+    if (length <= 0) return new Uint8Array(0);
+    const size = handle.getSize();
+    if (offset >= size) return new Uint8Array(0);
+    const toRead = Math.min(length, size - offset);
+    const buf = new Uint8Array(toRead);
+    const n = handle.read(buf, { at: offset });
+    this.stats.reads += 1;
+    if (n > 0) this.stats.bytesRead += n;
+    return n === toRead ? buf : buf.slice(0, Math.max(0, n));
+  }
+
+  /** Write `data` at byte `offset` directly to OPFS, optionally truncating first. */
+  async writeRange(
+    offset: number,
+    data: Uint8Array,
+    truncate = false,
+  ): Promise<void> {
+    const handle = this.requireHandle();
+    if (truncate) {
+      handle.truncate(0);
+      this.stats.truncates += 1;
+    }
+    if (data.byteLength > 0) {
+      const written = handle.write(data, { at: offset });
+      this.stats.writes += 1;
+      if (written > 0) this.stats.bytesWritten += written;
+    }
+  }
+
+  /** Export the entire database file as a `Uint8Array`. */
+  async exportDatabase(): Promise<Uint8Array> {
+    const handle = this.requireHandle();
+    const size = handle.getSize();
+    if (size === 0) return new Uint8Array(0);
+    const out = new Uint8Array(size);
+    const n = handle.read(out, { at: 0 });
+    this.stats.reads += 1;
+    if (n > 0) this.stats.bytesRead += n;
+    return n === size ? out : out.slice(0, Math.max(0, n));
+  }
+
+  /** Replace the entire database file contents with `data` and flush to disk. */
+  async importDatabase(data: Uint8Array): Promise<void> {
+    const handle = this.requireHandle();
+    handle.truncate(data.byteLength);
+    this.stats.truncates += 1;
+    if (data.byteLength > 0) {
+      const written = handle.write(data, { at: 0 });
+      this.stats.writes += 1;
+      if (written > 0) this.stats.bytesWritten += written;
+    }
+    handle.flush();
+    this.stats.flushes += 1;
+  }
+
+  /** Flush all pending writes to the underlying OPFS file. */
+  async sync(): Promise<void> {
+    const handle = this.requireHandle();
+    handle.flush();
+    this.stats.flushes += 1;
+  }
+
+  /** Truncate the database file to `0` bytes and flush. */
+  async clear(): Promise<void> {
+    const handle = this.requireHandle();
+    handle.truncate(0);
+    handle.flush();
+    this.stats.truncates += 1;
+    this.stats.flushes += 1;
+  }
+
+  /** Close the handle and delete the underlying `.fdb` file from OPFS. */
+  async destroy(): Promise<void> {
+    const dbName = this.currentDbName;
+    const shouldRemove = this.ownsHandle;
+    await this.close();
+    if (dbName && shouldRemove) {
+      await removeDatabaseFile(dbName, this.directoryName, this.getDirectory);
+    }
+  }
+
+  /**
+   * Mount this `OPFSVFS` instance into an Emscripten module's filesystem at
+   * `mountpoint` (default `'/opfs'`) and return the mounted database path.
+   */
+  mount(
+    mod: FirebirdWasmModule,
+    mountpoint = '/opfs',
+    options: Omit<MountOpfsOptions, 'stats'> = {},
+  ): { dbPath: string; stats: OpfsMountStats } {
+    const handle = this.requireHandle();
+    const fileName = normalizeOpfsFileName(this.currentDbName ?? 'database');
+    mountOpfs(mod, mountpoint, new Map([[fileName, handle]]), {
+      ...options,
+      stats: this.stats,
+    });
+    return {
+      dbPath: `${mountpoint.replace(/\/+$/, '')}/${fileName}`,
+      stats: this.stats,
+    };
+  }
+
+  /** Return a snapshot of cumulative I/O statistics for this VFS instance. */
+  getStats(): OpfsMountStats {
+    return { ...this.stats };
+  }
+
+  private requireHandle(): SyncAccessHandle {
+    if (!this.syncHandle) {
+      throw new Error('OPFSVFS is not open. Call open(dbName) first.');
+    }
+    return this.syncHandle;
+  }
 }

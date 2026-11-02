@@ -1359,7 +1359,7 @@ Next-horizon milestones for `v0.15.0`:
       Provide `cosineDistance`, `l2Distance`, and `dotProduct` over packed
       `Float32Array` embeddings stored in `BINARY(N)` / `BLOB` columns for
       local semantic search and RAG in the browser and Node.
-- [ ] **Direct Page-Level OPFS VFS (`FileSystemSyncAccessHandle` in Worker PIO).**
+- [x] **Direct Page-Level OPFS VFS (`FileSystemSyncAccessHandle` in Worker PIO).**
       Mount an Emscripten custom filesystem backend backed directly by
       `FileSystemSyncAccessHandle.read()` / `.write()` at offset inside the Web
       Worker so large `.fdb` databases (500 MB–2 GB+) run without holding the

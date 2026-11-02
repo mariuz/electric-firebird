@@ -181,6 +181,24 @@ export type {
   BinaryResultPayload,
 } from './browser/binary-result';
 export { VERSION } from './version';
+export {
+  OPFSVFS,
+  mountOpfs,
+  openDatabaseHandle,
+  removeDatabaseFile,
+  opfsAvailable,
+  createMemorySyncAccessHandle,
+  createOpfsMountStats,
+} from './browser/opfs-fs';
+export type {
+  OPFSVFSOptions,
+  SyncAccessHandle,
+  OpfsDirectoryHandle,
+  OpfsFileHandle,
+  MountOpfsOptions,
+  OpfsMountStats,
+  MemorySyncAccessHandle,
+} from './browser/opfs-fs';
 export type {
   FirebirdWasmModule,
   WasmLoadOptions,

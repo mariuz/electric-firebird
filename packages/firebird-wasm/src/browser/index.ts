@@ -173,6 +173,25 @@ export type {
 export { IndexedDBVFS } from './indexeddb-vfs';
 export type { IndexedDBVFSOptions, VFSMetadata } from './indexeddb-vfs';
 
+export {
+  OPFSVFS,
+  mountOpfs,
+  openDatabaseHandle,
+  removeDatabaseFile,
+  opfsAvailable,
+  createMemorySyncAccessHandle,
+  createOpfsMountStats,
+} from './opfs-fs';
+export type {
+  OPFSVFSOptions,
+  SyncAccessHandle,
+  OpfsDirectoryHandle,
+  OpfsFileHandle,
+  MountOpfsOptions,
+  OpfsMountStats,
+  MemorySyncAccessHandle,
+} from './opfs-fs';
+
 export { loadFirebirdWasm, disposeFirebirdWasm, allocString } from '../wasm-loader';
 export type {
   FirebirdWasmModule,

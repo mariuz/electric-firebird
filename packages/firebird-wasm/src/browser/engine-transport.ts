@@ -2397,14 +2397,27 @@ export class DirectTransport implements EngineTransport {
   }
 
   async exists(path: string): Promise<boolean> {
+    if (this.opfsHandle && path.startsWith(`${OPFS_MOUNT}/`)) return this.opfsHandle.getSize() > 0;
     return this.module.FS.analyzePath(path).exists;
   }
 
   async readFile(path: string): Promise<Uint8Array> {
+    if (this.opfsHandle && path.startsWith(`${OPFS_MOUNT}/`)) {
+      const size = this.opfsHandle.getSize();
+      const buf = new Uint8Array(size);
+      if (size > 0) this.opfsHandle.read(buf, { at: 0 });
+      return buf;
+    }
     return this.module.FS.readFile(path);
   }
 
   async writeFile(path: string, data: Uint8Array): Promise<void> {
+    if (this.opfsHandle && path.startsWith(`${OPFS_MOUNT}/`)) {
+      this.opfsHandle.truncate(data.byteLength);
+      if (data.byteLength > 0) this.opfsHandle.write(data, { at: 0 });
+      this.opfsHandle.flush();
+      return;
+    }
     this.module.FS.writeFile(path, data);
   }
 
@@ -2518,6 +2531,10 @@ export class DirectTransport implements EngineTransport {
 
   async unlink(path: string): Promise<void> {
     if (this.module.FS.analyzePath(path).exists) {
+      if (this.opfsHandle && path.startsWith(`${OPFS_MOUNT}/`)) {
+        this.opfsHandle.truncate(0);
+        this.opfsHandle.flush();
+      }
       this.module.FS.unlink(path);
     }
   }
