@@ -4,6 +4,25 @@ All notable changes to `firebird-wasm`. This project follows
 [semantic versioning](https://semver.org/); while the major version is 0 the
 API may still move between minor releases.
 
+## 0.15.0 — 2026-11-02
+
+### Added
+
+- **Statement handle execution by ID (`_fb_execute_stmt`, `_fb_execute_batch_stmt`, `_fb_query_stmt`, `_fb_query_stmt_binary`, `_fb_cursor_open_stmt`).**
+  - Prepared statements (`db.prepare(sql)` and `tx.prepare(sql)`) now execute, batch-execute, query, and stream cursors directly by their pinned integer `StmtHandle` across `DirectTransport`, `serveEngine`, `WorkerTransport`, and `SharedEngineTransport` with zero SQL string re-allocation or marshalling on subsequent calls.
+- **Nested transactions / Savepoints (`tx.savepoint(fn)` and `tx.savepoint(name, fn)`).**
+  - Added first-class savepoint helpers on both `FirebirdBrowserTransaction` and `FirebirdTransaction` (`SAVEPOINT <name>`, `RELEASE SAVEPOINT <name> ONLY`, and automatic `ROLLBACK TO SAVEPOINT <name>` on error), supporting arbitrary nesting depth.
+- **Statement cancellation & query timeouts (`AbortSignal`, `timeoutMs`, `db.cancelOperation()`, and `stmt.setTimeout()`).**
+  - Exposed `IAttachment::cancelOperation` (`_fb_cancel_operation`) and `IStatement::setTimeout` (`_fb_stmt_set_timeout`) in the WASM C bridge, transports, `FirebirdBrowser`, and `FirebirdLite`, supporting `{ signal, timeoutMs }` execution options across `query()`, `exec()`, `executeBatch()`, `queryStream()`, and prepared statements.
+- **Streaming CSV & JSONLines (`'jsonl'` / `'ndjson'`) import & export (`db.copyFromStream()` / `db.copyToStream()`).**
+  - Added Web `ReadableStream` / `WritableStream` bulk table import and export (`copyFromStream` and `copyToStream` on `FirebirdBrowser`, `FirebirdBrowserTransaction`, `FirebirdLite`, and `FirebirdTransaction`) with RFC 4180 CSV and NDJSON parsing/serialization and configurable batch sizes.
+- **Interactive Schema Inspector & Migration Viewer in `<firebird-repl>`.**
+  - Added a toggleable `.inspector` sidebar panel with **Schema** and **Migrations** tabs (plus programmatic `el.schema()`, `el.migrations()`, `el.toggleInspector()`, and `el.refreshInspector()` methods) rendering live `db.introspect()` catalog metadata and `FB_MIGRATIONS$` history with one-click `SELECT` query population.
+- **Drizzle Kit & Kysely Codegen introspection adapters (`generateDrizzleSchema` & `generateKyselyTypes`).**
+  - Added `generateDrizzleSchema`, `generateDrizzleSchemaFromCatalog`, `generateKyselyTypes`, and `generateKyselyTypesFromCatalog` (exported from `firebird-wasm/drizzle`, `firebird-wasm/kysely`, `firebird-wasm`, and `firebird-wasm/browser`) to generate typed Drizzle `firebirdTable(...)` definitions (with topological FK sorting, indexes, composite keys, and `relations(...)`) and Kysely `Database` interfaces directly from `db.introspect()`.
+- **Pluggable conflict resolution strategies in `createWriteQueue` (`onConflict`).**
+  - Added `onConflict` (`'client-wins'`, `'server-wins'`, `'merge'`, or custom resolver callback), `WriteConflict`, `mergeWriteConflict`, `getServerRow`, and `onConflictResolved` to `firebird-wasm/electric` (`createWriteQueue`), handling conflicts both when flushing offline mutations after reconnect and when reconciling live Electric shape batches.
+
 ## 0.14.0 — 2026-10-27
 
 ### Added
