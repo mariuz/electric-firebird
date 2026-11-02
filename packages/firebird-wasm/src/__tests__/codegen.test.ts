@@ -499,7 +499,7 @@ describe('Drizzle & Kysely Codegen Introspection Adapters', () => {
 
   it('resolves SchemaIntrospection from db.introspect() or Drizzle $client in generateDrizzleSchema / generateKyselyTypes', async () => {
     const catalog = buildRichCatalog();
-    const introspectSpy = jest.fn(async () => catalog);
+    const introspectSpy = vi.fn(async () => catalog);
 
     const fakeDbWithIntrospect = {
       introspect: introspectSpy,

@@ -7,19 +7,20 @@
  * the database to all of them, so it must never happen, by import or by call.
  */
 
+import { type Mock } from 'vitest';
 import { serveEngine } from '../browser/serve-engine';
 import type { EngineTransport } from '../browser/engine-transport';
 
 const transport = {} as EngineTransport;
 
 type Scope = {
-  postMessage: jest.Mock;
-  addEventListener: jest.Mock;
+  postMessage: Mock;
+  addEventListener: Mock;
   document?: unknown;
 };
 const scope = (extra: Partial<Scope> = {}): Scope => ({
-  postMessage: jest.fn(),
-  addEventListener: jest.fn(),
+  postMessage: vi.fn(),
+  addEventListener: vi.fn(),
   ...extra,
 });
 
@@ -42,38 +43,35 @@ describe('worker-entry', () => {
   afterEach(() => {
     delete g['self'];
     delete g['WorkerGlobalScope'];
-    jest.resetModules();
+    vi.resetModules();
   });
 
-  it('starts nothing outside a Worker, though the scope has postMessage', () => {
+  it('starts nothing outside a Worker, though the scope has postMessage', async () => {
     // A page's window: postMessage and addEventListener, no WorkerGlobalScope.
     const page = scope();
     g['self'] = page;
-    jest.isolateModules(() => {
-      require('../browser/worker-entry');
-    });
+    vi.resetModules();
+    await import('../browser/worker-entry');
     expect(page.addEventListener).not.toHaveBeenCalled();
   });
 
-  it('starts serving when loaded as a dedicated Worker\'s script', () => {
+  it("starts serving when loaded as a dedicated Worker's script", async () => {
     class WorkerGlobalScope {}
     const worker = Object.assign(new WorkerGlobalScope(), scope());
     g['WorkerGlobalScope'] = WorkerGlobalScope;
     g['self'] = worker;
-    jest.isolateModules(() => {
-      require('../browser/worker-entry');
-    });
+    vi.resetModules();
+    await import('../browser/worker-entry');
     expect(worker.addEventListener).toHaveBeenCalledWith('message', expect.any(Function));
   });
 
-  it('is not loaded by the library index, so importing the library starts nothing', () => {
+  it('is not loaded by the library index, so importing the library starts nothing', async () => {
     class WorkerGlobalScope {}
     const worker = Object.assign(new WorkerGlobalScope(), scope());
     g['WorkerGlobalScope'] = WorkerGlobalScope;
     g['self'] = worker;
-    jest.isolateModules(() => {
-      require('../browser/index');
-    });
+    vi.resetModules();
+    await import('../browser/index');
     expect(worker.addEventListener).not.toHaveBeenCalled();
   });
 });

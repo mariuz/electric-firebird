@@ -110,8 +110,8 @@ describe('firebird-wasm/vector – Client-Side Vector Similarity & Hybrid Search
     it('registers all 7 SQL vector functions via db.registerFunction', async () => {
       const registered = new Map<string, { opts: RegisterFunctionOptions; fn: JsFunctionHandler }>();
       const mockDb = {
-        query: jest.fn(async () => ({ rows: [], fields: [] })),
-        registerFunction: jest.fn(
+        query: vi.fn(async () => ({ rows: [], fields: [] })),
+        registerFunction: vi.fn(
           async (name: string, opts: RegisterFunctionOptions, fn: JsFunctionHandler): Promise<RegisteredRoutine> => {
             registered.set(name, { opts, fn });
             return {
@@ -177,7 +177,7 @@ describe('firebird-wasm/vector – Client-Side Vector Similarity & Hybrid Search
 
       const executedQueries: Array<{ sql: string; params: unknown[] }> = [];
       const mockDb = {
-        query: jest.fn(async (sql: string, params: unknown[] = []) => {
+        query: vi.fn(async (sql: string, params: unknown[] = []) => {
           executedQueries.push({ sql, params });
           const rows =
             params.length > 0

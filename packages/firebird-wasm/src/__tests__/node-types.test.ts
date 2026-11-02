@@ -146,43 +146,43 @@ function createMockFirebirdLite(
   const executedParams: unknown[][] = [];
 
   const attachment = {
-    startTransaction: jest.fn(async () => ({
-      commit: jest.fn(async () => undefined),
-      rollback: jest.fn(async () => undefined),
+    startTransaction: vi.fn(async () => ({
+      commit: vi.fn(async () => undefined),
+      rollback: vi.fn(async () => undefined),
     })),
-    execute: jest.fn(async () => undefined),
-    prepare: jest.fn(async () => {
+    execute: vi.fn(async () => undefined),
+    prepare: vi.fn(async () => {
       const stmt = {
         fields,
         columnLabels: Promise.resolve(fields.map((f) => f.name)),
         type: Promise.resolve(stmtType),
         hasResultSet,
-        execute: jest.fn(async (_tx: unknown, params: unknown[] = []) => {
+        execute: vi.fn(async (_tx: unknown, params: unknown[] = []) => {
           executedParams.push(params);
         }),
-        executeSingleton: jest.fn(async (_tx: unknown, params: unknown[] = []) => {
+        executeSingleton: vi.fn(async (_tx: unknown, params: unknown[] = []) => {
           executedParams.push(params);
           return allRows[0] ?? [];
         }),
-        executeQuery: jest.fn(async (_tx: unknown, params: unknown[] = []) => {
+        executeQuery: vi.fn(async (_tx: unknown, params: unknown[] = []) => {
           executedParams.push(params);
           let cursor = 0;
           return {
-            fetch: jest.fn(async (opts?: { fetchSize?: number }) => {
+            fetch: vi.fn(async (opts?: { fetchSize?: number }) => {
               if (cursor >= allRows.length) return [];
               const count = opts?.fetchSize ?? allRows.length;
               const slice = allRows.slice(cursor, cursor + count).map((r) => [...r]);
               cursor += slice.length;
               return slice;
             }),
-            close: jest.fn(async () => undefined),
+            close: vi.fn(async () => undefined),
           };
         }),
-        dispose: jest.fn(async () => undefined),
+        dispose: vi.fn(async () => undefined),
       };
       return stmt;
     }),
-    disconnect: jest.fn(async () => undefined),
+    disconnect: vi.fn(async () => undefined),
   };
 
   const db = new FirebirdLite('/tmp/mock-types.fdb', config.options);
@@ -262,34 +262,34 @@ describe('Native output metadata & binary buffer decoding on FirebirdLite', () =
       client: {
         statusAction: async <T>(fn: (status: unknown) => Promise<T>) => fn({}),
       },
-      startTransaction: jest.fn(async () => ({
-        commit: jest.fn(async () => undefined),
-        rollback: jest.fn(async () => undefined),
+      startTransaction: vi.fn(async () => ({
+        commit: vi.fn(async () => undefined),
+        rollback: vi.fn(async () => undefined),
       })),
-      openBlob: jest.fn(async (_tx: unknown, blob: FbBlob) => {
+      openBlob: vi.fn(async (_tx: unknown, blob: FbBlob) => {
         const id = blob.id[0]!;
         const data = blobContents.get(id) ?? Buffer.alloc(0);
         let readDone = false;
         return {
-          read: jest.fn(async (buf: Buffer) => {
+          read: vi.fn(async (buf: Buffer) => {
             if (readDone) return -1;
             readDone = true;
             data.copy(buf, 0);
             return data.length;
           }),
-          close: jest.fn(async () => undefined),
+          close: vi.fn(async () => undefined),
         };
       }),
-      prepare: jest.fn(async () => {
+      prepare: vi.fn(async () => {
         const stmt: Record<string, unknown> = {
           attachment,
           hasResultSet: true,
           type: Promise.resolve(1),
           outMetadata: driverOutMeta,
           outBuffer: new Uint8Array(driverOutMeta.getMessageLengthSync()),
-          dataReader: jest.fn(),
+          dataReader: vi.fn(),
           statementHandle: {
-            getOutputMetadataAsync: jest.fn(async () => preparedOutMeta),
+            getOutputMetadataAsync: vi.fn(async () => preparedOutMeta),
           },
           internalDispose: async function (this: { outMetadata?: { releaseSync: () => void } }) {
             if (this.outMetadata) {
@@ -301,7 +301,7 @@ describe('Native output metadata & binary buffer decoding on FirebirdLite', () =
           dispose: async function (this: { internalDispose: () => Promise<void> }) {
             await this.internalDispose();
           },
-          executeQuery: jest.fn(async (tx: unknown) => {
+          executeQuery: vi.fn(async (tx: unknown) => {
             // Populate stmt.outBuffer according to the custom outMetadata installed by setupOutput
             const outMeta = stmt.outMetadata as ReturnType<typeof buildMockNativeMetadata>;
             const buf = new Uint8Array(outMeta.getMessageLengthSync());
@@ -392,18 +392,18 @@ describe('Native output metadata & binary buffer decoding on FirebirdLite', () =
             const decodedRow = await reader(attachment, tx, buf);
             let fetched = false;
             return {
-              fetch: jest.fn(async () => {
+              fetch: vi.fn(async () => {
                 if (fetched) return [];
                 fetched = true;
                 return [decodedRow];
               }),
-              close: jest.fn(async () => undefined),
+              close: vi.fn(async () => undefined),
             };
           }),
         };
         return stmt;
       }),
-      disconnect: jest.fn(async () => undefined),
+      disconnect: vi.fn(async () => undefined),
     };
 
     const db = new FirebirdLite('/tmp/wire-decode.fdb');

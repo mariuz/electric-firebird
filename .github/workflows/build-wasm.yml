@@ -148,7 +148,7 @@ jobs:
         # is particular to the build without threads.
         env:
           FB_EXPECTED_ENGINE_PREFIX: '6.0.'
-        run: npx jest --testPathPattern='wasm-(integration|single-thread)' --forceExit
+        run: npx vitest run src/__tests__/wasm-integration.test.ts src/__tests__/wasm-single-thread.test.ts
 
       - name: Install Playwright browsers for WASM browser tests
         working-directory: e2e
@@ -335,4 +335,4 @@ jobs:
         working-directory: packages/firebird-wasm
         env:
           FB_EXPECTED_ENGINE_PREFIX: '5.0.'
-        run: npx jest --testPathPattern='wasm-(integration|single-thread)' --forceExit
+        run: npx vitest run src/__tests__/wasm-integration.test.ts src/__tests__/wasm-single-thread.test.ts

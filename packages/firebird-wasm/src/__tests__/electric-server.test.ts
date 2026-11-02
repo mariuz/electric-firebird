@@ -75,7 +75,7 @@ const byId = (rows: Row[]) => [...rows].sort((a, b) => Number(a['id']) - Number(
 const describeIfFirebird = hasFirebirdLib ? describe : describe.skip;
 
 describeIfFirebird('createShapeServer against a Firebird server', () => {
-  jest.setTimeout(60_000);
+  vi.setConfig({ testTimeout: 60_000 });
 
   let source: FirebirdLite;
   let server: ShapeServer;
@@ -618,14 +618,14 @@ describe('createShapeServer fast paths & protocol (mocked driver)', () => {
     let currentPairs: unknown[][] = [];
 
     const mockAttachment = {
-      startTransaction: jest.fn(async () => ({
-        commit: jest.fn(async () => undefined),
-        rollback: jest.fn(async () => undefined),
+      startTransaction: vi.fn(async () => ({
+        commit: vi.fn(async () => undefined),
+        rollback: vi.fn(async () => undefined),
       })),
-      execute: jest.fn(async (_tx: unknown, sql: string, params?: unknown[]) => {
+      execute: vi.fn(async (_tx: unknown, sql: string, params?: unknown[]) => {
         executedStmts.push({ sql, params });
       }),
-      executeQuery: jest.fn(async (_tx: unknown, sql: string, params?: unknown[]) => {
+      executeQuery: vi.fn(async (_tx: unknown, sql: string, params?: unknown[]) => {
         executedQueries.push({ sql, params });
         let rows: unknown[][] = [];
         if (sql.includes('FROM RDB$RELATION_FIELDS') && params?.[0] === 'ITEMS') {
@@ -670,30 +670,34 @@ describe('createShapeServer fast paths & protocol (mocked driver)', () => {
           rows = [[777]];
         }
         return {
-          fetch: jest.fn(async () => rows),
-          close: jest.fn(async () => undefined),
+          fetch: vi.fn(async () => rows),
+          close: vi.fn(async () => undefined),
         };
       }),
-      queueEvents: jest.fn(async () => ({ cancel: jest.fn(async () => undefined) })),
-      disconnect: jest.fn(async () => undefined),
+      queueEvents: vi.fn(async () => ({ cancel: vi.fn(async () => undefined) })),
+      disconnect: vi.fn(async () => undefined),
     };
 
     const mockClient = {
-      connect: jest.fn(async () => mockAttachment),
-      dispose: jest.fn(async () => undefined),
+      connect: vi.fn(async () => mockAttachment),
+      dispose: vi.fn(async () => undefined),
     };
 
     let srv: ShapeServer | undefined;
     let httpSrv: http.Server | undefined;
+    const resolvedNative = require.resolve('node-firebird-driver-native');
+    const savedNativeModule = require.cache[resolvedNative];
     try {
-      jest.resetModules();
-      jest.doMock('node-firebird-driver-native', () => ({
-        createNativeClient: () => mockClient,
-        getDefaultLibraryFilename: () => 'mock.dll',
-      }));
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const { createShapeServer: createMockedServer } = require('../electric-server') as typeof import('../electric-server');
-      srv = await createMockedServer({
+      require.cache[resolvedNative] = {
+        id: resolvedNative,
+        filename: resolvedNative,
+        loaded: true,
+        exports: {
+          createNativeClient: () => mockClient,
+          getDefaultLibraryFilename: () => 'mock.dll',
+        },
+      } as NodeJS.Module;
+      srv = await createShapeServer({
         database: 'localhost:/tmp/mock.fdb',
         tables: ['items', 'pairs'],
         install: false,
@@ -857,8 +861,11 @@ describe('createShapeServer fast paths & protocol (mocked driver)', () => {
       );
       expect(separateTableSelects).toHaveLength(0);
     } finally {
-      jest.dontMock('node-firebird-driver-native');
-      jest.resetModules();
+      if (savedNativeModule) {
+        require.cache[resolvedNative] = savedNativeModule;
+      } else {
+        delete require.cache[resolvedNative];
+      }
       httpSrv?.closeAllConnections();
       if (httpSrv) await new Promise((r) => httpSrv!.close(r));
       await srv?.close();

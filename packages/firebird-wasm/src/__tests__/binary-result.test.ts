@@ -314,7 +314,7 @@ describe('Binary result wire format (encodeBinaryResultSet / decodeBinaryResultS
     sharedView.set(encoded);
 
     const origDecode = TextDecoder.prototype.decode;
-    const decodeSpy = jest
+    const decodeSpy = vi
       .spyOn(TextDecoder.prototype, 'decode')
       .mockImplementation(function (this: TextDecoder, input?: AllowSharedBufferSource, options?: TextDecodeOptions) {
         if (
@@ -553,47 +553,47 @@ describe('Binary result wire format (encodeBinaryResultSet / decodeBinaryResultS
       rows: [{ ID: 99, ACTIVE: false }],
     });
 
-    const leaderQuerySpy = jest.fn();
-    const leaderQueryBinarySpy = jest.fn(async () => ({
+    const leaderQuerySpy = vi.fn();
+    const leaderQueryBinarySpy = vi.fn(async () => ({
       binaryResult: shape7Buf,
       shapeId: 7,
       shapeFields: queryFields,
     }));
-    const leaderCursorFetchBinarySpy = jest.fn(async () => ({
+    const leaderCursorFetchBinarySpy = vi.fn(async () => ({
       binaryResult: cursorBuf,
     }));
 
     const mockLeaderEngine = {
-      init: jest.fn(async () => undefined),
-      createDatabase: jest.fn(async () => 1),
-      attachDatabase: jest.fn(async () => 1),
-      detachDatabase: jest.fn(async () => undefined),
-      execute: jest.fn(async () => 0),
-      executeBatch: jest.fn(async () => 0),
+      init: vi.fn(async () => undefined),
+      createDatabase: vi.fn(async () => 1),
+      attachDatabase: vi.fn(async () => 1),
+      detachDatabase: vi.fn(async () => undefined),
+      execute: vi.fn(async () => 0),
+      executeBatch: vi.fn(async () => 0),
       query: leaderQuerySpy,
       queryBinary: leaderQueryBinarySpy,
-      cursorOpen: jest.fn(async () => 3),
-      cursorFetch: jest.fn(),
+      cursorOpen: vi.fn(async () => 3),
+      cursorFetch: vi.fn(),
       cursorFetchBinary: leaderCursorFetchBinarySpy,
-      cursorClose: jest.fn(async () => undefined),
-      describe: jest.fn(),
-      startTransaction: jest.fn(async () => 1),
-      commit: jest.fn(async () => undefined),
-      rollback: jest.fn(async () => undefined),
-      mkdir: jest.fn(async () => undefined),
-      exists: jest.fn(async () => true),
-      readFile: jest.fn(async () => new Uint8Array(0)),
-      writeFile: jest.fn(async () => undefined),
-      unlink: jest.fn(async () => undefined),
-      eventsSubscribe: jest.fn(async () => 1),
-      eventsPoll: jest.fn(async () => ({})),
-      eventsCancel: jest.fn(async () => undefined),
-      mountOpfs: jest.fn(async () => '/opfs/test.fdb'),
-      dispose: jest.fn(async () => undefined),
+      cursorClose: vi.fn(async () => undefined),
+      describe: vi.fn(),
+      startTransaction: vi.fn(async () => 1),
+      commit: vi.fn(async () => undefined),
+      rollback: vi.fn(async () => undefined),
+      mkdir: vi.fn(async () => undefined),
+      exists: vi.fn(async () => true),
+      readFile: vi.fn(async () => new Uint8Array(0)),
+      writeFile: vi.fn(async () => undefined),
+      unlink: vi.fn(async () => undefined),
+      eventsSubscribe: vi.fn(async () => 1),
+      eventsPoll: vi.fn(async () => ({})),
+      eventsCancel: vi.fn(async () => undefined),
+      mountOpfs: vi.fn(async () => '/opfs/test.fdb'),
+      dispose: vi.fn(async () => undefined),
     };
 
     let electedFirst = false;
-    const electSpy = jest
+    const electSpy = vi
       .spyOn(leaderElectionModule, 'electLeader')
       .mockImplementation((_dbName, opts) => {
         if (!electedFirst) {
@@ -616,23 +616,27 @@ describe('Binary result wire format (encodeBinaryResultSet / decodeBinaryResultS
         };
       });
     let lockHeld = false;
-    const origNavigator = (globalThis as { navigator?: unknown }).navigator;
-    (globalThis as { navigator?: unknown }).navigator = {
-      locks: {
-        request: (
-          _name: string,
-          _opts: unknown,
-          cb: () => Promise<unknown>,
-        ) => {
-          if (!lockHeld) {
-            lockHeld = true;
-            return Promise.resolve().then(() => cb());
-          }
-          // Second tab waits in the lock queue (follower)
-          return new Promise<void>(() => {});
+    const origNavigatorDesc = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      writable: true,
+      value: {
+        locks: {
+          request: (
+            _name: string,
+            _opts: unknown,
+            cb: () => Promise<unknown>,
+          ) => {
+            if (!lockHeld) {
+              lockHeld = true;
+              return Promise.resolve().then(() => cb());
+            }
+            // Second tab waits in the lock queue (follower)
+            return new Promise<void>(() => {});
+          },
         },
       },
-    };
+    });
 
     const channelMessages: unknown[] = [];
     const origBC = globalThis.BroadcastChannel;
@@ -730,10 +734,10 @@ describe('Binary result wire format (encodeBinaryResultSet / decodeBinaryResultS
       await leader.dispose();
       electSpy.mockRestore();
       globalThis.BroadcastChannel = origBC;
-      if (origNavigator === undefined) {
-        delete (globalThis as { navigator?: unknown }).navigator;
+      if (origNavigatorDesc) {
+        Object.defineProperty(globalThis, 'navigator', origNavigatorDesc);
       } else {
-        (globalThis as { navigator?: unknown }).navigator = origNavigator;
+        delete (globalThis as { navigator?: unknown }).navigator;
       }
     }
   });
@@ -758,7 +762,7 @@ describe('Binary result wire format (encodeBinaryResultSet / decodeBinaryResultS
       return allocBytes(bytes);
     };
 
-    const stringToUTF8Spy = jest.fn(
+    const stringToUTF8Spy = vi.fn(
       (str: string, outPtr: number, maxBytes: number) => {
         const encoded = new TextEncoder().encode(str);
         const slice = encoded.subarray(0, Math.max(0, maxBytes - 1));
@@ -766,15 +770,15 @@ describe('Binary result wire format (encodeBinaryResultSet / decodeBinaryResultS
         heap[outPtr + slice.byteLength] = 0;
       },
     );
-    const executeSqlSpy = jest.fn(() => 0);
-    const executeParamsSqlSpy = jest.fn(() => 0);
-    const executeBatchSqlSpy = jest.fn(() => 0);
-    const queryBinarySqlSpy = jest.fn(() => 0);
-    const cursorOpenSqlSpy = jest.fn(() => 0);
+    const executeSqlSpy = vi.fn(() => 0);
+    const executeParamsSqlSpy = vi.fn(() => 0);
+    const executeBatchSqlSpy = vi.fn(() => 0);
+    const queryBinarySqlSpy = vi.fn(() => 0);
+    const cursorOpenSqlSpy = vi.fn(() => 0);
 
-    const executeStmtSpy = jest.fn(() => 0);
-    const executeBatchStmtSpy = jest.fn(() => 0);
-    const queryStmtBinarySpy = jest.fn(
+    const executeStmtSpy = vi.fn(() => 0);
+    const executeBatchStmtSpy = vi.fn(() => 0);
+    const queryStmtBinarySpy = vi.fn(
       (
         _db: number,
         _tx: number,
@@ -793,8 +797,8 @@ describe('Binary result wire format (encodeBinaryResultSet / decodeBinaryResultS
         return ptr;
       },
     );
-    const cursorOpenStmtSpy = jest.fn(() => 77);
-    const stmtCloseSpy = jest.fn(() => 0);
+    const cursorOpenStmtSpy = vi.fn(() => 77);
+    const stmtCloseSpy = vi.fn(() => 0);
 
     const fakeMod = {
       HEAPU8: heap,
@@ -807,7 +811,7 @@ describe('Binary result wire format (encodeBinaryResultSet / decodeBinaryResultS
       _fb_free_result() {},
       _fb_last_error: () => 0,
       _fb_last_affected_rows: () => 3,
-      _fb_prepare: jest.fn(() =>
+      _fb_prepare: vi.fn(() =>
         allocUtf8(
           JSON.stringify({
             handle: 42,
@@ -978,15 +982,15 @@ describe('Binary result wire format (encodeBinaryResultSet / decodeBinaryResultS
 
     let cursorFetches = 0;
     const backendTransport = {
-      init: jest.fn(async () => undefined),
-      createDatabase: jest.fn(async () => 1),
-      attachDatabase: jest.fn(async () => 1),
-      detachDatabase: jest.fn(async () => undefined),
-      execute: jest.fn(async () => 0),
-      executeBatch: jest.fn(async () => 0),
-      query: jest.fn(),
-      queryBinary: jest.fn(),
-      prepare: jest.fn(async () => ({
+      init: vi.fn(async () => undefined),
+      createDatabase: vi.fn(async () => 1),
+      attachDatabase: vi.fn(async () => 1),
+      detachDatabase: vi.fn(async () => undefined),
+      execute: vi.fn(async () => 0),
+      executeBatch: vi.fn(async () => 0),
+      query: vi.fn(),
+      queryBinary: vi.fn(),
+      prepare: vi.fn(async () => ({
         handle: 101,
         params: [
           {
@@ -1003,36 +1007,36 @@ describe('Binary result wire format (encodeBinaryResultSet / decodeBinaryResultS
         statementType: 'SELECT' as const,
         hasResultSet: true,
       })),
-      stmtClose: jest.fn(async () => undefined),
-      executeStmt: jest.fn(async () => 1),
-      executeBatchStmt: jest.fn(async (_db, _tx, _stmt, rows: unknown[]) => rows.length),
-      queryStmtBinary: jest.fn(async () => ({
+      stmtClose: vi.fn(async () => undefined),
+      executeStmt: vi.fn(async () => 1),
+      executeBatchStmt: vi.fn(async (_db, _tx, _stmt, rows: unknown[]) => rows.length),
+      queryStmtBinary: vi.fn(async () => ({
         binaryResult: binBuf,
         shapeId: 33,
         shapeFields: queryFields,
       })),
-      cursorOpenStmt: jest.fn(async () => 501),
-      cursorFetchBinary: jest.fn(async () => {
+      cursorOpenStmt: vi.fn(async () => 501),
+      cursorFetchBinary: vi.fn(async () => {
         cursorFetches += 1;
         return {
           binaryResult: cursorFetches === 1 ? cursorBuf1 : cursorBufEmpty,
         };
       }),
-      cursorClose: jest.fn(async () => undefined),
-      describe: jest.fn(),
-      startTransaction: jest.fn(async () => 9),
-      commit: jest.fn(async () => undefined),
-      rollback: jest.fn(async () => undefined),
-      mkdir: jest.fn(async () => undefined),
-      exists: jest.fn(async () => false),
-      readFile: jest.fn(async () => new Uint8Array(0)),
-      writeFile: jest.fn(async () => undefined),
-      unlink: jest.fn(async () => undefined),
-      eventsSubscribe: jest.fn(async () => 1),
-      eventsPoll: jest.fn(async () => ({})),
-      eventsCancel: jest.fn(async () => undefined),
-      mountOpfs: jest.fn(async () => '/opfs/test.fdb'),
-      dispose: jest.fn(async () => undefined),
+      cursorClose: vi.fn(async () => undefined),
+      describe: vi.fn(),
+      startTransaction: vi.fn(async () => 9),
+      commit: vi.fn(async () => undefined),
+      rollback: vi.fn(async () => undefined),
+      mkdir: vi.fn(async () => undefined),
+      exists: vi.fn(async () => false),
+      readFile: vi.fn(async () => new Uint8Array(0)),
+      writeFile: vi.fn(async () => undefined),
+      unlink: vi.fn(async () => undefined),
+      eventsSubscribe: vi.fn(async () => 1),
+      eventsPoll: vi.fn(async () => ({})),
+      eventsCancel: vi.fn(async () => undefined),
+      mountOpfs: vi.fn(async () => '/opfs/test.fdb'),
+      dispose: vi.fn(async () => undefined),
     };
 
     serveEngine(workerScope, backendTransport as never);
@@ -1137,14 +1141,14 @@ describe('Binary result wire format (encodeBinaryResultSet / decodeBinaryResultS
 
     let resolveSlowQuery: ((val: { fields: never[]; rows: never[] }) => void) | null = null;
     const mockTransport = {
-      init: jest.fn(async () => undefined),
-      createDatabase: jest.fn(async () => 1),
-      attachDatabase: jest.fn(async () => 1),
-      detachDatabase: jest.fn(async () => undefined),
-      execute: jest.fn(async () => 1),
-      executeStmt: jest.fn(async () => 1),
-      executeBatch: jest.fn(async () => 0),
-      query: jest.fn(
+      init: vi.fn(async () => undefined),
+      createDatabase: vi.fn(async () => 1),
+      attachDatabase: vi.fn(async () => 1),
+      detachDatabase: vi.fn(async () => undefined),
+      execute: vi.fn(async () => 1),
+      executeStmt: vi.fn(async () => 1),
+      executeBatch: vi.fn(async () => 0),
+      query: vi.fn(
         (_db: number, _tx: number, sqlText: string) =>
           sqlText === 'SELECT SLOW'
             ? new Promise<{ fields: never[]; rows: never[] }>((resolve) => {
@@ -1152,38 +1156,38 @@ describe('Binary result wire format (encodeBinaryResultSet / decodeBinaryResultS
               })
             : Promise.resolve({ fields: [], rows: [] }),
       ),
-      queryStmt: jest.fn(async () => ({ fields: [], rows: [] })),
-      prepare: jest.fn(async () => ({
+      queryStmt: vi.fn(async () => ({ fields: [], rows: [] })),
+      prepare: vi.fn(async () => ({
         handle: 55,
         params: [],
         fields: [],
         statementType: 'SELECT' as const,
         hasResultSet: true,
       })),
-      stmtClose: jest.fn(async () => undefined),
-      stmtSetTimeout: jest.fn(async () => undefined),
-      cancelOperation: jest.fn(async () => {
+      stmtClose: vi.fn(async () => undefined),
+      stmtSetTimeout: vi.fn(async () => undefined),
+      cancelOperation: vi.fn(async () => {
         resolveSlowQuery?.({ fields: [], rows: [] });
       }),
-      describe: jest.fn(async () => ({
+      describe: vi.fn(async () => ({
         params: [],
         fields: [],
         statementType: 'SELECT' as const,
         hasResultSet: true,
       })),
-      startTransaction: jest.fn(async () => 3),
-      commit: jest.fn(async () => undefined),
-      rollback: jest.fn(async () => undefined),
-      mkdir: jest.fn(async () => undefined),
-      exists: jest.fn(async () => false),
-      readFile: jest.fn(async () => new Uint8Array(0)),
-      writeFile: jest.fn(async () => undefined),
-      unlink: jest.fn(async () => undefined),
-      eventsSubscribe: jest.fn(async () => 1),
-      eventsPoll: jest.fn(async () => ({})),
-      eventsCancel: jest.fn(async () => undefined),
-      mountOpfs: jest.fn(async () => '/opfs/test.fdb'),
-      dispose: jest.fn(async () => undefined),
+      startTransaction: vi.fn(async () => 3),
+      commit: vi.fn(async () => undefined),
+      rollback: vi.fn(async () => undefined),
+      mkdir: vi.fn(async () => undefined),
+      exists: vi.fn(async () => false),
+      readFile: vi.fn(async () => new Uint8Array(0)),
+      writeFile: vi.fn(async () => undefined),
+      unlink: vi.fn(async () => undefined),
+      eventsSubscribe: vi.fn(async () => 1),
+      eventsPoll: vi.fn(async () => ({})),
+      eventsCancel: vi.fn(async () => undefined),
+      mountOpfs: vi.fn(async () => '/opfs/test.fdb'),
+      dispose: vi.fn(async () => undefined),
     };
 
     const db = new FirebirdBrowser('memory://cancel-timeout-test', {

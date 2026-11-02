@@ -271,9 +271,9 @@ describe('firebird-wasm/repl', () => {
       };
 
       const fakeDb: ReplDatabase = {
-        describeQuery: jest.fn(async () => ({ hasResultSet: true })),
-        introspect: jest.fn(async () => fakeSchema),
-        monitorStats: jest.fn(async () => ({
+        describeQuery: vi.fn(async () => ({ hasResultSet: true })),
+        introspect: vi.fn(async () => fakeSchema),
+        monitorStats: vi.fn(async () => ({
           totalQueries: 2,
           totalExecs: 1,
           totalErrors: 0,
@@ -314,7 +314,7 @@ describe('firebird-wasm/repl', () => {
             },
           ],
         })),
-        query: jest.fn(async (sqlText: string) => {
+        query: vi.fn(async (sqlText: string) => {
           if (sqlText.includes('RDB$RELATIONS')) {
             return { fields: [{ name: 'X' }], rows: [[1]] };
           }
@@ -333,7 +333,7 @@ describe('firebird-wasm/repl', () => {
           }
           return { fields: [], rows: [] };
         }),
-        transaction: jest.fn(async (fn) =>
+        transaction: vi.fn(async (fn) =>
           fn({ exec: async () => ({ affectedRows: 1 }) }),
         ),
       };

@@ -161,8 +161,8 @@ describe('buildBlock', () => {
         getOutputMetadataAsync: async () => undefined,
         createBatchAsync: createBatchImpl,
       },
-      execute: jest.fn(async () => undefined),
-      dispose: jest.fn(async () => undefined),
+      execute: vi.fn(async () => undefined),
+      dispose: vi.fn(async () => undefined),
     });
 
     const batchHandle = {
@@ -191,7 +191,7 @@ describe('buildBlock', () => {
 
     const stmt1 = makeStmt(async () => batchHandle);
     const attachment1 = {
-      prepare: jest.fn(async () => stmt1),
+      prepare: vi.fn(async () => stmt1),
     } as unknown as Attachment;
     const tx1 = { transactionHandle: {} } as unknown as Transaction;
 
@@ -218,8 +218,8 @@ describe('buildBlock', () => {
       throw new Error('feature is not supported');
     });
     const attachment2 = {
-      prepare: jest.fn(async () => stmt2),
-      executeQuery: jest.fn(async () => ({
+      prepare: vi.fn(async () => stmt2),
+      executeQuery: vi.fn(async () => ({
         fetch: async () => [[0, 'NONE', 1]],
         close: async () => undefined,
       })),

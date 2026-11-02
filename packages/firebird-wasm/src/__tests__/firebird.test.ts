@@ -1389,14 +1389,14 @@ describeIfFirebird('FirebirdLite with Kysely and Drizzle ORM', () => {
 describe('FirebirdLite (no Firebird installed)', () => {
   it('supports explain() against a mocked native attachment', async () => {
     const db = new FirebirdLite('/tmp/mock-explain.fdb');
-    const getPlanAsync = jest.fn(async (_status: unknown, detailed: boolean) =>
+    const getPlanAsync = vi.fn(async (_status: unknown, detailed: boolean) =>
       detailed
         ? '\nSelect Expression\n    -> Table "ITEMS" Full Scan\n'
         : '\nPLAN (ITEMS NATURAL)\n',
     );
-    const dispose = jest.fn(async () => undefined);
-    const commit = jest.fn(async () => undefined);
-    const mockTx = { commit, rollback: jest.fn(async () => undefined) };
+    const dispose = vi.fn(async () => undefined);
+    const commit = vi.fn(async () => undefined);
+    const mockTx = { commit, rollback: vi.fn(async () => undefined) };
     const mockAttachment: Record<string, unknown> = {
       client: {
         master: {},
@@ -1407,13 +1407,13 @@ describe('FirebirdLite (no Firebird installed)', () => {
           return fn({});
         },
       },
-      startTransaction: jest.fn(async () => mockTx),
-      prepare: jest.fn(async () => ({
+      startTransaction: vi.fn(async () => mockTx),
+      prepare: vi.fn(async () => ({
         attachment: mockAttachment,
         statementHandle: { getPlanAsync },
         dispose,
       })),
-      disconnect: jest.fn(async () => undefined),
+      disconnect: vi.fn(async () => undefined),
     };
     (db as unknown as { attachment: unknown }).attachment = mockAttachment;
 
@@ -1429,7 +1429,7 @@ describe('FirebirdLite (no Firebird installed)', () => {
   });
   it('supports describeQuery() input parameter metadata via statementHandle.getInputMetadataAsync', async () => {
     const db = new FirebirdLite('/tmp/mock-describe.fdb');
-    const inReleaseSync = jest.fn(() => 0);
+    const inReleaseSync = vi.fn(() => 0);
     const mockInMeta = {
       getCountSync: () => 2,
       getTypeSync: (_s: unknown, i: number) => (i === 0 ? 496 : 580),
@@ -1440,9 +1440,9 @@ describe('FirebirdLite (no Firebird installed)', () => {
       getAliasSync: () => '',
       releaseSync: inReleaseSync,
     };
-    const dispose = jest.fn(async () => undefined);
-    const commit = jest.fn(async () => undefined);
-    const mockTx = { commit, rollback: jest.fn(async () => undefined) };
+    const dispose = vi.fn(async () => undefined);
+    const commit = vi.fn(async () => undefined);
+    const mockTx = { commit, rollback: vi.fn(async () => undefined) };
     const mockAttachment: Record<string, unknown> = {
       client: {
         master: {},
@@ -1453,11 +1453,11 @@ describe('FirebirdLite (no Firebird installed)', () => {
           return fn({});
         },
       },
-      startTransaction: jest.fn(async () => mockTx),
-      prepare: jest.fn(async () => ({
+      startTransaction: vi.fn(async () => mockTx),
+      prepare: vi.fn(async () => ({
         attachment: mockAttachment,
         statementHandle: {
-          getInputMetadataAsync: jest.fn(async () => mockInMeta),
+          getInputMetadataAsync: vi.fn(async () => mockInMeta),
         },
         fields: [
           {
@@ -1474,7 +1474,7 @@ describe('FirebirdLite (no Firebird installed)', () => {
         hasResultSet: true,
         dispose,
       })),
-      disconnect: jest.fn(async () => undefined),
+      disconnect: vi.fn(async () => undefined),
     };
     (db as unknown as { attachment: unknown }).attachment = mockAttachment;
 
@@ -1533,7 +1533,7 @@ describe('FirebirdLite (no Firebird installed)', () => {
         (val >>> 24) & 0xff,
       );
     };
-    const getInfoAsync = jest.fn(
+    const getInfoAsync = vi.fn(
       async (
         _status: unknown,
         _itemsLen: number,
@@ -1574,7 +1574,7 @@ describe('FirebirdLite (no Firebird installed)', () => {
       attachmentHandle: {
         getInfoAsync,
       },
-      disconnect: jest.fn(async () => undefined),
+      disconnect: vi.fn(async () => undefined),
     };
 
     const info = await db.databaseInfo();
@@ -1603,17 +1603,17 @@ describe('FirebirdLite (no Firebird installed)', () => {
   it('reuses a single prepared native statement across stmt.exec, stmt.query, and stmt.close in db.prepare()', async () => {
     const db = new FirebirdLite('/nonexistent/db.fdb');
     (db as unknown as { initialized: boolean }).initialized = true;
-    const dispose = jest.fn(async () => undefined);
-    const execute = jest.fn(async () => undefined);
-    const fetch = jest.fn(async () => [[1, 'alpha']]);
-    const closeResultSet = jest.fn(async () => undefined);
-    const executeQuery = jest.fn(async () => ({
+    const dispose = vi.fn(async () => undefined);
+    const execute = vi.fn(async () => undefined);
+    const fetch = vi.fn(async () => [[1, 'alpha']]);
+    const closeResultSet = vi.fn(async () => undefined);
+    const executeQuery = vi.fn(async () => ({
       fetch,
       close: closeResultSet,
     }));
-    const getAffectedRecordsAsync = jest.fn(async () => 1);
-    const commit = jest.fn(async () => undefined);
-    const rollback = jest.fn(async () => undefined);
+    const getAffectedRecordsAsync = vi.fn(async () => 1);
+    const commit = vi.fn(async () => undefined);
+    const rollback = vi.fn(async () => undefined);
 
     const mockAttachment: Record<string, unknown> = {
       client: {
@@ -1625,8 +1625,8 @@ describe('FirebirdLite (no Firebird installed)', () => {
           return fn({});
         },
       },
-      startTransaction: jest.fn(async () => ({ commit, rollback })),
-      prepare: jest.fn(async () => ({
+      startTransaction: vi.fn(async () => ({ commit, rollback })),
+      prepare: vi.fn(async () => ({
         attachment: mockAttachment,
         statementHandle: {
           getAffectedRecordsAsync,
@@ -1642,7 +1642,7 @@ describe('FirebirdLite (no Firebird installed)', () => {
         executeQuery,
         dispose,
       })),
-      disconnect: jest.fn(async () => undefined),
+      disconnect: vi.fn(async () => undefined),
     };
     (db as unknown as { attachment: unknown }).attachment = mockAttachment;
 
@@ -1709,17 +1709,17 @@ describe('FirebirdLite (no Firebird installed)', () => {
     (srcDb as unknown as { initialized: boolean }).initialized = true;
     (dstDb as unknown as { initialized: boolean }).initialized = true;
     (srcDb as unknown as { attachment: unknown }).attachment = {
-      disconnect: jest.fn(async () => undefined),
+      disconnect: vi.fn(async () => undefined),
     };
-    const reconnect = jest.fn(async () => ({
-      disconnect: jest.fn(async () => undefined),
+    const reconnect = vi.fn(async () => ({
+      disconnect: vi.fn(async () => undefined),
     }));
     (dstDb as unknown as { client: unknown }).client = {
       connect: reconnect,
-      dispose: jest.fn(async () => undefined),
+      dispose: vi.fn(async () => undefined),
     };
     (dstDb as unknown as { attachment: unknown }).attachment = {
-      disconnect: jest.fn(async () => undefined),
+      disconnect: vi.fn(async () => undefined),
     };
 
     try {
@@ -1750,38 +1750,38 @@ describe('FirebirdLite (no Firebird installed)', () => {
     const loadedPacks: Uint8Array[] = [];
     const writtenFiles = new Map<string, Uint8Array>();
     const mockTransport = {
-      init: jest.fn(async () => undefined),
-      loadIcuLocaleData: jest.fn(async (data: Uint8Array) => {
+      init: vi.fn(async () => undefined),
+      loadIcuLocaleData: vi.fn(async (data: Uint8Array) => {
         loadedPacks.push(data);
         writtenFiles.set(ICU_LOCALE_DATA_PATH, data);
       }),
-      createDatabase: jest.fn(async () => 1),
-      attachDatabase: jest.fn(async () => 1),
-      detachDatabase: jest.fn(async () => undefined),
-      execute: jest.fn(async () => 0),
-      executeBatch: jest.fn(async () => 0),
-      query: jest.fn(async () => ({ fields: [], rows: [] })),
-      describe: jest.fn(async () => ({
+      createDatabase: vi.fn(async () => 1),
+      attachDatabase: vi.fn(async () => 1),
+      detachDatabase: vi.fn(async () => undefined),
+      execute: vi.fn(async () => 0),
+      executeBatch: vi.fn(async () => 0),
+      query: vi.fn(async () => ({ fields: [], rows: [] })),
+      describe: vi.fn(async () => ({
         params: [],
         fields: [],
         statementType: 'DDL' as const,
         hasResultSet: false,
       })),
-      startTransaction: jest.fn(async () => 1),
-      commit: jest.fn(async () => undefined),
-      rollback: jest.fn(async () => undefined),
-      mkdir: jest.fn(async () => undefined),
-      exists: jest.fn(async (p: string) => writtenFiles.has(p)),
-      readFile: jest.fn(async (p: string) => writtenFiles.get(p) ?? new Uint8Array(0)),
-      writeFile: jest.fn(async (p: string, d: Uint8Array) => {
+      startTransaction: vi.fn(async () => 1),
+      commit: vi.fn(async () => undefined),
+      rollback: vi.fn(async () => undefined),
+      mkdir: vi.fn(async () => undefined),
+      exists: vi.fn(async (p: string) => writtenFiles.has(p)),
+      readFile: vi.fn(async (p: string) => writtenFiles.get(p) ?? new Uint8Array(0)),
+      writeFile: vi.fn(async (p: string, d: Uint8Array) => {
         writtenFiles.set(p, d);
       }),
-      unlink: jest.fn(async () => undefined),
-      eventsSubscribe: jest.fn(async () => 1),
-      eventsPoll: jest.fn(async () => ({})),
-      eventsCancel: jest.fn(async () => undefined),
-      mountOpfs: jest.fn(async () => '/opfs/test.fdb'),
-      dispose: jest.fn(async () => undefined),
+      unlink: vi.fn(async () => undefined),
+      eventsSubscribe: vi.fn(async () => 1),
+      eventsPoll: vi.fn(async () => ({})),
+      eventsCancel: vi.fn(async () => undefined),
+      mountOpfs: vi.fn(async () => '/opfs/test.fdb'),
+      dispose: vi.fn(async () => undefined),
     };
 
     const db = new FirebirdBrowser('memory://icu-opt-test', {
@@ -1806,17 +1806,17 @@ describe('FirebirdLite (no Firebird installed)', () => {
     const liteDb = new FirebirdLite('/nonexistent/db.fdb');
     (liteDb as unknown as { initialized: boolean }).initialized = true;
     const liteExecutedSql: string[] = [];
-    const liteCommit = jest.fn(async () => undefined);
-    const liteRollback = jest.fn(async () => undefined);
+    const liteCommit = vi.fn(async () => undefined);
+    const liteRollback = vi.fn(async () => undefined);
     (liteDb as unknown as { attachment: unknown }).attachment = {
-      startTransaction: jest.fn(async () => ({
+      startTransaction: vi.fn(async () => ({
         commit: liteCommit,
         rollback: liteRollback,
       })),
-      execute: jest.fn(async (_tx: unknown, sqlText: string) => {
+      execute: vi.fn(async (_tx: unknown, sqlText: string) => {
         liteExecutedSql.push(sqlText);
       }),
-      disconnect: jest.fn(async () => undefined),
+      disconnect: vi.fn(async () => undefined),
     };
 
     await liteDb.transaction(async (tx) => {
@@ -1877,38 +1877,38 @@ describe('FirebirdLite (no Firebird installed)', () => {
     // 2. FirebirdBrowser (FirebirdBrowserTransaction)
     const { FirebirdBrowser } = await import('../browser/firebird-browser');
     const browserExecutedSql: string[] = [];
-    const browserCommit = jest.fn(async () => undefined);
-    const browserRollback = jest.fn(async () => undefined);
+    const browserCommit = vi.fn(async () => undefined);
+    const browserRollback = vi.fn(async () => undefined);
     const mockTransport = {
-      init: jest.fn(async () => undefined),
-      createDatabase: jest.fn(async () => 1),
-      attachDatabase: jest.fn(async () => 1),
-      detachDatabase: jest.fn(async () => undefined),
-      execute: jest.fn(async (_db: number, _tx: number, sqlText: string) => {
+      init: vi.fn(async () => undefined),
+      createDatabase: vi.fn(async () => 1),
+      attachDatabase: vi.fn(async () => 1),
+      detachDatabase: vi.fn(async () => undefined),
+      execute: vi.fn(async (_db: number, _tx: number, sqlText: string) => {
         browserExecutedSql.push(sqlText);
         return 1;
       }),
-      executeBatch: jest.fn(async () => 0),
-      query: jest.fn(async () => ({ fields: [], rows: [] })),
-      describe: jest.fn(async () => ({
+      executeBatch: vi.fn(async () => 0),
+      query: vi.fn(async () => ({ fields: [], rows: [] })),
+      describe: vi.fn(async () => ({
         params: [],
         fields: [],
         statementType: 'DDL' as const,
         hasResultSet: false,
       })),
-      startTransaction: jest.fn(async () => 7),
+      startTransaction: vi.fn(async () => 7),
       commit: browserCommit,
       rollback: browserRollback,
-      mkdir: jest.fn(async () => undefined),
-      exists: jest.fn(async () => false),
-      readFile: jest.fn(async () => new Uint8Array(0)),
-      writeFile: jest.fn(async () => undefined),
-      unlink: jest.fn(async () => undefined),
-      eventsSubscribe: jest.fn(async () => 1),
-      eventsPoll: jest.fn(async () => ({})),
-      eventsCancel: jest.fn(async () => undefined),
-      mountOpfs: jest.fn(async () => '/opfs/test.fdb'),
-      dispose: jest.fn(async () => undefined),
+      mkdir: vi.fn(async () => undefined),
+      exists: vi.fn(async () => false),
+      readFile: vi.fn(async () => new Uint8Array(0)),
+      writeFile: vi.fn(async () => undefined),
+      unlink: vi.fn(async () => undefined),
+      eventsSubscribe: vi.fn(async () => 1),
+      eventsPoll: vi.fn(async () => ({})),
+      eventsCancel: vi.fn(async () => undefined),
+      mountOpfs: vi.fn(async () => '/opfs/test.fdb'),
+      dispose: vi.fn(async () => undefined),
     };
 
     const browserDb = new FirebirdBrowser('memory://sp-test', {
@@ -1953,11 +1953,11 @@ describe('FirebirdLite (no Firebird installed)', () => {
       type: Promise.resolve(1),
       hasResultSet: true,
       columnLabels: Promise.resolve(['VAL']),
-      setTimeout: jest.fn(async (ms: number) => {
+      setTimeout: vi.fn(async (ms: number) => {
         setTimeouts.push(ms);
       }),
-      executeQuery: jest.fn(async () => ({
-        fetch: jest.fn(
+      executeQuery: vi.fn(async () => ({
+        fetch: vi.fn(
           () =>
             new Promise<unknown[][]>((resolve) => {
               if (resolveSlowFetch === null) {
@@ -1967,33 +1967,33 @@ describe('FirebirdLite (no Firebird installed)', () => {
               }
             }),
         ),
-        close: jest.fn(async () => undefined),
+        close: vi.fn(async () => undefined),
       })),
-      dispose: jest.fn(async () => undefined),
+      dispose: vi.fn(async () => undefined),
     };
 
     const fakeAttachment = {
-      cancelOperation: jest.fn(async (option = 3) => {
+      cancelOperation: vi.fn(async (option = 3) => {
         cancelOptions.push(option);
         resolveSlowFetch?.([]);
       }),
-      startTransaction: jest.fn(async () => ({
-        commit: jest.fn(async () => undefined),
-        rollback: jest.fn(async () => undefined),
+      startTransaction: vi.fn(async () => ({
+        commit: vi.fn(async () => undefined),
+        rollback: vi.fn(async () => undefined),
       })),
-      prepare: jest.fn(async () => fakeStmt),
-      execute: jest.fn(async () => undefined),
-      disconnect: jest.fn(async () => undefined),
+      prepare: vi.fn(async () => fakeStmt),
+      execute: vi.fn(async () => undefined),
+      disconnect: vi.fn(async () => undefined),
     };
 
     (liteDb as unknown as { attachment: unknown }).attachment = fakeAttachment;
     (liteDb as unknown as { statements: unknown }).statements = {
       enabled: false,
-      acquire: jest.fn(async () => ({
+      acquire: vi.fn(async () => ({
         stmt: fakeStmt,
-        release: jest.fn(async () => undefined),
+        release: vi.fn(async () => undefined),
       })),
-      flush: jest.fn(async () => undefined),
+      flush: vi.fn(async () => undefined),
     };
 
     // 1. Pre-aborted signal rejects before acquiring a statement
@@ -2042,41 +2042,41 @@ describe('FirebirdLite (no Firebird installed)', () => {
     ];
 
     const mockTransport = {
-      init: jest.fn(async () => undefined),
-      createDatabase: jest.fn(async () => 1),
-      attachDatabase: jest.fn(async () => 1),
-      detachDatabase: jest.fn(async () => undefined),
-      execute: jest.fn(async () => 1),
-      executeBatch: jest.fn(async (_db: number, _tx: number, sqlText: string, rows: unknown[][]) => {
+      init: vi.fn(async () => undefined),
+      createDatabase: vi.fn(async () => 1),
+      attachDatabase: vi.fn(async () => 1),
+      detachDatabase: vi.fn(async () => undefined),
+      execute: vi.fn(async () => 1),
+      executeBatch: vi.fn(async (_db: number, _tx: number, sqlText: string, rows: unknown[][]) => {
         insertedBatches.push({ sql: sqlText, rows });
         for (const r of rows) {
           storedRows.push([r[0], r[1], r[2]]);
         }
         return rows.length;
       }),
-      query: jest.fn(async () => ({
+      query: vi.fn(async () => ({
         fields,
         rows: storedRows.map((r) => [...r]) as never,
       })),
-      describe: jest.fn(async () => ({
+      describe: vi.fn(async () => ({
         params: [],
         fields,
         statementType: 'SELECT' as const,
         hasResultSet: true,
       })),
-      startTransaction: jest.fn(async () => 11),
-      commit: jest.fn(async () => undefined),
-      rollback: jest.fn(async () => undefined),
-      mkdir: jest.fn(async () => undefined),
-      exists: jest.fn(async () => false),
-      readFile: jest.fn(async () => new Uint8Array(0)),
-      writeFile: jest.fn(async () => undefined),
-      unlink: jest.fn(async () => undefined),
-      eventsSubscribe: jest.fn(async () => 1),
-      eventsPoll: jest.fn(async () => ({})),
-      eventsCancel: jest.fn(async () => undefined),
-      mountOpfs: jest.fn(async () => '/opfs/test.fdb'),
-      dispose: jest.fn(async () => undefined),
+      startTransaction: vi.fn(async () => 11),
+      commit: vi.fn(async () => undefined),
+      rollback: vi.fn(async () => undefined),
+      mkdir: vi.fn(async () => undefined),
+      exists: vi.fn(async () => false),
+      readFile: vi.fn(async () => new Uint8Array(0)),
+      writeFile: vi.fn(async () => undefined),
+      unlink: vi.fn(async () => undefined),
+      eventsSubscribe: vi.fn(async () => 1),
+      eventsPoll: vi.fn(async () => ({})),
+      eventsCancel: vi.fn(async () => undefined),
+      mountOpfs: vi.fn(async () => '/opfs/test.fdb'),
+      dispose: vi.fn(async () => undefined),
     };
 
     const db = new FirebirdBrowser('memory://copy-stream-test', {

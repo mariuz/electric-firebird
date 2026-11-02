@@ -11,6 +11,7 @@
     "declarationMap": true,
     "sourceMap": true,
     "composite": true,
+    "types": ["vitest/globals", "node"],
     "outDir": "dist",
     "rootDir": "src"
   },
