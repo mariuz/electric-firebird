@@ -182,6 +182,21 @@ export type {
 } from './browser/binary-result';
 export { VERSION } from './version';
 export {
+  ENCRYPTED_PAGE_MAGIC,
+  AES_GCM_IV_LENGTH,
+  AES_GCM_TAG_LENGTH,
+  ENCRYPTED_PAGE_OVERHEAD,
+  isEncryptedPageBuffer,
+  generateEncryptionKey,
+  importRawEncryptionKey,
+  exportRawEncryptionKey,
+  deriveEncryptionKeyFromPassphrase,
+  resolveCryptoKey,
+  encryptPage,
+  decryptPage,
+} from './browser/page-crypto';
+export type { PageEncryptionKey } from './browser/page-crypto';
+export {
   OPFSVFS,
   mountOpfs,
   openDatabaseHandle,

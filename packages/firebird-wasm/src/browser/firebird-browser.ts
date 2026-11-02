@@ -24,6 +24,7 @@
 
 import { IndexedDBVFS } from './indexeddb-vfs';
 import type { IndexedDBVFSOptions } from './indexeddb-vfs';
+import type { PageEncryptionKey } from './page-crypto';
 import { DirectTransport, buildSweepResult } from './engine-transport';
 import type { EngineHandle, EngineTransport } from './engine-transport';
 import { WorkerTransport } from './worker-transport';
@@ -272,6 +273,8 @@ export interface ExecResult {
 export interface FirebirdBrowserOptions {
   /** Options forwarded to the IndexedDB VFS layer. */
   vfs?: IndexedDBVFSOptions;
+  /** Optional WebCrypto AES-GCM key (`CryptoKey` or 16/32-byte `Uint8Array` / `ArrayBuffer`) used to encrypt 8 KB database pages at rest. */
+  encryptionKey?: PageEncryptionKey;
   /**
    * URL or `ArrayBuffer` of the `firebird-embedded.wasm` binary.
    * Passed through to the engine loader.
@@ -545,7 +548,12 @@ export class FirebirdBrowser {
         ? dbName.slice(OPFS_PREFIX.length)
         : dbName;
     this.options = options;
-    this.vfs = new IndexedDBVFS(options.vfs);
+    this.vfs = new IndexedDBVFS({
+      ...options.vfs,
+      ...(options.encryptionKey !== undefined
+        ? { encryptionKey: options.encryptionKey }
+        : {}),
+    });
 
     // An ephemeral database is private to this instance and never stored, so
     // there is nothing for another tab to overwrite and nothing to lock

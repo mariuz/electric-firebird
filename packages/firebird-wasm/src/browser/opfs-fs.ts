@@ -30,6 +30,14 @@
 
 import type { FirebirdWasmModule } from '../wasm-loader';
 import type { VFSMetadata } from './indexeddb-vfs';
+import type { PageEncryptionKey } from './page-crypto';
+import {
+  ENCRYPTED_PAGE_OVERHEAD,
+  encryptPage,
+  decryptPage,
+  isEncryptedPageBuffer,
+  resolveCryptoKey,
+} from './page-crypto';
 
 // ---------------------------------------------------------------------------
 // The subset of OPFS this needs
@@ -102,6 +110,11 @@ export interface OPFSVFSOptions {
   handle?: SyncAccessHandle;
   /** Optional custom OPFS root directory provider (defaults to `navigator.storage.getDirectory()`). */
   getDirectory?: () => Promise<OpfsDirectoryHandle>;
+  /**
+   * Optional WebCrypto AES-GCM key (`CryptoKey` or 16/32-byte `Uint8Array` /
+   * `ArrayBuffer`) used to encrypt 8 KB database pages at rest in OPFS.
+   */
+  encryptionKey?: PageEncryptionKey;
 }
 
 /** In-memory `SyncAccessHandle` implementation for testing and non-OPFS environments. */
@@ -623,6 +636,7 @@ export class OPFSVFS {
   private readonly configuredPageSize: number;
   private readonly providedHandle?: SyncAccessHandle;
   private readonly getDirectory?: () => Promise<OpfsDirectoryHandle>;
+  private readonly encryptionKey?: PageEncryptionKey;
 
   private syncHandle: SyncAccessHandle | null = null;
   private ownsHandle = false;
@@ -634,6 +648,12 @@ export class OPFSVFS {
     this.configuredPageSize = options.pageSize ?? DEFAULT_PAGE_SIZE;
     this.providedHandle = options.handle;
     this.getDirectory = options.getDirectory;
+    this.encryptionKey = options.encryptionKey;
+  }
+
+  /** Whether this VFS instance is configured to encrypt pages at rest. */
+  get isEncrypted(): boolean {
+    return this.encryptionKey !== undefined;
   }
 
   /** Whether a `SyncAccessHandle` is currently open. */
@@ -663,6 +683,10 @@ export class OPFSVFS {
   async open(dbName: string): Promise<VFSMetadata> {
     if (this.syncHandle) {
       return (await this.getMetadata())!;
+    }
+
+    if (this.encryptionKey) {
+      await resolveCryptoKey(this.encryptionKey);
     }
 
     const cleanName = dbName.trim().replace(/^opfs:\/\//i, '').replace(/\.fdb$/i, '') || 'database';
@@ -702,13 +726,27 @@ export class OPFSVFS {
     }
   }
 
+  private hasEncryptedHeader(): boolean {
+    if (!this.syncHandle || this.syncHandle.getSize() < ENCRYPTED_PAGE_OVERHEAD) {
+      return false;
+    }
+    const probe = new Uint8Array(ENCRYPTED_PAGE_OVERHEAD);
+    this.syncHandle.read(probe, { at: 0 });
+    return isEncryptedPageBuffer(probe);
+  }
+
   /** Return metadata describing the currently open OPFS database file. */
   async getMetadata(): Promise<VFSMetadata | null> {
     if (!this.syncHandle || !this.currentDbName) return null;
     const size = this.syncHandle.getSize();
+    const encrypted = Boolean(this.encryptionKey) || this.hasEncryptedHeader();
+    const slotSize = encrypted
+      ? this.configuredPageSize + ENCRYPTED_PAGE_OVERHEAD
+      : this.configuredPageSize;
     return {
       pageSize: this.configuredPageSize,
-      pageCount: Math.ceil(size / this.configuredPageSize),
+      pageCount: Math.ceil(size / slotSize),
+      ...(encrypted ? { encrypted: true } : {}),
     };
   }
 
@@ -721,6 +759,55 @@ export class OPFSVFS {
     if (!Number.isInteger(pageNumber) || pageNumber < 0) {
       throw new RangeError(`Invalid pageNumber: ${pageNumber}`);
     }
+    const encrypted = Boolean(this.encryptionKey) || this.hasEncryptedHeader();
+    if (encrypted) {
+      const slotSize = this.configuredPageSize + ENCRYPTED_PAGE_OVERHEAD;
+      const offset = pageNumber * slotSize;
+      const size = handle.getSize();
+      if (offset >= size) return null;
+
+      const slot = new Uint8Array(slotSize);
+      const n = handle.read(slot, { at: offset });
+      this.stats.reads += 1;
+      if (n <= 0) return null;
+      this.stats.bytesRead += n;
+
+      if (isEncryptedPageBuffer(slot)) {
+        if (!this.encryptionKey) {
+          throw new Error(
+            `Database page ${pageNumber} is encrypted at rest, but no encryptionKey was provided to OPFSVFS`,
+          );
+        }
+        return decryptPage(
+          slot,
+          this.encryptionKey,
+          pageNumber,
+          this.configuredPageSize,
+        );
+      }
+
+      // Sparse unwritten intermediate page (all zeros)
+      let allZero = true;
+      for (let i = 0; i < slot.byteLength; i++) {
+        if (slot[i] !== 0) {
+          allZero = false;
+          break;
+        }
+      }
+      if (allZero) {
+        return new Uint8Array(this.configuredPageSize);
+      }
+      if (!this.encryptionKey) {
+        return slot.subarray(0, this.configuredPageSize);
+      }
+      return decryptPage(
+        slot,
+        this.encryptionKey,
+        pageNumber,
+        this.configuredPageSize,
+      );
+    }
+
     const offset = pageNumber * this.configuredPageSize;
     const size = handle.getSize();
     if (offset >= size) return null;
@@ -734,7 +821,25 @@ export class OPFSVFS {
   }
 
   /**
-   * Write a single database page at byte offset `pageNumber * pageSize`.
+   * Read the raw physical bytes stored for `pageNumber` without decrypting.
+   * Useful for diagnostics and verifying at-rest encryption.
+   */
+  async readRawPage(pageNumber: number): Promise<Uint8Array | null> {
+    const handle = this.requireHandle();
+    const encrypted = Boolean(this.encryptionKey) || this.hasEncryptedHeader();
+    const slotSize = encrypted
+      ? this.configuredPageSize + ENCRYPTED_PAGE_OVERHEAD
+      : this.configuredPageSize;
+    const offset = pageNumber * slotSize;
+    if (offset >= handle.getSize()) return null;
+    const buf = new Uint8Array(slotSize);
+    const n = handle.read(buf, { at: offset });
+    return n > 0 ? buf.subarray(0, n) : null;
+  }
+
+  /**
+   * Write a single database page at byte offset `pageNumber * pageSize` (or
+   * `pageNumber * (pageSize + 32)` when encrypted).
    */
   async writePage(pageNumber: number, data: Uint8Array): Promise<void> {
     const handle = this.requireHandle();
@@ -745,6 +850,20 @@ export class OPFSVFS {
       throw new RangeError(
         `Page data length (${data.byteLength}) does not match VFS pageSize (${this.configuredPageSize})`,
       );
+    }
+    if (this.encryptionKey) {
+      const slotSize = this.configuredPageSize + ENCRYPTED_PAGE_OVERHEAD;
+      const offset = pageNumber * slotSize;
+      const envelope = await encryptPage(
+        data,
+        this.encryptionKey,
+        pageNumber,
+        this.configuredPageSize,
+      );
+      const written = handle.write(envelope, { at: offset });
+      this.stats.writes += 1;
+      if (written > 0) this.stats.bytesWritten += written;
+      return;
     }
     const offset = pageNumber * this.configuredPageSize;
     const written = handle.write(data, { at: offset });
@@ -789,6 +908,17 @@ export class OPFSVFS {
     const handle = this.requireHandle();
     const size = handle.getSize();
     if (size === 0) return new Uint8Array(0);
+    if (this.encryptionKey || this.hasEncryptedHeader()) {
+      const meta = (await this.getMetadata())!;
+      const out = new Uint8Array(meta.pageCount * this.configuredPageSize);
+      for (let i = 0; i < meta.pageCount; i++) {
+        const page = await this.readPage(i);
+        if (page) {
+          out.set(page, i * this.configuredPageSize);
+        }
+      }
+      return out;
+    }
     const out = new Uint8Array(size);
     const n = handle.read(out, { at: 0 });
     this.stats.reads += 1;
@@ -799,6 +929,35 @@ export class OPFSVFS {
   /** Replace the entire database file contents with `data` and flush to disk. */
   async importDatabase(data: Uint8Array): Promise<void> {
     const handle = this.requireHandle();
+    if (this.encryptionKey) {
+      if (data.byteLength % this.configuredPageSize !== 0) {
+        throw new RangeError(
+          `Database size (${data.byteLength}) is not a multiple of page size (${this.configuredPageSize})`,
+        );
+      }
+      const pageCount = data.byteLength / this.configuredPageSize;
+      const slotSize = this.configuredPageSize + ENCRYPTED_PAGE_OVERHEAD;
+      handle.truncate(pageCount * slotSize);
+      this.stats.truncates += 1;
+      for (let i = 0; i < pageCount; i++) {
+        const plainPage = data.subarray(
+          i * this.configuredPageSize,
+          (i + 1) * this.configuredPageSize,
+        );
+        const envelope = await encryptPage(
+          plainPage,
+          this.encryptionKey,
+          i,
+          this.configuredPageSize,
+        );
+        const written = handle.write(envelope, { at: i * slotSize });
+        this.stats.writes += 1;
+        if (written > 0) this.stats.bytesWritten += written;
+      }
+      handle.flush();
+      this.stats.flushes += 1;
+      return;
+    }
     handle.truncate(data.byteLength);
     this.stats.truncates += 1;
     if (data.byteLength > 0) {

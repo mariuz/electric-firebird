@@ -172,6 +172,21 @@ export type {
 
 export { IndexedDBVFS } from './indexeddb-vfs';
 export type { IndexedDBVFSOptions, VFSMetadata } from './indexeddb-vfs';
+export {
+  ENCRYPTED_PAGE_MAGIC,
+  AES_GCM_IV_LENGTH,
+  AES_GCM_TAG_LENGTH,
+  ENCRYPTED_PAGE_OVERHEAD,
+  isEncryptedPageBuffer,
+  generateEncryptionKey,
+  importRawEncryptionKey,
+  exportRawEncryptionKey,
+  deriveEncryptionKeyFromPassphrase,
+  resolveCryptoKey,
+  encryptPage,
+  decryptPage,
+} from './page-crypto';
+export type { PageEncryptionKey } from './page-crypto';
 
 export {
   OPFSVFS,

@@ -28,6 +28,11 @@ import {
   vectorSearch,
 } from '../vector';
 import { OPFSVFS, createMemorySyncAccessHandle } from '../browser/opfs-fs';
+import {
+  generateEncryptionKey,
+  isEncryptedPageBuffer,
+  ENCRYPTED_PAGE_OVERHEAD,
+} from '../browser/page-crypto';
 
 const ST_JS_PATH = path.resolve(__dirname, '../../dist/wasm/firebird-embedded-st.js');
 const hasSingleThread = fs.existsSync(ST_JS_PATH);
@@ -1092,6 +1097,73 @@ describe('wasmGlueFile', () => {
       expect(headerPage![0]).toBe(1);
     } finally {
       await vfs.close();
+    }
+  });
+
+  it('encrypts and decrypts real Firebird .fdb database pages at rest with WebCrypto AES-256-GCM', async () => {
+    const key = await generateEncryptionKey(true);
+    const handle = createMemorySyncAccessHandle();
+    const encryptedVfs = new OPFSVFS({
+      pageSize: 8192,
+      handle,
+      encryptionKey: key,
+    });
+    await encryptedVfs.open('opfs://encrypted_vault');
+
+    // 1. Create a database and insert confidential data
+    const db1 = new FirebirdBrowser('memory://st-vault-source', {
+      transport: new DirectTransport({ threads: false }),
+    });
+    let plainDump: Uint8Array;
+    try {
+      await db1.exec(
+        'CREATE TABLE vault_secrets (id INTEGER NOT NULL PRIMARY KEY, secret_code VARCHAR(100))',
+      );
+      await db1.exec('INSERT INTO vault_secrets VALUES (?, ?)', [
+        1,
+        'CLASSIFIED-OMEGA-TOKEN-7749',
+      ]);
+      plainDump = await db1.dumpDataDir();
+    } finally {
+      await db1.close();
+    }
+
+    // 2. Persist the database into AES-256-GCM encrypted OPFSVFS
+    await encryptedVfs.importDatabase(plainDump);
+    const meta = await encryptedVfs.getMetadata();
+    expect(meta?.encrypted).toBe(true);
+    expect(meta?.pageCount).toBe(plainDump.byteLength / 8192);
+    expect(handle.getSize()).toBe(
+      meta!.pageCount * (8192 + ENCRYPTED_PAGE_OVERHEAD),
+    );
+
+    // 3. Raw bytes at rest are encrypted with FBE1 header and contain no plaintext
+    const rawPage0 = await encryptedVfs.readRawPage(0);
+    expect(rawPage0).not.toBeNull();
+    expect(isEncryptedPageBuffer(rawPage0!)).toBe(true);
+    expect(
+      Buffer.from(handle.toUint8Array()).includes(
+        Buffer.from('CLASSIFIED-OMEGA-TOKEN-7749'),
+      ),
+    ).toBe(false);
+
+    // 4. Export & decrypt from encrypted VFS and attach a new FirebirdBrowser
+    const decryptedDump = await encryptedVfs.exportDatabase();
+    await encryptedVfs.close();
+
+    const db2 = new FirebirdBrowser('memory://st-vault-restored', {
+      transport: new DirectTransport({ threads: false }),
+      loadDataDir: decryptedDump,
+    });
+    try {
+      const res = await db2.query<{ ID: number; SECRET_CODE: string }>(
+        'SELECT id, secret_code FROM vault_secrets',
+      );
+      expect(res.rows).toEqual([
+        { ID: 1, SECRET_CODE: 'CLASSIFIED-OMEGA-TOKEN-7749' },
+      ]);
+    } finally {
+      await db2.close();
     }
   });
 });

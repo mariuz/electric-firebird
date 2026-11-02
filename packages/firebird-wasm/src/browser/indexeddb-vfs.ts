@@ -14,9 +14,21 @@
  *
  *   key (pageNumber: number) → value ({ data: ArrayBuffer })
  *
+ * When `encryptionKey` is configured, each page is encrypted with WebCrypto
+ * AES-GCM (`"FBE1"` envelope with 96-bit random IV, 128-bit authentication tag,
+ * and `(pageNumber, pageSize)` AAD) before being stored in IndexedDB.
+ *
  * A special metadata record with key `__meta__` stores the page size and the
  * total number of pages.
  */
+
+import type { PageEncryptionKey } from './page-crypto';
+import {
+  encryptPage,
+  decryptPage,
+  isEncryptedPageBuffer,
+  resolveCryptoKey,
+} from './page-crypto';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -28,6 +40,8 @@ export interface VFSMetadata {
   pageSize: number;
   /** Total number of pages currently stored. */
   pageCount: number;
+  /** Whether pages are encrypted at rest with AES-GCM. */
+  encrypted?: boolean;
 }
 
 /** Options for creating an {@link IndexedDBVFS} instance. */
@@ -43,6 +57,16 @@ export interface IndexedDBVFSOptions {
    * @default 'firebird_'
    */
   prefix?: string;
+  /**
+   * Optional WebCrypto AES-GCM key (`CryptoKey` or 16/32-byte `Uint8Array` /
+   * `ArrayBuffer`) used to encrypt 8 KB database pages at rest in IndexedDB.
+   */
+  encryptionKey?: PageEncryptionKey;
+  /**
+   * Optional custom `IDBFactory` (defaults to global `indexedDB`), useful for
+   * testing or custom IndexedDB implementations.
+   */
+  indexedDB?: IDBFactory;
 }
 
 // ---------------------------------------------------------------------------
@@ -94,12 +118,23 @@ function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
 export class IndexedDBVFS {
   private readonly pageSize: number;
   private readonly prefix: string;
+  private readonly encryptionKey?: PageEncryptionKey;
+  private readonly idbFactory?: IDBFactory;
   private db: IDBDatabase | null = null;
   private dbName = '';
+  /** Cached plaintext pages for encrypted mode so unchanged pages are not re-encrypted on persist. */
+  private readonly plainPageCache = new Map<number, Uint8Array>();
 
   constructor(options: IndexedDBVFSOptions = {}) {
     this.pageSize = options.pageSize ?? DEFAULT_PAGE_SIZE;
     this.prefix = options.prefix ?? DEFAULT_PREFIX;
+    this.encryptionKey = options.encryptionKey;
+    this.idbFactory = options.indexedDB;
+  }
+
+  /** Whether this VFS instance is configured to encrypt pages at rest. */
+  get isEncrypted(): boolean {
+    return this.encryptionKey !== undefined;
   }
 
   // ── Lifecycle ─────────────────────────────────────────────────────────
@@ -113,11 +148,17 @@ export class IndexedDBVFS {
       throw new Error(`IndexedDBVFS already open for "${this.dbName}"`);
     }
 
+    if (this.encryptionKey) {
+      // Validate key upfront on open() rather than failing mid-write.
+      await resolveCryptoKey(this.encryptionKey);
+    }
+
     this.dbName = dbName;
     const idbName = `${this.prefix}${dbName}`;
+    const factory = this.idbFactory ?? indexedDB;
 
     this.db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open(idbName, 1);
+      const request = factory.open(idbName, 1);
 
       request.onupgradeneeded = () => {
         const db = request.result;
@@ -133,6 +174,7 @@ export class IndexedDBVFS {
 
   /** Close the underlying IndexedDB connection. */
   async close(): Promise<void> {
+    this.plainPageCache.clear();
     if (this.db) {
       this.db.close();
       this.db = null;
@@ -147,25 +189,75 @@ export class IndexedDBVFS {
    */
   async readPage(pageNumber: number): Promise<ArrayBuffer> {
     const record = await this.idbGet<{ data: ArrayBuffer }>(pageNumber);
-    if (record) return record.data;
-    return new ArrayBuffer(this.pageSize);
+    if (!record) {
+      return new ArrayBuffer(this.pageSize);
+    }
+
+    const storedBytes = new Uint8Array(record.data);
+    if (isEncryptedPageBuffer(storedBytes)) {
+      if (!this.encryptionKey) {
+        throw new Error(
+          `Database page ${pageNumber} is encrypted at rest, but no encryptionKey was provided to IndexedDBVFS`,
+        );
+      }
+      const decrypted = await decryptPage(
+        storedBytes,
+        this.encryptionKey,
+        pageNumber,
+        this.pageSize,
+      );
+      this.plainPageCache.set(pageNumber, decrypted.slice());
+      return decrypted.slice().buffer as ArrayBuffer;
+    }
+
+    if (this.encryptionKey) {
+      this.plainPageCache.set(pageNumber, storedBytes.slice());
+    }
+    return record.data;
   }
 
   /** Write a page (full page overwrite). */
-  async writePage(pageNumber: number, data: ArrayBuffer): Promise<void> {
-    if (data.byteLength !== this.pageSize) {
+  async writePage(pageNumber: number, data: ArrayBuffer | Uint8Array): Promise<void> {
+    const plain =
+      data instanceof Uint8Array
+        ? data
+        : new Uint8Array(data);
+    if (plain.byteLength !== this.pageSize) {
       throw new RangeError(
-        `Page data must be exactly ${this.pageSize} bytes (got ${data.byteLength})`,
+        `Page data must be exactly ${this.pageSize} bytes (got ${plain.byteLength})`,
       );
     }
-    await this.idbPut(pageNumber, { data });
+
+    if (this.encryptionKey) {
+      const envelope = await encryptPage(
+        plain,
+        this.encryptionKey,
+        pageNumber,
+        this.pageSize,
+      );
+      this.plainPageCache.set(pageNumber, plain.slice());
+      await this.idbPut(pageNumber, {
+        data: envelope.slice().buffer as ArrayBuffer,
+        encrypted: true,
+      });
+    } else {
+      await this.idbPut(pageNumber, {
+        data: plain.slice().buffer as ArrayBuffer,
+      });
+    }
     await this.updateMeta(pageNumber);
   }
 
   /** Read the stored metadata, or return defaults if none exists. */
   async getMetadata(): Promise<VFSMetadata> {
     const meta = await this.idbGet<VFSMetadata>(META_KEY);
-    return meta ?? { pageSize: this.pageSize, pageCount: 0 };
+    return (
+      meta ?? {
+        pageSize: this.pageSize,
+        pageCount: 0,
+        ...(this.encryptionKey ? { encrypted: true } : {}),
+      }
+    );
   }
 
   /**
@@ -214,6 +306,60 @@ export class IndexedDBVFS {
     const pageCount = data.byteLength / this.pageSize;
     const db = this.requireDb();
 
+    if (this.encryptionKey) {
+      // Pre-encrypt dirty pages outside the IDB transaction so async WebCrypto
+      // calls never cause IndexedDB to auto-commit an open transaction.
+      const dirtyEncrypted = new Map<number, ArrayBuffer>();
+      for (let i = 0; i < pageCount; i++) {
+        const offset = i * this.pageSize;
+        const page = data.subarray(offset, offset + this.pageSize);
+        const cached = this.plainPageCache.get(i);
+        if (cached && sameBytes(cached, page)) {
+          continue;
+        }
+        const envelope = await encryptPage(
+          page,
+          this.encryptionKey,
+          i,
+          this.pageSize,
+        );
+        dirtyEncrypted.set(i, envelope.slice().buffer as ArrayBuffer);
+        this.plainPageCache.set(i, page.slice());
+      }
+      for (const k of [...this.plainPageCache.keys()]) {
+        if (k >= pageCount) this.plainPageCache.delete(k);
+      }
+
+      await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(STORE_NAME, 'readwrite');
+        const store = tx.objectStore(STORE_NAME);
+
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () =>
+          reject(tx.error ?? new Error('IndexedDB transaction aborted'));
+
+        const metaRequest = store.get(META_KEY);
+        metaRequest.onsuccess = () => {
+          const previous =
+            (metaRequest.result as VFSMetadata | undefined)?.pageCount ?? 0;
+          for (let i = pageCount; i < previous; i++) {
+            store.delete(i);
+          }
+        };
+
+        for (const [pageNumber, encryptedBuffer] of dirtyEncrypted) {
+          store.put({ data: encryptedBuffer, encrypted: true }, pageNumber);
+        }
+
+        store.put(
+          { pageSize: this.pageSize, pageCount, encrypted: true },
+          META_KEY,
+        );
+      });
+      return;
+    }
+
     await new Promise<void>((resolve, reject) => {
       const tx = db.transaction(STORE_NAME, 'readwrite');
       const store = tx.objectStore(STORE_NAME);
@@ -255,6 +401,16 @@ export class IndexedDBVFS {
   }
 
   /**
+   * Inspect the raw stored bytes for a page in IndexedDB without decrypting.
+   * Useful for diagnostics and verifying at-rest encryption.
+   */
+  async readRawPage(pageNumber: number): Promise<Uint8Array | null> {
+    const record = await this.idbGet<{ data: ArrayBuffer }>(pageNumber);
+    if (!record) return null;
+    return new Uint8Array(record.data.slice(0));
+  }
+
+  /**
    * Flush – a no-op for IndexedDB since each `put` is already durable once
    * the transaction completes.  Provided for API symmetry.
    */
@@ -264,6 +420,7 @@ export class IndexedDBVFS {
 
   /** Delete all stored pages and metadata for this database. */
   async clear(): Promise<void> {
+    this.plainPageCache.clear();
     const db = this.requireDb();
     await new Promise<void>((resolve, reject) => {
       const tx = db.transaction(STORE_NAME, 'readwrite');
@@ -277,9 +434,10 @@ export class IndexedDBVFS {
   /** Delete the entire IndexedDB database. */
   async destroy(): Promise<void> {
     const idbName = `${this.prefix}${this.dbName}`;
+    const factory = this.idbFactory ?? indexedDB;
     await this.close();
     await new Promise<void>((resolve, reject) => {
-      const request = indexedDB.deleteDatabase(idbName);
+      const request = factory.deleteDatabase(idbName);
       request.onsuccess = () => resolve();
       request.onerror = () => reject(request.error);
     });
@@ -347,8 +505,12 @@ export class IndexedDBVFS {
   private async updateMeta(latestPageNumber: number): Promise<void> {
     const meta = await this.getMetadata();
     const newCount = Math.max(meta.pageCount, latestPageNumber + 1);
-    if (newCount !== meta.pageCount) {
-      await this.idbPut(META_KEY, { pageSize: this.pageSize, pageCount: newCount });
+    if (newCount !== meta.pageCount || (this.encryptionKey && !meta.encrypted)) {
+      await this.idbPut(META_KEY, {
+        pageSize: this.pageSize,
+        pageCount: newCount,
+        ...(this.encryptionKey ? { encrypted: true } : {}),
+      });
     }
   }
 }

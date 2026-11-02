@@ -1364,7 +1364,7 @@ Next-horizon milestones for `v0.15.0`:
       `FileSystemSyncAccessHandle.read()` / `.write()` at offset inside the Web
       Worker so large `.fdb` databases (500 MB–2 GB+) run without holding the
       entire database image in WASM `MEMFS` RAM.
-- [ ] **Encrypted Local Databases at Rest (`WebCrypto` AES-GCM page encryption for `idb://` & `opfs://`).**
+- [x] **Encrypted Local Databases at Rest (`WebCrypto` AES-GCM page encryption for `idb://` & `opfs://`).**
       Add an optional `encryptionKey: CryptoKey | Uint8Array` option to
       `IndexedDBVFS` and `OPFSVFS` that encrypts 8 KB database pages with
       AES-256-GCM before persisting to IndexedDB or OPFS.
