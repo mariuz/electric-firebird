@@ -26,6 +26,14 @@
       "types": "./dist/vue/index.d.ts",
       "default": "./dist/vue/index.js"
     },
+    "./svelte": {
+      "types": "./dist/svelte/index.d.ts",
+      "default": "./dist/svelte/index.js"
+    },
+    "./solid": {
+      "types": "./dist/solid/index.d.ts",
+      "default": "./dist/solid/index.js"
+    },
     "./repl": {
       "types": "./dist/repl/index.d.ts",
       "default": "./dist/repl/index.js"
@@ -82,6 +90,8 @@
     "drizzle-orm": ">=0.30",
     "kysely": ">=0.27",
     "react": ">=18",
+    "solid-js": ">=1.7",
+    "svelte": ">=4.0.0 || >=5.0.0",
     "vue": ">=3.3"
   },
   "peerDependenciesMeta": {
@@ -89,6 +99,12 @@
       "optional": true
     },
     "vue": {
+      "optional": true
+    },
+    "svelte": {
+      "optional": true
+    },
+    "solid-js": {
       "optional": true
     },
     "@electric-sql/client": {

@@ -155,6 +155,10 @@ export type {
   JsFunctionHandler,
   JsProcedureHandler,
   RegisteredRoutine,
+  PageIoCounters,
+  QueryProfileEvent,
+  QueryProfileListener,
+  MonitorStats,
 } from './types';
 
 // WASM loader (available on all platforms)
@@ -200,6 +204,10 @@ export type {
   DatabaseSnapshotInfo,
   DatabaseSnapshot,
 } from './browser/snapshots';
+export {
+  QueryProfiler,
+  DEFAULT_MAX_RECENT_QUERIES,
+} from './browser/profiler';
 export {
   ENCRYPTED_PAGE_MAGIC,
   AES_GCM_IV_LENGTH,

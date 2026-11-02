@@ -64,12 +64,15 @@ import {
   type DatabaseSnapshotInfo,
   type SnapshotOptions,
 } from './browser/snapshots';
+import { QueryProfiler } from './browser/profiler';
 import type {
   JsFunctionHandler,
   JsProcedureHandler,
   RegisterFunctionOptions,
   RegisterProcedureOptions,
   RegisteredRoutine,
+  MonitorStats,
+  QueryProfileListener,
 } from './types';
 import {
   BLOB_INTERNAL_DATA,
@@ -311,6 +314,7 @@ export class FirebirdLite {
   private readonly preparedStatements = new Set<PreparedStatement>();
   private readonly udr = new UdrManager();
   private readonly snapshotStore = new CowSnapshotStore(8192);
+  private readonly profiler = new QueryProfiler();
   private readonly types: TypeOptions | undefined;
 
   constructor(dbPath: string, options: FirebirdLiteOptions = {}) {
@@ -388,7 +392,29 @@ export class FirebirdLite {
     // one place, and `transaction()` already wraps it in the commit-or-roll-
     // back this needs. Two copies would drift the first time either grows a
     // case.
-    await this.transaction((tx) => tx.exec(sql, params, options));
+    const script = toStatement(sql, params);
+    const startedAt = this.profiler.begin();
+    try {
+      await this.transaction((tx) => tx.exec(sql, params, options));
+      this.profiler.end({
+        startedAt,
+        sql: script.sql,
+        params: script.params,
+        kind: 'exec',
+        rowCount: 0,
+        cacheHit: false,
+      });
+    } catch (err) {
+      this.profiler.end({
+        startedAt,
+        sql: script.sql,
+        params: script.params,
+        kind: 'exec',
+        cacheHit: false,
+        error: err,
+      });
+      throw err;
+    }
   }
 
   /**
@@ -397,7 +423,28 @@ export class FirebirdLite {
    * as the browser backend's.
    */
   async execBatch(sql: string, rows: QueryParams[]): Promise<void> {
-    await this.transaction((tx) => tx.execBatch(sql, rows));
+    const startedAt = this.profiler.begin();
+    try {
+      await this.transaction((tx) => tx.execBatch(sql, rows));
+      this.profiler.end({
+        startedAt,
+        sql,
+        params: rows[0] ?? [],
+        kind: 'execBatch',
+        rowCount: rows.length,
+        cacheHit: rows.length > 1,
+      });
+    } catch (err) {
+      this.profiler.end({
+        startedAt,
+        sql,
+        params: rows[0] ?? [],
+        kind: 'execBatch',
+        cacheHit: rows.length > 1,
+        error: err,
+      });
+      throw err;
+    }
   }
 
   /**
@@ -472,68 +519,102 @@ export class FirebirdLite {
     }
     const attachment = this.attachment!;
 
-    if (
-      this.sharedReads &&
-      queryOpts.isolationLevel === undefined &&
-      queryOpts.readOnly === undefined &&
-      queryOpts.signal === undefined &&
-      queryOpts.timeoutMs === undefined &&
-      !this.ownTransaction.has(statement.sql)
-    ) {
-      const shared = await this.sharedRead<T>(statement.sql, statement.params, rowMode);
-      if (shared) return shared;
-    }
-    await this.endReadTransaction();
-
-    const serializedParams = this.serialize(statement.params);
-    const txOptions = buildTransactionOptions(queryOpts);
-    const transaction = await attachment.startTransaction(txOptions);
-
-    let rows: T[];
-    let fields: FieldInfo[];
+    const startedAt = this.profiler.begin();
+    let cacheHit = false;
     try {
-      const lease = await this.statements!.acquire(transaction, statement.sql);
-      const stmt = lease.stmt;
+      if (
+        this.sharedReads &&
+        queryOpts.isolationLevel === undefined &&
+        queryOpts.readOnly === undefined &&
+        queryOpts.signal === undefined &&
+        queryOpts.timeoutMs === undefined &&
+        !this.ownTransaction.has(statement.sql)
+      ) {
+        const shared = await this.sharedRead<T>(statement.sql, statement.params, rowMode);
+        if (shared) {
+          this.profiler.end({
+            startedAt,
+            sql: statement.sql,
+            params: statement.params,
+            kind: 'query',
+            rowCount: shared.result.rows.length,
+            cacheHit: shared.cacheHit,
+          });
+          return shared.result;
+        }
+      }
+      await this.endReadTransaction();
 
-      // Released in `finally`, not after the fetch: a statement that throws on
-      // execute — a lock conflict, an overflow, a wrong parameter count — would
-      // otherwise leak its handle, and the retry loop such failures are usually
-      // wrapped in leaks one per attempt until the attachment refuses more.
-      let failed = true;
+      const serializedParams = this.serialize(statement.params);
+      const txOptions = buildTransactionOptions(queryOpts);
+      const transaction = await attachment.startTransaction(txOptions);
+
+      let rows: T[];
+      let fields: FieldInfo[];
       try {
-        fields = await outputFields(stmt);
-        if (queryOpts.timeoutMs !== undefined && queryOpts.timeoutMs > 0) {
-          await applyStatementHandleTimeout(stmt, queryOpts.timeoutMs);
+        const lease = await this.statements!.acquire(transaction, statement.sql);
+        cacheHit = lease.cacheHit;
+        const stmt = lease.stmt;
+
+        // Released in `finally`, not after the fetch: a statement that throws on
+        // execute — a lock conflict, an overflow, a wrong parameter count — would
+        // otherwise leak its handle, and the retry loop such failures are usually
+        // wrapped in leaks one per attempt until the attachment refuses more.
+        let failed = true;
+        try {
+          fields = await outputFields(stmt);
+          if (queryOpts.timeoutMs !== undefined && queryOpts.timeoutMs > 0) {
+            await applyStatementHandleTimeout(stmt, queryOpts.timeoutMs);
+          }
+
+          const rawRows = await runWithCancellation(
+            () => fetchRows(stmt, transaction, serializedParams, fields, this.types),
+            queryOpts,
+            () => this.cancelOperation(),
+          );
+          rows = shapeRows<T>(rawRows, fields, rowMode);
+          failed = false;
+        } finally {
+          if (queryOpts.timeoutMs !== undefined && queryOpts.timeoutMs > 0 && !failed) {
+            await applyStatementHandleTimeout(stmt, 0).catch(() => undefined);
+          }
+          await lease.release(failed);
         }
 
-        const rawRows = await runWithCancellation(
-          () => fetchRows(stmt, transaction, serializedParams, fields, this.types),
-          queryOpts,
-          () => this.cancelOperation(),
-        );
-        rows = shapeRows<T>(rawRows, fields, rowMode);
-        failed = false;
-      } finally {
-        if (queryOpts.timeoutMs !== undefined && queryOpts.timeoutMs > 0 && !failed) {
-          await applyStatementHandleTimeout(stmt, 0).catch(() => undefined);
+        // After the statement is disposed, as before — the commit is the last
+        // thing that happens on the success path.
+        try {
+          await transaction.commit();
+        } catch (err) {
+          await transaction.rollback().catch(() => undefined);
+          throw err;
         }
-        await lease.release(failed);
+      } catch (err) {
+        await transaction.rollback().catch(() => undefined);
+        throw err;
       }
 
-      // After the statement is disposed, as before — the commit is the last
-      // thing that happens on the success path.
-      try {
-      await transaction.commit();
+      const typed = applyTypes({ rows, fields }, this.types, rowMode);
+      this.profiler.end({
+        startedAt,
+        sql: statement.sql,
+        params: statement.params,
+        kind: 'query',
+        rowCount: typed.rows.length,
+        cacheHit,
+      });
+      return typed;
     } catch (err) {
-      await transaction.rollback().catch(() => undefined);
+      this.profiler.end({
+        startedAt,
+        sql: statement.sql,
+        params: statement.params,
+        kind: 'query',
+        cacheHit,
+        error: err,
+      });
       throw err;
     }
-    } catch (err) {
-      await transaction.rollback().catch(() => undefined);
-      throw err;
-    }
-
-    return applyTypes({ rows, fields }, this.types, rowMode);
   }
 
   /**
@@ -692,7 +773,7 @@ export class FirebirdLite {
     sql: string,
     params: QueryParams,
     rowMode: RowMode,
-  ): Promise<QueryResult<T> | undefined> {
+  ): Promise<{ result: QueryResult<T>; cacheHit: boolean } | undefined> {
     const serializedParams = this.serialize(params);
     const attachment = this.attachment!;
     this.readTransaction ??= await attachment.startTransaction({
@@ -733,7 +814,10 @@ export class FirebirdLite {
     } finally {
       await lease.release(failed);
     }
-    return applyTypes({ rows: shapeRows<T>(rawRows, fields, rowMode), fields }, this.types, rowMode);
+    return {
+      result: applyTypes({ rows: shapeRows<T>(rawRows, fields, rowMode), fields }, this.types, rowMode),
+      cacheHit: lease.cacheHit,
+    };
   }
 
   private remember(sql: string): void {
@@ -951,6 +1035,30 @@ export class FirebirdLite {
       fetches,
       marks,
     });
+  }
+
+  /**
+   * Subscribe to structured query execution telemetry ({@link QueryProfileEvent}).
+   * Returns an unsubscribe callback.
+   */
+  onQuery(listener: QueryProfileListener): () => void {
+    return this.profiler.onQuery(listener);
+  }
+
+  /**
+   * Return aggregated query profiling metrics, prepare-cache hit/miss rates,
+   * page-level I/O counters, and transaction health diagnostics.
+   */
+  async monitorStats(): Promise<MonitorStats> {
+    await this.ensureReady();
+    return this.profiler.snapshot(() => this.databaseInfo());
+  }
+
+  /**
+   * Reset accumulated query profiler counters and clear the recent queries buffer.
+   */
+  resetMonitorStats(): void {
+    this.profiler.reset();
   }
 
   /**
@@ -1956,6 +2064,7 @@ export class FirebirdLite {
     this.closed = true;
     this.udr.clear();
     this.snapshotStore.clear();
+    this.profiler.clear();
 
     await this.endReadTransaction();
     for (const stmt of [...this.preparedStatements]) {
@@ -4430,6 +4539,7 @@ const STMT_DDL = 5;
 /** A statement handed out by {@link StatementCache.acquire}; release it once, when done. */
 interface StatementLease {
   stmt: Statement;
+  cacheHit: boolean;
   /** `failed` drops a kept statement, in case it went stale. */
   release(failed: boolean): Promise<void>;
 }
@@ -4477,12 +4587,12 @@ class StatementCache {
       this.kept.delete(sql);
       this.kept.set(sql, hit);
       hit.busy = true;
-      return this.lease(hit);
+      return this.lease(hit, true);
     }
 
     const stmt = await this.attachment.prepare(transaction, sql);
     if (!this.enabled) {
-      return { stmt, release: () => stmt.dispose().catch(() => undefined) };
+      return { stmt, cacheHit: false, release: () => stmt.dispose().catch(() => undefined) };
     }
 
     const type = await stmt.type;
@@ -4494,7 +4604,7 @@ class StatementCache {
       this.kept.set(sql, entry);
       await this.evictBeyondSize();
     }
-    return this.lease(entry);
+    return this.lease(entry, false);
   }
 
   /** Dispose every kept statement; those still busy go when released. */
@@ -4507,9 +4617,10 @@ class StatementCache {
     }
   }
 
-  private lease(entry: KeptStatement): StatementLease {
+  private lease(entry: KeptStatement, cacheHit: boolean): StatementLease {
     return {
       stmt: entry.stmt,
+      cacheHit,
       release: async (failed: boolean) => {
         entry.busy = false;
         if (entry.kept && failed) {

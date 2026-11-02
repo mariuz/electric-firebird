@@ -1063,3 +1063,93 @@ export interface RegisteredRoutine {
   /** Alias for `unregister()` supporting `await using`. */
   [Symbol.asyncDispose](): Promise<void>;
 }
+
+/**
+ * Page-level I/O deltas or cumulative counters (`isc_info_reads`,
+ * `isc_info_writes`, `isc_info_fetches`, `isc_info_marks`).
+ */
+export interface PageIoCounters {
+  /** Physical page reads (`isc_info_reads`). */
+  reads: number;
+  /** Physical page writes (`isc_info_writes`). */
+  writes: number;
+  /** Page cache fetches (`isc_info_fetches`). */
+  fetches: number;
+  /** Page cache marks / dirtied pages (`isc_info_marks`). */
+  marks: number;
+}
+
+/**
+ * Structured telemetry event emitted to listeners registered with
+ * `db.onQuery(listener)`.
+ */
+export interface QueryProfileEvent {
+  /** Executed SQL statement text. */
+  sql: string;
+  /** Positional parameters bound to the statement. */
+  params: unknown[];
+  /** Execution entry point (`'query'`, `'exec'`, `'execBatch'`, or `'prepared'`). */
+  kind: 'query' | 'exec' | 'execBatch' | 'prepared';
+  /** Wall-clock execution duration in milliseconds. */
+  durationMs: number;
+  /** Number of rows returned (`query`) or affected (`exec` / `execBatch`). */
+  rowCount: number;
+  /** Whether the statement reused an existing prepared handle / statement cache entry. */
+  cacheHit: boolean;
+  /** Epoch timestamp (`Date.now()`) when the statement completed. */
+  timestamp: number;
+  /** Optional page-level I/O delta when captured. */
+  io?: PageIoCounters;
+  /** Error thrown by the statement if execution failed. */
+  error?: Error;
+}
+
+/**
+ * Listener callback passed to `db.onQuery(listener)`.
+ */
+export type QueryProfileListener = (event: QueryProfileEvent) => void;
+
+/**
+ * Aggregated query profiler, statement cache, `MON$`, and `IAttachment::getInfo`
+ * telemetry snapshot returned by `db.monitorStats()`.
+ */
+export interface MonitorStats {
+  /** Total number of `query()` / prepared query executions recorded. */
+  totalQueries: number;
+  /** Total number of `exec()` / `execBatch()` executions recorded. */
+  totalExecs: number;
+  /** Total number of failed statement executions recorded. */
+  totalErrors: number;
+  /** Cumulative execution time across all recorded statements in milliseconds. */
+  totalDurationMs: number;
+  /** Mean execution time per statement in milliseconds (`0` when no statements have run). */
+  avgDurationMs: number;
+  /** Maximum single-statement execution time in milliseconds. */
+  maxDurationMs: number;
+  /** SQL text of the slowest recorded statement, or `null` if none. */
+  slowestSql: string | null;
+  /** Number of statements that hit the prepared statement cache or reused a `PreparedStatement`. */
+  prepareCacheHits: number;
+  /** Number of statements that required preparing a new statement. */
+  prepareCacheMisses: number;
+  /** Prepare cache hit rate in `[0, 1]` (`prepareCacheHits / (prepareCacheHits + prepareCacheMisses)`). */
+  prepareCacheHitRate: number;
+  /** Cumulative attachment page I/O and memory pool counters from `IAttachment::getInfo` / `MON$IO_STATS`. */
+  io: PageIoCounters & {
+    pageBuffers: number;
+    currentMemory: number;
+    maxMemory: number;
+  };
+  /** Transaction health counters (OIT / OAT / OST / Next / Gap). */
+  transactions: {
+    oldestTransaction: number;
+    oldestActive: number;
+    oldestSnapshot: number;
+    nextTransaction: number;
+    transactionGap: number;
+  };
+  /** Number of currently active statements (`MON$STATEMENTS` / in-flight). */
+  activeStatements: number;
+  /** Ring buffer of the most recent recorded query profile events (oldest to newest). */
+  recentQueries: QueryProfileEvent[];
+}

@@ -1384,12 +1384,12 @@ Next-horizon milestones for `v0.15.0`:
       Coordinate initial snapshots and live `up-to-date` boundaries across
       related tables in `firebird-wasm/electric` so foreign-key relationships
       stay consistent during multi-shape sync.
-- [ ] **Query Profiler & `MON$` Telemetry Hook (`db.onQuery(listener)` & `db.monitorStats()`).**
+- [x] **Query Profiler & `MON$` Telemetry Hook (`db.onQuery(listener)` & `db.monitorStats()`).**
       Expose structured query timing, prepare-cache hit/miss rates, and page
       reads/writes/fetches/marks (`isc_info_reads`, `isc_info_writes`,
       `isc_info_fetches`, `isc_info_marks`), plus a `Profiler` tab in
       `<firebird-repl>`.
-- [ ] **Svelte 5 Runes & SolidJS Reactive Adapters (`firebird-wasm/svelte`, `firebird-wasm/solid`).**
+- [x] **Svelte 5 Runes & SolidJS Reactive Adapters (`firebird-wasm/svelte`, `firebird-wasm/solid`).**
       Complement `firebird-wasm/react` and `firebird-wasm/vue` with reactive
       `createLiveQuery` helpers for Svelte and SolidJS.
 

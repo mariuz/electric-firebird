@@ -160,6 +160,10 @@ export type {
   DatabaseSnapshotInfo,
   DatabaseSnapshot,
 } from './snapshots';
+export {
+  QueryProfiler,
+  DEFAULT_MAX_RECENT_QUERIES,
+} from './profiler';
 export type { ScriptStatement } from './sql-script';
 
 export { DirectTransport } from './engine-transport';
@@ -286,4 +290,8 @@ export type {
   JsFunctionHandler,
   JsProcedureHandler,
   RegisteredRoutine,
+  PageIoCounters,
+  QueryProfileEvent,
+  QueryProfileListener,
+  MonitorStats,
 } from '../types';

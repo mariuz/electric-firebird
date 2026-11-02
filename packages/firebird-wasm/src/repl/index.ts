@@ -37,14 +37,15 @@ import type {
   FieldInfo,
   IntrospectOptions,
   MigrateOptions,
+  MonitorStats,
   QueryResult,
   Row,
   SchemaIntrospection,
   SweepResult,
 } from '../types';
 
-/** Active tab in the `<firebird-repl>` Schema Inspector & Migration Viewer sidebar. */
-export type ReplInspectorTab = 'schema' | 'migrations';
+/** Active tab in the `<firebird-repl>` Schema Inspector, Migration Viewer & Profiler sidebar. */
+export type ReplInspectorTab = 'schema' | 'migrations' | 'profiler';
 
 /** What the console needs of a database: `FirebirdBrowser` has it. */
 export interface ReplDatabase {
@@ -63,6 +64,10 @@ export interface ReplDatabase {
   sweep?(): Promise<SweepResult>;
   /** Introspect database tables, views, columns, keys, indexes, sequences, and triggers. */
   introspect?(options?: IntrospectOptions): Promise<SchemaIntrospection>;
+  /** Inspect cumulative query telemetry, page I/O counters, and `MON$` state. */
+  monitorStats?(): Promise<MonitorStats>;
+  /** Reset cumulative query telemetry counters. */
+  resetMonitorStats?(): void;
   /**
    * For a statement without rows: a transaction's `exec()` runs exactly one
    * statement and reports what it changed.  (`FirebirdBrowser.exec()` would
@@ -88,6 +93,7 @@ export interface ReplEntry {
   sweep?: SweepResult;
   schema?: SchemaIntrospection;
   migrations?: AppliedMigration[];
+  stats?: MonitorStats;
   error?: Error;
 }
 
@@ -99,7 +105,7 @@ export interface FirebirdReplElement extends HTMLElement {
   value: string;
   /** Whether the Schema Inspector & Migration Viewer sidebar is open. */
   inspectorOpen: boolean;
-  /** Currently active sidebar tab (`'schema'` or `'migrations'`). */
+  /** Currently active sidebar tab (`'schema'`, `'migrations'`, or `'profiler'`). */
   inspectorTab: ReplInspectorTab;
   /** Run `script` (default: the editor's text); resolves with what each statement did. */
   run(script?: string): Promise<ReplEntry[]>;
@@ -115,9 +121,11 @@ export interface FirebirdReplElement extends HTMLElement {
   migrations(
     options?: Pick<MigrateOptions, 'tableName'>,
   ): Promise<ReplEntry | undefined>;
-  /** Toggle (or switch to `tab` in) the interactive Schema Inspector & Migration Viewer sidebar. */
+  /** Inspect query telemetry and `MON$` monitoring counters, open/update the Profiler tab, and log a profiler entry. */
+  profiler(): Promise<ReplEntry | undefined>;
+  /** Toggle (or switch to `tab` in) the interactive Schema Inspector, Migration Viewer & Profiler sidebar. */
   toggleInspector(tab?: ReplInspectorTab): Promise<void>;
-  /** Refresh the interactive Schema Inspector & Migration Viewer sidebar from the database. */
+  /** Refresh the interactive Schema Inspector, Migration Viewer & Profiler sidebar from the database. */
   refreshInspector(): Promise<void>;
   /** Empty the output. */
   clear(): void;
@@ -251,6 +259,7 @@ export function defineFirebirdRepl(
     private readonly inspectorBody: HTMLDivElement;
     private readonly tabSchemaBtn: HTMLButtonElement;
     private readonly tabMigrationsBtn: HTMLButtonElement;
+    private readonly tabProfilerBtn: HTMLButtonElement;
     private readonly inspectorRefreshBtn: HTMLButtonElement;
     private readonly inspectorCloseBtn: HTMLButtonElement;
     private readonly editor: HTMLTextAreaElement;
@@ -260,6 +269,7 @@ export function defineFirebirdRepl(
     private readonly sweepButton: HTMLButtonElement;
     private readonly schemaButton: HTMLButtonElement;
     private readonly migrationsButton: HTMLButtonElement;
+    private readonly profilerButton: HTMLButtonElement;
     private readonly history: string[] = [];
     /** Position in `history` while walking it; `history.length` is the draft. */
     private cursor = 0;
@@ -269,6 +279,7 @@ export function defineFirebirdRepl(
     private activeTab: ReplInspectorTab = 'schema';
     private lastSchema: SchemaIntrospection | null = null;
     private lastMigrations: AppliedMigration[] = [];
+    private lastStats: MonitorStats | null = null;
 
     constructor() {
       super();
@@ -283,7 +294,7 @@ export function defineFirebirdRepl(
 
       this.inspector = el('div', 'inspector');
       this.inspector.hidden = true;
-      this.inspector.setAttribute('aria-label', 'Schema and migrations inspector');
+      this.inspector.setAttribute('aria-label', 'Schema, migrations, and profiler inspector');
 
       const inspectorHeader = el('div', 'inspector-header');
       const inspectorTabs = el('div', 'inspector-tabs');
@@ -296,7 +307,16 @@ export function defineFirebirdRepl(
       this.tabMigrationsBtn.type = 'button';
       this.tabMigrationsBtn.className = 'tab-migrations';
       this.tabMigrationsBtn.textContent = 'Migrations';
-      inspectorTabs.append(this.tabSchemaBtn, this.tabMigrationsBtn);
+
+      this.tabProfilerBtn = document.createElement('button');
+      this.tabProfilerBtn.type = 'button';
+      this.tabProfilerBtn.className = 'tab-profiler';
+      this.tabProfilerBtn.textContent = 'Profiler';
+      inspectorTabs.append(
+        this.tabSchemaBtn,
+        this.tabMigrationsBtn,
+        this.tabProfilerBtn,
+      );
 
       const inspectorActions = el('div', 'inspector-actions');
       this.inspectorRefreshBtn = document.createElement('button');
@@ -336,6 +356,12 @@ export function defineFirebirdRepl(
       this.migrationsButton.textContent = 'Migrations';
       this.migrationsButton.title = 'Inspect applied schema migrations (FB_MIGRATIONS$)';
 
+      this.profilerButton = document.createElement('button');
+      this.profilerButton.type = 'button';
+      this.profilerButton.className = 'profiler';
+      this.profilerButton.textContent = 'Profiler';
+      this.profilerButton.title = 'Inspect query telemetry, cache hits, and MON$ monitoring counters';
+
       this.sweepButton = document.createElement('button');
       this.sweepButton.type = 'button';
       this.sweepButton.className = 'sweep';
@@ -362,6 +388,7 @@ export function defineFirebirdRepl(
         this.editor,
         this.schemaButton,
         this.migrationsButton,
+        this.profilerButton,
         this.sweepButton,
         this.infoButton,
         this.explainButton,
@@ -377,12 +404,17 @@ export function defineFirebirdRepl(
       this.sweepButton.addEventListener('click', () => void this.sweep());
       this.schemaButton.addEventListener('click', () => void this.schema());
       this.migrationsButton.addEventListener('click', () => void this.migrations());
+      this.profilerButton.addEventListener('click', () => void this.profiler());
       this.tabSchemaBtn.addEventListener('click', () => {
         this.inspectorTab = 'schema';
         void this.refreshInspector();
       });
       this.tabMigrationsBtn.addEventListener('click', () => {
         this.inspectorTab = 'migrations';
+        void this.refreshInspector();
+      });
+      this.tabProfilerBtn.addEventListener('click', () => {
+        this.inspectorTab = 'profiler';
         void this.refreshInspector();
       });
       this.inspectorRefreshBtn.addEventListener(
@@ -436,11 +468,20 @@ export function defineFirebirdRepl(
     }
 
     set inspectorTab(tab: ReplInspectorTab) {
-      this.activeTab = tab === 'migrations' ? 'migrations' : 'schema';
+      this.activeTab =
+        tab === 'migrations'
+          ? 'migrations'
+          : tab === 'profiler'
+            ? 'profiler'
+            : 'schema';
       this.tabSchemaBtn.classList.toggle('active', this.activeTab === 'schema');
       this.tabMigrationsBtn.classList.toggle(
         'active',
         this.activeTab === 'migrations',
+      );
+      this.tabProfilerBtn.classList.toggle(
+        'active',
+        this.activeTab === 'profiler',
       );
       this.renderInspector();
     }
@@ -452,6 +493,7 @@ export function defineFirebirdRepl(
       this.sweepButton.disabled = disabled;
       this.schemaButton.disabled = disabled;
       this.migrationsButton.disabled = disabled;
+      this.profilerButton.disabled = disabled;
       this.inspectorRefreshBtn.disabled = disabled;
     }
 
@@ -479,14 +521,17 @@ export function defineFirebirdRepl(
       if (!this.db) {
         this.lastSchema = null;
         this.lastMigrations = [];
+        this.lastStats = null;
         this.renderInspector();
         return;
       }
       try {
         if (this.activeTab === 'schema') {
           this.lastSchema = await this.fetchSchema();
-        } else {
+        } else if (this.activeTab === 'migrations') {
           this.lastMigrations = await this.fetchMigrations();
+        } else {
+          this.lastStats = await this.fetchStats();
         }
       } catch {
         // Keep previous state on transient failure.
@@ -548,12 +593,131 @@ export function defineFirebirdRepl(
       }));
     }
 
+    private async fetchStats(): Promise<MonitorStats | null> {
+      const db = this.db!;
+      if (typeof db.monitorStats === 'function') {
+        return db.monitorStats();
+      }
+      if (typeof db.databaseInfo === 'function') {
+        const info = await db.databaseInfo();
+        return {
+          totalQueries: 0,
+          totalExecs: 0,
+          totalErrors: 0,
+          totalDurationMs: 0,
+          avgDurationMs: 0,
+          maxDurationMs: 0,
+          slowestSql: null,
+          prepareCacheHits: 0,
+          prepareCacheMisses: 0,
+          prepareCacheHitRate: 0,
+          io: {
+            reads: info.reads,
+            writes: info.writes,
+            fetches: info.fetches,
+            marks: info.marks,
+            pageBuffers: info.pageBuffers,
+            currentMemory: info.currentMemory,
+            maxMemory: info.maxMemory,
+          },
+          transactions: {
+            oldestTransaction: info.oldestTransaction,
+            oldestActive: info.oldestActive,
+            oldestSnapshot: info.oldestSnapshot,
+            nextTransaction: info.nextTransaction,
+            transactionGap: info.transactionGap,
+          },
+          activeStatements: 0,
+          recentQueries: [],
+        };
+      }
+      return null;
+    }
+
     private renderInspector(): void {
       this.inspectorBody.replaceChildren();
       if (!this.db) {
         const empty = el('p', 'inspector-empty');
         empty.textContent = 'No database connected.';
         this.inspectorBody.append(empty);
+        return;
+      }
+
+      if (this.activeTab === 'profiler') {
+        const panel = el('div', 'inspector-profiler');
+        const stats = this.lastStats;
+        if (!stats) {
+          const empty = el('p', 'inspector-empty');
+          empty.textContent = 'No profiler telemetry available.';
+          panel.append(empty);
+          this.inspectorBody.append(panel);
+          return;
+        }
+
+        const totalStmts = stats.totalQueries + stats.totalExecs;
+        const hitPct = (stats.prepareCacheHitRate * 100).toFixed(1);
+        const totalCache = stats.prepareCacheHits + stats.prepareCacheMisses;
+        const summaryEl = el('p', 'inspector-summary');
+        summaryEl.textContent =
+          `${totalStmts} ${totalStmts === 1 ? 'query' : 'queries'} · ` +
+          `avg ${stats.avgDurationMs.toFixed(1)} ms · ` +
+          `cache ${hitPct}% (${stats.prepareCacheHits}/${totalCache})`;
+        panel.append(summaryEl);
+
+        const ioDiv = el('div', 'schema-sub');
+        const ioLabel = el('span', 'schema-sub-label');
+        ioLabel.textContent = 'Engine & Page I/O:';
+        ioDiv.append(ioLabel);
+        const ioList = el('ul', 'schema-list profiler-metrics');
+        const metrics: Array<[string, string]> = [
+          ['Page reads / writes', `${stats.io.reads} / ${stats.io.writes}`],
+          ['Page fetches / marks', `${stats.io.fetches} / ${stats.io.marks}`],
+          [
+            'Transaction gap (OIT → Next)',
+            `${stats.transactions.transactionGap} (${stats.transactions.oldestTransaction} → ${stats.transactions.nextTransaction})`,
+          ],
+          [
+            'Memory (current / max)',
+            `${stats.io.currentMemory} / ${stats.io.maxMemory} bytes`,
+          ],
+        ];
+        for (const [label, value] of metrics) {
+          const li = el('li', 'schema-meta-item');
+          const k = el('span', 'col-name');
+          k.textContent = `${label}:`;
+          const v = el('span', 'col-type');
+          v.textContent = value;
+          li.append(k, v);
+          ioList.append(li);
+        }
+        ioDiv.append(ioList);
+        panel.append(ioDiv);
+
+        const recentTitle = el('div', 'schema-group-title');
+        recentTitle.textContent = `Recent Queries (${stats.recentQueries.length})`;
+        panel.append(recentTitle);
+
+        if (stats.recentQueries.length === 0) {
+          const empty = el('p', 'inspector-empty');
+          empty.textContent = 'No queries profiled yet.';
+          panel.append(empty);
+        } else {
+          const qList = el('ol', 'migrations-list profiler-queries');
+          for (const q of [...stats.recentQueries].reverse()) {
+            const li = el('li', 'migration-item profiler-query-item');
+            const dur = el('span', 'migration-version');
+            dur.textContent = `${q.durationMs.toFixed(2)} ms`;
+            const sqlSpan = el('span', 'migration-name');
+            sqlSpan.textContent = q.sql;
+            const badge = el('span', 'schema-badge');
+            badge.textContent = `${q.kind} · ${q.rowCount} rows${q.cacheHit ? ' · cached' : ''}`;
+            li.append(dur, sqlSpan, badge);
+            qList.append(li);
+          }
+          panel.append(qList);
+        }
+
+        this.inspectorBody.append(panel);
         return;
       }
 
@@ -1035,6 +1199,7 @@ export function defineFirebirdRepl(
         this.activeTab = 'schema';
         this.tabSchemaBtn.classList.add('active');
         this.tabMigrationsBtn.classList.remove('active');
+        this.tabProfilerBtn.classList.remove('active');
         this.inspectorOpen = true;
         this.renderInspector();
       } catch (err) {
@@ -1081,6 +1246,7 @@ export function defineFirebirdRepl(
         this.activeTab = 'migrations';
         this.tabMigrationsBtn.classList.add('active');
         this.tabSchemaBtn.classList.remove('active');
+        this.tabProfilerBtn.classList.remove('active');
         this.inspectorOpen = true;
         this.renderInspector();
       } catch (err) {
@@ -1093,6 +1259,61 @@ export function defineFirebirdRepl(
       this.show(entry);
       this.dispatchEvent(
         new CustomEvent('firebird-repl-migrations', {
+          detail: entry,
+          bubbles: true,
+          composed: true,
+        }),
+      );
+      return entry;
+    }
+
+    async profiler(): Promise<ReplEntry | undefined> {
+      if (this.busy) return undefined;
+      if (
+        !this.db ||
+        (typeof this.db.monitorStats !== 'function' &&
+          typeof this.db.databaseInfo !== 'function')
+      ) {
+        const entry: ReplEntry = {
+          sql: 'MONITOR STATS',
+          line: 1,
+          ms: 0,
+          error: new Error(
+            !this.db
+              ? 'No database: set the element’s db property first'
+              : 'Database does not support monitorStats()',
+          ),
+        };
+        this.show(entry);
+        return entry;
+      }
+
+      this.busy = true;
+      this.setButtonsDisabled(true);
+      const started = performance.now();
+      const entry: ReplEntry = { sql: 'MONITOR STATS', line: 1, ms: 0 };
+      try {
+        const stats = await this.fetchStats();
+        if (stats) {
+          entry.stats = stats;
+          this.lastStats = stats;
+        }
+        this.activeTab = 'profiler';
+        this.tabProfilerBtn.classList.add('active');
+        this.tabSchemaBtn.classList.remove('active');
+        this.tabMigrationsBtn.classList.remove('active');
+        this.inspectorOpen = true;
+        this.renderInspector();
+      } catch (err) {
+        entry.error = asError(err);
+      } finally {
+        entry.ms = performance.now() - started;
+        this.busy = false;
+        this.setButtonsDisabled(false);
+      }
+      this.show(entry);
+      this.dispatchEvent(
+        new CustomEvent('firebird-repl-profiler', {
           detail: entry,
           bubbles: true,
           composed: true,
@@ -1251,6 +1472,24 @@ export function defineFirebirdRepl(
             ),
           );
         }
+        if (entry.stats !== undefined) {
+          const st = entry.stats;
+          const totalStmts = st.totalQueries + st.totalExecs;
+          block.append(
+            table(
+              [{ name: 'Metric' }, { name: 'Value' }],
+              [
+                ['Queries profiled (errors)', `${totalStmts} (${st.totalErrors})`],
+                ['Total / Avg / Max duration (ms)', `${st.totalDurationMs.toFixed(2)} / ${st.avgDurationMs.toFixed(2)} / ${st.maxDurationMs.toFixed(2)}`],
+                ['Prepare cache hits / misses', `${st.prepareCacheHits} / ${st.prepareCacheMisses} (${(st.prepareCacheHitRate * 100).toFixed(1)}%)`],
+                ['Page reads / writes', `${st.io.reads} / ${st.io.writes}`],
+                ['Page fetches / marks', `${st.io.fetches} / ${st.io.marks}`],
+                ['Transaction gap (OIT → Next)', `${st.transactions.transactionGap} (${st.transactions.oldestTransaction} → ${st.transactions.nextTransaction})`],
+                ['Current / Max memory (bytes)', `${st.io.currentMemory} / ${st.io.maxMemory}`],
+              ],
+            ),
+          );
+        }
         const meta = el('p', 'meta');
         meta.textContent = `${summary(entry, fields.length > 0)} · ${entry.ms.toFixed(1)} ms`;
         block.append(meta);
@@ -1289,6 +1528,10 @@ function summary(entry: ReplEntry, returnsRows: boolean): string {
   if (entry.migrations !== undefined) {
     const n = entry.migrations.length;
     return `migrations (${n} applied)`;
+  }
+  if (entry.stats !== undefined) {
+    const n = entry.stats.totalQueries + entry.stats.totalExecs;
+    return `profiler (${n} ${n === 1 ? 'query' : 'queries'})`;
   }
   if (returnsRows) {
     const n = entry.rows?.length ?? 0;

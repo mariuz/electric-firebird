@@ -273,6 +273,47 @@ describe('firebird-wasm/repl', () => {
       const fakeDb: ReplDatabase = {
         describeQuery: jest.fn(async () => ({ hasResultSet: true })),
         introspect: jest.fn(async () => fakeSchema),
+        monitorStats: jest.fn(async () => ({
+          totalQueries: 2,
+          totalExecs: 1,
+          totalErrors: 0,
+          totalDurationMs: 12.5,
+          avgDurationMs: 4.16,
+          maxDurationMs: 6.2,
+          slowestSql: 'SELECT * FROM USERS',
+          prepareCacheHits: 2,
+          prepareCacheMisses: 1,
+          prepareCacheHitRate: 2 / 3,
+          io: {
+            reads: 14,
+            writes: 3,
+            fetches: 120,
+            marks: 8,
+            pageBuffers: 2048,
+            currentMemory: 262144,
+            maxMemory: 524288,
+          },
+          transactions: {
+            oldestTransaction: 10,
+            oldestActive: 11,
+            oldestSnapshot: 11,
+            nextTransaction: 12,
+            transactionGap: 1,
+          },
+          activeStatements: 0,
+          recentQueries: [
+            {
+              sql: 'SELECT * FROM USERS',
+              params: [],
+              kind: 'query' as const,
+              durationMs: 3.1,
+              rowCount: 2,
+              cacheHit: true,
+              timestamp: 1000,
+              io: { reads: 0, writes: 0, fetches: 4, marks: 0 },
+            },
+          ],
+        })),
         query: jest.fn(async (sqlText: string) => {
           if (sqlText.includes('RDB$RELATIONS')) {
             return { fields: [{ name: 'X' }], rows: [[1]] };
@@ -359,8 +400,28 @@ describe('firebird-wasm/repl', () => {
       expect(inspectorNode.allText()).toContain('create_users');
       expect(inspectorNode.allText()).toContain('add_email_index');
 
-      // 3. Toggle inspector closed
-      await el.toggleInspector('migrations');
+      // 3. Inspect profiler telemetry via el.profiler()
+      let profilerEventDetail: ReplEntry | undefined;
+      el.addEventListener('firebird-repl-profiler', ((ev: {
+        detail: ReplEntry;
+      }) => {
+        profilerEventDetail = ev.detail;
+      }) as unknown as EventListener);
+
+      const profEntry = await el.profiler();
+      expect(profEntry?.stats?.totalQueries).toBe(2);
+      expect(profEntry?.stats?.totalExecs).toBe(1);
+      expect(profEntry?.stats?.prepareCacheHits).toBe(2);
+      expect(profilerEventDetail?.stats?.io.fetches).toBe(120);
+      expect(el.inspectorOpen).toBe(true);
+      expect(el.inspectorTab).toBe('profiler');
+      expect(inspectorNode.allText()).toContain('3 queries');
+      expect(inspectorNode.allText()).toContain('cache 66.7% (2/3)');
+      expect(inspectorNode.allText()).toContain('SELECT * FROM USERS');
+      expect(inspectorNode.allText()).toContain('cached');
+
+      // 4. Toggle inspector closed
+      await el.toggleInspector('profiler');
       expect(el.inspectorOpen).toBe(false);
       expect(inspectorNode.hidden).toBe(true);
     } finally {

@@ -46,6 +46,7 @@ import {
   type DatabaseSnapshotInfo,
   type SnapshotOptions,
 } from './snapshots';
+import { QueryProfiler } from './profiler';
 import { ICU_LOCALE_DATA_PATH, isValidIcuDataPackage } from './icu-locales';
 import { introspect as introspectSchema, migrate as runMigrations } from './schema';
 import {
@@ -93,6 +94,9 @@ import type {
   RegisterFunctionOptions,
   RegisterProcedureOptions,
   RegisteredRoutine,
+  MonitorStats,
+  PageIoCounters,
+  QueryProfileListener,
   QueryOptions,
   QueryStreamOptions,
   StatementExecutionOptions,
@@ -557,6 +561,8 @@ export class FirebirdBrowser {
   private readonly snapshotStore: CowSnapshotStore;
   /** Cross-tab BroadcastChannel + POST_EVENT live query invalidation bridge. */
   private readonly liveBridge: CrossTabLiveBridge;
+  /** Query profiler and MON$ telemetry collector. */
+  private readonly profiler = new QueryProfiler();
   /** Set only in shared mode; owns the election and the channel. */
   private shared: SharedEngineTransport | null = null;
 
@@ -764,21 +770,46 @@ export class FirebirdBrowser {
       if (/^\s*(DROP|RECREATE)\b/i.test(statement.sql)) {
         this.liveTriggerPromises.clear();
       }
-      const affectedRows = await runWithCancellation(
-        async () => {
-          await this.applyOneShotTimeout(options.timeoutMs);
-          return this.engine.execute(
-            this.dbHandle,
-            0,
-            statement.sql,
-            this.serialize(script.params),
-          );
-        },
-        options,
-        () => this.cancelOperation(),
-      );
+      const startedAt = this.profiler.begin();
+      const ioBefore = await this.captureIoIfListening();
+      try {
+        const affectedRows = await runWithCancellation(
+          async () => {
+            await this.applyOneShotTimeout(options.timeoutMs);
+            return this.engine.execute(
+              this.dbHandle,
+              0,
+              statement.sql,
+              this.serialize(script.params),
+            );
+          },
+          options,
+          () => this.cancelOperation(),
+        );
+        const ioAfter = await this.captureIoIfListening();
+        this.profiler.end({
+          startedAt,
+          sql: statement.sql,
+          params: script.params,
+          kind: 'exec',
+          rowCount: affectedRows,
+          cacheHit: false,
+          ioBefore,
+          ioAfter,
+        });
         this.liveBridge.broadcastTables(extractMutatedTables(statement.sql));
         results.push({ affectedRows });
+      } catch (err) {
+        this.profiler.end({
+          startedAt,
+          sql: statement.sql,
+          params: script.params,
+          kind: 'exec',
+          cacheHit: false,
+          error: err,
+        });
+        throw err;
+      }
     }
 
     if (results.length > 0) {
@@ -816,12 +847,38 @@ export class FirebirdBrowser {
       );
     }
 
-    const affectedRows = await this.engine.executeBatch(
-      this.dbHandle,
-      0,
-      statements[0].sql,
-      rows.map((row) => this.serialize(row)),
-    );
+    const startedAt = this.profiler.begin();
+    const ioBefore = await this.captureIoIfListening();
+    let affectedRows = 0;
+    try {
+      affectedRows = await this.engine.executeBatch(
+        this.dbHandle,
+        0,
+        statements[0].sql,
+        rows.map((row) => this.serialize(row)),
+      );
+      const ioAfter = await this.captureIoIfListening();
+      this.profiler.end({
+        startedAt,
+        sql: statements[0].sql,
+        params: rows[0] ?? [],
+        kind: 'execBatch',
+        rowCount: affectedRows,
+        cacheHit: rows.length > 1,
+        ioBefore,
+        ioAfter,
+      });
+    } catch (err) {
+      this.profiler.end({
+        startedAt,
+        sql: statements[0].sql,
+        params: rows[0] ?? [],
+        kind: 'execBatch',
+        cacheHit: rows.length > 1,
+        error: err,
+      });
+      throw err;
+    }
 
     if (rows.length > 0) {
       this.markDirty();
@@ -913,24 +970,52 @@ export class FirebirdBrowser {
       }
     }
     if (!hasTransactionOptions(queryOpts)) {
-      const raw = await runWithCancellation(
-        async () => {
-          await this.applyOneShotTimeout(queryOpts.timeoutMs);
-          return this.engine.query<T>(
-            this.dbHandle,
-            0,
-            statement.sql,
-            this.serialize(statement.params),
-            rowMode,
-            binaryBlobs,
-          );
-        },
-        queryOpts,
-        () => this.cancelOperation(),
-      );
-      return applyTypes(raw, this.options.types, rowMode);
+      const startedAt = this.profiler.begin();
+      const ioBefore = await this.captureIoIfListening();
+      try {
+        const raw = await runWithCancellation(
+          async () => {
+            await this.applyOneShotTimeout(queryOpts.timeoutMs);
+            return this.engine.query<T>(
+              this.dbHandle,
+              0,
+              statement.sql,
+              this.serialize(statement.params),
+              rowMode,
+              binaryBlobs,
+            );
+          },
+          queryOpts,
+          () => this.cancelOperation(),
+        );
+        const typed = applyTypes(raw, this.options.types, rowMode);
+        const ioAfter = await this.captureIoIfListening();
+        this.profiler.end({
+          startedAt,
+          sql: statement.sql,
+          params: statement.params,
+          kind: 'query',
+          rowCount: typed.rows.length,
+          cacheHit: false,
+          ioBefore,
+          ioAfter,
+        });
+        return typed;
+      } catch (err) {
+        this.profiler.end({
+          startedAt,
+          sql: statement.sql,
+          params: statement.params,
+          kind: 'query',
+          cacheHit: false,
+          error: err,
+        });
+        throw err;
+      }
     }
 
+    const startedAt = this.profiler.begin();
+    const ioBefore = await this.captureIoIfListening();
     const txHandle = await this.engine.startTransaction(this.dbHandle, queryOpts);
     try {
       const result = await runWithCancellation(
@@ -949,11 +1034,31 @@ export class FirebirdBrowser {
         () => this.cancelOperation(),
       );
       await this.engine.commit(txHandle);
-      return applyTypes(result, this.options.types, rowMode);
+      const typed = applyTypes(result, this.options.types, rowMode);
+      const ioAfter = await this.captureIoIfListening();
+      this.profiler.end({
+        startedAt,
+        sql: statement.sql,
+        params: statement.params,
+        kind: 'query',
+        rowCount: typed.rows.length,
+        cacheHit: false,
+        ioBefore,
+        ioAfter,
+      });
+      return typed;
     } catch (err) {
       // A failed commit finishes the transaction itself, so only a failure
       // from the query leaves anything to roll back.
       await this.engine.rollback(txHandle).catch(() => undefined);
+      this.profiler.end({
+        startedAt,
+        sql: statement.sql,
+        params: statement.params,
+        kind: 'query',
+        cacheHit: false,
+        error: err,
+      });
       throw err;
     }
   }
@@ -962,6 +1067,7 @@ export class FirebirdBrowser {
     stmtHandle: EngineHandle,
     params: QueryParams,
     options: QueryOptions = {},
+    sqlText = '<prepared>',
   ): Promise<QueryResult<T>> {
     assertNotAborted(options.signal);
     validateTimeoutMs(options.timeoutMs);
@@ -970,24 +1076,50 @@ export class FirebirdBrowser {
     const rowMode = options.rowMode ?? 'object';
     const binaryBlobs = this.options.types?.binary === true;
     const serialized = this.serialize(params);
+    const startedAt = this.profiler.begin();
+    const ioBefore = await this.captureIoIfListening();
 
     if (!hasTransactionOptions(options)) {
-      const raw = await runWithCancellation(
-        async () => {
-          await this.applyOneShotTimeout(options.timeoutMs);
-          return this.engine.queryStmt!<T>(
-            this.dbHandle,
-            0,
-            stmtHandle,
-            serialized,
-            rowMode,
-            binaryBlobs,
-          );
-        },
-        options,
-        () => this.cancelOperation(),
-      );
-      return applyTypes(raw, this.options.types, rowMode);
+      try {
+        const raw = await runWithCancellation(
+          async () => {
+            await this.applyOneShotTimeout(options.timeoutMs);
+            return this.engine.queryStmt!<T>(
+              this.dbHandle,
+              0,
+              stmtHandle,
+              serialized,
+              rowMode,
+              binaryBlobs,
+            );
+          },
+          options,
+          () => this.cancelOperation(),
+        );
+        const typed = applyTypes(raw, this.options.types, rowMode);
+        const ioAfter = await this.captureIoIfListening();
+        this.profiler.end({
+          startedAt,
+          sql: sqlText,
+          params,
+          kind: 'prepared',
+          rowCount: typed.rows.length,
+          cacheHit: true,
+          ioBefore,
+          ioAfter,
+        });
+        return typed;
+      } catch (err) {
+        this.profiler.end({
+          startedAt,
+          sql: sqlText,
+          params,
+          kind: 'prepared',
+          cacheHit: true,
+          error: err,
+        });
+        throw err;
+      }
     }
 
     const txHandle = await this.engine.startTransaction(this.dbHandle, options);
@@ -1008,9 +1140,29 @@ export class FirebirdBrowser {
         () => this.cancelOperation(),
       );
       await this.engine.commit(txHandle);
-      return applyTypes(result, this.options.types, rowMode);
+      const typed = applyTypes(result, this.options.types, rowMode);
+      const ioAfter = await this.captureIoIfListening();
+      this.profiler.end({
+        startedAt,
+        sql: sqlText,
+        params,
+        kind: 'prepared',
+        rowCount: typed.rows.length,
+        cacheHit: true,
+        ioBefore,
+        ioAfter,
+      });
+      return typed;
     } catch (err) {
       await this.engine.rollback(txHandle).catch(() => undefined);
+      this.profiler.end({
+        startedAt,
+        sql: sqlText,
+        params,
+        kind: 'prepared',
+        cacheHit: true,
+        error: err,
+      });
       throw err;
     }
   }
@@ -1576,6 +1728,59 @@ export class FirebirdBrowser {
   }
 
   /**
+   * Subscribe to structured query execution telemetry ({@link QueryProfileEvent}).
+   * Returns an unsubscribe callback.
+   *
+   * ```ts
+   * const unsub = db.onQuery((event) => {
+   *   console.log(event.sql, `${event.durationMs.toFixed(2)}ms`, event.cacheHit, event.io);
+   * });
+   * ```
+   */
+  onQuery(listener: QueryProfileListener): () => void {
+    return this.profiler.onQuery(listener);
+  }
+
+  /**
+   * Return aggregated query profiling metrics, prepare-cache hit/miss rates,
+   * page-level I/O counters (`isc_info_reads`, `isc_info_writes`,
+   * `isc_info_fetches`, `isc_info_marks`), and transaction health diagnostics.
+   */
+  async monitorStats(): Promise<MonitorStats> {
+    await this.ensureReady();
+    return this.profiler.snapshot(async () => {
+      if (typeof this.engine.databaseInfo === 'function') {
+        return this.engine.databaseInfo(this.dbHandle);
+      }
+      return null;
+    });
+  }
+
+  /**
+   * Reset accumulated query profiler counters and clear the recent queries buffer.
+   */
+  resetMonitorStats(): void {
+    this.profiler.reset();
+  }
+
+  private async captureIoIfListening(): Promise<PageIoCounters | null> {
+    if (!this.profiler.hasListeners || typeof this.engine.databaseInfo !== 'function') {
+      return null;
+    }
+    try {
+      const info = await this.engine.databaseInfo(this.dbHandle);
+      return {
+        reads: info.reads,
+        writes: info.writes,
+        fetches: info.fetches,
+        marks: info.marks,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Trigger an immediate database garbage-collection sweep (`isc_dpb_sweep =
    * isc_dpb_records` and cooperative user-table scan), advancing OIT and
    * returning before/after {@link DatabaseInfo} diagnostics.
@@ -1840,7 +2045,7 @@ export class FirebirdBrowser {
             : rawOptions;
         checkParamCount(callParams.length);
         if (stmtHandle > 0 && typeof this.engine.queryStmt === 'function') {
-          return this.queryPreparedHandle(stmtHandle, callParams, callOptions);
+          return this.queryPreparedHandle(stmtHandle, callParams, callOptions, sqlText);
         }
         return this.query(sqlText, callParams, callOptions);
       }) as PreparedStatement['query'],
@@ -2633,6 +2838,7 @@ export class FirebirdBrowser {
     this.udr.clear();
     this.snapshotStore.clear();
     this.liveBridge.close();
+    this.profiler.clear();
     this.liveTriggerPromises.clear();
 
     if (this.dbHandle) {
