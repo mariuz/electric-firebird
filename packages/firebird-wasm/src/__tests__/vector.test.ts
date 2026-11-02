@@ -40,6 +40,14 @@ describe('firebird-wasm/vector – Client-Side Vector Similarity & Hybrid Search
       const textLiteral = formatVectorText(original);
       expect(textLiteral).toBe('[1,-0.5,0.25,4]');
       expect(Array.from(decodeVector(textLiteral))).toEqual(original);
+
+      // Base64-wrapped ASCII text literals (how ENGINE JS serializes string literals passed to VARBINARY parameters)
+      const base64Text3 = Buffer.from('[1,0,0]', 'utf8').toString('base64');
+      expect(Array.from(decodeVector(base64Text3))).toEqual([1, 0, 0]);
+      const base64Text4 = Buffer.from('[1, 0, 0, 0]', 'utf8').toString('base64');
+      expect(Array.from(decodeVector(base64Text4))).toEqual([1, 0, 0, 0]);
+      const base64Hex = Buffer.from(`x'${hexStr}'`, 'utf8').toString('base64');
+      expect(Array.from(decodeVector(base64Hex))).toEqual(original);
     });
 
     it('validates vector dimensions and rejects malformed inputs', () => {

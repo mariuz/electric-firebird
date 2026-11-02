@@ -282,6 +282,42 @@ function bytesToFloat32Array(bytes: Uint8Array): Float32Array {
 }
 
 /**
+ * When a SQL string literal (e.g. `'[1,0,0]'` or `"x'0000803f'"`) is passed
+ * into a `VARBINARY` (`CHARACTER SET OCTETS`) UDR parameter, Firebird's C++
+ * JSON bridge serializes the parameter bytes as base64. Check whether a
+ * base64-decoded byte buffer is actually an ASCII text vector literal before
+ * interpreting it as raw IEEE-754 float32 bytes.
+ */
+function tryDecodeAsciiVectorBytes(bytes: Uint8Array): Float32Array | null {
+  if (bytes.byteLength < 3) return null;
+  for (let i = 0; i < bytes.byteLength; i++) {
+    const b = bytes[i]!;
+    if (!((b >= 0x20 && b <= 0x7e) || b === 0x09 || b === 0x0a || b === 0x0d)) {
+      return null;
+    }
+  }
+  let text = '';
+  for (let i = 0; i < bytes.byteLength; i++) {
+    text += String.fromCharCode(bytes[i]!);
+  }
+  const trimmed = text.trim();
+  if (
+    (trimmed.startsWith('[') &&
+      trimmed.endsWith(']') &&
+      /^\[\s*[-+]?(?:\d|\.\d)/.test(trimmed)) ||
+    /^[xX]'[0-9a-fA-F]+'$/.test(trimmed) ||
+    /^0[xX][0-9a-fA-F]+$/.test(trimmed)
+  ) {
+    try {
+      return decodeVector(trimmed);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
  * Decode any supported {@link VectorInput} (`Float32Array`, `number[]`,
  * `Uint8Array`, `ArrayBuffer`, bracketed `"[0.1, 0.2]"` text, hex string, or
  * base64-encoded binary column value) into a `Float32Array`.
@@ -369,6 +405,10 @@ export function decodeVector(input: unknown): Float32Array {
       /^[A-Za-z0-9+/]+={0,2}$/.test(trimmed)
     ) {
       const bytes = decodeBase64ToBytes(trimmed);
+      const fromAsciiLiteral = tryDecodeAsciiVectorBytes(bytes);
+      if (fromAsciiLiteral) {
+        return fromAsciiLiteral;
+      }
       if (bytes.byteLength > 0 && bytes.byteLength % 4 === 0) {
         return bytesToFloat32Array(bytes);
       }
@@ -612,7 +652,7 @@ export async function registerVectorFunctions(
 
   const maxLen = Math.max(64, Math.min(8191, options.maxArgLength ?? 8191));
   const replace = options.replace !== false;
-  const vecArgType = `VARCHAR(${maxLen})`;
+  const vecArgType = `VARBINARY(${maxLen})`;
 
   const routines: RegisteredRoutine[] = [];
 
