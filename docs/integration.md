@@ -9,7 +9,7 @@ before you meet them.
 - Want to know how the port works? See [porting.md](./porting.md).
 - Full type-by-type reference: [api.md](./api.md).
 
-> **Status.** `firebird-wasm@0.1.0` is on npm and ships the compiled engine.
+> **Status.** `firebird-wasm` is on npm and ships the compiled engine.
 > Everything described here works and is covered by tests, but it is a 0.x
 > release — the API may still move.
 
@@ -235,11 +235,11 @@ from IndexedDB if it exists, creating it if not.
 > `SELECT title AS "title"` if you want it lowercase, and be consistent —
 > quoted identifiers are case-sensitive from then on.
 
-### React and Vue
+### React, Vue, Svelte 5, and SolidJS
 
-`firebird-wasm/react` and `firebird-wasm/vue` keep a component's rows in step
-with a query. React 18+ and Vue 3.3+ are optional peer dependencies: install
-the one you use.
+`firebird-wasm/react`, `firebird-wasm/vue`, `firebird-wasm/svelte`, and
+`firebird-wasm/solid` keep a component's rows in step with a query. All four
+framework packages are optional peer dependencies: install the one you use.
 
 ```tsx
 import { FirebirdProvider, useQuery, useLiveQuery } from 'firebird-wasm/react';
@@ -274,7 +274,11 @@ const { rows } = useLiveQuery('SELECT id, title FROM notes ORDER BY id', { event
 const { rows: note } = useQuery('SELECT title FROM notes WHERE id = ?', () => [props.id]);
 ```
 
-Both return `rows` (`undefined` until the first result), `error`, `loading`
+Svelte 5 (`setFirebirdContext`, `createQuery`, `createLiveQuery` from
+`firebird-wasm/svelte`) and SolidJS (`FirebirdContext`, `createQuery`,
+`createLiveQuery` from `firebird-wasm/solid`) follow the same pattern.
+
+All four return `rows` (`undefined` until the first result), `error`, `loading`
 and `refresh()`. Other SQL or parameters run the query again; equal
 parameters in a new array do not. While the new result loads, the previous
 rows stay, so a list does not blank out. A result that arrives after the
@@ -291,11 +295,24 @@ CREATE TRIGGER notes_changed FOR notes AFTER INSERT OR UPDATE OR DELETE
 AS BEGIN POST_EVENT 'notes'; END
 ```
 
+### Kysely, Drizzle, and Vector Search
 
-### A SQL console
+- **`firebird-wasm/kysely`**: Provides `FirebirdBrowserDialect` (translating
+  `LIMIT`/`OFFSET` to `ROWS ... TO ...`) and `generateKyselyTypes(db)` to
+  emit a TypeScript `Database` interface from live `db.introspect()` metadata.
+- **`firebird-wasm/drizzle`**: Provides a lightweight `drizzle(db)` query
+  builder plus `generateDrizzleSchema(db)` for code-generating table definitions.
+- **`firebird-wasm/vector`**: Provides `encodeVector` / `decodeVector`
+  (`Float32` & `Int8`), `registerVectorFunctions(db)` (`COSINE_DISTANCE`,
+  `L2_DISTANCE`, `DOT_PRODUCT`, `VECTOR_DIMS`, `VECTOR_NORM` in SQL via
+  `ENGINE JS`), and `vectorSearch(db, options)` for top-$k$ RAG similarity
+  queries.
 
-`firebird-wasm/repl` is an interactive console as a custom element, so it
-works the same in a plain page, React or Vue:
+### A SQL console & Inspector (`<firebird-repl>`)
+
+`firebird-wasm/repl` is an interactive console and database inspector as a
+custom element, so it works the same in a plain page, React, Vue, Svelte, or
+Solid:
 
 ```js
 import { defineFirebirdRepl } from 'firebird-wasm/repl';
@@ -313,6 +330,11 @@ statements with what they changed, each with its time; ArrowUp on the first
 line and ArrowDown on the last walk the history. `repl.run(sql)` runs SQL from
 code and resolves with what each statement did, the same list the
 `firebird-repl-run` event carries.
+
+Click **Inspector** in the toolbar (or call `repl.toggleInspector()`,
+`await repl.schema()`, `await repl.migrations()`, `await repl.profiler()`) to
+browse tables, columns, indexes, triggers, applied migrations, and query
+latency/plan metrics.
 
 Values are written as text, never as HTML: a row cannot put markup in the
 page. Colours follow the page's `color-scheme` and can be set through
@@ -346,91 +368,19 @@ await sync.unsubscribe();
 
 - **Writes go through your API.** Electric takes no writes: write through
   your own API to Postgres, and the change comes back down the shape.
-  `createWriteQueue` (below) shows the write at once while it does.
+  `createWriteQueue` (below) shows the write at once while it does, and
+  supports custom conflict resolution via `onConflict`.
 - **Consistent.** Each batch Electric marks complete is applied in one Firebird
   transaction together with the sync position (kept in a table
   `ELECTRIC_SHAPES`), so after a reload the next sync with the same
   `shapeKey` resumes exactly where the stored database is. When Electric
   says the shape must be fetched again (a `TRUNCATE`, an expired shape), the
   table is emptied and refilled in one transaction.
-- **Names.** A Postgres column `title` is the Firebird column `TITLE`; a name
-  that needed quotes in Postgres (`"camelCase"`) keeps them. `columns` maps
-  names that should differ. A name that is a Firebird reserved word (`day`,
-  `time`) must be quoted in your queries: `SELECT "DAY" FROM items`.
-- **Types.** Integers, `numeric` (exact), floats, `boolean`, text, `uuid`,
-  `date`, `time`, `timestamp`, `timestamptz` and `timetz`, `json` and `jsonb`
-  (as text), arrays (as JSON text), and `bytea` (as the bytes, in a
-  `BLOB SUB_TYPE BINARY`). A shape with any other type (`interval`, ranges,
-  `money`) is refused before any row is stored, naming the columns: leave
-  them out with the shape's `columns` parameter.
-- **Following it.** The sync posts the event `electric_<shapeKey>` with each
-  batch, so `useLiveQuery(sql, { events: ['electric_items'] })` and
-  `db.live()` follow it; triggers on the table fire as for any write.
-- **One shape per table**, and one tab syncing a database: with
-  `multiTab: 'shared'`, start the sync in the leading tab only.
-- **Several tables together.** `syncShapesToTables` keeps several tables in
-  step in one sync, and applies each batch to all of them in one Firebird
-  transaction, so a Postgres transaction that wrote to two of them never
-  shows in one and not the other:
-
-  ```js
-  import { syncShapesToTables } from 'firebird-wasm/electric';
-
-  const sync = await syncShapesToTables(db, {
-    shapes: {
-      orders: { shape: { url, params: { table: 'orders' } }, table: 'orders' },
-      lines:  { shape: { url, params: { table: 'order_lines' } }, table: 'order_lines' },
-    },
-    key: 'shop',        // positions kept as shop:orders and shop:lines; null starts over
-  });
-  ```
-
-  A batch is applied once every shape has reached up-to-date after the last
-  change it received, and, where the server marks up-to-date with its
-  position in the Postgres log (Electric and the shape server below do), once
-  they are all at the same one: a shape left behind is asked to refresh. It
-  posts one event per batch, `electric_<key>`.
-- **Writing back.** Electric takes no writes; your API does. A write queue
-  shows a write at once and sends it to your API in the background:
-
-  ```js
-  import { createWriteQueue, WriteRejected } from 'firebird-wasm/electric';
-
-  const writes = await createWriteQueue(db, {
-    // One write at a time, in order. Return the transaction id that applied
-    // it (Postgres: pg_current_xact_id()::xid::text; Firebird:
-    // CURRENT_TRANSACTION) so the queue knows when it has come back.
-    send: async (w) => {
-      const r = await fetch('/api/write', { method: 'POST', body: JSON.stringify(w) });
-      if (r.status === 422) throw new WriteRejected(await r.text());  // rolled back
-      if (!r.ok) throw new Error(r.statusText);                       // retried
-      return r.json();                                                // { txid }
-    },
-  });
-  const sync = await syncShapeToTable(db, { shape, table: 'items', shapeKey: 'items', writes });
-
-  await writes.insert('items', { id: 7, title: 'new' });     // in the table now
-  await writes.update('items', { id: 7 }, { done: true });
-  await writes.delete('items', { id: 7 });
-  ```
-
-  A write is applied to the table and recorded (`ELECTRIC_WRITES`) in one
-  transaction, so it survives a reload and an offline spell; the queue sends
-  it when it can. Each batch the sync applies is followed by the writes still
-  pending, so the source's older state never shows over them. A sent write
-  is dropped when its change comes back: by the transaction id `send`
-  returned (in Electric's `txids`; the shape server below sends them too),
-  otherwise when the row changes in the shape, or after
-  `confirmTimeoutMs`. A `WriteRejected` from `send` rolls the write back by
-  fetching the table's shape again. Values are keyed by the shape's column
-  names and may be strings, numbers, booleans, `null`, `Date` and
-  `Uint8Array`; the key needs the table's primary key columns. The sync and
-  the queue run their transactions one at a time on the database.
-
-See [plans/electric-sync.md](./plans/electric-sync.md) for the design.
-[`examples/electric`](../examples/electric) is a working app: two tables, one
-synced from Postgres through Electric and one from a Firebird server, with
-writes going through its server and `db.live()` drawing what comes back.
+- **Several tables & relational FK order.** `syncShapesToTables` and
+  `syncShapes` keep several tables in step in one sync and apply each batch to
+  all of them in one Firebird transaction; `syncShapes` also orders parent and
+  child tables by their declared `relations` so foreign-key constraints are
+  never violated during inserts or deletes.
 
 ### Syncing from a Firebird server
 
@@ -460,40 +410,10 @@ await syncShapeToTable(db, {
 });
 ```
 
-On start it installs, once, a change log (`ELECTRIC_CHANGES`) and a trigger
-per served table that logs each changed row's key. Before every read it
-numbers the changes committed since, so the stream follows commit order: a
-transaction that wrote first and committed last is not skipped. Values are
-read from the table when served and sent as Firebird renders them (exact
-for `BIGINT`, `NUMERIC`, `INT128` and timestamps). A binary `BLOB` and a
-`BINARY` or `VARBINARY` column are served as `bytea`. Put your own
-authentication in front of it, as Electric's documentation advises for
-Electric itself. What else it does:
-
-- **`where`**, as Electric takes it (`params: { table: 'items', where: 'done = $1', params: { 1: 'false' } }`):
-  comparisons, `AND` / `OR` / `NOT`, `IS [NOT] NULL`, `IN`, `LIKE` / `ILIKE`,
-  `BETWEEN`, literals and `$n` parameters over the table's columns, with every
-  value bound. Anything else (functions, casts, subqueries) is refused with a
-  400 naming it. A row that stops matching leaves the shape as a delete. Each
-  `where` and `columns` is a shape of its own, with its own handle.
-- **Pages.** A snapshot is served `snapshotPageRows` rows a response (default
-  10 000), in key order; the client reads on until up-to-date.
-- **Pruning.** The log keeps a change `retainLogMs` after numbering it
-  (default 7 days; `null` keeps all, and `shapes.prune(before)` prunes by
-  hand). A client further behind is sent back to a snapshot.
-- **Events.** A commit that logged a change posts `ELECTRIC_CHANGES`, which
-  wakes waiting live requests at once, through a connection of its own;
-  polling (`pollIntervalMs`, default 1 s) is the fallback. Firebird delivers
-  events on a second connection to the server's `RemoteAuxPort`, random by
-  default: for a Firebird in a container, pin it (`RemoteAuxPort = 3051`, or
-  `FIREBIRD_CONF_RemoteAuxPort=3051` in the official image) and publish it.
-  `shapes.events` says whether events are on; without them the server warns
-  once and polls.
-- **Several servers** can serve one database: numbering takes a lock, so the
-  log is numbered in commit order whichever server numbers it.
-
-See
-[plans/firebird-shape-server.md](./plans/firebird-shape-server.md).
+Supports `where` pushdown (joined directly into the snapshot and incremental
+log SQL), `replica=full` old-row images on updates/deletes, and
+`shapes.applyWrite(mutation)` (also exposed via `POST /v1/shape?table=...`) for
+conflict-checked optimistic write ingestion.
 
 ---
 
@@ -597,17 +517,12 @@ await db.query('SELECT * FROM notes WHERE title = ?', [userInput]);
 
 | JavaScript | Sent as |
 |------------|---------|
-| `number`, `string` | text, converted by the engine |
+| `number`, `string` | text, converted by the engine (plus exact binary `INT64` / `DOUBLE` alongside) |
 | `boolean` | `TRUE` / `FALSE` |
 | `Date` | ISO-8601 |
 | `null`, `undefined` | SQL `NULL` |
 | `Uint8Array`, `ArrayBuffer` | the bytes themselves, into a `BLOB` or a `BINARY` / `VARBINARY` (`OCTETS`) column; any other column refuses them |
 | `NaN`, `Infinity`, plain objects | **throws** |
-
-Values cross as text and are converted using the statement's declared
-parameter metadata, so the engine's own coercion rules apply. Bytes are the
-exception: they are never text, so they go only where bytes are kept, and a
-`Uint8Array` bound to a `VARCHAR` throws rather than being read as text.
 
 ### Reading values back
 
@@ -620,17 +535,7 @@ Anything a `double` cannot hold arrives as an **exact decimal string**:
 | `NUMERIC`, `DECIMAL`, `DECFLOAT`, `INT128` | `string` |
 | `DATE`, `TIME`, `TIMESTAMP` | ISO-8601 `string` |
 | `BLOB SUB_TYPE TEXT` | `string` |
-| `BLOB SUB_TYPE BINARY`, `BINARY`, `VARBINARY` (`OCTETS`) | base64 `string` |
-
-Which means a money column is a string, and `+` will concatenate it:
-
-```ts
-const { rows } = await db.query('SELECT price FROM items');
-rows[0].PRICE + 1;              // "20.251"  ← string concatenation
-Number(rows[0].PRICE) + 1;      // 21.25     ← loses exactness for big values
-```
-
-Use a decimal library, or do the arithmetic in SQL where it stays exact.
+| `BLOB SUB_TYPE BINARY`, `BINARY`, `VARBINARY` (`OCTETS`) | base64 `string` (or `Uint8Array` with `types: { binary: true }`) |
 
 ### Richer types, opt-in
 
@@ -648,36 +553,13 @@ const db = new FirebirdBrowser('mydb', {
 |--------|--------|---------------|
 | `bigint` | `BIGINT` → `bigint`, always | Nothing, but `NUMERIC` keeps its string — it shares `BIGINT`'s storage and a `bigint` would drop the scale |
 | `binary` | Binary `BLOB` → `Uint8Array` | Nothing. Base64 is 33% larger than the bytes and has to be decoded anyway |
-| `dates` | `DATE`, `TIMESTAMP` → `Date` | **Precision and zone** — see below |
-
-`dates` is the one to think about. Firebird keeps 100 µs and `Date` keeps 1 ms,
-so `11:22:33.4567` becomes `11:22:33.456`. And Firebird's `DATE`/`TIMESTAMP`
-carry no time zone while `Date` is an absolute instant, so one has to be
-chosen: **UTC**, so the same stored value gives the same `Date` everywhere.
-Left to JavaScript's own parsing it would be local for `TIMESTAMP` and UTC for
-`DATE` — machine-dependent, and inconsistent between two types that ought to
-behave alike.
-
-`TIME`, `TIME WITH TIME ZONE` and `TIMESTAMP WITH TIME ZONE` are never
-converted. `new Date('11:22:33')` is `Invalid Date`, and `Date` has nowhere to
-put `Europe/Bucharest`.
-
-To tell an exact number from text, read the column description:
-
-```ts
-const { fields } = await db.query('SELECT price FROM items');
-// { name: 'PRICE', typeName: 'NUMERIC', scale: -2, length: 8, nullable: true }
-```
-
-`typeName` reports `NUMERIC` whenever the scale is non-zero, because Firebird
-stores `NUMERIC` as a scaled integer — the raw type code alone would say
-`BIGINT`.
+| `dates` | `DATE`, `TIMESTAMP` → `Date` | **Precision and zone** — 100 µs truncated to 1 ms, interpreted as UTC |
 
 ---
 
 ## 6. Transactions, scripts, persistence
 
-### Transactions
+### Transactions & Savepoints
 
 ```ts
 await db.transaction(async (tx) => {
@@ -688,30 +570,8 @@ await db.transaction(async (tx) => {
 
 Committed when the callback returns, rolled back if it throws. To abandon a
 transaction without raising an error, call `tx.rollback()` — the wrapper will
-not then try to commit.
-
-Statements issued on `tx` are bound to that transaction. Statements on `db`
-are not, so a rollback will not undo them.
-
-`isolationLevel` and `readOnly` are honoured:
-
-```ts
-await db.transaction(async (tx) => {
-  const { rows } = await tx.query('SELECT SUM(amount) AS total FROM ledger');
-  await tx.exec('INSERT INTO audit (total) VALUES (?)', [rows[0].TOTAL]);
-}, { isolationLevel: 'SNAPSHOT' });
-
-// A read-only transaction is enforced by the engine, not merely advisory.
-await db.query('SELECT * FROM ledger', [], { readOnly: true });
-```
-
-`SNAPSHOT` gives the transaction a stable view: work another transaction
-commits after it starts is invisible to it. `READ_COMMITTED` sees such commits.
-`SNAPSHOT_TABLE_STABILITY` maps to Firebird's `CONSISTENCY`.
-
-Passing options to `query()` runs the statement inside its own transaction
-carrying them, which costs one extra round trip to the Worker. Without options
-the engine's auto-commit transaction is used instead.
+not then try to commit. Use `tx.savepoint(fn)` for nested savepoints inside an
+active transaction.
 
 ### Multi-statement scripts
 
@@ -727,13 +587,6 @@ const results = await db.exec(`
 `);
 results.map((r) => r.affectedRows);  // [0, 0, 1]
 ```
-
-Each statement runs in its own transaction and commits on success, so a
-failure part-way leaves the earlier statements committed — as in `isql`. For
-all-or-nothing migrations use `transaction()`.
-
-Parameters are rejected for multi-statement scripts: there is no way to say
-which statement a value belongs to.
 
 ### Persistence
 
@@ -751,53 +604,17 @@ const db = new FirebirdBrowser('mydb', {
 await db.persist();  // force one now
 ```
 
-Each persist writes the whole image in a single IndexedDB transaction, and
-only pages that changed are rewritten. All-or-nothing matters: a tab closed
-mid-write leaves the previous image intact rather than a half-updated file.
-
-Handle `onPersistError`. Background persists have no caller to reject into,
-and the default merely logs — which is silent data loss in production.
-
-Import and export whole databases through the VFS:
-
-```ts
-import { IndexedDBVFS } from 'firebird-wasm/browser';
-
-const vfs = new IndexedDBVFS();
-await vfs.open('mydb');
-const snapshot = await vfs.exportDatabase();  // Uint8Array
-await vfs.importDatabase(snapshot);
-await vfs.close();
-```
-
 ### Two tabs
 
-Opening the same database in two tabs is refused by default:
-
-```ts
-import { DatabaseLockedError } from 'firebird-wasm/browser';
-
-try {
-  await db.query('SELECT 1 FROM RDB$DATABASE');
-} catch (err) {
-  if (err instanceof DatabaseLockedError) {
-    showBanner('This app is already open in another tab.');
-  }
-}
-```
-
-This is not conservatism. Each tab holds a complete copy and writes the whole
-image, so the later persist discards the other tab's work entirely — with both
-tabs reporting success. Options:
+Opening the same database in two tabs is refused by default (`multiTab: 'exclusive'`),
+or transparently shared across tabs with `multiTab: 'shared'`:
 
 | Option | Meaning |
 |--------|---------|
-| `multiTab: 'exclusive'` | Default. Refuse the second tab |
+| `multiTab: 'exclusive'` | Default. Refuse the second tab with `DatabaseLockedError` |
+| `multiTab: 'shared'` | Elect one leader tab to run the engine and serve follower tabs over `BroadcastChannel`, with automatic failover and cross-tab `live()` event notifications |
 | `multiTab: 'allow-unsafe'` | Skip the lock. Only sound if at most one tab writes |
 | `lockTimeoutMs` | How long to wait, default `5000`; `Infinity` waits |
-
-Two tabs *sharing* one database is not supported yet — see
-[roadmap.md](./roadmap.md) §M4.
 
 ---
 
@@ -810,39 +627,6 @@ nothing to supply. What it gives up is statement and idle timeouts.
 To keep the threaded build, a service worker can supply the headers, because
 it sits in front of the network for its own scope and can re-issue every
 response with the headers attached.
-
-This repository's demo did this until it moved to the build without threads
-(`demo/public/coi-serviceworker.js` is now the retired version, which
-unregisters itself for visitors who still have the old one). The essential
-part:
-
-```js
-self.addEventListener('fetch', (event) => {
-  event.respondWith(fetch(event.request).then((response) => {
-    if (response.status === 0) return response;      // opaque
-    const headers = new Headers(response.headers);
-    headers.set('Cross-Origin-Embedder-Policy', 'require-corp');
-    headers.set('Cross-Origin-Opener-Policy', 'same-origin');
-    headers.set('Cross-Origin-Resource-Policy', 'cross-origin');
-    return new Response(response.body, {
-      status: response.status, statusText: response.statusText, headers,
-    });
-  }));
-});
-```
-
-Two caveats, both inherent to service workers rather than to this
-implementation:
-
-- **A service worker cannot control the load that registered it.** The first
-  visit arrives un-isolated and must reload once. Show something during that
-  moment rather than a blank page.
-- **It needs a secure context** — HTTPS or `localhost`. Over plain HTTP there
-  is no service worker and therefore no isolation.
-
-When you test this, serve the site *without* COOP/COEP locally. A dev server
-that helpfully sets the headers will make your app work locally and fail once
-deployed, which is precisely the bug this arrangement exists to survive.
 
 ---
 
@@ -861,8 +645,8 @@ const db = new FirebirdLite('/var/lib/firebird/app.fdb', {
 ```
 
 It requires Firebird's client library and a running server. For an embedded
-engine in Node with no server at all, use `DirectTransport` — the same
-transport the Worker uses, calling the exports in-process:
+engine in Node with no server at all, use `FirebirdBrowser` (which falls back
+to in-memory storage when `indexedDB` is absent) or `DirectTransport`:
 
 ```ts
 import { DirectTransport } from 'firebird-wasm/browser';
@@ -873,57 +657,37 @@ const dbh = await engine.createDatabase('/tmp/app.fdb');
 const result = await engine.query(dbh, 0, 'SELECT 1 AS n FROM RDB$DATABASE');
 ```
 
-Blocking the calling thread is fine in Node, so no Worker is needed.
-
 ---
 
 ## 9. Things that will bite you
 
 **`crossOriginIsolated` is `false` and nothing works.** The headers are
 missing, or a subresource is being blocked by `require-corp`. Check the
-Network panel for blocked requests, and remember that headers set on a dev
-server do not apply to a preview build.
+Network panel for blocked requests, or use the default single-threaded build
+(`firebird-embedded-st.js`).
 
 **The page freezes on the first query.** The engine is on the main thread.
 Pass a `worker`.
 
 **`CHARACTER SET "SYSTEM"."SJIS_0208" is not installed`.** Only the built-in
-character sets are compiled in. Use `UTF8`, which is.
+character sets are compiled in by default. Use `UTF8`, or load an ICU locale
+collation pack via `loadIcuLocaleData()`.
 
 **Arithmetic on a money column produces string concatenation.** See §5.
 
 **Writes vanish after closing the tab.** Either `autoPersist` was disabled, or
 the tab closed inside the debounce window. Call `persist()` at meaningful
-points; the automatic flush on `visibilitychange` is best-effort because the
-event cannot await an async write.
+points, or use `opfs://mydb`.
 
-**A second tab throws `DatabaseLockedError`.** Working as intended — see §6.
+**A second tab throws `DatabaseLockedError`.** Working as intended — see §6, or
+enable `multiTab: 'shared'`.
 
-**The build aborts inside `fb_create_database`.** Almost certainly a toolchain
-mismatch. Build with the pinned Emscripten from
-`packages/firebird-wasm/wasm/emsdk-version.txt`; the build script now refuses
-anything else, but an artifact produced before that check may still be lying
-around.
-
-**`node:fs` ends up in your browser bundle.** Mark `*firebird-embedded.js`
+**`node:fs` ends up in your browser bundle.** Mark `*firebird-embedded*.js`
 external — see §4.
 
 ---
 
 ## 10. Verifying your integration
-
-The suites in this repository are worth copying the *shape* of, whatever your
-stack:
-
-- Assert `crossOriginIsolated` is true before anything else. Every later
-  failure is a red herring otherwise.
-- Assert on **data**, not shapes. While the C API was stubbed, `fb_init()`
-  returned 0 and `fb_query()` returned a well-formed empty result set — a
-  shape-only check could not tell a working engine from a stub.
-- Test against a server that does **not** set COOP/COEP if you rely on the
-  service worker.
-- If your app can be opened twice, test it with two pages in one browser
-  context. They share an origin, so they contend for real.
 
 To point the demo suite at your own deployment:
 

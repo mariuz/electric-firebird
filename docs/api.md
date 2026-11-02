@@ -1052,3 +1052,271 @@ interface WasmLoadOptions {
 ```ts
 type FbHandle = number; // opaque integer pointer
 ```
+
+
+---
+
+## Advanced Database Operations (`FirebirdBrowser` & `FirebirdLite`)
+
+### `db.prepare(sql)` — Reusable Prepared Statements
+
+Prepare a SQL statement once and execute or stream it repeatedly without
+re-preparing:
+
+```ts
+const stmt = await db.prepare('INSERT INTO items (id, name) VALUES (?, ?)');
+try {
+  await stmt.exec([1, 'alpha']);
+  await stmt.exec([2, 'beta']);
+} finally {
+  await stmt.close(); // or use `await using stmt = await db.prepare(...)`
+}
+```
+
+| Member | Type | Description |
+|--------|------|-------------|
+| `stmt.sql` | `string` | SQL text of the prepared statement |
+| `stmt.fields` | `FieldInfo[]` | Output column metadata |
+| `stmt.params` | `FieldInfo[] \| undefined` | Input parameter metadata |
+| `stmt.statementType` | `StatementKind` | `'SELECT'`, `'INSERT'`, `'UPDATE'`, etc. |
+| `stmt.hasResultSet` | `boolean` | Whether executing returns rows |
+| `stmt.exec(params?, options?)` | `Promise<ExecResult \| void>` | Execute without materialising rows |
+| `stmt.query<T>(params?, options?)` | `Promise<QueryResult<T>>` | Execute and return all rows |
+| `stmt.stream<T>(params?, options?)` | `AsyncIterableIterator<QueryStreamBatch<T>>` | Stream rows in batches |
+| `stmt.setTimeout(timeoutMs)` | `Promise<void>` | Set per-statement execution timeout (ms, `0` to clear) |
+| `stmt.close()` | `Promise<void>` | Free the prepared statement handle |
+
+---
+
+### `db.queryStream<T>(sql, params?, options?)` — Cursor Streaming
+
+Stream large result sets in configurable batches (`batchSize`, default `250`)
+without loading the entire table into memory:
+
+```ts
+for await (const batch of db.queryStream('SELECT * FROM events', [], { batchSize: 500 })) {
+  for (const row of batch.rows) {
+    processRow(row);
+  }
+}
+```
+
+---
+
+### `db.createBlobStream(options?)` & `db.openBlobStream(blobId, options?)`
+
+Stream large binary or text BLOBs in chunks without holding the full buffer in
+memory:
+
+```ts
+// Write a BLOB from a stream:
+const writer = await db.createBlobStream({ chunkSize: 16384 });
+await writer.write(new Uint8Array([1, 2, 3, 4]));
+const blobId = await writer.close();
+
+// Read a BLOB as a Web ReadableStream<Uint8Array>:
+const stream = await db.openBlobStream(blobId);
+```
+
+---
+
+### `db.copyFromStream(table, stream, options?)` & `db.copyToStream(tableOrQuery, writable, options?)`
+
+Bulk-ingest or export CSV / JSONL streams (`ReadableStream` / `WritableStream`
+or `AsyncIterable<Uint8Array | string>`) with automatic transaction batching:
+
+```ts
+// Bulk import CSV:
+const { rowsImported, batchesCommitted } = await db.copyFromStream('items', csvStream, {
+  format: 'csv',
+  header: true,
+  batchSize: 500,
+});
+
+// Bulk export JSONL:
+const { rowsExported } = await db.copyToStream(
+  'SELECT id, name FROM items ORDER BY id',
+  writableStream,
+  { format: 'jsonl' },
+);
+```
+
+---
+
+### `tx.savepoint(fn)` / `tx.savepoint(name, fn)`
+
+Run a callback inside a nested SQL `SAVEPOINT` within an active transaction
+(`FirebirdBrowserTransaction` or `FirebirdTransaction`). Released when `fn`
+resolves; rolled back with `ROLLBACK TO SAVEPOINT` if `fn` throws or calls
+`sp.rollback()`, leaving earlier transaction work intact:
+
+```ts
+await db.transaction(async (tx) => {
+  await tx.exec("INSERT INTO items VALUES (1, 'kept')");
+
+  await tx.savepoint(async (sp) => {
+    await sp.exec("INSERT INTO items VALUES (2, 'discarded')");
+    await sp.rollback();
+  });
+});
+```
+
+---
+
+### Statement Cancellation & Timeouts (`AbortSignal`, `timeoutMs`, `db.cancelOperation()`)
+
+Pass `signal` (`AbortSignal`) or `timeoutMs` (`number`) in `QueryExecutionOptions`
+to `exec()`, `query()`, or `queryStream()`, or call `db.cancelOperation('raise')`:
+
+```ts
+const controller = new AbortController();
+setTimeout(() => controller.abort(), 1000);
+
+await db.query('SELECT * FROM heavy_view', [], {
+  signal: controller.signal,
+  timeoutMs: 2000,
+});
+```
+
+---
+
+### `db.explain(sql, params?)`, `db.introspect()`, `db.migrate(migrations, options?)`, `db.sweep()`
+
+- **`db.explain(sql, params?)`**: Returns `{ planText, nodes, fields, statementType }`
+  without executing the query.
+- **`db.introspect()`**: Queries `RDB$*` system catalogs and returns a
+  `DatabaseSchema` (`tables`, `views`, `sequences`, `columns`, `indexes`,
+  `primaryKey`, `foreignKeys`, `triggers`).
+- **`db.migrate(migrations, options?)`**: Applies pending versioned SQL
+  migrations in order inside transactions and records them in
+  `SCHEMA_MIGRATIONS`.
+- **`db.sweep()`**: Runs cooperative garbage collection and compacts unused
+  pages in the VFS.
+
+---
+
+### `db.registerFunction(name, options, fn)` & `db.registerProcedure(name, options, fn)`
+
+Register a JavaScript function or selectable stored procedure (`ENGINE JS`) on
+the database connection:
+
+```ts
+// Scalar UDR function:
+await db.registerFunction(
+  ' REVERSE_STR',
+  { args: [{ name: 'VAL', type: 'VARCHAR(200)' }], returns: 'VARCHAR(200)' },
+  (val) => (val == null ? null : String(val).split('').reverse().join('')),
+);
+
+// Selectable UDR procedure yielding multiple rows:
+await db.registerProcedure(
+  'GEN_SERIES',
+  {
+    args: [
+      { name: 'START_N', type: 'INTEGER' },
+      { name: 'STOP_N', type: 'INTEGER' },
+    ],
+    returns: [{ name: 'N', type: 'INTEGER' }],
+  },
+  function* (start, stop) {
+    for (let n = Number(start); n <= Number(stop); n++) {
+      yield { N: n };
+    }
+  },
+);
+```
+
+---
+
+### Copy-on-Write Snapshots & Branching (`FirebirdBrowser`)
+
+```ts
+const snap = await db.snapshot('checkpoint-1'); // DatabaseSnapshotInfo
+const list = db.listSnapshots();                // DatabaseSnapshotInfo[]
+await db.restoreSnapshot(snap.id);              // restore in-place
+const forkedDb = await db.branch('experiment'); // new independent FirebirdBrowser
+db.deleteSnapshot(snap.id);
+```
+
+---
+
+### Query Observability (`db.onQuery(listener)`, `db.monitorStats()`, `db.resetMonitorStats()`)
+
+```ts
+const unsub = db.onQuery((event) => {
+  console.log(event.kind, event.sql, `${event.durationMs.toFixed(2)}ms`, event.rowCount);
+});
+
+const stats = await db.monitorStats();
+// { totalQueries, totalExecs, totalErrors, totalDurationMs, maxDurationMs, recentQueries, engineTables }
+```
+
+---
+
+### `OPFSVFS` & WebCrypto Page Encryption (`firebird-wasm/browser`)
+
+```ts
+import {
+  OPFSVFS,
+  deriveEncryptionKey,
+  generateEncryptionKey,
+} from 'firebird-wasm/browser';
+
+const { key, salt } = await deriveEncryptionKey('my-passphrase');
+const vfs = new OPFSVFS({ encryptionKey: key });
+await vfs.open('mydb');
+```
+
+---
+
+## Subpath Modules
+
+### `firebird-wasm/vector`
+
+Float32 / Int8 vector encoding, SQL UDR registration (`COSINE_DISTANCE`,
+`L2_DISTANCE`, `DOT_PRODUCT`, `VECTOR_DIMS`, `VECTOR_NORM`), and similarity
+search:
+
+```ts
+import {
+  encodeVector,
+  registerVectorFunctions,
+  vectorSearch,
+} from 'firebird-wasm/vector';
+
+await registerVectorFunctions(db);
+await db.exec('CREATE TABLE docs (id INTEGER PRIMARY KEY, title VARCHAR(100), embedding VARBINARY(12))');
+await db.exec('INSERT INTO docs VALUES (?, ?, ?)', [1, 'Firebird WASM', encodeVector([1, 0, 0])]);
+
+const matches = await vectorSearch(db, {
+  table: 'docs',
+  column: 'embedding',
+  query: [1, 0, 0],
+  metric: 'cosine',
+  limit: 5,
+});
+```
+
+### `firebird-wasm/kysely` & `firebird-wasm/drizzle`
+
+```ts
+import { FirebirdBrowserDialect, generateKyselyTypes } from 'firebird-wasm/kysely';
+import { drizzle, generateDrizzleSchema } from 'firebird-wasm/drizzle';
+
+const kyselyDts = await generateKyselyTypes(db);
+const drizzleTs = await generateDrizzleSchema(db);
+```
+
+### `firebird-wasm/react`, `firebird-wasm/vue`, `firebird-wasm/svelte`, `firebird-wasm/solid`
+
+Reactive query and live-query hooks/stores across all four UI frameworks:
+
+- `firebird-wasm/react`: `FirebirdProvider`, `useFirebird`, `useQuery`, `useLiveQuery`
+- `firebird-wasm/vue`: `FIREBIRD`, `provideFirebird`, `useFirebird`, `useQuery`, `useLiveQuery`
+- `firebird-wasm/svelte`: `FIREBIRD_CONTEXT_KEY`, `setFirebirdContext`, `getFirebirdContext`, `createQuery`, `createLiveQuery`
+- `firebird-wasm/solid`: `FirebirdContext`, `useFirebird`, `createQuery`, `createLiveQuery`
+
+### `firebird-wasm/electric` & `firebird-wasm/electric-server`
+
+- `firebird-wasm/electric`: `syncShapeToTable`, `syncShapesToTables`, `syncShapes` (relational FK-ordered multi-shape sync), `createWriteQueue` (with `onConflict` resolution), `tableFromSchema`.
+- `firebird-wasm/electric-server`: `createShapeServer` (with `where` join pushdown, `replica=full` old-row tracking, and `applyWrite` optimistic mutation endpoint).

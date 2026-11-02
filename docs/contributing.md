@@ -36,7 +36,7 @@ npm run build -w packages/firebird-wasm
 ### 4. Run tests
 
 ```bash
-# Unit tests
+# Unit & WASM integration tests (Vitest)
 FIREBIRD_PASSWORD=masterkey npm test -w packages/firebird-wasm
 
 # End-to-end tests
@@ -53,7 +53,7 @@ npm run bench -- bench-results/decode.json  # …and record it
 
 Measures the built package, so run the build first. It needs no database: the
 result sets are synthetic, and what it times is the decode path between the
-engine's JSON and the rows a caller gets.
+engine's JSON/binary buffers and the rows a caller gets.
 
 CI runs this and **fails on a regression**. The checks are ratios against the
 `Object.fromEntries` construction that decoding used to do, not wall-clock
@@ -76,12 +76,22 @@ electric-firebird/
 │   └── firebird-wasm/
 │       ├── bench/                ← decode benchmark + regression guard
 │       ├── src/
-│       │   ├── __tests__/       ← Jest unit tests
-│       │   ├── browser/         ← Browser/WASM entry point
-│       │   ├── firebird.ts      ← Node.js backend
+│       │   ├── __tests__/       ← Vitest unit & WASM integration tests
+│       │   ├── browser/         ← Browser/WASM entry point (FirebirdBrowser, VFS, transport)
+│       │   ├── drizzle/         ← Drizzle-style query builder & schema codegen
+│       │   ├── electric/        ← ElectricSQL client shape sync & write queue
+│       │   ├── electric-server/ ← Firebird-backed Electric shape server
+│       │   ├── kysely/          ← Kysely dialect & TypeScript schema codegen
+│       │   ├── react/           ← React hooks & provider
+│       │   ├── repl/            ← <firebird-repl> Web Component + Inspector
+│       │   ├── solid/           ← SolidJS hooks & context
+│       │   ├── svelte/          ← Svelte 5 context & reactive stores
+│       │   ├── vector/          ← Vector embeddings codec, UDRs & similarity search
+│       │   ├── vue/             ← Vue 3 composables & provider
+│       │   ├── firebird.ts      ← Node.js backend (FirebirdLite)
 │       │   ├── index.ts         ← Node.js entry point
 │       │   ├── types.ts         ← Shared types
-│       │   └── wasm-loader.ts   ← WASM loader
+│       │   └── wasm-loader.ts   ← WASM loader & ICU locale data loader
 │       └── wasm/                ← WASM build artefacts
 │           ├── build.sh
 │           ├── CMakeLists.txt
@@ -133,7 +143,7 @@ feature quietly do nothing (`EXECUTE STATEMENT` did, until 0.9.0).  A stub
 belongs there only when it is accurate in a browser engine, and its comment
 says why; when that reason changes, the stub is a bug.  Match signatures to
 the headers of the Firebird revision the submodule is on — currently
-**`master`, 6.0.0**.
+**`master`, 6.0.0** (with `v5.0-release` also supported via `FB_TARGET_VERSION=5`).
 
 ---
 

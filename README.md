@@ -54,7 +54,7 @@ console.log(result.rows); // [ { ID: 1, NAME: 'hello' } ]
 await db.close();
 ```
 
-### Browser (WASM + IndexedDB)
+### Browser (WASM + IndexedDB / OPFS / Memory)
 
 ```ts
 import { FirebirdBrowser } from 'firebird-wasm/browser';
@@ -95,10 +95,10 @@ const live = await db.live(
 await live.unsubscribe();
 ```
 
-In React or Vue, the same as a hook:
+In React, Vue, Svelte 5, or SolidJS, the same as a reactive hook or store:
 
 ```tsx
-import { FirebirdProvider, useLiveQuery } from 'firebird-wasm/react'; // or firebird-wasm/vue
+import { FirebirdProvider, useLiveQuery } from 'firebird-wasm/react'; // or /vue, /svelte, /solid
 
 function Items() {
   const { rows } = useLiveQuery('SELECT id, name FROM items ORDER BY id', { events: ['items_changed'] });
@@ -106,9 +106,25 @@ function Items() {
 }
 ```
 
-See [docs/integration.md](./docs/integration.md) §3 for both, and for
-`<firebird-repl>` (`firebird-wasm/repl`), an interactive SQL console as a
-custom element.
+### Subpath exports
+
+| Import | Description |
+|--------|-------------|
+| `firebird-wasm` | `FirebirdLite` — Node.js native/embedded driver |
+| `firebird-wasm/browser` | `FirebirdBrowser`, `IndexedDBVFS`, `OPFSVFS`, encryption helpers |
+| `firebird-wasm/browser/worker-entry` | Dedicated Web Worker entry point for the WASM engine |
+| `firebird-wasm/react` | React `<FirebirdProvider>`, `useFirebird`, `useQuery`, `useLiveQuery` |
+| `firebird-wasm/vue` | Vue 3 `provideFirebird`, `useFirebird`, `useQuery`, `useLiveQuery` |
+| `firebird-wasm/svelte` | Svelte 5 `setFirebirdContext`, `getFirebirdContext`, `createQuery`, `createLiveQuery` |
+| `firebird-wasm/solid` | SolidJS `FirebirdContext`, `useFirebird`, `createQuery`, `createLiveQuery` |
+| `firebird-wasm/repl` | `<firebird-repl>` custom element with Schema, Migrations, and Profiler tabs |
+| `firebird-wasm/electric` | ElectricSQL Postgres shape sync (`syncShapeToTable`, `syncShapes`, `createWriteQueue`) |
+| `firebird-wasm/electric-server` | Firebird-backed shape server & HTTP handler (`createShapeServer`, `applyWrite`) |
+| `firebird-wasm/kysely` | Kysely dialect (`FirebirdBrowserDialect`) & TypeScript codegen (`generateKyselyTypes`) |
+| `firebird-wasm/drizzle` | Drizzle-style query builder (`drizzle`) & schema codegen (`generateDrizzleSchema`) |
+| `firebird-wasm/vector` | Float32/Int8 vector codec, SQL UDR registration (`COSINE_DISTANCE`, `L2_DISTANCE`, `DOT_PRODUCT`), and `vectorSearch` |
+
+See [docs/integration.md](./docs/integration.md) and [docs/api.md](./docs/api.md) for full details and usage examples.
 
 The two engine builds, with threads and without, are compared (with
 diagrams) in [docs/builds.md](./docs/builds.md).
@@ -220,7 +236,7 @@ The library provides two execution backends:
 │  Application code (shared QueryResult/Row types) │
 ├────────────────────┬────────────────────────────┤
 │  FirebirdLite      │  FirebirdBrowser           │
-│  (Node.js native)  │  (WASM + IndexedDB)        │
+│  (Node.js native)  │  (WASM + IndexedDB / OPFS) │
 ├────────────────────┼────────────────────────────┤
 │  libfbclient.so    │  firebird-embedded.wasm    │
 │                    │  + IndexedDB / OPFS / memory│
@@ -239,16 +255,15 @@ The library provides two execution backends:
 > ROWS: {"columns":[{"name":"ID","type":496,"subType":0,"scale":0,"length":4,"nullable":true},{"name":"NAME","type":448,"subType":0,"scale":0,"length":128,"nullable":true}],"rows":[[1,"alpha"],[2,"beta"]]}
 > ```
 >
-> Verified in Node (15 integration tests) **and in Chromium** through the
+> Verified in Node (integration tests) **and in Chromium** through the
 > public `FirebirdBrowser` API — including transactions and data surviving a
-> page reload via IndexedDB.  The engine runs inside a Web Worker, which is
-> required because the build uses pthreads and a browser main thread cannot
-> block.  Databases created by this build define only the built-in character
-> sets, UTF8 among them — see [docs/roadmap.md](./docs/roadmap.md).
+> page reload via IndexedDB and OPFS.  Databases created by this build define
+> the built-in character sets (UTF8 among them) and support optional on-demand
+> ICU locale collation packs — see [docs/roadmap.md](./docs/roadmap.md).
 
-- [x] WASM build infrastructure (Emscripten CMake + build script, tracks Firebird `master`)
+- [x] WASM build infrastructure (Emscripten CMake + build script, targeting Firebird 5.0 LTS & 6.0)
 - [x] Browser support module (`FirebirdBrowser`)
-- [x] IndexedDB persistence layer (`IndexedDBVFS`)
+- [x] IndexedDB persistence layer (`IndexedDBVFS`) & direct block-level OPFS page PIO (`OPFSVFS`)
 - [x] Browser test suite (Playwright, real Chromium + real IndexedDB)
 - [x] C API implemented over the Firebird OO API — attach/create, transactions, cursors, typed values, engine error text
 - [x] Transactions that bind statements to the transaction handle
@@ -258,19 +273,25 @@ The library provides two execution backends:
 - [x] Enable C++ exceptions (`-fwasm-exceptions`) — Firebird reports every error by throwing
 - [x] Threads (`-pthread` + a pre-spawned worker pool), real `sem_timedwait`, realistic stack sizes
 - [x] Attach threads to the libcds hazard-pointer GC, which the metadata cache requires
-- [x] **The engine runs: create database, DDL, DML, SELECT** (15 Node integration tests)
+- [x] **The engine runs: create database, DDL, DML, SELECT**
 - [x] Run the engine in a Web Worker (verified in Chromium end to end)
 - [x] Point `FirebirdBrowser` at the Worker (real SQL through the public API, verified in Chromium)
 - [x] Parameterised queries (`?` placeholders) on both backends
 - [x] Incremental, atomic IndexedDB persistence (one transaction, changed pages only)
 - [x] Web Worker + multi-tab safety, and multi-tab *sharing* (`multiTab: 'shared'`)
 - [x] Pre-built WASM binary published to npm — `npm install firebird-wasm`
-- [x] Live queries / `POST_EVENT`-based notifications (`live()`, `listen()`, `notify()`)
-- [x] React and Vue hooks (`firebird-wasm/react`, `firebird-wasm/vue`)
-- [x] A REPL component: `<firebird-repl>` (`firebird-wasm/repl`)
-- [x] Sync a Postgres table through ElectricSQL (`firebird-wasm/electric`)
-- [x] Sync a Firebird server's table the same way (`firebird-wasm/electric-server`), with `where`, paged snapshots and a pruned log
-- [x] `bytea`, several tables in one transaction (`syncShapesToTables`), and a write path (`createWriteQueue`)
+- [x] Live queries / `POST_EVENT`-based notifications (`live()`, `listen()`, `notify()`), including cross-tab `BroadcastChannel` fan-out
+- [x] React, Vue, Svelte 5, and SolidJS hooks (`firebird-wasm/react`, `/vue`, `/svelte`, `/solid`)
+- [x] A REPL component: `<firebird-repl>` (`firebird-wasm/repl`) with Schema, Migrations, and Query Profiler inspector tabs
+- [x] Sync a Postgres table through ElectricSQL (`firebird-wasm/electric`) with relational `syncShapes` and conflict-aware `createWriteQueue`
+- [x] Sync a Firebird server's table the same way (`firebird-wasm/electric-server`), with `where`, join pushdown, `replica=full`, and `applyWrite`
+- [x] Reusable prepared statements (`db.prepare()`), streaming cursors (`queryStream()`), BLOB streams (`createBlobStream()` / `openBlobStream()`), and `COPY`-style bulk CSV/JSONL streams (`copyFromStream()` / `copyToStream()`)
+- [x] Database dump/restore (`dumpDataDir()` / `loadDataDir()`, `dumpDataStream()` / `loadDataStream()`), schema introspection (`introspect()`), and declarative migrations (`migrate()`)
+- [x] Nested savepoints (`tx.savepoint()`), `AbortSignal` / `timeoutMs` statement cancellation, and query observability (`db.onQuery()` / `db.monitorStats()`)
+- [x] WebCrypto AES-256-GCM page encryption at rest, and Copy-on-Write snapshots & branching (`db.snapshot()`, `db.restoreSnapshot()`, `db.branch()`)
+- [x] JavaScript User-Defined Functions & Procedures (`db.registerFunction()` / `db.registerProcedure()`) via a native C++ `IExternalEngine` (`ENGINE JS`) bridge
+- [x] Vector embeddings & similarity search (`firebird-wasm/vector`) and Kysely / Drizzle adapters + schema codegen (`firebird-wasm/kysely`, `firebird-wasm/drizzle`)
+- [x] Typed binary result wire format (`FBR\x01`), on-demand ICU locale collation packs (`loadIcuLocaleData`), and Firebird 5.0 LTS + 6.0 WASM build targets
 
 See [docs/roadmap.md](./docs/roadmap.md) for the full status audit, a
 feature-by-feature comparison with PGlite, and the staged plan.

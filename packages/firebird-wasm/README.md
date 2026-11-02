@@ -1,6 +1,6 @@
 # firebird-wasm
 
-**Firebird Embedded for Node.js / TypeScript** — a [PGlite](https://pglite.dev)-inspired wrapper around the [Firebird](https://firebirdsql.org) embedded engine.
+**Firebird Embedded for Node.js & the Browser (WebAssembly)** — a [PGlite](https://pglite.dev)-inspired wrapper around the [Firebird](https://firebirdsql.org) embedded engine.
 
 > **Status:** Alpha — API may change before 1.0.
 
@@ -25,12 +25,23 @@ npm install firebird-wasm --omit=optional
 See [Firebird installation](https://firebirdsql.org/en/server-packages/) if you
 do want the native path.
 
-## Two backends
+## Two backends & subpath exports
 
-| Import | Engine | Needs |
-|--------|--------|-------|
-| `firebird-wasm` | Native driver → a real Firebird server | Firebird client library |
-| `firebird-wasm/browser` | Firebird 6.0 compiled to WebAssembly | A browser, or Node |
+| Import | Engine / Module | Needs |
+|--------|-----------------|-------|
+| `firebird-wasm` | Native driver → a real Firebird server (`FirebirdLite`) | Firebird client library |
+| `firebird-wasm/browser` | Firebird 5.0 LTS / 6.0 compiled to WebAssembly (`FirebirdBrowser`, `IndexedDBVFS`, `OPFSVFS`) | A browser, or Node |
+| `firebird-wasm/browser/worker-entry` | Dedicated Web Worker entry point for the WASM engine | Browser / Worker |
+| `firebird-wasm/react` | React `<FirebirdProvider>`, `useFirebird`, `useQuery`, `useLiveQuery` | React 18+ |
+| `firebird-wasm/vue` | Vue 3 `provideFirebird`, `useFirebird`, `useQuery`, `useLiveQuery` | Vue 3+ |
+| `firebird-wasm/svelte` | Svelte 5 `setFirebirdContext`, `getFirebirdContext`, `createQuery`, `createLiveQuery` | Svelte 5+ |
+| `firebird-wasm/solid` | SolidJS `FirebirdContext`, `useFirebird`, `createQuery`, `createLiveQuery` | SolidJS 1.8+ |
+| `firebird-wasm/repl` | `<firebird-repl>` interactive SQL console + Schema/Migrations/Profiler inspector | Browser custom elements |
+| `firebird-wasm/electric` | ElectricSQL client sync (`syncShapeToTable`, `syncShapesToTables`, `syncShapes`, `createWriteQueue`) | `FirebirdBrowser` / `FirebirdLite` |
+| `firebird-wasm/electric-server` | Firebird-backed Electric shape feed & write ingestion (`createShapeServer`, `applyWrite`) | `FirebirdLite` / `FirebirdBrowser` |
+| `firebird-wasm/kysely` | Kysely dialect (`FirebirdBrowserDialect`) & TypeScript schema codegen (`generateKyselyTypes`) | Kysely (optional) |
+| `firebird-wasm/drizzle` | Drizzle-style query builder (`drizzle`) & schema codegen (`generateDrizzleSchema`) | `FirebirdBrowser` / `FirebirdLite` |
+| `firebird-wasm/vector` | Float32/Int8 vector codec, SQL UDR registration (`COSINE_DISTANCE`, `L2_DISTANCE`, `DOT_PRODUCT`), and `vectorSearch` | `FirebirdBrowser` / `FirebirdLite` |
 
 The rest of this file documents the Node backend. For the browser engine —
 which is what the package is named after — see
@@ -171,36 +182,36 @@ Shipped in 0.1.0:
 Shipped since:
 
 - [x] Live queries built on Firebird's `POST_EVENT` (`live()`, `listen()`,
-      `notify()`)
+      `notify()`), including cross-tab `BroadcastChannel` notifications
 - [x] Multi-tab *sharing* (`multiTab: 'shared'`): one tab runs the engine,
       the others are served by it
-- [x] OPFS backend (`opfs://name`), with no image copy and no persist step
+- [x] OPFS backend (`opfs://name`) and direct block-level page PIO (`OPFSVFS`)
+      with WebCrypto AES-256-GCM page encryption at rest
+- [x] Copy-on-Write (CoW) page snapshots and instant database branching
+      (`db.snapshot()`, `db.restoreSnapshot()`, `db.branch()`)
 - [x] A build without `SharedArrayBuffer` (`firebird-embedded-st`), for pages
-      served without COOP/COEP headers
-- [x] React and Vue hooks (`firebird-wasm/react`, `firebird-wasm/vue`) and a
-      REPL element (`firebird-wasm/repl`)
-- [x] ElectricSQL sync, read path: a shape from Postgres through Electric
-      (`firebird-wasm/electric`), or from a Firebird server
-      (`firebird-wasm/electric-server`), with an example app syncing from
-      both ([`examples/electric`](../../examples/electric)), `bytea`
-      included, and several tables in one transaction
-      (`syncShapesToTables`)
-- [x] ElectricSQL writes: `createWriteQueue` applies a write at once, sends
-      it to the app's API, and keeps it over the sync until it comes back
+      served without COOP/COEP headers, plus Firebird 5.0 LTS (`v5`) and 6.0
+      (`v6`) WASM build targets
+- [x] Typed binary result wire format (`FBR\x01`) for zero-JSON-parse cursor
+      fetches, and on-demand ICU locale collation packs (`loadIcuLocaleData`)
+- [x] Reusable prepared statements (`db.prepare()`), streaming cursors
+      (`queryStream()`), BLOB streams (`createBlobStream()` / `openBlobStream()`),
+      and `COPY`-style bulk CSV/JSONL streaming (`copyFromStream()` / `copyToStream()`)
+- [x] Nested savepoints (`tx.savepoint()`), `AbortSignal` / `timeoutMs` statement
+      cancellation, and query observability (`db.onQuery()` / `db.monitorStats()`)
+- [x] JavaScript User-Defined Functions & Procedures (`db.registerFunction()`,
+      `db.registerProcedure()`) via a C++ `IExternalEngine` (`ENGINE JS`) bridge
+- [x] Vector embeddings & similarity search (`firebird-wasm/vector`)
+- [x] React, Vue, Svelte 5, and SolidJS integrations (`firebird-wasm/react`,
+      `/vue`, `/svelte`, `/solid`), Kysely & Drizzle adapters + schema codegen
+      (`firebird-wasm/kysely`, `firebird-wasm/drizzle`), and `<firebird-repl>`
+      (`firebird-wasm/repl`) with Schema, Migrations, and Profiler tabs
+- [x] ElectricSQL sync, read & write paths: Postgres shapes (`firebird-wasm/electric`),
+      relational multi-shape sync (`syncShapes`), conflict-aware `createWriteQueue`,
+      and Firebird shape server (`firebird-wasm/electric-server`) with `where` join
+      pushdown, `replica=full`, and `applyWrite`
 - [x] Module disposal: `disposeFirebirdWasm()`, and closing the last
       database frees the engine's memory
-
-Next:
-
-- [ ] A typed binary result ABI, so exact numerics need not travel as strings
-- [ ] UNICODE collations (case- and accent-insensitive comparison), which
-      need ICU collation data in the build. See
-      [docs/roadmap.md](../../docs/roadmap.md)
-
-**"Firebird 4 & 5 support" is gone from this list because it was never the
-gap.** The build tracks Firebird `master` and the shipped engine reports
-`ENGINE_VERSION 6.0.0`. What is actually missing is a build *matrix* across
-versions, not initial support for them.
 
 Fuller status, and a feature-by-feature comparison with PGlite, in
 [docs/roadmap.md](../../docs/roadmap.md).
