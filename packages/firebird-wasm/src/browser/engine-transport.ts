@@ -2124,7 +2124,12 @@ export class DirectTransport implements EngineTransport {
     option = 3,
   ): Promise<void> {
     const mod = this.module;
-    if (typeof mod._fb_cancel_operation === 'function') {
+    if (typeof mod._fb_wasm_cancel_operation === 'function') {
+      const rc = mod._fb_wasm_cancel_operation(dbHandle, option);
+      if (rc !== 0) {
+        throw engineError(mod, 'Firebird cancelOperation failed', rc);
+      }
+    } else if (typeof mod._fb_cancel_operation === 'function') {
       const rc = mod._fb_cancel_operation(dbHandle, option);
       if (rc !== 0) {
         throw engineError(mod, 'Firebird cancelOperation failed', rc);

@@ -3362,6 +3362,20 @@ public:
 		return nullptr;
 	}
 
+#if __cplusplus >= 202002L
+	IExternalAggregateFunction* makeAggregateFunction(CheckStatusWrapper* status,
+		IExternalContext* context, IRoutineMetadata* metadata,
+		IMetadataBuilder* inBuilder, IMetadataBuilder* outBuilder) override
+	{
+		(void) context;
+		(void) metadata;
+		(void) inBuilder;
+		(void) outBuilder;
+		setUdrStatusError(status, "JS UDR aggregate functions are not supported");
+		return nullptr;
+	}
+#endif
+
 private:
 	std::atomic<int>   m_refs{1};
 	IReferenceCounted* m_owner = nullptr;
@@ -7898,7 +7912,7 @@ int fb_cursor_open_stmt(int db_handle, int tx_handle, int stmt_handle,
  * Returns 0 on success, non-zero on failure.
  */
 FB_WASM_EXPORT
-int fb_cancel_operation(int db_handle, int option)
+int fb_wasm_cancel_operation(int db_handle, int option)
 {
 	clearError();
 
