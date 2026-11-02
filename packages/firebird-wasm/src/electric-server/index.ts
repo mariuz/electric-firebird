@@ -27,16 +27,17 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Attachment, Blob as FbBlob, Client, Transaction } from 'node-firebird-driver';
 import { TransactionIsolation } from 'node-firebird-driver';
-import { planTable, quote, relationName, renderValue } from './catalog';
+import { planTable, quote, relationName, renderValue, selectColumnWithAlias } from './catalog';
 import type { FirebirdColumn, TablePlan } from './catalog';
 import { CHANGES, CHANGE_EVENT, KEY_COLUMNS, META, installCapture, pruneLog, stampCommitted } from './capture';
 import { WhereError, translateWhere } from './where';
-import type { FirebirdWhere } from './where';
+import type { FirebirdWhere, TranslateWhereOptions } from './where';
 import { WriteRejected } from '../electric/writes';
 
 export { triggerName, tableTrigger } from './capture';
 export { translateWhere, WhereError } from './where';
-export { planTable, planColumn, shapeName } from './catalog';
+export type { FirebirdWhere, TranslateWhereOptions };
+export { planTable, planColumn, shapeName, selectColumnWithAlias } from './catalog';
 export type { TablePlan, ColumnPlan, FirebirdColumn } from './catalog';
 
 /** Options of {@link createShapeServer}. */
@@ -237,6 +238,69 @@ export async function createShapeServer(options: ShapeServerOptions): Promise<Sh
       if (after < pruned) return { gone: true, messages: [] as Message[], offset: after, seen: top };
       if (top <= after) return { gone: false, messages: [] as Message[], offset: after, seen: top };
       const table = shape.table;
+      if (shape.where && shape.whereAliased) {
+        const cKeys = Array.from({ length: KEY_COLUMNS }, (_, i) => `c.K${i + 1}`).join(', ');
+        const joinOn = table.key.map((k, i) => `t.${quote(k)} = c.K${i + 1}`).join(' AND ');
+        const matchedExpr = `CASE WHEN t.${quote(table.key[0]!)} IS NOT NULL THEN 1 ELSE 0 END`;
+        const selectCols = shape.columns.map((c) => selectColumnWithAlias(c, 't')).join(', ');
+        const rs = await attachment.executeQuery(
+          tx,
+          `SELECT c.OP, c.TX_ID, ${cKeys}, ${matchedExpr}, ${selectCols} ` +
+            `FROM ${CHANGES} c ` +
+            `LEFT JOIN ${quote(table.name)} t ON ${joinOn} AND (${shape.whereAliased.sql}) ` +
+            `WHERE c.TABLE_NAME = ? AND c.COMMIT_SEQ > ? AND c.COMMIT_SEQ <= ? ` +
+            'ORDER BY c.COMMIT_SEQ, c.CHANGE_ID',
+          [...shape.whereAliased.params, table.name, after, top],
+        );
+        const last = new Map<
+          string,
+          {
+            firstOp: string;
+            op: string;
+            key: unknown[];
+            txids: Set<string>;
+            matched: boolean;
+            tableRow: unknown[];
+          }
+        >();
+        for (const row of await rs.fetch()) {
+          const op = String(row[0]);
+          const key = row.slice(2, 2 + table.key.length);
+          const id = JSON.stringify(key);
+          const prev = last.get(id);
+          const txids = prev?.txids ?? new Set<string>();
+          txids.add(String(row[1]));
+          const matched = Number(row[2 + KEY_COLUMNS]) === 1;
+          const tableRow = row.slice(2 + KEY_COLUMNS + 1);
+          last.set(id, {
+            firstOp: prev ? prev.firstOp : op,
+            op,
+            key,
+            txids,
+            matched,
+            tableRow,
+          });
+        }
+        await rs.close();
+
+        const messages: Message[] = [];
+        for (const { firstOp, op, key, txids, matched, tableRow } of last.values()) {
+          let message: Message;
+          if (op !== 'D' && matched) {
+            message = await change('insert', table, shape.columns, tableRow, tx);
+          } else if (firstOp === 'I') {
+            // Newly inserted after `after` and does not match the pushed-down
+            // WHERE predicate at `top`: never belonged to this filtered shape.
+            continue;
+          } else {
+            message = deletion(table, key);
+          }
+          (message['headers'] as Record<string, unknown>)['txids'] = [...txids].map(Number);
+          messages.push(message);
+        }
+        return { gone: false, messages, offset: top, seen: top };
+      }
+
       const keys = Array.from({ length: KEY_COLUMNS }, (_, i) => `K${i + 1}`).join(', ');
       const rs = await attachment.executeQuery(
         tx,
@@ -616,6 +680,7 @@ interface Shape {
   columns: TablePlan['columns'];
   schema: Record<string, unknown>;
   where: FirebirdWhere | undefined;
+  whereAliased: FirebirdWhere | undefined;
   replica: 'default' | 'full';
   handle: string;
 }
@@ -631,16 +696,34 @@ function shapeOfRequest(params: URLSearchParams, tables: ReadonlyMap<string, Tab
   const schema = Object.fromEntries(columns.map((c) => [c.shapeName, table.schema[c.shapeName]]));
 
   const whereText = params.get('where');
-  // Electric's positional parameters: params[1]=…, params[2]=…
+  // Electric's positional parameters: params[1]=…, params.1=…, or params={"1":"…"}
   const values = new Map<number, string>();
+  const jsonParams = params.get('params');
+  if (jsonParams) {
+    try {
+      const parsed = JSON.parse(jsonParams) as Record<string, unknown>;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        for (const [k, v] of Object.entries(parsed)) {
+          const idx = Number(k.replace(/^\$/, ''));
+          if (Number.isInteger(idx) && idx > 0 && v !== undefined && v !== null) {
+            values.set(idx, String(v));
+          }
+        }
+      }
+    } catch {
+      throw new WhereError('where: params must be a valid JSON object when passed as params={…}');
+    }
+  }
   for (const [name, value] of params) {
-    const m = /^params\[(\d+)\]$/.exec(name);
-    if (m) values.set(Number(m[1]), value);
+    const m = /^params(?:\[(\d+)\]|\.(\d+))$/.exec(name);
+    if (m) values.set(Number(m[1] ?? m[2]), value);
   }
   let where: FirebirdWhere | undefined;
+  let whereAliased: FirebirdWhere | undefined;
   if (whereText) {
     const names = new Map(table.columns.map((c) => [c.shapeName, quote(c.name)]));
     where = translateWhere(whereText, names, values);
+    whereAliased = translateWhere(whereText, names, values, { tableAlias: 't' });
   }
   const replicaParam = params.get('replica');
   if (replicaParam !== null && replicaParam !== 'default' && replicaParam !== 'full') {
@@ -653,7 +736,7 @@ function shapeOfRequest(params: URLSearchParams, tables: ReadonlyMap<string, Tab
   const definition = whereText || columnsParam || replica === 'full'
     ? `${table.name}\u0000${columns.map((c) => c.name).join(',')}\u0000${whereText ?? ''}\u0000${JSON.stringify([...values].sort())}${replica === 'full' ? '\u0000full' : ''}`
     : table.name;
-  return { table, columns, schema, where, replica, handle: `${epoch}-${hashName(definition)}` };
+  return { table, columns, schema, where, whereAliased, replica, handle: `${epoch}-${hashName(definition)}` };
 }
 
 /** `(k1, k2, …) > (v1, v2, …)`, as Firebird 3 can write it. */

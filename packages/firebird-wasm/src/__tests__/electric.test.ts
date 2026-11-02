@@ -8,7 +8,7 @@
  * the real engine, in e2e/tests/browser-electric.spec.ts.
  */
 
-import { syncShapeToTable, syncShapesToTables, tableFromSchema, toFirebird, firebirdColumn, firebirdName, checkSchema } from '../electric';
+import { syncShapeToTable, syncShapesToTables, syncShapes, topologicalSortShapes, tableFromSchema, toFirebird, firebirdColumn, firebirdName, checkSchema } from '../electric';
 import { planColumn } from '../electric-server/catalog';
 import type { ElectricDatabase, ElectricSchema, ElectricTransaction } from '../electric';
 import type { FirebirdBrowser } from '../browser/firebird-browser';
@@ -369,6 +369,100 @@ describe('syncShapesToTables', () => {
       },
       key: null,
     })).rejects.toThrow(/table of its own/);
+  });
+
+  it('orders resets/deletes child-before-parent and inserts/updates parent-before-child when foreign keys exist', async () => {
+    const db = new FakeDb();
+    const { FakeStream, created } = scriptedStream();
+    const committedBatches: Array<{ tables: string[]; txids: string[]; lsn?: bigint }> = [];
+
+    // Register child ('tags') BEFORE parent ('items'), with explicit `dependencies: ['items']`
+    const sync = await syncShapes(db, {
+      shapes: {
+        tags: {
+          shape: { url: 'http://electric.test/v1/shape', params: { table: 'tags' } },
+          table: 'tags',
+          dependencies: ['items'],
+        },
+        items: {
+          shape: { url: 'http://electric.test/v1/shape', params: { table: 'items' } },
+          table: 'items',
+        },
+      },
+      key: 'fk-app',
+      onBatchCommitted: (info) => committedBatches.push(info),
+      ShapeStream: FakeStream as never,
+    });
+
+    const tags = created[0]!.instance;
+    const items = created[1]!.instance;
+
+    // 1. Initial snapshot: resets must run child ('TAGS') before parent ('ITEMS'),
+    //    while upserts must run parent ('ITEMS') before child ('TAGS').
+    await tags.deliver([insert({ id: '7', item: '1' }), at('100')], '1_0', TAGS);
+    await items.deliver([insert({ id: '1', title: 'parent-1', done: 'f' }), at('100')], '1_0', SCHEMA);
+    await sync.upToDate;
+
+    expect(commits(db)).toEqual([
+      ['DELETE FROM "TAGS"', 'DELETE FROM "ITEMS"', 'upsert "ITEMS"', 'upsert "TAGS"'],
+    ]);
+    expect(committedBatches).toEqual([
+      { tables: ['"TAGS"', '"ITEMS"'], txids: [], lsn: 100n },
+    ]);
+
+    // 2. Live transaction deleting item 1 + tag 7 and inserting item 2 + tag 8:
+    //    TAG delete runs before ITEM delete, and ITEM upsert runs before TAG upsert.
+    await tags.deliver(
+      [
+        { ...del('7'), headers: { operation: 'delete', txids: [501] } },
+        { ...insert({ id: '8', item: '2' }), headers: { operation: 'insert', txids: [501] } },
+        at('110'),
+      ],
+      '2_0',
+    );
+    await items.deliver(
+      [
+        { ...del('1'), headers: { operation: 'delete', txids: [501] } },
+        { ...insert({ id: '2', title: 'parent-2', done: 't' }), headers: { operation: 'insert', txids: [501] } },
+        at('110'),
+      ],
+      '2_0',
+    );
+
+    expect(commits(db)[1]).toEqual([
+      'DELETE FROM "TAGS" WHERE "ID" = ?',
+      'DELETE FROM "ITEMS" WHERE "ID" = ?',
+      'upsert "ITEMS"',
+      'upsert "TAGS"',
+    ]);
+    expect(committedBatches[1]).toEqual({
+      tables: ['"TAGS"', '"ITEMS"'],
+      txids: ['501'],
+      lsn: 110n,
+    });
+
+    await sync.unsubscribe();
+  });
+
+  it('topologically sorts multi-level dependencies and detects cycles', () => {
+    const sorted = topologicalSortShapes(
+      [
+        { shapeName: 'subtags', table: 'subtags', dependencies: ['tags'] },
+        { shapeName: 'tags', table: 'tags' },
+        { shapeName: 'items', table: 'items' },
+      ],
+      [{ childTable: 'TAGS', parentTable: 'ITEMS' }],
+    );
+    expect(sorted.hasDependencies).toBe(true);
+    expect(sorted.parentOrder).toEqual([2, 1, 0]); // items -> tags -> subtags
+    expect(sorted.childOrder).toEqual([0, 1, 2]);  // subtags -> tags -> items
+
+    expect(() =>
+      topologicalSortShapes([
+        { shapeName: 'a', table: 'a', dependencies: ['b'] },
+        { shapeName: 'b', table: 'b', dependencies: ['a'] },
+      ]),
+    ).toThrow(/Cyclic foreign-key dependency/);
   });
 });
 

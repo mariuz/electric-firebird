@@ -21,6 +21,16 @@ export interface FirebirdWhere {
   params: unknown[];
 }
 
+/** Options for {@link translateWhere}. */
+export interface TranslateWhereOptions {
+  /**
+   * Optional SQL table alias (e.g. `'t'`) to prefix every translated column
+   * reference (`t."COL"`), used when pushing `WHERE` predicates into
+   * `ELECTRIC_CHANGES` / base-table joins.
+   */
+  tableAlias?: string;
+}
+
 type Token =
   | { kind: 'word'; text: string }
   | { kind: 'quoted'; text: string }
@@ -91,6 +101,7 @@ export function translateWhere(
   text: string,
   columns: ReadonlyMap<string, string>,
   params: ReadonlyMap<number, string>,
+  options: TranslateWhereOptions = {},
 ): FirebirdWhere {
   const tokens = tokenize(text);
   const bound: unknown[] = [];
@@ -107,9 +118,9 @@ export function translateWhere(
   const column = (name: string, quoted: boolean): string => {
     // Unquoted, Postgres folds to lower case, and the shape's names are lower
     // case where Firebird's were upper.
-    const found = columns.get(quoted ? name : name.toLowerCase());
+    const found = columns.get(quoted ? name : name.toLowerCase()) ?? columns.get(name);
     if (!found) throw new WhereError(`where: ${name} is not a column of this shape's table`);
-    return found;
+    return options.tableAlias ? `${options.tableAlias}.${found}` : found;
   };
 
   const bind = (value: unknown) => {
@@ -169,9 +180,19 @@ export function translateWhere(
       pos++;
       const not = isWord(peek(), 'NOT');
       if (not) pos++;
-      if (!isWord(peek(), 'NULL')) throw new WhereError('where: IS takes only [NOT] NULL');
-      pos++;
-      return `${left} IS ${not ? 'NOT ' : ''}NULL`;
+      if (isWord(peek(), 'NULL')) {
+        pos++;
+        return `${left} IS ${not ? 'NOT ' : ''}NULL`;
+      }
+      if (isWord(peek(), 'TRUE')) {
+        pos++;
+        return `${left} IS ${not ? 'NOT ' : ''}TRUE`;
+      }
+      if (isWord(peek(), 'FALSE')) {
+        pos++;
+        return `${left} IS ${not ? 'NOT ' : ''}FALSE`;
+      }
+      throw new WhereError('where: IS takes only [NOT] NULL, TRUE, or FALSE');
     }
     const not = isWord(t, 'NOT') && (isWord(tokens[pos + 1], 'IN') || isWord(tokens[pos + 1], 'LIKE')
       || isWord(tokens[pos + 1], 'ILIKE') || isWord(tokens[pos + 1], 'BETWEEN'));

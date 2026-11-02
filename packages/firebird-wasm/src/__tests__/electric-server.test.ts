@@ -649,6 +649,15 @@ describe('createShapeServer fast paths & protocol (mocked driver)', () => {
           rows = [];
         } else if (sql.includes('SELECT (SELECT MAX(COMMIT_SEQ) FROM ELECTRIC_CHANGES), MAX(PRUNED_THROUGH) FROM ELECTRIC_META')) {
           rows = [[10, 0]];
+        } else if (sql.includes('FROM ELECTRIC_CHANGES c LEFT JOIN "ITEMS" t')) {
+          // Pushed-down WHERE join query: params = [...whereParams, tableName, after, top]
+          const wantedTitle = String(params?.[0] ?? '');
+          rows = currentChanges.map((chg) => {
+            const k1 = Number(chg[2]);
+            const baseRow = currentRowsByKey.get(k1);
+            const matched = baseRow && String(baseRow[1]) === wantedTitle;
+            return matched ? [...chg, 1, ...baseRow] : [...chg, 0, null, null];
+          });
         } else if (sql.includes('FROM ELECTRIC_CHANGES WHERE TABLE_NAME = ?')) {
           rows = currentChanges;
         } else if (sql.startsWith('SELECT "ID", "TITLE" FROM "ITEMS" WHERE ')) {
@@ -800,6 +809,53 @@ describe('createShapeServer fast paths & protocol (mocked driver)', () => {
       await expect(
         srv.applyWrite({ table: 'items', operation: 'delete', key: {} }),
       ).rejects.toThrow(/missing primary key column id/);
+
+      // 4. Filtered WHERE pushdown in changesAfter (single LEFT JOIN query, skips non-matching inserts)
+      currentChanges = [
+        ['I', 101, '1', null, null, null], // Newly inserted for tenant-a (matches)
+        ['I', 102, '2', null, null, null], // Newly inserted for tenant-b (does NOT match -> skipped!)
+        ['U', 103, '3', null, null, null], // Previously existed, updated to tenant-b (moves out -> delete!)
+      ];
+      currentRowsByKey = new Map([
+        [1, [1, 'tenant-a']],
+        [2, [2, 'tenant-b']],
+        [3, [3, 'tenant-b']],
+      ]);
+      const whereParam = encodeURIComponent('title = $1');
+      const jsonParams = encodeURIComponent(JSON.stringify({ 1: 'tenant-a' }));
+      const filteredSnap = await fetch(`${base}?table=items&offset=-1&where=${whereParam}&params=${jsonParams}`);
+      expect(filteredSnap.status).toBe(200);
+      const filteredHandle = filteredSnap.headers.get('electric-handle')!;
+
+      executedQueries.length = 0;
+      const filteredDelta = await fetch(
+        `${base}?table=items&offset=0_0&handle=${filteredHandle}&where=${whereParam}&params=${jsonParams}`,
+      );
+      expect(filteredDelta.status).toBe(200);
+      const filteredBody = (await filteredDelta.json()) as Array<Record<string, unknown>>;
+      // Key 1 (matching insert) + Key 3 (moved-out delete) + 1 up-to-date control message.
+      // Key 2 (non-matching insert) is completely filtered out by the pushed-down join!
+      expect(filteredBody).toHaveLength(3);
+      expect(filteredBody[0]).toMatchObject({
+        key: '"ITEMS"/"1"',
+        value: { id: '1', title: 'tenant-a' },
+        headers: { operation: 'insert', txids: [101] },
+      });
+      expect(filteredBody[1]).toMatchObject({
+        key: '"ITEMS"/"3"',
+        value: { id: '3' },
+        headers: { operation: 'delete', txids: [103] },
+      });
+      // Verify it executed a single pushed-down LEFT JOIN query and 0 separate SELECT ... FROM "ITEMS" queries
+      const pushedJoinQueries = executedQueries.filter((q) =>
+        q.sql.includes('FROM ELECTRIC_CHANGES c LEFT JOIN "ITEMS" t ON t."ID" = c.K1 AND (t."TITLE" = ?)'),
+      );
+      expect(pushedJoinQueries).toHaveLength(1);
+      expect(pushedJoinQueries[0]!.params).toEqual(['tenant-a', 'ITEMS', 0, 10]);
+      const separateTableSelects = executedQueries.filter((q) =>
+        q.sql.startsWith('SELECT "ID", "TITLE" FROM "ITEMS"'),
+      );
+      expect(separateTableSelects).toHaveLength(0);
     } finally {
       jest.dontMock('node-firebird-driver-native');
       jest.resetModules();

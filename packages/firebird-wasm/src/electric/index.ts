@@ -92,6 +92,24 @@ export interface ShapeTableOptions {
   primaryKey?: string[];
   /** Firebird column names for Postgres columns. */
   columns?: Record<string, string>;
+  /**
+   * Optional names of parent shapes or parent Firebird tables that this
+   * shape's table depends on (foreign keys). When present (or discovered
+   * automatically from `RDB$REF_CONSTRAINTS`), resets and deletes run
+   * child-before-parent while inserts and updates run parent-before-child
+   * inside each atomic batch transaction.
+   */
+  dependencies?: string[];
+}
+
+/** Metadata passed to {@link SyncShapesToTablesOptions.onBatchCommitted}. */
+export interface SyncBatchCommitInfo {
+  /** Firebird table names (quoted) touched in the committed atomic batch. */
+  tables: string[];
+  /** Source transaction IDs (`txids`) included in the committed batch. */
+  txids: string[];
+  /** Aligned `global_last_seen_lsn` across shapes when reported by the server. */
+  lsn?: bigint;
 }
 
 /** Options of {@link syncShapesToTables}. */
@@ -107,6 +125,8 @@ export interface SyncShapesToTablesOptions {
   event?: string | null;
   /** Called when the sync stops on an error.  Default: console.error. */
   onError?: (error: Error) => void;
+  /** Called after each atomic multi-shape batch commits. */
+  onBatchCommitted?: (info: SyncBatchCommitInfo) => void;
   /** Local writes to keep over what the sync applies, and to drop once confirmed: {@link createWriteQueue}. */
   writes?: WriteQueue;
   /** For tests: the ShapeStream class to use. */
@@ -141,7 +161,7 @@ export async function syncShapeToTable(
   db: ElectricDatabase,
   options: SyncShapeToTableOptions,
 ): Promise<ShapeSync> {
-  return syncShapes(db, {
+  return syncShapesInternal(db, {
     shapes: [{
       shape: options.shape,
       table: options.table,
@@ -177,21 +197,192 @@ export async function syncShapesToTables(
   if (names.length === 0) throw new RangeError('syncShapesToTables needs at least one shape');
   const tables = names.map((n) => firebirdName(options.shapes[n]!.table));
   if (new Set(tables).size !== tables.length) throw new RangeError('Each shape needs a table of its own');
-  return syncShapes(db, {
+  return syncShapesInternal(db, {
     shapes: names.map((name) => ({
       ...options.shapes[name]!,
+      shapeName: name,
       positionKey: options.key === null ? null : `${options.key}:${name}`,
     })),
     event: options.event === undefined ? (options.key === null ? null : `electric_${options.key}`) : options.event,
     onError: options.onError,
+    onBatchCommitted: options.onBatchCommitted,
     writes: options.writes,
     ShapeStream: options.ShapeStream,
   });
 }
 
+/**
+ * Alias for {@link syncShapesToTables} for multi-table transactional sync.
+ */
+export const syncShapes = syncShapesToTables;
+
 interface ShapeSpec extends ShapeTableOptions {
+  /** Logical shape key in `options.shapes`, if provided. */
+  shapeName?: string;
   /** The ELECTRIC_SHAPES key of its position, or null to start over. */
   positionKey: string | null;
+}
+
+/**
+ * Topologically sort shape indices from parent tables to child tables so
+ * foreign-key dependencies are satisfied. Throws a `RangeError` on cycles.
+ */
+export function topologicalSortShapes(
+  specs: ReadonlyArray<{ shapeName?: string; table: string; dependencies?: string[] }>,
+  catalogFkEdges: ReadonlyArray<{ childTable: string; parentTable: string }> = [],
+): { parentOrder: number[]; childOrder: number[]; hasDependencies: boolean } {
+  const n = specs.length;
+  const byShapeName = new Map<string, number>();
+  const byQuotedTable = new Map<string, number>();
+  const byUnquotedUpper = new Map<string, number>();
+
+  for (let i = 0; i < n; i++) {
+    const spec = specs[i]!;
+    if (spec.shapeName) {
+      byShapeName.set(spec.shapeName, i);
+      byShapeName.set(spec.shapeName.toUpperCase(), i);
+    }
+    const q = firebirdName(spec.table);
+    byQuotedTable.set(q, i);
+    const unquoted = q.slice(1, -1).replace(/""/g, '"');
+    byUnquotedUpper.set(unquoted.toUpperCase(), i);
+  }
+
+  const resolveIndex = (ref: string): number | undefined => {
+    const trimmed = ref.trim();
+    if (byShapeName.has(trimmed)) return byShapeName.get(trimmed);
+    if (byShapeName.has(trimmed.toUpperCase())) return byShapeName.get(trimmed.toUpperCase());
+    try {
+      const q = firebirdName(trimmed);
+      if (byQuotedTable.has(q)) return byQuotedTable.get(q);
+    } catch {
+      // Ignore invalid Firebird identifier when looking up by shape name.
+    }
+    return byUnquotedUpper.get(trimmed.replace(/^"(.*)"$/, '$1').toUpperCase());
+  };
+
+  // parentsOf[childIdx] = Set of parentIdx
+  const parentsOf: Array<Set<number>> = Array.from({ length: n }, () => new Set<number>());
+  let edgeCount = 0;
+
+  for (let childIdx = 0; childIdx < n; childIdx++) {
+    const deps = specs[childIdx]!.dependencies ?? [];
+    for (const dep of deps) {
+      const parentIdx = resolveIndex(dep);
+      if (parentIdx === undefined) {
+        throw new RangeError(
+          `Shape "${specs[childIdx]!.shapeName ?? specs[childIdx]!.table}" depends on unknown shape or table "${dep}"`,
+        );
+      }
+      if (parentIdx !== childIdx && !parentsOf[childIdx]!.has(parentIdx)) {
+        parentsOf[childIdx]!.add(parentIdx);
+        edgeCount++;
+      }
+    }
+  }
+
+  for (const edge of catalogFkEdges) {
+    const childIdx = resolveIndex(edge.childTable);
+    const parentIdx = resolveIndex(edge.parentTable);
+    if (
+      childIdx !== undefined &&
+      parentIdx !== undefined &&
+      childIdx !== parentIdx &&
+      !parentsOf[childIdx]!.has(parentIdx)
+    ) {
+      parentsOf[childIdx]!.add(parentIdx);
+      edgeCount++;
+    }
+  }
+
+  if (edgeCount === 0) {
+    const identity = Array.from({ length: n }, (_, i) => i);
+    return { parentOrder: identity, childOrder: [...identity].reverse(), hasDependencies: false };
+  }
+
+  const inDegree = parentsOf.map((s) => s.size);
+  const childrenOf: Array<number[]> = Array.from({ length: n }, () => []);
+  for (let child = 0; child < n; child++) {
+    for (const parent of parentsOf[child]!) {
+      childrenOf[parent]!.push(child);
+    }
+  }
+
+  const queue: number[] = [];
+  for (let i = 0; i < n; i++) {
+    if (inDegree[i] === 0) queue.push(i);
+  }
+
+  const parentOrder: number[] = [];
+  while (queue.length > 0) {
+    const curr = queue.shift()!;
+    parentOrder.push(curr);
+    for (const child of childrenOf[curr]!) {
+      inDegree[child]!--;
+      if (inDegree[child] === 0) {
+        queue.push(child);
+      }
+    }
+  }
+
+  if (parentOrder.length !== n) {
+    throw new RangeError('Cyclic foreign-key dependency detected across synced shapes');
+  }
+
+  return {
+    parentOrder,
+    childOrder: [...parentOrder].reverse(),
+    hasDependencies: true,
+  };
+}
+
+/**
+ * Split a shape's pending `LogEntry[]` into:
+ * - `deleteEntries`: resets (`DELETE FROM <table>`) and net deletes (`DELETE FROM <table> WHERE ...`)
+ *   that must run in child-before-parent order, and
+ * - `upsertEntries`: inserts and updates that must run in parent-before-child order.
+ */
+function splitEntriesForFkPhases(
+  entries: LogEntry[],
+  primaryKey: string[],
+): { deleteEntries: LogEntry[]; upsertEntries: LogEntry[] } {
+  let lastResetIdx = -1;
+  for (let i = 0; i < entries.length; i++) {
+    if (entries[i]!.kind === 'reset') lastResetIdx = i;
+  }
+
+  const deleteEntries: LogEntry[] = lastResetIdx >= 0 ? [{ kind: 'reset' }] : [];
+  const afterReset = lastResetIdx >= 0 ? entries.slice(lastResetIdx + 1) : entries;
+
+  const keyId = (value: Record<string, unknown>): string =>
+    JSON.stringify(primaryKey.map((k) => value[k]));
+
+  // Find the final operation for each primary key after any reset.
+  const finalKindByKey = new Map<string, 'insert' | 'update' | 'delete'>();
+  for (const entry of afterReset) {
+    if (entry.kind === 'reset') continue;
+    finalKindByKey.set(keyId(entry.value), entry.kind);
+  }
+
+  const emittedDeletes = new Set<string>();
+  const upsertEntries: LogEntry[] = [];
+
+  for (const entry of afterReset) {
+    if (entry.kind === 'reset') continue;
+    const id = keyId(entry.value);
+    const finalKind = finalKindByKey.get(id);
+    if (finalKind === 'delete') {
+      // Only emit the delete in Phase 1 if the table wasn't already emptied by a reset.
+      if (lastResetIdx < 0 && entry.kind === 'delete' && !emittedDeletes.has(id)) {
+        emittedDeletes.add(id);
+        deleteEntries.push(entry);
+      }
+    } else if (entry.kind !== 'delete') {
+      upsertEntries.push(entry);
+    }
+  }
+
+  return { deleteEntries, upsertEntries };
 }
 
 /** One shape's part of a running sync. */
@@ -220,12 +411,13 @@ interface ShapeState {
   txids: Set<string>;
 }
 
-async function syncShapes(
+async function syncShapesInternal(
   given: ElectricDatabase,
   options: {
     shapes: ShapeSpec[];
     event: string | null;
     onError?: (error: Error) => void;
+    onBatchCommitted?: (info: SyncBatchCommitInfo) => void;
     writes?: WriteQueue;
     ShapeStream?: typeof ShapeStream;
   },
@@ -240,6 +432,7 @@ async function syncShapes(
   // in that same transaction.
   await ensureMetadata(db);
   const positions = new Map<string, { handle: string; offset: string; schema: ElectricSchema }>();
+  const catalogFkEdges: Array<{ childTable: string; parentTable: string }> = [];
   await db.transaction(async (tx) => {
     for (const spec of options.shapes) {
       if (spec.positionKey === null) continue;
@@ -256,7 +449,34 @@ async function syncShapes(
         });
       }
     }
+    if (options.shapes.length > 1) {
+      try {
+        const fkRes = await tx.query(
+          'SELECT TRIM(rc_child.RDB$RELATION_NAME) AS CHILD_TABLE, ' +
+            'TRIM(rc_parent.RDB$RELATION_NAME) AS PARENT_TABLE ' +
+            'FROM RDB$RELATION_CONSTRAINTS rc_child ' +
+            'JOIN RDB$REF_CONSTRAINTS refc ON refc.RDB$CONSTRAINT_NAME = rc_child.RDB$CONSTRAINT_NAME ' +
+            'JOIN RDB$RELATION_CONSTRAINTS rc_parent ON rc_parent.RDB$CONSTRAINT_NAME = refc.RDB$CONST_NAME_UQ ' +
+            "WHERE rc_child.RDB$CONSTRAINT_TYPE = 'FOREIGN KEY'",
+        );
+        for (const r of fkRes.rows) {
+          if (r['CHILD_TABLE'] && r['PARENT_TABLE']) {
+            catalogFkEdges.push({
+              childTable: String(r['CHILD_TABLE']).trim(),
+              parentTable: String(r['PARENT_TABLE']).trim(),
+            });
+          }
+        }
+      } catch {
+        // Ignore if the test double does not implement system FK catalog queries.
+      }
+    }
   });
+
+  const { parentOrder, childOrder, hasDependencies } = topologicalSortShapes(
+    options.shapes,
+    catalogFkEdges,
+  );
 
   let upToDate = false;
   let failure: Error | undefined;
@@ -311,24 +531,71 @@ async function syncShapes(
       return { table: s.table, column: s.column, schema, primaryKey };
     });
     await db.transaction(async (tx) => {
-      for (let i = 0; i < batch.length; i++) {
-        const { s, entries, handle, offset } = batch[i]!;
-        await applyEntries(tx, targets[i]!, entries);
-        if (options.writes) {
-          // Local writes stay over what the source sent, until it sends them back.
-          const keys = targets[i]!.primaryKey;
-          const touched = entries.some((e) => e.kind === 'reset')
-            ? 'all' as const
-            : new Set(entries.map((e) => writeKeyText(Object.fromEntries(
-              keys.map((k) => [k, (e as { value: Record<string, unknown> }).value[k]])))));
-          await options.writes.sync.reconcile(tx, s.spec.table, touched, txids);
+      if (hasDependencies) {
+        const split = batch.map(({ entries }, i) =>
+          splitEntriesForFkPhases(entries, targets[i]!.primaryKey),
+        );
+        // Phase 1: Resets and deletes in child-before-parent order so foreign-key
+        // references from child tables are removed before parent rows are deleted.
+        for (const i of childOrder) {
+          const { deleteEntries } = split[i]!;
+          if (deleteEntries.length > 0) {
+            await applyEntries(tx, targets[i]!, deleteEntries);
+          }
         }
-        if (s.spec.positionKey !== null && handle && offset) {
-          await tx.exec(
-            `UPDATE OR INSERT INTO ${METADATA} (SHAPE_KEY, SHAPE_HANDLE, SHAPE_OFFSET, SHAPE_SCHEMA) ` +
-              'VALUES (?, ?, ?, ?) MATCHING (SHAPE_KEY)',
-            [s.spec.positionKey, handle, offset, JSON.stringify(targets[i]!.schema)],
-          );
+        // Phase 2: Inserts and updates in parent-before-child order so parent rows
+        // exist before child rows reference them.
+        for (const i of parentOrder) {
+          const { upsertEntries } = split[i]!;
+          if (upsertEntries.length > 0) {
+            await applyEntries(tx, targets[i]!, upsertEntries);
+          }
+        }
+        for (const i of parentOrder) {
+          const { s, entries, handle, offset } = batch[i]!;
+          if (options.writes) {
+            const keys = targets[i]!.primaryKey;
+            const touched = entries.some((e) => e.kind === 'reset')
+              ? ('all' as const)
+              : new Set(
+                  entries.map((e) =>
+                    writeKeyText(
+                      Object.fromEntries(
+                        keys.map((k) => [k, (e as { value: Record<string, unknown> }).value[k]]),
+                      ),
+                    ),
+                  ),
+                );
+            await options.writes.sync.reconcile(tx, s.spec.table, touched, txids);
+          }
+          if (s.spec.positionKey !== null && handle && offset) {
+            await tx.exec(
+              `UPDATE OR INSERT INTO ${METADATA} (SHAPE_KEY, SHAPE_HANDLE, SHAPE_OFFSET, SHAPE_SCHEMA) ` +
+                'VALUES (?, ?, ?, ?) MATCHING (SHAPE_KEY)',
+              [s.spec.positionKey, handle, offset, JSON.stringify(targets[i]!.schema)],
+            );
+          }
+        }
+      } else {
+        for (let i = 0; i < batch.length; i++) {
+          const { s, entries, handle, offset } = batch[i]!;
+          await applyEntries(tx, targets[i]!, entries);
+          if (options.writes) {
+            // Local writes stay over what the source sent, until it sends them back.
+            const keys = targets[i]!.primaryKey;
+            const touched = entries.some((e) => e.kind === 'reset')
+              ? 'all' as const
+              : new Set(entries.map((e) => writeKeyText(Object.fromEntries(
+                keys.map((k) => [k, (e as { value: Record<string, unknown> }).value[k]])))));
+            await options.writes.sync.reconcile(tx, s.spec.table, touched, txids);
+          }
+          if (s.spec.positionKey !== null && handle && offset) {
+            await tx.exec(
+              `UPDATE OR INSERT INTO ${METADATA} (SHAPE_KEY, SHAPE_HANDLE, SHAPE_OFFSET, SHAPE_SCHEMA) ` +
+                'VALUES (?, ?, ?, ?) MATCHING (SHAPE_KEY)',
+              [s.spec.positionKey, handle, offset, JSON.stringify(targets[i]!.schema)],
+            );
+          }
         }
       }
       if (eventName) {
@@ -338,6 +605,16 @@ async function syncShapes(
         );
       }
     });
+    if (options.onBatchCommitted) {
+      const knownLsns = states.map((s) => s.lsn).filter((l): l is bigint => l !== undefined);
+      const alignedLsn =
+        knownLsns.length > 0 ? knownLsns.reduce((a, b) => (b > a ? b : a)) : undefined;
+      options.onBatchCommitted({
+        tables: targets.map((t) => t.table),
+        txids: [...txids],
+        ...(alignedLsn !== undefined ? { lsn: alignedLsn } : {}),
+      });
+    }
     if (!upToDate) {
       upToDate = true;
       resolveReady();

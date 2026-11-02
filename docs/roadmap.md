@@ -1376,11 +1376,11 @@ Next-horizon milestones for `v0.15.0`:
       Automatically broadcast table-level `FB_LIVE$<table>` invalidations across
       same-origin browser tabs so `useLiveQuery()` updates across all open tabs
       when any tab commits writes.
-- [ ] **Filtered `WHERE` Pushdown in `firebird-wasm/electric-server`.**
+- [x] **Filtered `WHERE` Pushdown in `firebird-wasm/electric-server`.**
       Push parameterized `WHERE` predicates down into both the initial snapshot
       query and the `ELECTRIC_CHANGES` / base-table join in `createShapeServer`
       to reduce network and memory overhead for multi-tenant shape servers.
-- [ ] **Multi-Table Transactional Sync (`syncShapes` atomic batching across shapes).**
+- [x] **Multi-Table Transactional Sync (`syncShapes` atomic batching across shapes).**
       Coordinate initial snapshots and live `up-to-date` boundaries across
       related tables in `firebird-wasm/electric` so foreign-key relationships
       stay consistent during multi-shape sync.

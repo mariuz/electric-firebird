@@ -40,6 +40,15 @@ export function quote(name: string): string {
 }
 
 /**
+ * Qualify a column's `SELECT` expression (`plan.select`) with a table alias
+ * (e.g. `t."ID"`, `CAST(t."DAY_" AS VARCHAR(10))`).
+ */
+export function selectColumnWithAlias(plan: ColumnPlan, alias: string): string {
+  const q = quote(plan.name);
+  return plan.select.replace(q, `${alias}.${q}`);
+}
+
+/**
  * The shape's name for a Firebird column: a name Firebird folded to upper
  * case is lower case, as Postgres would fold it, and the client folds it back
  * (`TITLE` → `title` → `"TITLE"`); any other name is kept as it is.
