@@ -59,6 +59,19 @@ export {
   DEFAULT_MIGRATIONS_TABLE,
 } from './schema';
 export {
+  generateDrizzleSchema,
+  generateDrizzleSchemaFromCatalog,
+  generateKyselyTypes,
+  generateKyselyTypesFromCatalog,
+  resolveSchemaIntrospection,
+} from './codegen';
+export type {
+  CodegenIdentifierCase,
+  DrizzleCodegenOptions,
+  IntrospectableSource,
+  KyselyCodegenOptions,
+} from './codegen';
+export {
   isBlobHandle,
   isBlobWritableStream,
   DEFAULT_BLOB_SEGMENT_SIZE,

@@ -74,17 +74,21 @@ import {
   customType,
   date,
   doublePrecision,
+  foreignKey,
+  index,
   integer,
   json,
   jsonb,
   numeric,
   pgTable,
+  primaryKey,
   real,
   serial,
   smallint,
   text,
   time,
   timestamp,
+  uniqueIndex,
   uuid,
   varchar,
 } from 'drizzle-orm/pg-core';
@@ -105,6 +109,17 @@ import type {
   TransactionOptions,
 } from '../types';
 import { parseMultiRowInsert } from '../kysely';
+
+export {
+  generateDrizzleSchema,
+  generateDrizzleSchemaFromCatalog,
+  resolveSchemaIntrospection,
+} from '../browser/codegen';
+export type {
+  CodegenIdentifierCase,
+  DrizzleCodegenOptions,
+  IntrospectableSource,
+} from '../browser/codegen';
 
 export {
   pgTable,
@@ -128,6 +143,10 @@ export {
   jsonb,
   uuid,
   customType,
+  index,
+  uniqueIndex,
+  primaryKey,
+  foreignKey,
 };
 
 export {

@@ -1336,7 +1336,7 @@ With M0–M8 complete, these are the next-horizon milestones for `v0.14.0`:
       Wire `db.introspect()`, `db.sweep()`, and `FB_MIGRATIONS$` into a visual
       sidebar/tab inside `<firebird-repl>` displaying tables, columns, primary/foreign
       keys, indexes, sequences, triggers, and applied migration history.
-- [ ] **Drizzle Kit / Kysely Codegen introspection adapter.**
+- [x] **Drizzle Kit / Kysely Codegen introspection adapter.**
       Use `db.introspect()` to generate TypeScript `firebirdTable(...)` schema
       definitions (for `firebird-wasm/drizzle`) and Kysely `Database` interfaces
       (for `firebird-wasm/kysely`) directly from any live `.fdb` database or SQL

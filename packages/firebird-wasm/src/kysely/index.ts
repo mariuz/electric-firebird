@@ -84,6 +84,17 @@ import type {
   TransactionOptions,
 } from '../types';
 
+export {
+  generateKyselyTypes,
+  generateKyselyTypesFromCatalog,
+  resolveSchemaIntrospection,
+} from '../browser/codegen';
+export type {
+  CodegenIdentifierCase,
+  IntrospectableSource,
+  KyselyCodegenOptions,
+} from '../browser/codegen';
+
 /**
  * How identifiers and returned column keys are cased between Kysely and Firebird.
  *
