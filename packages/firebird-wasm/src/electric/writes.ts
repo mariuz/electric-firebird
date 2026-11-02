@@ -48,6 +48,16 @@ export interface LocalWrite {
   key: Record<string, unknown>;
   /** The values written (for a delete, none), by column name. */
   value: Record<string, unknown>;
+  /**
+   * Pre-mutation snapshot of the local row before this write was applied
+   * (`null` when inserting a new row or when unavailable).
+   */
+  before?: Record<string, unknown> | null;
+  /**
+   * Set to `true` when `send` is re-invoked after `onConflict` resolved a
+   * conflict with `'client-wins'` or `'merge'`.
+   */
+  conflictResolved?: boolean;
 }
 
 /** What `send` may return: the source transaction that applied the write. */
@@ -64,10 +74,141 @@ export class WriteRejected extends Error {
   }
 }
 
+/**
+ * Thrown by `send` when the remote server reports a concurrency / version
+ * conflict (e.g. HTTP 409) and optionally provides the current server row.
+ * Handled according to {@link WriteQueueOptions.onConflict}.
+ */
+export class WriteConflict extends Error {
+  readonly conflict = true;
+  readonly server: Record<string, unknown> | null;
+
+  constructor(
+    message: string,
+    serverOrOptions?:
+      | { server?: Record<string, unknown> | null }
+      | Record<string, unknown>
+      | null,
+  ) {
+    super(message);
+    this.name = 'WriteConflict';
+    if (serverOrOptions === undefined || serverOrOptions === null) {
+      this.server = null;
+    } else if (
+      typeof serverOrOptions === 'object' &&
+      'server' in serverOrOptions &&
+      Object.keys(serverOrOptions).every((k) => k === 'server')
+    ) {
+      this.server =
+        (serverOrOptions as { server?: Record<string, unknown> | null }).server ??
+        null;
+    } else {
+      this.server = serverOrOptions as Record<string, unknown>;
+    }
+  }
+}
+
+/** Context passed to a custom {@link WriteQueueOptions.onConflict} callback. */
+export interface WriteConflictContext {
+  /** The queued local mutation that conflicted. */
+  write: LocalWrite;
+  /**
+   * The local row's snapshot before `write` was applied (`BEFORE_JSON`),
+   * or `null` if the row did not exist locally before `write`.
+   */
+  before: Record<string, unknown> | null;
+  /**
+   * The current server row state (from `WriteConflict.server`, `getServerRow`,
+   * or an incoming Electric sync batch), or `null` if the row does not exist
+   * on the server.
+   */
+  server: Record<string, unknown> | null;
+  /**
+   * Where the conflict was detected:
+   * - `'send'`: while flushing `write` to the remote backend
+   * - `'sync'`: while reconciling an incoming Electric shape batch touching the same row
+   */
+  source: 'send' | 'sync';
+  /** The `WriteConflict` error thrown by `send`, when applicable. */
+  error?: Error;
+  /** 1-based conflict resolution attempt count for this write. */
+  attempt: number;
+}
+
+/** Normalized conflict resolution outcome. */
+export type ResolvedConflictOutcome =
+  | { action: 'client-wins' }
+  | { action: 'server-wins' }
+  | {
+      action: 'merge';
+      value: Record<string, unknown>;
+      operation: LocalWrite['operation'];
+    };
+
+/**
+ * Outcome returned by a custom `onConflict` resolver callback:
+ * - `'client-wins'` or `{ action: 'client-wins' }`: keep the client's write over `server`.
+ * - `'server-wins'` or `{ action: 'server-wins' }`: discard the client's write and adopt `server`.
+ * - `'merge'`: perform a 3-way field-level merge using `before`, `server`, and `write.value`.
+ * - `{ action: 'merge', value, operation? }` or a plain `Record<string, unknown>`: replace the
+ *   queued write's `value` (and optionally `operation`) with the merged values.
+ */
+export type ConflictResolution =
+  | 'client-wins'
+  | 'server-wins'
+  | 'merge'
+  | { action: 'client-wins' }
+  | { action: 'server-wins' }
+  | {
+      action: 'merge';
+      value: Record<string, unknown>;
+      operation?: LocalWrite['operation'];
+    }
+  | Record<string, unknown>;
+
+/**
+ * Pluggable conflict strategy or custom resolver callback for {@link createWriteQueue}.
+ */
+export type ConflictStrategy =
+  | 'client-wins'
+  | 'server-wins'
+  | 'merge'
+  | ((
+      context: WriteConflictContext,
+    ) => ConflictResolution | Promise<ConflictResolution>);
+
 /** Options of {@link createWriteQueue}. */
 export interface WriteQueueOptions {
-  /** Hand one write to the source (the app's API); throw `WriteRejected` to refuse it. */
+  /** Hand one write to the source (the app's API); throw `WriteRejected` to refuse it or `WriteConflict` on conflict. */
   send: (write: LocalWrite) => Promise<SendResult | void>;
+  /**
+   * Pluggable conflict handler invoked when flushing offline mutations after
+   * reconnect (`send` throws `WriteConflict` or `getServerRow` detects a
+   * concurrent server change) or when an incoming Electric sync batch modifies
+   * a row that has an unconfirmed pending local write.
+   *
+   * - `'client-wins'` (default): keep the client's mutation over the server state.
+   * - `'server-wins'`: discard the client's mutation and adopt the server's row state.
+   * - `'merge'`: 3-way field-level merge comparing `before`, `server`, and `write.value`.
+   * - Custom callback `(ctx) => ...`: inspect `{ write, before, server, source }` and
+   *   return `'client-wins'`, `'server-wins'`, `'merge'`, or a merged `value` object.
+   *
+   * @default 'client-wins'
+   */
+  onConflict?: ConflictStrategy;
+  /**
+   * Optional helper to fetch the current server row for a queued write during
+   * `flush()` (for pre-send conflict detection against `write.before` or when
+   * `WriteConflict` does not embed the server row).
+   */
+  getServerRow?: (write: LocalWrite) => Promise<Record<string, unknown> | null>;
+  /**
+   * Called whenever a conflict is resolved via `onConflict`.
+   */
+  onConflictResolved?: (
+    context: WriteConflictContext,
+    outcome: ResolvedConflictOutcome,
+  ) => void;
   /** Called when a write is rejected and rolled back, and on each failed send. */
   onError?: (error: Error, write: LocalWrite) => void;
   /** Called whenever one or more queued writes finish sending in a flush pass. */
@@ -185,6 +326,165 @@ function shapeColumnName(firebirdCol: string): string {
   return /^[A-Z][A-Z0-9_$]*$/.test(firebirdCol)
     ? firebirdCol.toLowerCase()
     : firebirdCol;
+}
+
+function valuesEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if ((a === null || a === undefined) && (b === null || b === undefined)) {
+    return true;
+  }
+  if (a instanceof Date && b instanceof Date) {
+    return a.getTime() === b.getTime();
+  }
+  if (a instanceof Uint8Array && b instanceof Uint8Array) {
+    if (a.byteLength !== b.byteLength) return false;
+    for (let i = 0; i < a.byteLength; i++) {
+      if (a[i] !== b[i]) return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+function rowsEqual(
+  a: Record<string, unknown> | null,
+  b: Record<string, unknown> | null,
+): boolean {
+  if (a === b) return true;
+  if (a === null || b === null) return false;
+  const allKeys = new Set([...Object.keys(a), ...Object.keys(b)]);
+  for (const k of allKeys) {
+    if (!valuesEqual(a[k], b[k])) return false;
+  }
+  return true;
+}
+
+/**
+ * Perform a 3-way field-level merge between a row's pre-mutation snapshot
+ * (`before`), the current `server` row, and a queued local `write`.
+ */
+export function mergeWriteConflict(
+  before: Record<string, unknown> | null,
+  server: Record<string, unknown> | null,
+  write: Pick<LocalWrite, 'operation' | 'key' | 'value'>,
+): ResolvedConflictOutcome {
+  if (server === null) {
+    if (write.operation === 'delete') {
+      return { action: 'server-wins' };
+    }
+    if (write.operation === 'insert') {
+      return {
+        action: 'merge',
+        operation: 'insert',
+        value: { ...write.key, ...write.value },
+      };
+    }
+    return {
+      action: 'merge',
+      operation: 'insert',
+      value: { ...(before ?? {}), ...write.key, ...write.value },
+    };
+  }
+
+  if (write.operation === 'delete') {
+    return { action: 'client-wins' };
+  }
+
+  const keyCols = new Set(Object.keys(write.key));
+  const merged: Record<string, unknown> = {};
+  for (const [col, val] of Object.entries(server)) {
+    if (!keyCols.has(col) || write.operation === 'insert') {
+      merged[col] = val;
+    }
+  }
+  for (const [col, clientVal] of Object.entries(write.value)) {
+    const clientChanged =
+      before === null ||
+      !(col in before) ||
+      !valuesEqual(before[col], clientVal);
+    const serverChanged =
+      before !== null &&
+      col in before &&
+      col in server &&
+      !valuesEqual(before[col], server[col]);
+    if (clientChanged || !serverChanged) {
+      merged[col] = clientVal;
+    }
+  }
+  return {
+    action: 'merge',
+    operation: write.operation,
+    value: merged,
+  };
+}
+
+async function evaluateConflictStrategy(
+  strategy: ConflictStrategy | undefined,
+  ctx: WriteConflictContext,
+): Promise<ResolvedConflictOutcome> {
+  const effective = strategy ?? 'client-wins';
+  const raw: ConflictResolution =
+    typeof effective === 'function' ? await effective(ctx) : effective;
+
+  if (raw === 'client-wins') {
+    return { action: 'client-wins' };
+  }
+  if (raw === 'server-wins') {
+    return { action: 'server-wins' };
+  }
+  if (raw === 'merge') {
+    return mergeWriteConflict(ctx.before, ctx.server, ctx.write);
+  }
+  if (typeof raw === 'object' && raw !== null) {
+    if (raw.action === 'client-wins') {
+      return { action: 'client-wins' };
+    }
+    if (raw.action === 'server-wins') {
+      return { action: 'server-wins' };
+    }
+    if (
+      raw.action === 'merge' &&
+      typeof raw.value === 'object' &&
+      raw.value !== null
+    ) {
+      return {
+        action: 'merge',
+        value: raw.value as Record<string, unknown>,
+        operation:
+          raw.operation === 'insert' ||
+          raw.operation === 'update' ||
+          raw.operation === 'delete'
+            ? raw.operation
+            : ctx.write.operation,
+      };
+    }
+    return {
+      action: 'merge',
+      value: raw as Record<string, unknown>,
+      operation: ctx.write.operation,
+    };
+  }
+  return { action: 'client-wins' };
+}
+
+function isWriteConflictError(error: Error): boolean {
+  return (
+    error instanceof WriteConflict ||
+    (error as { conflict?: boolean }).conflict === true
+  );
+}
+
+function extractConflictServerRow(
+  error: Error,
+): Record<string, unknown> | null | undefined {
+  if (error instanceof WriteConflict) {
+    return error.server;
+  }
+  if ('server' in error) {
+    const s = (error as { server?: Record<string, unknown> | null }).server;
+    return s ?? null;
+  }
+  return undefined;
 }
 
 /**
@@ -418,6 +718,61 @@ export async function createWriteQueue(given: WritesDatabase, options: WriteQueu
     report(error, w);
   };
 
+  /** Apply a resolved conflict outcome to the local table and queue row in `tx`. */
+  const applyResolvedOutcomeInTx = async (
+    tx: ElectricTransaction,
+    target: StoredWrite,
+    serverRow: Record<string, unknown> | null | undefined,
+    outcome: ResolvedConflictOutcome,
+  ): Promise<LocalWrite | null> => {
+    const effectiveBase = serverRow !== undefined ? serverRow : target.before;
+    if (outcome.action === 'server-wins') {
+      await revertWriteInTx(tx, { ...target, before: effectiveBase });
+      return null;
+    }
+
+    const nextOp =
+      outcome.action === 'merge' ? outcome.operation : target.operation;
+    const nextValue =
+      outcome.action === 'merge' ? outcome.value : target.value;
+    const updatedWrite: LocalWrite = {
+      id: target.id,
+      table: target.table,
+      operation: nextOp,
+      key: target.key,
+      value: nextValue,
+      ...(hasBeforeColumn ? { before: effectiveBase } : {}),
+      conflictResolved: true,
+    };
+
+    if (hasBeforeColumn && serverRow !== undefined) {
+      await restoreSnapshot(tx, target.table, target.key, serverRow);
+    }
+    await applyWrite(tx, updatedWrite);
+
+    const encodedVal = encode(nextValue);
+    const encodedBefore =
+      hasBeforeColumn && effectiveBase !== null ? encode(effectiveBase) : null;
+    const safeBefore =
+      encodedBefore !== null && encodedBefore.length <= MAX_BEFORE_VALUE
+        ? encodedBefore
+        : null;
+
+    if (hasBeforeColumn) {
+      await tx.exec(
+        `UPDATE ${writesQuoted} SET OP = ?, VALUE_JSON = ?, BEFORE_JSON = ? WHERE ID = ?`,
+        [nextOp[0]!.toUpperCase(), encodedVal, safeBefore, target.id],
+      );
+    } else {
+      await tx.exec(
+        `UPDATE ${writesQuoted} SET OP = ?, VALUE_JSON = ? WHERE ID = ?`,
+        [nextOp[0]!.toUpperCase(), encodedVal, target.id],
+      );
+    }
+
+    return updatedWrite;
+  };
+
   /** Send every pending write, in order; stop at the first that fails. */
   const sendAll = async (ignorePaused = false) => {
     const flushedInPass: LocalWrite[] = [];
@@ -426,27 +781,118 @@ export async function createWriteQueue(given: WritesDatabase, options: WriteQueu
       const next = (await db.transaction((tx) => load(tx))).find((w) => w.state === 'P');
       if (!next) break;
       let result: SendResult | void;
-      const payload: LocalWrite = {
+      let payload: LocalWrite = {
         id: next.id,
         table: next.table,
         operation: next.operation,
         key: next.key,
         value: next.value,
+        ...(hasBeforeColumn ? { before: next.before } : {}),
       };
+
+      // Pre-send conflict check if `getServerRow` is configured
+      if (options.getServerRow && hasBeforeColumn) {
+        try {
+          const liveServerRow = await options.getServerRow(payload);
+          const hasPreSendConflict =
+            next.operation === 'insert'
+              ? liveServerRow !== null &&
+                !rowsEqual({ ...next.key, ...next.value }, liveServerRow)
+              : !rowsEqual(next.before, liveServerRow);
+
+          if (hasPreSendConflict) {
+            const ctx: WriteConflictContext = {
+              write: payload,
+              before: next.before,
+              server: liveServerRow,
+              source: 'send',
+              attempt: 1,
+            };
+            const outcome = await evaluateConflictStrategy(options.onConflict, ctx);
+            options.onConflictResolved?.(ctx, outcome);
+            const updatedPayload = await db.transaction((tx) =>
+              applyResolvedOutcomeInTx(tx, next, liveServerRow, outcome),
+            );
+            if (updatedPayload === null) {
+              for (const refetch of refetchers.get(firebirdName(next.table)) ?? []) refetch();
+              continue;
+            }
+            payload = updatedPayload;
+          }
+        } catch (preErr) {
+          const error = preErr instanceof Error ? preErr : new Error(String(preErr));
+          report(error, next);
+          if (!closed && !isPaused) {
+            clearTimeout(timer);
+            timer = setTimeout(kick, retryMs);
+          }
+          break;
+        }
+      }
+
       try {
         result = await options.send(payload);
       } catch (err) {
         const error = err instanceof Error ? err : new Error(String(err));
-        if (error instanceof WriteRejected || (error as { rejected?: boolean }).rejected) {
+        if (isWriteConflictError(error)) {
+          let serverRow = extractConflictServerRow(error);
+          if ((serverRow === undefined || serverRow === null) && options.getServerRow) {
+            try {
+              serverRow = await options.getServerRow(payload);
+            } catch {
+              // Keep extracted serverRow if getServerRow fails
+            }
+          }
+          const resolvedServer = serverRow === undefined ? null : serverRow;
+          const ctx: WriteConflictContext = {
+            write: payload,
+            before: next.before,
+            server: resolvedServer,
+            source: 'send',
+            error,
+            attempt: 1,
+          };
+          const outcome = await evaluateConflictStrategy(options.onConflict, ctx);
+          options.onConflictResolved?.(ctx, outcome);
+          const updatedPayload = await db.transaction((tx) =>
+            applyResolvedOutcomeInTx(tx, next, serverRow, outcome),
+          );
+          if (updatedPayload === null) {
+            for (const refetch of refetchers.get(firebirdName(next.table)) ?? []) refetch();
+            continue;
+          }
+          payload = updatedPayload;
+          try {
+            result = await options.send(payload);
+          } catch (retryErr) {
+            const retryError =
+              retryErr instanceof Error ? retryErr : new Error(String(retryErr));
+            if (
+              retryError instanceof WriteRejected ||
+              (retryError as { rejected?: boolean }).rejected ||
+              isWriteConflictError(retryError)
+            ) {
+              await reject(next, retryError);
+              continue;
+            }
+            report(retryError, next);
+            if (!closed && !isPaused) {
+              clearTimeout(timer);
+              timer = setTimeout(kick, retryMs);
+            }
+            break;
+          }
+        } else if (error instanceof WriteRejected || (error as { rejected?: boolean }).rejected) {
           await reject(next, error);
           continue;
+        } else {
+          report(error, next);
+          if (!closed && !isPaused) {
+            clearTimeout(timer);
+            timer = setTimeout(kick, retryMs);
+          }
+          break;
         }
-        report(error, next);
-        if (!closed && !isPaused) {
-          clearTimeout(timer);
-          timer = setTimeout(kick, retryMs);
-        }
-        break;
       }
       const txid = result && result.txid !== undefined && result.txid !== null ? String(result.txid) : null;
       await db.transaction((tx) =>
@@ -496,6 +942,46 @@ export async function createWriteQueue(given: WritesDatabase, options: WriteQueu
           await tx.exec(`DELETE FROM ${writesQuoted} WHERE ID = ?`, [w.id]);
           continue;
         }
+
+        const isTouched = touched === 'all' || touched.has(keyText(w.key));
+        if (w.state === 'P' && hasBeforeColumn && isTouched) {
+          const currentAfterSync = await snapshotRow(tx, w.table, w.key);
+          let serverRow: Record<string, unknown> | null;
+          if (currentAfterSync === null) {
+            serverRow = null;
+          } else if (w.operation === 'update' && w.before !== null) {
+            serverRow = { ...w.before, ...currentAfterSync };
+            for (const col of Object.keys(w.value)) {
+              if (valuesEqual(currentAfterSync[col], w.value[col])) {
+                serverRow[col] = w.before[col];
+              }
+            }
+          } else {
+            serverRow = currentAfterSync;
+          }
+
+          if (!rowsEqual(w.before, serverRow)) {
+            const ctx: WriteConflictContext = {
+              write: {
+                id: w.id,
+                table: w.table,
+                operation: w.operation,
+                key: w.key,
+                value: w.value,
+                before: w.before,
+              },
+              before: w.before,
+              server: serverRow,
+              source: 'sync',
+              attempt: 1,
+            };
+            const outcome = await evaluateConflictStrategy(options.onConflict, ctx);
+            options.onConflictResolved?.(ctx, outcome);
+            await applyResolvedOutcomeInTx(tx, w, serverRow, outcome);
+            continue;
+          }
+        }
+
         await applyWrite(tx, w);
       }
     },

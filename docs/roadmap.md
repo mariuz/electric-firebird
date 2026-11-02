@@ -1341,7 +1341,7 @@ With M0–M8 complete, these are the next-horizon milestones for `v0.14.0`:
       definitions (for `firebird-wasm/drizzle`) and Kysely `Database` interfaces
       (for `firebird-wasm/kysely`) directly from any live `.fdb` database or SQL
       schema.
-- [ ] **Conflict resolution strategies in `createWriteQueue` (`onConflict`).**
+- [x] **Conflict resolution strategies in `createWriteQueue` (`onConflict`).**
       Extend the durable offline write queue (`FB_WRITE_QUEUE$`) with pluggable
       conflict handlers (`'client-wins'`, `'server-wins'`, or custom merge
       callbacks inspecting `before` and current server state) when flushing
