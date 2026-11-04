@@ -58,6 +58,15 @@ export {
   formatFirebirdColumnType,
   decodeFirebirdTriggerType,
   DEFAULT_MIGRATIONS_TABLE,
+  diffSchema,
+  generateMigration,
+} from './schema';
+export type {
+  SchemaDiffSource,
+  ColumnModification,
+  SchemaDiff,
+  GenerateMigrationOptions,
+  GeneratedMigration,
 } from './schema';
 export {
   generateDrizzleSchema,

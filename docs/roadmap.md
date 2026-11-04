@@ -1407,7 +1407,7 @@ Next-horizon milestones for `v0.17.0`:
       Inverted index tables, tokenization/stemming SQL UDRs, BM25 relevance
       ranking, and Reciprocal Rank Fusion (RRF) combining full-text keyword
       search with `vectorSearch()`.
-- [ ] **Schema Diff & Automatic Migration Generator (`diffSchema(dbA, dbB)` / `generateMigration()`).**
+- [x] **Schema Diff & Automatic Migration Generator (`diffSchema(dbA, dbB)` / `generateMigration()`).**
       Compare two `DatabaseSchema` snapshots (or a live database against a target
       DDL / Drizzle schema) and emit forward + rollback Firebird `ALTER TABLE` /
       `CREATE INDEX` migration SQL.

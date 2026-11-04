@@ -25,6 +25,15 @@ import type {
   ViewSchemaInfo,
 } from '../types';
 import { splitStatements } from './sql-script';
+export {
+  diffSchema,
+  generateMigration,
+  type SchemaDiffSource,
+  type ColumnModification,
+  type SchemaDiff,
+  type GenerateMigrationOptions,
+  type GeneratedMigration,
+} from './schema-diff';
 
 /** Default table name used by `migrate()` to record applied versions. */
 export const DEFAULT_MIGRATIONS_TABLE = 'FB_MIGRATIONS$';

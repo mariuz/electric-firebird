@@ -35,6 +35,15 @@ export {
   formatFirebirdColumnType,
   decodeFirebirdTriggerType,
   DEFAULT_MIGRATIONS_TABLE,
+  diffSchema,
+  generateMigration,
+} from './browser/schema';
+export type {
+  SchemaDiffSource,
+  ColumnModification,
+  SchemaDiff,
+  GenerateMigrationOptions,
+  GeneratedMigration,
 } from './browser/schema';
 export {
   generateDrizzleSchema,
