@@ -1393,7 +1393,7 @@ Next-horizon milestones for `v0.15.0`:
       Complement `firebird-wasm/react` and `firebird-wasm/vue` with reactive
       `createLiveQuery` helpers for Svelte and SolidJS.
 
-### M11 — HNSW Vector Index, Full-Text Search, Schema Diff, State Adapters & Binary Page Diffs
+### M11 — HNSW Vector Index, Full-Text Search, Schema Diff, Replication, State Adapters & Binary Page Diffs
 
 Next-horizon milestones for `v0.17.0`:
 
@@ -1423,6 +1423,11 @@ Next-horizon milestones for `v0.17.0`:
       Export and import compact binary page deltas between any two Copy-on-Write
       snapshots (`db.snapshot()`) for lightweight cloud backup and sync
       checkpoints.
+- [ ] **Database Replication (`firebird-wasm/replication` — Logical & Journal-Based Primary/Replica Sync).**
+      Support continuous primary-to-replica and bidirectional logical/journal
+      replication between `FirebirdLite` (server/embedded) and `FirebirdBrowser`
+      (WASM) instances, with publication/subscription management, LSN/transaction
+      watermarking, DDL + DML change capture, and pluggable conflict resolution.
 
 ---
 
