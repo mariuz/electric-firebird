@@ -1403,7 +1403,7 @@ Next-horizon milestones for `v0.17.0`:
       incremental `add`/`upsert`, `remove` with neighborhood link repair,
       `serialize`/`deserialize`, hybrid SQL `WHERE` filtering, and automatic
       integration with `vectorSearch({ ..., index })`.
-- [ ] **Full-Text Search & BM25 Ranking (`firebird-wasm/fts` + Hybrid RRF Search).**
+- [x] **Full-Text Search & BM25 Ranking (`firebird-wasm/fts` + Hybrid RRF Search).**
       Inverted index tables, tokenization/stemming SQL UDRs, BM25 relevance
       ranking, and Reciprocal Rank Fusion (RRF) combining full-text keyword
       search with `vectorSearch()`.

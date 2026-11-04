@@ -58,6 +58,10 @@
       "types": "./dist/vector/index.d.ts",
       "default": "./dist/vector/index.js"
     },
+    "./fts": {
+      "types": "./dist/fts/index.d.ts",
+      "default": "./dist/fts/index.js"
+    },
     "./package.json": "./package.json"
   },
   "scripts": {
