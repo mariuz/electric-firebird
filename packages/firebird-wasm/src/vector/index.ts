@@ -4,6 +4,7 @@
  * Provides pure TypeScript vector encoding, normalization, distance metrics
  * (`cosineDistance`, `cosineSimilarity`, `l2Distance`, `squaredL2Distance`,
  * `dotProduct`, `innerProductDistance`), SQL UDR registration (`registerVectorFunctions`),
+ * HNSW Approximate Nearest Neighbor indexing (`HnswIndex`, `createVectorIndex`),
  * and hybrid vector + SQL search (`vectorSearch`) over packed IEEE-754
  * little-endian `Float32Array` embeddings stored in `BINARY(N)`, `VARBINARY(N)`,
  * `CHAR(N) CHARACTER SET OCTETS`, `VARCHAR(N) CHARACTER SET OCTETS`, or `BLOB`
@@ -34,6 +35,20 @@
 
 import type { QueryParams, QueryResult, RegisteredRoutine, Row } from '../types';
 import type { RegisterFunctionOptions, JsFunctionHandler } from '../types';
+import type { PersistentVectorIndex } from './hnsw';
+
+export {
+  HnswIndex,
+  createVectorIndex,
+  type HnswIndexOptions,
+  type HnswSearchOptions,
+  type HnswSearchResult,
+  type SerializedHnswGraph,
+  type VectorIndexDatabaseExecutor,
+  type CreateVectorIndexOptions,
+  type PersistentVectorIndexSearchOptions,
+  type PersistentVectorIndex,
+} from './hnsw';
 
 /**
  * Supported vector similarity/distance metrics.
@@ -152,6 +167,15 @@ export interface VectorSearchOptions {
    * (default: `false` so result payloads stay compact).
    */
   includeVector?: boolean;
+  /**
+   * Optional pre-built {@link PersistentVectorIndex} to accelerate search via
+   * HNSW Approximate Nearest Neighbor traversal instead of a full table scan.
+   */
+  index?: Pick<PersistentVectorIndex<never>, 'search'>;
+  /**
+   * HNSW beam width (`efSearch`) when `index` is provided.
+   */
+  efSearch?: number;
 }
 
 /**
@@ -819,18 +843,31 @@ function getRowCaseInsensitive(
  * Execute a hybrid SQL + vector K-Nearest-Neighbors (KNN) search against a
  * Firebird table or view.
  *
- * 1. Pushes down any SQL `WHERE` filter and column projection to Firebird.
- * 2. Decodes each candidate row's packed `Float32Array` embedding (`BINARY(N)`,
- *    `VARBINARY(N)`, `OCTETS`, `BLOB`, or bracketed text).
- * 3. Computes exact `distance` and `similarity` using the chosen metric
- *    (`'cosine'`, `'l2'`, or `'dot'`), applies optional `maxDistance` /
- *    `minSimilarity` cutoffs, and returns the top `limit` rows sorted by
- *    ascending distance.
+ * 1. If `options.index` is provided, traverses the HNSW graph first and fetches
+ *    only the top candidate rows from Firebird.
+ * 2. Otherwise pushes down any SQL `WHERE` filter and column projection to Firebird,
+ *    decodes each candidate row's packed `Float32Array` embedding, and ranks rows
+ *    by the chosen distance metric (`'cosine'`, `'l2'`, or `'dot'`).
  */
 export async function vectorSearch<T extends Row = Row>(
   db: VectorDatabaseExecutor,
   options: VectorSearchOptions,
 ): Promise<Array<VectorSearchRow<T>>> {
+  if (options.index) {
+    return options.index.search<T>(options.query, {
+      limit: options.limit,
+      efSearch: options.efSearch,
+      where: options.where,
+      params: options.params,
+      select: options.select,
+      maxDistance: options.maxDistance,
+      minSimilarity: options.minSimilarity,
+      distanceColumn: options.distanceColumn,
+      similarityColumn: options.similarityColumn,
+      includeVector: options.includeVector,
+    });
+  }
+
   const tableIdent = quoteSqlIdentifier(options.table, 'table name');
   const colIdent = quoteSqlIdentifier(options.column, 'vector column name');
   const rawColName = options.column.trim().replace(/^"|"$/g, '');

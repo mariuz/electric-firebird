@@ -13,6 +13,8 @@ import {
   cosineDistance,
   registerVectorFunctions,
   vectorSearch,
+  HnswIndex,
+  createVectorIndex,
 } from '../vector';
 import type { RegisterFunctionOptions, JsFunctionHandler, RegisteredRoutine } from '../types';
 
@@ -212,6 +214,153 @@ describe('firebird-wasm/vector – Client-Side Vector Similarity & Hybrid Search
       expect(results[1]!.ID).toBe(2);
       expect(results[1]!.DISTANCE).toBeCloseTo(0.2, 5);
       expect(results[1]!.SIMILARITY).toBeCloseTo(0.8, 5);
+    });
+  });
+
+  describe('HNSW Approximate Nearest Neighbor Index (HnswIndex & createVectorIndex)', () => {
+    it('builds a multi-layer HNSW graph, searches with high recall, supports removal, and round-trips serialize/deserialize', () => {
+      const index = new HnswIndex<number>({
+        dimensions: 4,
+        metric: 'cosine',
+        M: 8,
+        efConstruction: 32,
+        efSearch: 32,
+        seed: 42,
+      });
+
+      // Add 120 vectors around the unit circle in 4D
+      for (let i = 0; i < 120; i++) {
+        const angle = (i / 120) * Math.PI * 2;
+        index.add(i, [
+          Math.cos(angle),
+          Math.sin(angle),
+          Math.cos(angle * 2) * 0.2,
+          Math.sin(angle * 2) * 0.2,
+        ]);
+      }
+
+      expect(index.size).toBe(120);
+      expect(index.dimensions).toBe(4);
+      expect(index.has(0)).toBe(true);
+
+      // Query near angle = 0 (vector id 0)
+      const hits = index.search([1, 0, 0.2, 0], { k: 5 });
+      expect(hits).toHaveLength(5);
+      expect(hits[0]!.id).toBe(0);
+      expect(hits[0]!.distance).toBeCloseTo(0, 6);
+
+      // Remove vector 0 and verify next closest neighbor becomes top hit
+      expect(index.remove(0)).toBe(true);
+      expect(index.has(0)).toBe(false);
+      expect(index.size).toBe(119);
+
+      const afterRemove = index.search([1, 0, 0.2, 0], { k: 3 });
+      expect(afterRemove[0]!.id).not.toBe(0);
+      expect([1, 119]).toContain(afterRemove[0]!.id);
+
+      // Serialize and deserialize
+      const bytes = index.serialize();
+      const restored = HnswIndex.deserialize<number>(bytes);
+      expect(restored.size).toBe(119);
+      const restoredHits = restored.search([1, 0, 0.2, 0], { k: 3 });
+      expect(restoredHits.map((h) => h.id)).toEqual(afterRemove.map((h) => h.id));
+    });
+
+    it('creates a persistent database-backed HNSW index (createVectorIndex) and accelerates vectorSearch()', async () => {
+      const tableRows = new Map<number, { ID: number; TITLE: string; TAG: string; EMBEDDING: string }>([
+        [1, { ID: 1, TITLE: 'Alpha', TAG: 'a', EMBEDDING: Buffer.from(encodeVector([1, 0, 0])).toString('base64') }],
+        [2, { ID: 2, TITLE: 'Beta', TAG: 'b', EMBEDDING: Buffer.from(encodeVector([0.9, 0.43589, 0])).toString('base64') }],
+        [3, { ID: 3, TITLE: 'Gamma', TAG: 'a', EMBEDDING: Buffer.from(encodeVector([0, 1, 0])).toString('base64') }],
+        [4, { ID: 4, TITLE: 'Delta', TAG: 'b', EMBEDDING: Buffer.from(encodeVector([0, 0, 1])).toString('base64') }],
+      ]);
+
+      const catalogStore = new Map<string, string>();
+
+      const mockDb = {
+        exec: vi.fn(async (sql: string, params: unknown[] = []) => {
+          if (sql.includes('UPDATE OR INSERT INTO "FB_VECTOR_INDEX$"')) {
+            catalogStore.set(String(params[0]), String(params[5]));
+          } else if (sql.includes('DELETE FROM "FB_VECTOR_INDEX$"')) {
+            catalogStore.delete(String(params[0]));
+          }
+        }),
+        query: vi.fn(async (sql: string, params: unknown[] = []) => {
+          if (sql.includes('RDB$RELATIONS')) {
+            return { rows: [{ CNT: catalogStore.size > 0 ? 1 : 0 }] as never[], fields: [] };
+          }
+          if (sql.includes('SELECT GRAPH_JSON FROM "FB_VECTOR_INDEX$"')) {
+            const json = catalogStore.get(String(params[0]));
+            return { rows: (json ? [{ GRAPH_JSON: json }] : []) as never[], fields: [] };
+          }
+          if (sql.includes('SELECT "ID", "EMBEDDING" FROM "DOCS"')) {
+            return { rows: Array.from(tableRows.values()) as never[], fields: [] };
+          }
+          if (sql.includes('SELECT "ID" FROM "DOCS" WHERE (TAG = ?)')) {
+            const matching = Array.from(tableRows.values()).filter((r) => r.TAG === params[0]);
+            return { rows: matching.map((r) => ({ ID: r.ID })) as never[], fields: [] };
+          }
+          if (sql.includes('WHERE "ID" IN')) {
+            const ids = new Set(params.map(Number));
+            const matching = Array.from(tableRows.values()).filter((r) => ids.has(r.ID));
+            return { rows: matching as never[], fields: [] };
+          }
+          return { rows: [], fields: [] };
+        }),
+      };
+
+      const vIndex = await createVectorIndex<number>(mockDb, {
+        table: 'docs',
+        column: 'embedding',
+        keyColumn: 'id',
+        metric: 'cosine',
+        persist: true,
+        seed: 7,
+      });
+
+      expect(vIndex.size).toBe(4);
+      expect(catalogStore.has('IDX_DOCS_EMBEDDING_HNSW')).toBe(true);
+
+      // Search through vectorSearch({ ..., index: vIndex })
+      const hits = await vectorSearch<{ ID: number; TITLE: string; TAG: string }>(mockDb, {
+        table: 'docs',
+        column: 'embedding',
+        query: [1, 0, 0],
+        limit: 2,
+        index: vIndex,
+      });
+
+      expect(hits).toHaveLength(2);
+      expect(hits[0]!.ID).toBe(1);
+      expect(hits[0]!.TITLE).toBe('Alpha');
+      expect(hits[1]!.ID).toBe(2);
+
+      // Filtered search via index
+      const filtered = await vIndex.search<{ ID: number; TITLE: string; TAG: string }>([1, 0, 0], {
+        where: 'TAG = ?',
+        params: ['b'],
+        limit: 2,
+      });
+      expect(filtered.map((r) => r.ID)).toEqual([2, 4]);
+
+      // Upsert a new row and reload from persisted catalog
+      tableRows.set(5, {
+        ID: 5,
+        TITLE: 'Epsilon',
+        TAG: 'a',
+        EMBEDDING: Buffer.from(encodeVector([0.99, 0.141, 0])).toString('base64'),
+      });
+      await vIndex.upsert(5, [0.99, 0.141, 0]);
+      expect(vIndex.size).toBe(5);
+
+      const reloaded = await createVectorIndex<number>(mockDb, {
+        table: 'docs',
+        column: 'embedding',
+        keyColumn: 'id',
+        persist: true,
+      });
+      expect(reloaded.size).toBe(5);
+      const topAfterReload = await reloaded.search([1, 0, 0], { limit: 2 });
+      expect(topAfterReload.map((r) => r.ID)).toEqual([1, 5]);
     });
   });
 });

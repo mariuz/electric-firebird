@@ -1393,6 +1393,37 @@ Next-horizon milestones for `v0.15.0`:
       Complement `firebird-wasm/react` and `firebird-wasm/vue` with reactive
       `createLiveQuery` helpers for Svelte and SolidJS.
 
+### M11 — HNSW Vector Index, Full-Text Search, Schema Diff, State Adapters & Binary Page Diffs
+
+Next-horizon milestones for `v0.17.0`:
+
+- [x] **HNSW Approximate Nearest Neighbor (ANN) Vector Index (`HnswIndex` & `createVectorIndex` in `firebird-wasm/vector`).**
+      Add an in-memory and persistent (`FB_VECTOR_INDEX$`) multi-layer
+      Hierarchical Navigable Small World (HNSW) proximity graph index supporting
+      incremental `add`/`upsert`, `remove` with neighborhood link repair,
+      `serialize`/`deserialize`, hybrid SQL `WHERE` filtering, and automatic
+      integration with `vectorSearch({ ..., index })`.
+- [ ] **Full-Text Search & BM25 Ranking (`firebird-wasm/fts` + Hybrid RRF Search).**
+      Inverted index tables, tokenization/stemming SQL UDRs, BM25 relevance
+      ranking, and Reciprocal Rank Fusion (RRF) combining full-text keyword
+      search with `vectorSearch()`.
+- [ ] **Schema Diff & Automatic Migration Generator (`diffSchema(dbA, dbB)` / `generateMigration()`).**
+      Compare two `DatabaseSchema` snapshots (or a live database against a target
+      DDL / Drizzle schema) and emit forward + rollback Firebird `ALTER TABLE` /
+      `CREATE INDEX` migration SQL.
+- [ ] **TanStack Query / TanStack DB & RxDB Storage Adapters.**
+      Official adapters bridging `db.live()`, `syncShapes`, and
+      `createWriteQueue` with TanStack Query cache invalidation and local-first
+      state managers.
+- [ ] **Visual Query Plan & Flamegraph Explorer in `<firebird-repl>`.**
+      Render `db.explain()` plan trees and `db.monitorStats()` per-table page
+      reads/fetches as an interactive tree inside the `<firebird-repl>`
+      Inspector.
+- [ ] **Incremental Binary Page Diffs for Snapshots & Remote Backup (`exportDiff` / `applyDiff`).**
+      Export and import compact binary page deltas between any two Copy-on-Write
+      snapshots (`db.snapshot()`) for lightweight cloud backup and sync
+      checkpoints.
+
 ---
 
 ## 5. Test coverage added alongside this review
