@@ -45,6 +45,8 @@ import {
   type DatabaseSnapshot,
   type DatabaseSnapshotInfo,
   type SnapshotOptions,
+  type PageDiffOptions,
+  type ApplyPageDiffOptions,
 } from './snapshots';
 import { QueryProfiler } from './profiler';
 import { ICU_LOCALE_DATA_PATH, isValidIcuDataPackage } from './icu-locales';
@@ -2521,6 +2523,78 @@ export class FirebirdBrowser {
   /** Delete a stored copy-on-write snapshot by `id`, `label`, or reference. */
   deleteSnapshot(snapshotOrId: DatabaseSnapshot | string): boolean {
     return this.snapshotStore.deleteSnapshot(snapshotOrId);
+  }
+
+  /**
+   * Export a compact binary page diff (`FBDF\x01`) between `fromSnapshot` (or
+   * `null` for an initial full checkpoint) and `toSnapshot` (defaults to the
+   * current live database state).
+   */
+  async exportDiff(
+    fromSnapshot?: DatabaseSnapshot | string | Uint8Array | null,
+    toSnapshot?: DatabaseSnapshot | string | Uint8Array,
+    options?: PageDiffOptions,
+  ): Promise<Uint8Array> {
+    if (this.closed) {
+      throw new Error('FirebirdBrowser instance has been closed');
+    }
+    await this.ensureReady();
+    let target: DatabaseSnapshot | string | Uint8Array;
+    if (toSnapshot !== undefined) {
+      target = toSnapshot;
+    } else {
+      if (this.dbHandle) {
+        await this.engine.detachDatabase(this.dbHandle);
+        this.dbHandle = 0;
+      }
+      try {
+        target = await this.engine.readFile(this.dbPath);
+      } finally {
+        this.dbHandle = await this.engine.attachDatabase(this.dbPath);
+        if (this.options.sharedReads) {
+          await this.engine.setSharedReads!(this.dbHandle, true);
+        }
+      }
+    }
+    return this.snapshotStore.exportDiff(fromSnapshot ?? null, target, options);
+  }
+
+  /**
+   * Apply a compact binary page diff (`FBDF\x01`) onto `baseSnapshot` (or the
+   * current live database image when `baseSnapshot` is omitted) and restore the
+   * database to the resulting state.
+   */
+  async applyDiff(
+    diffBytes: Uint8Array,
+    baseSnapshot?: DatabaseSnapshot | string | Uint8Array | null,
+    options: ApplyPageDiffOptions = {},
+  ): Promise<Uint8Array> {
+    if (this.closed) {
+      throw new Error('FirebirdBrowser instance has been closed');
+    }
+    await this.ensureReady();
+    let effectiveBase = baseSnapshot;
+    if (effectiveBase === undefined) {
+      if (this.dbHandle) {
+        await this.engine.detachDatabase(this.dbHandle);
+        this.dbHandle = 0;
+      }
+      try {
+        effectiveBase = await this.engine.readFile(this.dbPath);
+      } finally {
+        this.dbHandle = await this.engine.attachDatabase(this.dbPath);
+        if (this.options.sharedReads) {
+          await this.engine.setSharedReads!(this.dbHandle, true);
+        }
+      }
+    }
+    const nextBytes = this.snapshotStore.applyDiff(
+      diffBytes,
+      effectiveBase,
+      options,
+    );
+    await this.restoreSnapshot(nextBytes);
+    return nextBytes;
   }
 
   /**

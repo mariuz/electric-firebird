@@ -1419,7 +1419,7 @@ Next-horizon milestones for `v0.17.0`:
       Render `db.explain()` plan trees and `db.monitorStats()` per-table page
       reads/fetches as an interactive tree inside the `<firebird-repl>`
       Inspector.
-- [ ] **Incremental Binary Page Diffs for Snapshots & Remote Backup (`exportDiff` / `applyDiff`).**
+- [x] **Incremental Binary Page Diffs for Snapshots & Remote Backup (`exportDiff` / `applyDiff`).**
       Export and import compact binary page deltas between any two Copy-on-Write
       snapshots (`db.snapshot()`) for lightweight cloud backup and sync
       checkpoints.

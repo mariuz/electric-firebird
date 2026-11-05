@@ -63,6 +63,8 @@ import {
   type DatabaseSnapshot,
   type DatabaseSnapshotInfo,
   type SnapshotOptions,
+  type PageDiffOptions,
+  type ApplyPageDiffOptions,
 } from './browser/snapshots';
 import { QueryProfiler } from './browser/profiler';
 import type {
@@ -1893,6 +1895,50 @@ export class FirebirdLite {
   /** Delete a stored copy-on-write snapshot by `id`, `label`, or reference. */
   deleteSnapshot(snapshotOrId: DatabaseSnapshot | string): boolean {
     return this.snapshotStore.deleteSnapshot(snapshotOrId);
+  }
+
+  /**
+   * Export a compact binary page diff (`FBDF\x01`) between `fromSnapshot` (or
+   * `null` for an initial full checkpoint) and `toSnapshot` (defaults to the
+   * current live database file).
+   */
+  async exportDiff(
+    fromSnapshot?: DatabaseSnapshot | string | Uint8Array | null,
+    toSnapshot?: DatabaseSnapshot | string | Uint8Array,
+    options?: PageDiffOptions,
+  ): Promise<Uint8Array> {
+    if (this.closed) {
+      throw new Error('FirebirdLite instance has been closed');
+    }
+    await this.ensureReady();
+    const target =
+      toSnapshot !== undefined ? toSnapshot : await this.dumpDataDir();
+    return this.snapshotStore.exportDiff(fromSnapshot ?? null, target, options);
+  }
+
+  /**
+   * Apply a compact binary page diff (`FBDF\x01`) onto `baseSnapshot` (or the
+   * current database file when `baseSnapshot` is omitted) and restore the
+   * database file to the resulting state.
+   */
+  async applyDiff(
+    diffBytes: Uint8Array,
+    baseSnapshot?: DatabaseSnapshot | string | Uint8Array | null,
+    options: ApplyPageDiffOptions = {},
+  ): Promise<Uint8Array> {
+    if (this.closed) {
+      throw new Error('FirebirdLite instance has been closed');
+    }
+    await this.ensureReady();
+    const effectiveBase =
+      baseSnapshot !== undefined ? baseSnapshot : await this.dumpDataDir();
+    const nextBytes = this.snapshotStore.applyDiff(
+      diffBytes,
+      effectiveBase,
+      options,
+    );
+    await this.restoreSnapshot(nextBytes);
+    return nextBytes;
   }
 
   async dumpDataDir(): Promise<Uint8Array> {

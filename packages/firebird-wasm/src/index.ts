@@ -207,11 +207,25 @@ export type {
   CrossTabLiveMessage,
   CrossTabLiveBridgeOptions,
 } from './browser/live-tables';
-export { CowSnapshotStore } from './browser/snapshots';
+export {
+  CowSnapshotStore,
+  PAGE_DIFF_MAGIC,
+  PAGE_DIFF_HEADER_BYTES,
+  computeCrc32,
+  isPageDiffPayload,
+  exportPageDiff,
+  inspectPageDiff,
+  applyPageDiff,
+} from './browser/snapshots';
 export type {
   SnapshotOptions,
   DatabaseSnapshotInfo,
   DatabaseSnapshot,
+  SnapshotOrImageInput,
+  PageDiffOptions,
+  ApplyPageDiffOptions,
+  PageDiffEntry,
+  ParsedPageDiff,
 } from './browser/snapshots';
 export {
   QueryProfiler,
