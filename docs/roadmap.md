@@ -1429,6 +1429,52 @@ Next-horizon milestones for `v0.17.0`:
       (WASM) instances, with publication/subscription management, LSN/transaction
       watermarking, DDL + DML change capture, and pluggable conflict resolution.
 
+### M12 — Full Database Replication Architecture (Triggers, Slots, HLC/CRDTs, Snapshot Bootstrap, Whole-DB Catalog Sync, Network Transports & Firebird 4/5 Native Journal Bridge)
+
+Next-horizon milestones for full end-to-end replication (`v0.18.0`):
+
+- [ ] **1. Native Firebird SQL Trigger-Based Change Capture (`installReplicationTriggers`).**
+      Generate and install idempotent `AFTER INSERT OR UPDATE OR DELETE` PSQL
+      triggers (`FB_REPL_TRG$<table>`) and an atomic generator (`FB_REPL_LSN_GEN$`)
+      that serialize row keys and column values into `FB_REPL_JOURNAL$` inside the
+      committing transaction, using `RDB$GET_CONTEXT('USER_SESSION', 'FB_REPL_ROLE')`
+      to bypass triggers during replica replay and `POST_EVENT` for instant wakeups.
+- [ ] **2. Replication Slots, Heartbeats & Safe Auto-Pruning (`FB_REPL_SLOTS$`).**
+      Track registered replica slots (`slotName`, `nodeId`, `confirmedFlushLsn`,
+      `lastSeenAt`, `ttlMs`) on the primary so `publication.pruneAcked()` safely
+      reclaims journal entries `<= MIN(confirmedFlushLsn)` across all active
+      subscribers while expiring stale slots past their TTL.
+- [ ] **3. Initial Snapshot Seeding & Automatic Catch-Up (`bootstrapReplica`).**
+      Automatically bootstrap a new or fallen-behind replica (`watermark === 0` or
+      `watermark < minRetainedLsn`) via either consistent logical table+catalog
+      snapshots or binary Copy-on-Write page diffs (`exportDiff` / `applyDiff`)
+      tagged with the exact LSN watermark where incremental journal replay resumes.
+- [ ] **4. Whole-Database ("Full") Catalog, Sequence & Schema Auto-Replication (`publishAllTables` & `syncCatalog`).**
+      Support `tables: '*'` (all user tables discovered via `introspect()`),
+      automatic schema evolution on replicas using `diffSchema()` +
+      `generateMigration()` before DML replay, and generator/sequence watermark
+      synchronization (`RDB$GENERATORS` / `ALTER SEQUENCE ... RESTART WITH`) so
+      replicas can seamlessly promote to primary on failover.
+- [ ] **5. Row & Column Filtering (Multi-Tenant Partial Publications) & Atomic `txid` Replay.**
+      Support per-table row predicates (`where`) and column projections
+      (`columns` / `excludeColumns`) for multi-tenant edge/browser slicing, and
+      group replayed journal entries by `txid` with foreign-key topological
+      ordering inside atomic replica transactions.
+- [ ] **6. Hybrid Logical Clocks (`HLC`) & Per-Column CRDT Conflict Resolution.**
+      Provide a monotonic Hybrid Logical Clock (`<wallMs>:<counter>:<nodeId>`)
+      for skew-tolerant causal ordering, plus per-column LWW-Element-Set,
+      additive numeric counter deltas (`PN-Counter`), and set-union merges.
+- [ ] **7. Network Replication Transports (HTTP/SSE, WebSocket & `BroadcastChannel`).**
+      Provide pluggable transport adapters (`createHttpReplicationHandler`,
+      `createHttpReplicationClient`, `createBroadcastChannelTransport`, and
+      WebSocket duplex streaming) connecting `FirebirdBrowser` (WASM) and
+      `FirebirdLite` (Node.js server) over the network or across browser contexts.
+- [ ] **8. Firebird 4.0 / 5.0 Native `fb_replication` Binary Journal Segment Bridge & Observability (`replicator.stats()`).**
+      Parse and emit Firebird 4.0/5.0 native binary replication journal segments
+      (`replication.conf` / `IReplicator` protocol compatibility), incremental
+      `HnswIndex` / `Bm25Index` hooks on replica apply, and live lag/throughput
+      telemetry (`lagEntries`, `lagMs`, `bytesTransferred`, `status`).
+
 ---
 
 ## 5. Test coverage added alongside this review
