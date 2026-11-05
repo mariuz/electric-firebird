@@ -52,6 +52,12 @@ import type {
   SchemaIntrospection,
   SweepResult,
 } from '../types';
+import {
+  DEFAULT_REPL_JOURNAL_TABLE,
+  DEFAULT_REPL_SLOTS_TABLE,
+  DEFAULT_REPL_WATERMARK_TABLE,
+  type ReplicationStats,
+} from '../replication';
 
 export {
   computeTableIoBreakdown,
@@ -63,8 +69,50 @@ export {
   type TableIoStats,
 };
 
-/** Active tab in the `<firebird-repl>` Schema Inspector, Migration Viewer, Profiler & Query Plan Explorer sidebar. */
-export type ReplInspectorTab = 'schema' | 'migrations' | 'profiler' | 'plan';
+/** Active tab in the `<firebird-repl>` Schema Inspector, Migration Viewer, Profiler, Query Plan Explorer & Replication Inspector sidebar. */
+export type ReplInspectorTab =
+  | 'schema'
+  | 'migrations'
+  | 'profiler'
+  | 'plan'
+  | 'replication';
+
+/** Replication slot summary displayed in the `<firebird-repl>` Replication Inspector. */
+export interface ReplReplicationSlotInfo {
+  readonly slotName: string;
+  readonly nodeId: string;
+  readonly confirmedFlushLsn: number;
+  readonly updatedAt: string;
+}
+
+/** Subscriber watermark summary displayed in the `<firebird-repl>` Replication Inspector. */
+export interface ReplReplicationWatermarkInfo {
+  readonly peerId: string;
+  readonly lastLsn: number;
+  readonly updatedAt: string;
+}
+
+/** Recent journal entry summary displayed in the `<firebird-repl>` Replication Inspector. */
+export interface ReplReplicationJournalEntrySummary {
+  readonly lsn: number;
+  readonly originNode: string;
+  readonly tableName: string;
+  readonly op: string;
+  readonly pkJson: string;
+  readonly createdAt: string;
+}
+
+/** Structured replication state returned by `el.replication()` in `<firebird-repl>`. */
+export interface ReplReplicationInfo {
+  readonly journalTableExists: boolean;
+  readonly journalEntryCount: number;
+  readonly minJournalLsn: number;
+  readonly maxJournalLsn: number;
+  readonly slots: ReplReplicationSlotInfo[];
+  readonly watermarks: ReplReplicationWatermarkInfo[];
+  readonly recentEntries: ReplReplicationJournalEntrySummary[];
+  readonly liveStats?: ReplicationStats | null;
+}
 
 /** What the console needs of a database: `FirebirdBrowser` has it. */
 export interface ReplDatabase {
@@ -114,6 +162,7 @@ export interface ReplEntry {
   schema?: SchemaIntrospection;
   migrations?: AppliedMigration[];
   stats?: MonitorStats;
+  replication?: ReplReplicationInfo;
   error?: Error;
 }
 
@@ -121,11 +170,13 @@ export interface ReplEntry {
 export interface FirebirdReplElement extends HTMLElement {
   /** The database statements run against. */
   db: ReplDatabase | null;
+  /** Optional `DatabaseReplicator` or `ReplicationSubscription` providing live `stats()` telemetry. */
+  replicator?: { stats(): Promise<ReplicationStats> } | null;
   /** The editor's text. */
   value: string;
   /** Whether the Schema Inspector & Migration Viewer sidebar is open. */
   inspectorOpen: boolean;
-  /** Currently active sidebar tab (`'schema'`, `'migrations'`, `'profiler'`, or `'plan'`). */
+  /** Currently active sidebar tab (`'schema'`, `'migrations'`, `'profiler'`, `'plan'`, or `'replication'`). */
   inspectorTab: ReplInspectorTab;
   /** Run `script` (default: the editor's text); resolves with what each statement did. */
   run(script?: string): Promise<ReplEntry[]>;
@@ -143,6 +194,8 @@ export interface FirebirdReplElement extends HTMLElement {
   ): Promise<ReplEntry | undefined>;
   /** Inspect query telemetry and `MON$` monitoring counters, open/update the Profiler tab, and log a profiler entry. */
   profiler(): Promise<ReplEntry | undefined>;
+  /** Inspect replication journal (`FB_REPL_JOURNAL$`), slots (`FB_REPL_SLOTS$`), watermarks (`FB_REPL_WATERMARKS$`), and live lag telemetry. */
+  replication(): Promise<ReplEntry | undefined>;
   /** Toggle (or switch to `tab` in) the interactive Schema Inspector, Migration Viewer, Profiler & Plan Explorer sidebar. */
   toggleInspector(tab?: ReplInspectorTab): Promise<void>;
   /** Refresh the interactive Schema Inspector, Migration Viewer, Profiler & Plan Explorer sidebar from the database. */
@@ -294,6 +347,7 @@ export function defineFirebirdRepl(
 
   class FirebirdRepl extends HTMLElement implements FirebirdReplElement {
     private database: ReplDatabase | null = null;
+    private replicatorHandle: { stats(): Promise<ReplicationStats> } | null = null;
     private readonly output: HTMLDivElement;
     private readonly inspector: HTMLDivElement;
     private readonly inspectorBody: HTMLDivElement;
@@ -301,6 +355,7 @@ export function defineFirebirdRepl(
     private readonly tabMigrationsBtn: HTMLButtonElement;
     private readonly tabProfilerBtn: HTMLButtonElement;
     private readonly tabPlanBtn: HTMLButtonElement;
+    private readonly tabReplicationBtn: HTMLButtonElement;
     private readonly inspectorRefreshBtn: HTMLButtonElement;
     private readonly inspectorCloseBtn: HTMLButtonElement;
     private readonly editor: HTMLTextAreaElement;
@@ -311,6 +366,7 @@ export function defineFirebirdRepl(
     private readonly schemaButton: HTMLButtonElement;
     private readonly migrationsButton: HTMLButtonElement;
     private readonly profilerButton: HTMLButtonElement;
+    private readonly replicationButton: HTMLButtonElement;
     private readonly history: string[] = [];
     /** Position in `history` while walking it; `history.length` is the draft. */
     private cursor = 0;
@@ -322,6 +378,7 @@ export function defineFirebirdRepl(
     private lastMigrations: AppliedMigration[] = [];
     private lastStats: MonitorStats | null = null;
     private lastPlans: Array<{ sql: string; parsed: ParsedQueryPlan }> = [];
+    private lastReplication: ReplReplicationInfo | null = null;
 
     constructor() {
       super();
@@ -363,11 +420,17 @@ export function defineFirebirdRepl(
       this.tabPlanBtn.className = 'tab-plan';
       this.tabPlanBtn.textContent = 'Plan';
 
+      this.tabReplicationBtn = document.createElement('button');
+      this.tabReplicationBtn.type = 'button';
+      this.tabReplicationBtn.className = 'tab-replication';
+      this.tabReplicationBtn.textContent = 'Replication';
+
       inspectorTabs.append(
         this.tabSchemaBtn,
         this.tabMigrationsBtn,
         this.tabProfilerBtn,
         this.tabPlanBtn,
+        this.tabReplicationBtn,
       );
 
       const inspectorActions = el('div', 'inspector-actions');
@@ -414,6 +477,12 @@ export function defineFirebirdRepl(
       this.profilerButton.textContent = 'Profiler';
       this.profilerButton.title = 'Inspect query telemetry, cache hits, and MON$ monitoring counters';
 
+      this.replicationButton = document.createElement('button');
+      this.replicationButton.type = 'button';
+      this.replicationButton.className = 'replication';
+      this.replicationButton.textContent = 'Replication';
+      this.replicationButton.title = 'Inspect replication journal, slots, watermarks, and lag telemetry';
+
       this.sweepButton = document.createElement('button');
       this.sweepButton.type = 'button';
       this.sweepButton.className = 'sweep';
@@ -441,6 +510,7 @@ export function defineFirebirdRepl(
         this.schemaButton,
         this.migrationsButton,
         this.profilerButton,
+        this.replicationButton,
         this.sweepButton,
         this.infoButton,
         this.explainButton,
@@ -457,6 +527,7 @@ export function defineFirebirdRepl(
       this.schemaButton.addEventListener('click', () => void this.schema());
       this.migrationsButton.addEventListener('click', () => void this.migrations());
       this.profilerButton.addEventListener('click', () => void this.profiler());
+      this.replicationButton.addEventListener('click', () => void this.replication());
       this.tabSchemaBtn.addEventListener('click', () => {
         this.inspectorTab = 'schema';
         void this.refreshInspector();
@@ -473,6 +544,10 @@ export function defineFirebirdRepl(
         this.inspectorTab = 'plan';
         void this.refreshInspector();
       });
+      this.tabReplicationBtn.addEventListener('click', () => {
+        this.inspectorTab = 'replication';
+        void this.refreshInspector();
+      });
       this.inspectorRefreshBtn.addEventListener(
         'click',
         () => void this.refreshInspector(),
@@ -485,7 +560,7 @@ export function defineFirebirdRepl(
       // A property set before the element was defined (React and Vue both
       // set properties as they render) sits on the instance and would hide
       // the accessor: take it over.
-      for (const name of ['db', 'value', 'inspectorOpen', 'inspectorTab'] as const) {
+      for (const name of ['db', 'replicator', 'value', 'inspectorOpen', 'inspectorTab'] as const) {
         if (Object.prototype.hasOwnProperty.call(this, name)) {
           const early = (this as Record<string, unknown>)[name];
           delete (this as Record<string, unknown>)[name];
@@ -500,6 +575,14 @@ export function defineFirebirdRepl(
 
     set db(db: ReplDatabase | null) {
       this.database = db;
+    }
+
+    get replicator(): { stats(): Promise<ReplicationStats> } | null {
+      return this.replicatorHandle;
+    }
+
+    set replicator(rep: { stats(): Promise<ReplicationStats> } | null) {
+      this.replicatorHandle = rep;
     }
 
     get value(): string {
@@ -531,7 +614,9 @@ export function defineFirebirdRepl(
             ? 'profiler'
             : tab === 'plan'
               ? 'plan'
-              : 'schema';
+              : tab === 'replication'
+                ? 'replication'
+                : 'schema';
       this.updateActiveTabButtons();
       this.renderInspector();
     }
@@ -547,6 +632,10 @@ export function defineFirebirdRepl(
         this.activeTab === 'profiler',
       );
       this.tabPlanBtn.classList.toggle('active', this.activeTab === 'plan');
+      this.tabReplicationBtn.classList.toggle(
+        'active',
+        this.activeTab === 'replication',
+      );
     }
 
     private setButtonsDisabled(disabled: boolean): void {
@@ -557,6 +646,7 @@ export function defineFirebirdRepl(
       this.schemaButton.disabled = disabled;
       this.migrationsButton.disabled = disabled;
       this.profilerButton.disabled = disabled;
+      this.replicationButton.disabled = disabled;
       this.inspectorRefreshBtn.disabled = disabled;
     }
 
@@ -585,6 +675,7 @@ export function defineFirebirdRepl(
         this.lastSchema = null;
         this.lastMigrations = [];
         this.lastStats = null;
+        this.lastReplication = null;
         this.renderInspector();
         return;
       }
@@ -595,6 +686,8 @@ export function defineFirebirdRepl(
           this.lastMigrations = await this.fetchMigrations();
         } else if (this.activeTab === 'profiler' || this.activeTab === 'plan') {
           this.lastStats = await this.fetchStats();
+        } else if (this.activeTab === 'replication') {
+          this.lastReplication = await this.fetchReplication();
         }
       } catch {
         // Keep previous state on transient failure.
@@ -695,6 +788,122 @@ export function defineFirebirdRepl(
         };
       }
       return null;
+    }
+
+    private async fetchReplication(): Promise<ReplReplicationInfo> {
+      const db = this.db!;
+      const relRes = await db.query(
+        `SELECT TRIM(RDB$RELATION_NAME) AS REL_NAME
+         FROM RDB$RELATIONS
+         WHERE TRIM(RDB$RELATION_NAME) IN (?, ?, ?)`,
+        [
+          DEFAULT_REPL_JOURNAL_TABLE,
+          DEFAULT_REPL_SLOTS_TABLE,
+          DEFAULT_REPL_WATERMARK_TABLE,
+        ],
+        { rowMode: 'array' },
+      );
+      const existingTables = new Set(
+        relRes.rows.map((r) => String(r[0] ?? '').trim().toUpperCase()),
+      );
+
+      let journalEntryCount = 0;
+      let minJournalLsn = 0;
+      let maxJournalLsn = 0;
+      const recentEntries: ReplReplicationJournalEntrySummary[] = [];
+
+      if (existingTables.has(DEFAULT_REPL_JOURNAL_TABLE)) {
+        const jQuoted = `"${DEFAULT_REPL_JOURNAL_TABLE}"`;
+        const statsRes = await db.query(
+          `SELECT COUNT(*), COALESCE(MIN(LSN), 0), COALESCE(MAX(LSN), 0) FROM ${jQuoted}`,
+          [],
+          { rowMode: 'array' },
+        );
+        const sRow = statsRes.rows[0];
+        if (sRow) {
+          journalEntryCount = Number(sRow[0] ?? 0);
+          minJournalLsn = Number(sRow[1] ?? 0);
+          maxJournalLsn = Number(sRow[2] ?? 0);
+        }
+
+        const recentRes = await db.query(
+          `SELECT LSN, ORIGIN_NODE, TABLE_NAME, OP, PK_JSON, CREATED_AT
+           FROM ${jQuoted}
+           ORDER BY LSN DESC
+           ROWS 20`,
+          [],
+          { rowMode: 'array' },
+        );
+        for (const r of recentRes.rows) {
+          recentEntries.push({
+            lsn: Number(r[0] ?? 0),
+            originNode: String(r[1] ?? '').trim(),
+            tableName: String(r[2] ?? '').trim(),
+            op: String(r[3] ?? '').trim(),
+            pkJson: String(r[4] ?? '').trim(),
+            createdAt: String(r[5] ?? '').trim(),
+          });
+        }
+      }
+
+      const slots: ReplReplicationSlotInfo[] = [];
+      if (existingTables.has(DEFAULT_REPL_SLOTS_TABLE)) {
+        const sQuoted = `"${DEFAULT_REPL_SLOTS_TABLE}"`;
+        const slotRes = await db.query(
+          `SELECT SLOT_NAME, NODE_ID, CONFIRMED_FLUSH_LSN, UPDATED_AT
+           FROM ${sQuoted}
+           ORDER BY SLOT_NAME ASC`,
+          [],
+          { rowMode: 'array' },
+        );
+        for (const r of slotRes.rows) {
+          slots.push({
+            slotName: String(r[0] ?? '').trim(),
+            nodeId: String(r[1] ?? '').trim(),
+            confirmedFlushLsn: Number(r[2] ?? 0),
+            updatedAt: String(r[3] ?? '').trim(),
+          });
+        }
+      }
+
+      const watermarks: ReplReplicationWatermarkInfo[] = [];
+      if (existingTables.has(DEFAULT_REPL_WATERMARK_TABLE)) {
+        const wQuoted = `"${DEFAULT_REPL_WATERMARK_TABLE}"`;
+        const wmRes = await db.query(
+          `SELECT PEER_ID, LAST_LSN, UPDATED_AT
+           FROM ${wQuoted}
+           ORDER BY PEER_ID ASC`,
+          [],
+          { rowMode: 'array' },
+        );
+        for (const r of wmRes.rows) {
+          watermarks.push({
+            peerId: String(r[0] ?? '').trim(),
+            lastLsn: Number(r[1] ?? 0),
+            updatedAt: String(r[2] ?? '').trim(),
+          });
+        }
+      }
+
+      let liveStats: ReplicationStats | null = null;
+      if (this.replicatorHandle && typeof this.replicatorHandle.stats === 'function') {
+        try {
+          liveStats = await this.replicatorHandle.stats();
+        } catch {
+          liveStats = null;
+        }
+      }
+
+      return {
+        journalTableExists: existingTables.has(DEFAULT_REPL_JOURNAL_TABLE),
+        journalEntryCount,
+        minJournalLsn,
+        maxJournalLsn,
+        slots,
+        watermarks,
+        recentEntries,
+        liveStats,
+      };
     }
 
     private renderPlanTreeNode(node: PlanTreeNode): HTMLElement {
@@ -956,6 +1165,140 @@ export function defineFirebirdRepl(
           }
           panel.append(ol);
         }
+        this.inspectorBody.append(panel);
+        return;
+      }
+
+      if (this.activeTab === 'replication') {
+        const panel = el('div', 'inspector-replication');
+        const repl = this.lastReplication;
+        if (!repl) {
+          const empty = el('p', 'inspector-empty');
+          empty.textContent = 'No replication state loaded yet.';
+          panel.append(empty);
+          this.inspectorBody.append(panel);
+          return;
+        }
+
+        const summaryEl = el('p', 'inspector-summary');
+        summaryEl.textContent =
+          `Journal: ${repl.journalEntryCount} ${repl.journalEntryCount === 1 ? 'entry' : 'entries'} ` +
+          `(LSN ${repl.minJournalLsn} → ${repl.maxJournalLsn}) · ` +
+          `${repl.slots.length} ${repl.slots.length === 1 ? 'slot' : 'slots'} · ` +
+          `${repl.watermarks.length} ${repl.watermarks.length === 1 ? 'watermark' : 'watermarks'}`;
+        panel.append(summaryEl);
+
+        if (repl.liveStats) {
+          const st = repl.liveStats;
+          const liveDiv = el('div', 'schema-sub');
+          const liveLabel = el('span', 'schema-sub-label');
+          liveLabel.textContent = 'Live Replicator Telemetry:';
+          liveDiv.append(liveLabel);
+          const liveList = el('ul', 'schema-list replication-live-metrics');
+          const metrics: Array<[string, string]> = [
+            ['Status', st.status],
+            [
+              'LSN (primary / watermark)',
+              `${st.primaryLsn} / ${st.replicaWatermark}`,
+            ],
+            [
+              'Lag (entries / ms)',
+              `${st.lagEntries} entries / ${st.lagMs} ms`,
+            ],
+            [
+              'Changes (fetched / applied)',
+              `${st.totalFetched} / ${st.totalApplied} (${st.bytesTransferred} B)`,
+            ],
+            [
+              'Conflicts resolved',
+              String(st.totalConflicts),
+            ],
+          ];
+          for (const [label, value] of metrics) {
+            const li = el('li', 'schema-meta-item');
+            const k = el('span', 'col-name');
+            k.textContent = `${label}:`;
+            const v = el('span', 'col-type');
+            v.textContent = value;
+            li.append(k, v);
+            liveList.append(li);
+          }
+          liveDiv.append(liveList);
+          panel.append(liveDiv);
+        }
+
+        const slotsTitle = el('div', 'schema-group-title');
+        slotsTitle.textContent = `Replication Slots (${repl.slots.length})`;
+        panel.append(slotsTitle);
+        if (repl.slots.length === 0) {
+          const empty = el('p', 'inspector-empty');
+          empty.textContent = 'No replication slots registered in FB_REPL_SLOTS$.';
+          panel.append(empty);
+        } else {
+          const slotList = el('ul', 'schema-list replication-slots');
+          for (const s of repl.slots) {
+            const li = el('li', 'migration-item replication-slot-item');
+            const nameEl = el('span', 'migration-version');
+            nameEl.textContent = s.slotName;
+            const nodeEl = el('span', 'migration-name');
+            nodeEl.textContent = `node: ${s.nodeId}`;
+            const lag = Math.max(0, repl.maxJournalLsn - s.confirmedFlushLsn);
+            const badgeEl = el('span', 'schema-badge');
+            badgeEl.textContent = `ack LSN ${s.confirmedFlushLsn} · lag ${lag}`;
+            li.append(nameEl, nodeEl, badgeEl);
+            slotList.append(li);
+          }
+          panel.append(slotList);
+        }
+
+        const wmTitle = el('div', 'schema-group-title');
+        wmTitle.textContent = `Peer Watermarks (${repl.watermarks.length})`;
+        panel.append(wmTitle);
+        if (repl.watermarks.length === 0) {
+          const empty = el('p', 'inspector-empty');
+          empty.textContent = 'No peer watermarks recorded in FB_REPL_WATERMARKS$.';
+          panel.append(empty);
+        } else {
+          const wmList = el('ul', 'schema-list replication-watermarks');
+          for (const w of repl.watermarks) {
+            const li = el('li', 'migration-item replication-watermark-item');
+            const peerEl = el('span', 'migration-version');
+            peerEl.textContent = w.peerId;
+            const lsnEl = el('span', 'migration-name');
+            lsnEl.textContent = `last LSN ${w.lastLsn}`;
+            const dateEl = el('span', 'schema-badge');
+            dateEl.textContent = w.updatedAt;
+            li.append(peerEl, lsnEl, dateEl);
+            wmList.append(li);
+          }
+          panel.append(wmList);
+        }
+
+        const entriesTitle = el('div', 'schema-group-title');
+        entriesTitle.textContent = `Recent Journal Entries (${repl.recentEntries.length})`;
+        panel.append(entriesTitle);
+        if (repl.recentEntries.length === 0) {
+          const empty = el('p', 'inspector-empty');
+          empty.textContent = repl.journalTableExists
+            ? 'No journal entries in FB_REPL_JOURNAL$.'
+            : 'Replication journal table FB_REPL_JOURNAL$ is not initialized.';
+          panel.append(empty);
+        } else {
+          const jList = el('ol', 'migrations-list replication-entries');
+          for (const e of repl.recentEntries) {
+            const li = el('li', 'migration-item replication-entry-item');
+            const lsnSpan = el('span', 'migration-version');
+            lsnSpan.textContent = `#${e.lsn}`;
+            const descSpan = el('span', 'migration-name');
+            descSpan.textContent = `${e.op} ${e.tableName} ${e.pkJson}`;
+            const badge = el('span', 'schema-badge');
+            badge.textContent = `${e.originNode} · ${e.createdAt}`;
+            li.append(lsnSpan, descSpan, badge);
+            jList.append(li);
+          }
+          panel.append(jList);
+        }
+
         this.inspectorBody.append(panel);
         return;
       }
@@ -1542,6 +1885,49 @@ export function defineFirebirdRepl(
       return entry;
     }
 
+    async replication(): Promise<ReplEntry | undefined> {
+      if (this.busy) return undefined;
+      if (!this.db) {
+        const entry: ReplEntry = {
+          sql: 'INSPECT REPLICATION',
+          line: 1,
+          ms: 0,
+          error: new Error('No database: set the element’s db property first'),
+        };
+        this.show(entry);
+        return entry;
+      }
+
+      this.busy = true;
+      this.setButtonsDisabled(true);
+      const started = performance.now();
+      const entry: ReplEntry = { sql: 'INSPECT REPLICATION', line: 1, ms: 0 };
+      try {
+        const info = await this.fetchReplication();
+        entry.replication = info;
+        this.lastReplication = info;
+        this.activeTab = 'replication';
+        this.updateActiveTabButtons();
+        this.inspectorOpen = true;
+        this.renderInspector();
+      } catch (err) {
+        entry.error = asError(err);
+      } finally {
+        entry.ms = performance.now() - started;
+        this.busy = false;
+        this.setButtonsDisabled(false);
+      }
+      this.show(entry);
+      this.dispatchEvent(
+        new CustomEvent('firebird-repl-replication', {
+          detail: entry,
+          bubbles: true,
+          composed: true,
+        }),
+      );
+      return entry;
+    }
+
     private onKey(event: KeyboardEvent): void {
       if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
         event.preventDefault();
@@ -1715,6 +2101,50 @@ export function defineFirebirdRepl(
             ),
           );
         }
+        if (entry.replication !== undefined) {
+          const r = entry.replication;
+          const rows: ArrayRow[] = [
+            ['Journal initialized', r.journalTableExists ? 'Yes' : 'No'],
+            ['Journal entries', r.journalEntryCount],
+            ['Journal LSN range', `${r.minJournalLsn} → ${r.maxJournalLsn}`],
+            [
+              'Registered slots',
+              r.slots.length > 0
+                ? r.slots
+                    .map(
+                      (s) =>
+                        `${s.slotName} (${s.nodeId} @ LSN ${s.confirmedFlushLsn})`,
+                    )
+                    .join(', ')
+                : 'none',
+            ],
+            [
+              'Peer watermarks',
+              r.watermarks.length > 0
+                ? r.watermarks
+                    .map((w) => `${w.peerId} @ LSN ${w.lastLsn}`)
+                    .join(', ')
+                : 'none',
+            ],
+          ];
+          if (r.liveStats) {
+            rows.push(
+              [
+                'Live Replicator Status',
+                `${r.liveStats.status} (primary LSN ${r.liveStats.primaryLsn} / watermark ${r.liveStats.replicaWatermark})`,
+              ],
+              [
+                'Live Lag (entries / ms)',
+                `${r.liveStats.lagEntries} entries / ${r.liveStats.lagMs} ms`,
+              ],
+              [
+                'Changes fetched / applied (conflicts)',
+                `${r.liveStats.totalFetched} / ${r.liveStats.totalApplied} (${r.liveStats.totalConflicts}, ${r.liveStats.bytesTransferred} B)`,
+              ],
+            );
+          }
+          block.append(table([{ name: 'Metric' }, { name: 'Value' }], rows));
+        }
         const meta = el('p', 'meta');
         meta.textContent = `${summary(entry, fields.length > 0)} · ${entry.ms.toFixed(1)} ms`;
         block.append(meta);
@@ -1757,6 +2187,10 @@ function summary(entry: ReplEntry, returnsRows: boolean): string {
   if (entry.stats !== undefined) {
     const n = entry.stats.totalQueries + entry.stats.totalExecs;
     return `profiler (${n} ${n === 1 ? 'query' : 'queries'})`;
+  }
+  if (entry.replication !== undefined) {
+    const n = entry.replication.journalEntryCount;
+    return `replication (${n} ${n === 1 ? 'entry' : 'entries'}, ${entry.replication.slots.length} ${entry.replication.slots.length === 1 ? 'slot' : 'slots'})`;
   }
   if (returnsRows) {
     const n = entry.rows?.length ?? 0;

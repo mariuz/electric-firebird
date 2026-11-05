@@ -409,6 +409,16 @@ describe('firebird-wasm/repl', () => {
           ],
         })),
         query: vi.fn(async (sqlText: string) => {
+          if (sqlText.includes('RDB$RELATIONS') && sqlText.includes('IN (?, ?, ?)')) {
+            return {
+              fields: [{ name: 'REL_NAME' }],
+              rows: [
+                ['FB_REPL_JOURNAL$'],
+                ['FB_REPL_SLOTS$'],
+                ['FB_REPL_WATERMARKS$'],
+              ],
+            };
+          }
           if (sqlText.includes('RDB$RELATIONS')) {
             return { fields: [{ name: 'X' }], rows: [[1]] };
           }
@@ -423,6 +433,62 @@ describe('firebird-wasm/repl', () => {
                 ['001', 'create_users', '2026-10-30T10:00:00.000Z'],
                 ['002', 'add_email_index', '2026-10-31T12:00:00.000Z'],
               ],
+            };
+          }
+          if (sqlText.includes('COUNT(*)') && sqlText.includes('FB_REPL_JOURNAL$')) {
+            return {
+              fields: [{ name: 'COUNT' }, { name: 'MIN' }, { name: 'MAX' }],
+              rows: [[5, 2, 6]],
+            };
+          }
+          if (sqlText.includes('FROM "FB_REPL_JOURNAL$"')) {
+            return {
+              fields: [
+                { name: 'LSN' },
+                { name: 'ORIGIN_NODE' },
+                { name: 'TABLE_NAME' },
+                { name: 'OP' },
+                { name: 'PK_JSON' },
+                { name: 'CREATED_AT' },
+              ],
+              rows: [
+                [
+                  6,
+                  'node-a',
+                  'USERS',
+                  'I',
+                  '{"ID":42}',
+                  '2026-11-05T12:00:00.000Z',
+                ],
+              ],
+            };
+          }
+          if (sqlText.includes('FROM "FB_REPL_SLOTS$"')) {
+            return {
+              fields: [
+                { name: 'SLOT_NAME' },
+                { name: 'NODE_ID' },
+                { name: 'CONFIRMED_FLUSH_LSN' },
+                { name: 'UPDATED_AT' },
+              ],
+              rows: [
+                [
+                  'slot_edge_1',
+                  'edge-1',
+                  4,
+                  '2026-11-05T11:59:00.000Z',
+                ],
+              ],
+            };
+          }
+          if (sqlText.includes('FROM "FB_REPL_WATERMARKS$"')) {
+            return {
+              fields: [
+                { name: 'PEER_ID' },
+                { name: 'LAST_LSN' },
+                { name: 'UPDATED_AT' },
+              ],
+              rows: [['edge-1', 5, '2026-11-05T11:59:30.000Z']],
             };
           }
           return { fields: [], rows: [] };
@@ -530,8 +596,51 @@ describe('firebird-wasm/repl', () => {
       expect(inspectorNode.allText()).toContain('INDEX: IDX_USERS_EMAIL');
       expect(inspectorNode.allText()).toContain('Full table scan (NATURAL) on ORGS');
 
-      // 5. Toggle inspector closed
-      await el.toggleInspector('plan');
+      // 5. Inspect replication topology, slots, watermarks & lag via el.replication()
+      el.replicator = {
+        stats: async () => ({
+          status: 'idle' as const,
+          primaryLsn: 6,
+          replicaWatermark: 5,
+          lagEntries: 1,
+          lagMs: 45,
+          totalFetched: 5,
+          totalApplied: 5,
+          totalConflicts: 1,
+          bytesTransferred: 512,
+          lastSyncedAt: 1730800000000,
+        }),
+      };
+
+      let replicationEventDetail: ReplEntry | undefined;
+      el.addEventListener('firebird-repl-replication', ((ev: {
+        detail: ReplEntry;
+      }) => {
+        replicationEventDetail = ev.detail;
+      }) as unknown as EventListener);
+
+      const replEntry = await el.replication();
+      expect(replEntry?.replication?.journalTableExists).toBe(true);
+      expect(replEntry?.replication?.journalEntryCount).toBe(5);
+      expect(replEntry?.replication?.minJournalLsn).toBe(2);
+      expect(replEntry?.replication?.maxJournalLsn).toBe(6);
+      expect(replEntry?.replication?.slots).toHaveLength(1);
+      expect(replEntry?.replication?.slots[0]?.slotName).toBe('slot_edge_1');
+      expect(replEntry?.replication?.watermarks).toHaveLength(1);
+      expect(replEntry?.replication?.liveStats?.lagEntries).toBe(1);
+      expect(replicationEventDetail?.replication?.journalEntryCount).toBe(5);
+      expect(el.inspectorOpen).toBe(true);
+      expect(el.inspectorTab).toBe('replication');
+      expect(inspectorNode.allText()).toContain(
+        'Journal: 5 entries (LSN 2 → 6) · 1 slot · 1 watermark',
+      );
+      expect(inspectorNode.allText()).toContain('1 entries / 45 ms');
+      expect(inspectorNode.allText()).toContain('slot_edge_1');
+      expect(inspectorNode.allText()).toContain('ack LSN 4 · lag 2');
+      expect(inspectorNode.allText()).toContain('#6');
+
+      // 6. Toggle inspector closed
+      await el.toggleInspector('replication');
       expect(el.inspectorOpen).toBe(false);
       expect(inspectorNode.hidden).toBe(true);
     } finally {

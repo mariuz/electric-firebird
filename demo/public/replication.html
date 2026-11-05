@@ -3,10 +3,10 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Firebird WASM — Interactive Replication Simulator &amp; Demo</title>
+    <title>Firebird WASM — Interactive Replication Simulator v2 &amp; Demo</title>
     <meta
       name="description"
-      content="Interactive Primary/Replica and Bidirectional Database Replication Simulator and Live WASM Demo for Firebird in the browser."
+      content="Interactive Primary/Replica and Bidirectional Database Replication Simulator v2 with HLC, Per-Column CRDTs, Row/Column Filtering, Replication Slots, and Native Binary Segment Hex Inspector."
     />
     <link rel="stylesheet" href="./demo.css" />
     <link
@@ -115,7 +115,7 @@
       }
       .scenarios-bar {
         display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
         gap: 0.75rem;
       }
       .scenario-card {
@@ -170,11 +170,13 @@
         gap: 0.5rem;
         border-bottom: 1px solid var(--border);
         padding-bottom: 0.65rem;
+        flex-wrap: wrap;
       }
       .node-title {
         display: flex;
         align-items: center;
         gap: 0.5rem;
+        flex-wrap: wrap;
       }
       .node-title h2 {
         margin: 0;
@@ -211,7 +213,7 @@
         justify-content: center;
         gap: 0.5rem;
         padding: 0.5rem;
-        min-width: 120px;
+        min-width: 135px;
         text-align: center;
       }
       .link-arrow {
@@ -227,7 +229,7 @@
         font-family: var(--mono);
         font-size: 0.72rem;
         color: var(--muted);
-        line-height: 1.4;
+        line-height: 1.45;
       }
       .table-wrap {
         overflow-x: auto;
@@ -239,11 +241,11 @@
         width: 100%;
         border-collapse: collapse;
         font-family: var(--mono);
-        font-size: 0.78rem;
+        font-size: 0.76rem;
       }
       .repl-table th,
       .repl-table td {
-        padding: 0.42rem 0.65rem;
+        padding: 0.4rem 0.55rem;
         text-align: left;
         border-bottom: 1px solid var(--border);
       }
@@ -295,10 +297,10 @@
         border: 1px solid var(--border);
         border-radius: var(--radius);
         font-family: var(--mono);
-        font-size: 0.75rem;
+        font-size: 0.74rem;
         line-height: 1.5;
         overflow-x: auto;
-        max-height: 320px;
+        max-height: 360px;
         color: var(--fg);
       }
       .event-feed {
@@ -323,16 +325,34 @@
       .event-item.conflict {
         color: var(--accent);
       }
+      .slots-bar {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.5rem;
+        padding: 0.55rem 0.75rem;
+        background: var(--bg);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        font-size: 0.76rem;
+      }
+      .slots-list {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.4rem;
+        align-items: center;
+      }
     </style>
   </head>
   <body>
     <header class="masthead">
       <div class="masthead-text">
-        <h1>Firebird Database Replication Simulator &amp; Demo</h1>
+        <h1>Firebird Database Replication Simulator v2 &amp; Demo</h1>
         <p>
           Interactive logical &amp; journal-based replication (<code>FB_REPL_JOURNAL$</code>,
-          <code>FB_REPL_WATERMARKS$</code>, and <code>FB_REPL_TRG$</code> PSQL triggers).
-          Test one-way &amp; bidirectional sync, network partitions, and 3-way conflict resolution.
+          <code>FB_REPL_SLOTS$</code>, <code>FB_REPL_WATERMARKS$</code>, and <code>FB_REPL_TRG$</code> PSQL triggers).
+          Test HLC + per-column CRDTs, multi-tenant row/column filtering, replication slots, and Firebird 4/5 binary journal segments (<code>0x52444246</code>).
         </p>
         <nav class="repl-nav">
           <a href="./index.html">← SQL Console Playground</a>
@@ -342,7 +362,7 @@
       </div>
       <div class="status" id="engine-status" data-state="ready">
         <span class="status-dot"></span>
-        <span class="status-text" id="engine-status-text">Replication Simulator Ready</span>
+        <span class="status-text" id="engine-status-text">Replication Simulator v2 Ready</span>
       </div>
     </header>
 
@@ -361,10 +381,28 @@
           <div class="repl-control-group">
             <label for="conflict-select">Conflict Policy</label>
             <select id="conflict-select" class="repl-select">
-              <option value="merge" selected>3-Way Field Merge ('merge')</option>
+              <option value="crdt-merge" selected>CRDT + HLC ('crdt-merge': PN-Counter + Set-Union)</option>
+              <option value="merge">3-Way Field Merge ('merge')</option>
               <option value="last-write-wins">Last-Write-Wins ('last-write-wins')</option>
               <option value="primary-wins">Primary Wins ('primary-wins')</option>
               <option value="replica-wins">Replica Wins ('replica-wins')</option>
+            </select>
+          </div>
+
+          <div class="repl-control-group">
+            <label for="tenant-filter-select">Row Filter (WHERE)</label>
+            <select id="tenant-filter-select" class="repl-select">
+              <option value="all" selected>All Tenants (No Filter)</option>
+              <option value="acme">TENANT_ID = 'acme' Only</option>
+              <option value="high">PRIORITY IN ('HIGH', 'CRITICAL')</option>
+            </select>
+          </div>
+
+          <div class="repl-control-group">
+            <label for="col-filter-select">Column Projection</label>
+            <select id="col-filter-select" class="repl-select">
+              <option value="exclude-secret" selected>excludeColumns: ['SECRET_HASH']</option>
+              <option value="all-cols">All Columns (Include SECRET_HASH)</option>
             </select>
           </div>
         </div>
@@ -377,7 +415,7 @@
             Sync Now (<code>replicator.sync()</code>)
           </button>
           <button type="button" id="prune-journal" class="btn-sm">
-            Prune Acked Journal
+            Prune Acked (<code>pruneAcked()</code>)
           </button>
           <button type="button" id="reset-sim" class="btn-sm">
             Reset State
@@ -391,17 +429,25 @@
           <strong>1. Primary → Replica Stream</strong>
           <span>Insert &amp; update tasks on Primary and watch LSN journal entries replicate to Replica.</span>
         </button>
-        <button type="button" class="scenario-card" data-scenario="merge">
-          <strong>2. Offline Partition + 3-Way Merge</strong>
-          <span>Go offline, edit TITLE on Primary and DONE + PRIORITY on Replica for Row #1, then sync &amp; merge.</span>
+        <button type="button" class="scenario-card" data-scenario="crdt">
+          <strong>2. HLC + CRDT Counter &amp; Set Merge</strong>
+          <span>Partition edits on Row #1: increment STOCK (+5 vs +3) &amp; add TAGS on both nodes, then converge to +8 &amp; union!</span>
         </button>
-        <button type="button" class="scenario-card" data-scenario="lww">
-          <strong>3. Concurrent Same-Column Conflict</strong>
-          <span>Modify TITLE on both nodes while partitioned and resolve via the active conflict strategy.</span>
+        <button type="button" class="scenario-card" data-scenario="merge">
+          <strong>3. Offline Partition + 3-Way Merge</strong>
+          <span>Edit TITLE on Primary and DONE + PRIORITY on Replica for Row #1 while offline, then sync &amp; merge.</span>
+        </button>
+        <button type="button" class="scenario-card" data-scenario="filter">
+          <strong>4. Multi-Tenant &amp; Column Filtering</strong>
+          <span>Enable TENANT_ID='acme' + exclude SECRET_HASH, insert 'acme' &amp; 'globex' rows, and verify filtered sync.</span>
+        </button>
+        <button type="button" class="scenario-card" data-scenario="slots">
+          <strong>5. Lagging Slot &amp; Safe Auto-Pruning</strong>
+          <span>Register a lagging 'analytics_dr' slot in FB_REPL_SLOTS$, test pruneAcked() holdback, then advance &amp; prune.</span>
         </button>
         <button type="button" class="scenario-card" data-scenario="ddl">
-          <strong>4. Schema DDL Replication</strong>
-          <span>Record an ALTER TABLE / CREATE TABLE DDL entry in FB_REPL_JOURNAL$ and apply on Replica.</span>
+          <strong>6. Schema DDL Replication</strong>
+          <span>Record an ALTER TABLE DDL entry in FB_REPL_JOURNAL$ and replicate schema changes to Replica.</span>
         </button>
       </section>
 
@@ -413,6 +459,7 @@
             <div class="node-title">
               <h2>Node A — Primary</h2>
               <span class="badge accent">node_id: primary</span>
+              <span class="badge" id="primary-hlc-badge">HLC: 0:0:primary</span>
             </div>
             <span class="badge" id="primary-lsn-badge">Journal LSN: 0</span>
           </div>
@@ -420,6 +467,7 @@
           <div class="node-toolbar">
             <button type="button" class="btn-sm" id="primary-insert">+ Insert Task</button>
             <button type="button" class="btn-sm" id="primary-update-title">Rename Row #1</button>
+            <button type="button" class="btn-sm" id="primary-crdt-bump">+5 STOCK &amp; Tag (#1)</button>
             <button type="button" class="btn-sm" id="primary-escalate">Priority=HIGH (#1)</button>
             <button type="button" class="btn-sm" id="primary-delete-last">Delete Last Row</button>
           </div>
@@ -429,10 +477,13 @@
               <thead>
                 <tr>
                   <th>ID</th>
+                  <th>TENANT</th>
                   <th>TITLE</th>
-                  <th>OWNER</th>
                   <th>PRIORITY</th>
+                  <th>STOCK (PN)</th>
+                  <th>TAGS (Set)</th>
                   <th>DONE</th>
+                  <th>SECRET_HASH</th>
                 </tr>
               </thead>
               <tbody id="primary-rows"></tbody>
@@ -456,6 +507,7 @@
             <div class="node-title">
               <h2>Node B — Replica</h2>
               <span class="badge ok">node_id: replica</span>
+              <span class="badge" id="replica-hlc-badge">HLC: 0:0:replica</span>
             </div>
             <span class="badge" id="replica-watermark-badge">Watermark LSN: 0</span>
           </div>
@@ -463,6 +515,7 @@
           <div class="node-toolbar">
             <button type="button" class="btn-sm" id="replica-insert">+ Insert Task (Replica)</button>
             <button type="button" class="btn-sm" id="replica-toggle-done">Toggle DONE (#1)</button>
+            <button type="button" class="btn-sm" id="replica-crdt-bump">+3 STOCK &amp; Tag (#1)</button>
             <button type="button" class="btn-sm" id="replica-update-title">Rename Row #1 (Replica)</button>
           </div>
 
@@ -471,10 +524,13 @@
               <thead>
                 <tr>
                   <th>ID</th>
+                  <th>TENANT</th>
                   <th>TITLE</th>
-                  <th>OWNER</th>
                   <th>PRIORITY</th>
+                  <th>STOCK (PN)</th>
+                  <th>TAGS (Set)</th>
                   <th>DONE</th>
+                  <th>SECRET_HASH</th>
                 </tr>
               </thead>
               <tbody id="replica-rows"></tbody>
@@ -483,14 +539,24 @@
         </div>
       </section>
 
-      <!-- Bottom Inspector Panels: Journal Table + PSQL Trigger / Setup Code -->
+      <!-- Bottom Inspector Panels: Journal Table + Slots + Binary Hex / Setup Code -->
       <section class="bottom-panels">
         <div class="node-card">
           <div class="node-header">
             <div class="node-title">
-              <h2>Replication Change Journal (<code>FB_REPL_JOURNAL$</code>)</h2>
+              <h2>Change Journal (<code>FB_REPL_JOURNAL$</code>) &amp; Slots (<code>FB_REPL_SLOTS$</code>)</h2>
             </div>
             <span class="badge" id="journal-count-badge">0 entries</span>
+          </div>
+
+          <!-- Replication Slots Bar -->
+          <div class="slots-bar" aria-label="Replication slots in FB_REPL_SLOTS$">
+            <div class="slots-list" id="slots-list"></div>
+            <div class="node-toolbar">
+              <button type="button" class="btn-sm" id="add-lagging-slot">+ Lagging Slot (analytics_dr)</button>
+              <button type="button" class="btn-sm" id="advance-lagging-slot">Advance analytics_dr</button>
+              <button type="button" class="btn-sm" id="drop-lagging-slot">Drop analytics_dr</button>
+            </div>
           </div>
 
           <div class="table-wrap">
@@ -498,7 +564,7 @@
               <thead>
                 <tr>
                   <th>LSN</th>
-                  <th>ORIGIN</th>
+                  <th>ORIGIN / HLC</th>
                   <th>OP</th>
                   <th>TABLE</th>
                   <th>KEY_JSON</th>
@@ -515,11 +581,12 @@
         <div class="node-card">
           <div class="node-header">
             <div class="node-title">
-              <h2>Generated Trigger DDL &amp; Setup Code</h2>
+              <h2>Replication Inspector</h2>
             </div>
             <div class="node-toolbar">
               <button type="button" class="btn-sm" id="show-setup-code">Setup TS</button>
               <button type="button" class="btn-sm" id="show-trigger-ddl">PSQL Trigger DDL</button>
+              <button type="button" class="btn-sm" id="show-binary-hex">Binary Segment (0x52444246)</button>
             </div>
           </div>
           <pre class="code-pre" id="code-inspector"></pre>
