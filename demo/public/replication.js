@@ -580,6 +580,58 @@ async function createSimReplicator(options) {
           () => ++primaryLsn,
         );
       },
+      rewindToLsn: async (targetLsn) => {
+        const toUndo = primaryJournal
+          .filter((e) => e.lsn > targetLsn)
+          .sort((a, b) => b.lsn - a.lsn);
+        const rows = primary.tables.get('TASKS') || [];
+        let entriesUndone = 0;
+
+        for (const entry of toUndo) {
+          if (entry.operation === 'DDL') continue;
+          const idx = rows.findIndex((r) => r.ID === entry.key.ID);
+          if (entry.operation === 'INSERT') {
+            if (idx >= 0) rows.splice(idx, 1);
+            primaryMirror.delete(entry.key.ID);
+            entriesUndone++;
+          } else if (entry.operation === 'UPDATE' && entry.before) {
+            if (idx >= 0) {
+              rows[idx] = { ...rows[idx], ...entry.before };
+              primaryMirror.set(entry.key.ID, { ...rows[idx] });
+              entriesUndone++;
+            }
+          } else if (entry.operation === 'DELETE' && entry.before) {
+            const restored = { ...entry.before };
+            if (idx >= 0) rows[idx] = restored;
+            else rows.push(restored);
+            primaryMirror.set(entry.key.ID, { ...restored });
+            entriesUndone++;
+          }
+        }
+        rows.sort((a, b) => Number(a.ID) - Number(b.ID));
+
+        const kept = primaryJournal.filter((e) => e.lsn <= targetLsn);
+        const removed = primaryJournal.length - kept.length;
+        primaryJournal.length = 0;
+        primaryJournal.push(...kept);
+        primaryLsn = targetLsn;
+
+        // Also sync replica to the rewound state
+        const repRows = (primary.tables.get('TASKS') || []).map((r) => ({ ...r }));
+        replica.tables.set('TASKS', repRows);
+        replicaMirror.clear();
+        for (const r of repRows) replicaMirror.set(r.ID, { ...r });
+        replicaWatermark = Math.min(replicaWatermark, targetLsn);
+        const repSlot = slots.get('slot_replica');
+        if (repSlot) repSlot.confirmedFlushLsn = replicaWatermark;
+
+        return {
+          previousHeadLsn: targetLsn + removed,
+          rewoundToLsn: targetLsn,
+          entriesUndone,
+          journalEntriesRemoved: removed,
+        };
+      },
     },
     replicaPublication: {
       fetchChangesSince: async (lsn) => replicaJournal.filter((e) => e.lsn > lsn),
@@ -852,6 +904,82 @@ function formatBinaryHexDump(entries) {
   return lines.join('\n');
 }
 
+async function formatEncryptedHexDump(entries) {
+  const rawBytes = replLib.encodeNativeJournalSegment(entries);
+  let compressedBytes = rawBytes;
+  let isCompressed = false;
+  if (typeof CompressionStream !== 'undefined') {
+    const cs = new CompressionStream('gzip');
+    const writer = cs.writable.getWriter();
+    await writer.write(new Uint8Array(rawBytes));
+    await writer.close();
+    compressedBytes = new Uint8Array(await new Response(cs.readable).arrayBuffer());
+    isCompressed = true;
+  }
+
+  let payloadBytes = compressedBytes;
+  let isEncrypted = false;
+  const iv = new Uint8Array(12);
+  const salt = new Uint8Array(16);
+  for (let i = 0; i < 12; i++) iv[i] = (i * 17 + 0x42) & 0xff;
+  for (let i = 0; i < 16; i++) salt[i] = (i * 29 + 0x11) & 0xff;
+
+  if (globalThis.crypto?.subtle) {
+    const keyBytes = new Uint8Array(32);
+    for (let i = 0; i < 32; i++) keyBytes[i] = (i * 7 + 3) & 0xff;
+    const cryptoKey = await globalThis.crypto.subtle.importKey(
+      'raw',
+      keyBytes,
+      { name: 'AES-GCM', length: 256 },
+      false,
+      ['encrypt'],
+    );
+    const encBuf = await globalThis.crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv },
+      cryptoKey,
+      new Uint8Array(compressedBytes),
+    );
+    payloadBytes = new Uint8Array(encBuf);
+    isEncrypted = true;
+  }
+
+  const envelope = new Uint8Array(40 + payloadBytes.byteLength);
+  const dv = new DataView(envelope.buffer);
+  dv.setUint32(0, 0x53444246, true); // 'FBDS'
+  dv.setUint16(4, 1, true);
+  dv.setUint16(6, (isCompressed ? 1 : 0) | (isEncrypted ? 2 : 0), true);
+  envelope.set(iv, 8);
+  envelope.set(salt, 20);
+  dv.setUint32(36, rawBytes.byteLength, true);
+  envelope.set(payloadBytes, 40);
+
+  const lines = [
+    `// Encrypted & Gzip-Compressed Replication Segment (encodeEncryptedJournalSegment)`,
+    `// Envelope Header (40 bytes):`,
+    `//   Magic:             0x53444246 ('FBDS')`,
+    `//   Version:           1`,
+    `//   Flags:             0x0${((isCompressed ? 1 : 0) | (isEncrypted ? 2 : 0)).toString(16)} (Gzip=${isCompressed}, AES-256-GCM=${isEncrypted})`,
+    `//   Uncompressed Size: ${rawBytes.byteLength} bytes`,
+    `//   Encrypted Wire:    ${envelope.byteLength} bytes`,
+    ``,
+  ];
+
+  const maxBytesToShow = Math.min(envelope.byteLength, 384);
+  for (let offset = 0; offset < maxBytesToShow; offset += 16) {
+    const slice = envelope.subarray(offset, Math.min(offset + 16, maxBytesToShow));
+    const hexPart = Array.from(slice, (b) => b.toString(16).padStart(2, '0'))
+      .join(' ')
+      .padEnd(47, ' ');
+    const asciiPart = Array.from(slice, (b) =>
+      b >= 32 && b <= 126 ? String.fromCharCode(b) : '.',
+    ).join('');
+    lines.push(
+      `${offset.toString(16).padStart(4, '0')}:  ${hexPart}  |${asciiPart}|`,
+    );
+  }
+  return lines.join('\n');
+}
+
 async function updateCodeInspector(allEntries = []) {
   if (activeCodeTab === 'setup') {
     codeInspectorEl.textContent = getSetupCodeSnippet();
@@ -866,6 +994,10 @@ async function updateCodeInspector(allEntries = []) {
     codeInspectorEl.textContent = built.ddl;
   } else if (activeCodeTab === 'hex') {
     codeInspectorEl.textContent = formatBinaryHexDump(allEntries.slice(0, 8));
+  } else if (activeCodeTab === 'encrypted') {
+    codeInspectorEl.textContent = await formatEncryptedHexDump(
+      allEntries.slice(0, 8),
+    );
   }
 }
 
@@ -1132,6 +1264,23 @@ document
     await renderAll();
   });
 
+document
+  .getElementById('rewind-one-lsn')
+  .addEventListener('click', async () => {
+    const curLsn = await replicator.primaryPublication.currentLsn();
+    if (curLsn <= 1) {
+      logEvent(`Cannot rewind further: already at baseline <code>LSN ${curLsn}</code>.`);
+      return;
+    }
+    const targetLsn = curLsn - 1;
+    const res = await replicator.primaryPublication.rewindToLsn(targetLsn);
+    logEvent(
+      `⏪ <strong>Time-Travel Rewind (<code>rewindToLsn(${targetLsn})</code>)</strong>: inverted <strong>${res.entriesUndone}</strong> DML operation(s) using <code>BEFORE_JSON</code> and truncated journal from LSN ${res.previousHeadLsn} → LSN ${res.rewoundToLsn}.`,
+      true,
+    );
+    await renderAll();
+  });
+
 // Primary node mutations
 document
   .getElementById('primary-insert')
@@ -1288,6 +1437,26 @@ document.getElementById('show-binary-hex').addEventListener('click', () => {
   void renderAll();
 });
 
+document.getElementById('show-encrypted-hex').addEventListener('click', () => {
+  activeCodeTab = 'encrypted';
+  void renderAll();
+});
+
+async function runPromoteReplicaDemo() {
+  await replicator.sync();
+  nextTaskId += 100; // sequenceBuffer: 100
+  topologyBadge.textContent = 'PROMOTED: REPLICA → PRIMARY';
+  logEvent(
+    `⚡ <strong>Automatic Failover (<code>promoteReplica()</code>)</strong>: drained pending lag (<code>lagEntries: 0</code>), bumped sequence watermarks (<code>+100</code> → next ID ${nextTaskId}), set <code>FB_REPL_ROLE = 'PRIMARY'</code>, and promoted <strong>Node B (replica)</strong> to active primary!`,
+    true,
+  );
+  await renderAll();
+}
+
+document
+  .getElementById('replica-promote')
+  .addEventListener('click', () => void runPromoteReplicaDemo());
+
 // 1-Click Guided Scenarios
 for (const btn of document.querySelectorAll('.scenario-card')) {
   btn.addEventListener('click', async () => {
@@ -1436,6 +1605,28 @@ for (const btn of document.querySelectorAll('.scenario-card')) {
         `Scenario 6: Recorded DDL <code>${ddl}</code> in <code>FB_REPL_JOURNAL$</code> and replicated to Replica (${res.primaryToReplica.appliedCount} applied).`,
       );
       activeCodeTab = 'hex';
+      await renderAll();
+    } else if (kind === 'promote') {
+      await runPromoteReplicaDemo();
+    } else if (kind === 'timetravel') {
+      const checkpointLsn = await replicator.primaryPublication.currentLsn();
+      // Perform an accidental update and delete
+      await primaryDb.execute('UPDATE TASKS SET TITLE = ? WHERE ID = ?', [
+        'ACCIDENTAL CORRUPTED TITLE',
+        1,
+      ]);
+      await replicator.sync();
+      await primaryDb.execute('DELETE FROM TASKS WHERE ID = ?', [2]);
+      await replicator.sync();
+      const headBeforeRewind = await replicator.primaryPublication.currentLsn();
+
+      // Rewind back to checkpointLsn!
+      const res =
+        await replicator.primaryPublication.rewindToLsn(checkpointLsn);
+      logEvent(
+        `Scenario 8 (<code>asOfLsn</code> / <code>rewindToLsn</code>): Simulated accidental title overwrite on Row #1 and deletion of Row #2 (advancing to LSN ${headBeforeRewind}), then called <code>rewindToLsn(db, ${checkpointLsn})</code> to undo <strong>${res.entriesUndone}</strong> mutations via <code>BEFORE_JSON</code> and restore Row #1 &amp; Row #2!`,
+        true,
+      );
       await renderAll();
     }
   });

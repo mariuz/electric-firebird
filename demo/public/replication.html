@@ -449,6 +449,14 @@
           <strong>6. Schema DDL Replication</strong>
           <span>Record an ALTER TABLE DDL entry in FB_REPL_JOURNAL$ and replicate schema changes to Replica.</span>
         </button>
+        <button type="button" class="scenario-card" data-scenario="promote">
+          <strong>7. Failover Promotion (<code>promoteReplica</code>)</strong>
+          <span>Drain pending lag, bump sequence watermarks (+100), set FB_REPL_ROLE='PRIMARY', and promote Replica!</span>
+        </button>
+        <button type="button" class="scenario-card" data-scenario="timetravel">
+          <strong>8. Time-Travel &amp; Rollback (<code>rewindToLsn</code>)</strong>
+          <span>Perform accidental updates/deletes, inspect historical state via asOfLsn(), and rewind back in time!</span>
+        </button>
       </section>
 
       <!-- Dual Database Nodes Grid -->
@@ -517,6 +525,7 @@
             <button type="button" class="btn-sm" id="replica-toggle-done">Toggle DONE (#1)</button>
             <button type="button" class="btn-sm" id="replica-crdt-bump">+3 STOCK &amp; Tag (#1)</button>
             <button type="button" class="btn-sm" id="replica-update-title">Rename Row #1 (Replica)</button>
+            <button type="button" class="btn-sm" id="replica-promote">⚡ Promote to Primary</button>
           </div>
 
           <div class="table-wrap">
@@ -556,6 +565,7 @@
               <button type="button" class="btn-sm" id="add-lagging-slot">+ Lagging Slot (analytics_dr)</button>
               <button type="button" class="btn-sm" id="advance-lagging-slot">Advance analytics_dr</button>
               <button type="button" class="btn-sm" id="drop-lagging-slot">Drop analytics_dr</button>
+              <button type="button" class="btn-sm" id="rewind-one-lsn">⏪ Rewind 1 LSN (<code>rewindToLsn</code>)</button>
             </div>
           </div>
 
@@ -587,6 +597,7 @@
               <button type="button" class="btn-sm" id="show-setup-code">Setup TS</button>
               <button type="button" class="btn-sm" id="show-trigger-ddl">PSQL Trigger DDL</button>
               <button type="button" class="btn-sm" id="show-binary-hex">Binary Segment (0x52444246)</button>
+              <button type="button" class="btn-sm" id="show-encrypted-hex">AES-GCM + Gzip (0x53444246)</button>
             </div>
           </div>
           <pre class="code-pre" id="code-inspector"></pre>
