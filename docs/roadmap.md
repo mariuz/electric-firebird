@@ -1423,7 +1423,7 @@ Next-horizon milestones for `v0.17.0`:
       Export and import compact binary page deltas between any two Copy-on-Write
       snapshots (`db.snapshot()`) for lightweight cloud backup and sync
       checkpoints.
-- [ ] **Database Replication (`firebird-wasm/replication` — Logical & Journal-Based Primary/Replica Sync).**
+- [x] **Database Replication (`firebird-wasm/replication` — Logical & Journal-Based Primary/Replica Sync).**
       Support continuous primary-to-replica and bidirectional logical/journal
       replication between `FirebirdLite` (server/embedded) and `FirebirdBrowser`
       (WASM) instances, with publication/subscription management, LSN/transaction
