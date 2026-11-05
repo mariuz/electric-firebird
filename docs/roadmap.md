@@ -1464,12 +1464,12 @@ Next-horizon milestones for full end-to-end replication (`v0.18.0`):
       Provide a monotonic Hybrid Logical Clock (`<wallMs>:<counter>:<nodeId>`)
       for skew-tolerant causal ordering, plus per-column LWW-Element-Set,
       additive numeric counter deltas (`PN-Counter`), and set-union merges.
-- [ ] **7. Network Replication Transports (HTTP/SSE, WebSocket & `BroadcastChannel`).**
+- [x] **7. Network Replication Transports (HTTP/SSE, WebSocket & `BroadcastChannel`).**
       Provide pluggable transport adapters (`createHttpReplicationHandler`,
       `createHttpReplicationClient`, `createBroadcastChannelTransport`, and
       WebSocket duplex streaming) connecting `FirebirdBrowser` (WASM) and
       `FirebirdLite` (Node.js server) over the network or across browser contexts.
-- [ ] **8. Firebird 4.0 / 5.0 Native `fb_replication` Binary Journal Segment Bridge & Observability (`replicator.stats()`).**
+- [x] **8. Firebird 4.0 / 5.0 Native `fb_replication` Binary Journal Segment Bridge & Observability (`replicator.stats()`).**
       Parse and emit Firebird 4.0/5.0 native binary replication journal segments
       (`replication.conf` / `IReplicator` protocol compatibility), incremental
       `HnswIndex` / `Bm25Index` hooks on replica apply, and live lag/throughput

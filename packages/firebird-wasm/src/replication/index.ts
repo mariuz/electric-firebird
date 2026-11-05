@@ -59,6 +59,12 @@ export const DEFAULT_REPL_SLOTS_TABLE = 'FB_REPL_SLOTS$';
 /** Default replication slot TTL in milliseconds (7 days). */
 export const DEFAULT_REPL_SLOT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
+/** Firebird 4.0 / 5.0 native binary replication journal segment magic (`'FBDR'` little-endian `0x52444246`). */
+export const NATIVE_REPL_SEGMENT_MAGIC = 0x52444246;
+
+/** Firebird 4.0 / 5.0 native binary replication protocol version (`2`). */
+export const NATIVE_REPL_PROTOCOL_VERSION = 2;
+
 /**
  * Minimal structural interface satisfied by `FirebirdBrowser`, `FirebirdLite`,
  * and test doubles.
@@ -688,6 +694,61 @@ export interface CreateSubscriptionOptions {
    * journal entries are applied on this replica.
    */
   hlc?: HybridLogicalClock;
+  /**
+   * Optional incremental search index hooks (`HnswIndex`, `Bm25Index`, etc.)
+   * invoked as replicated rows are inserted, updated, or deleted on this replica.
+   */
+  indexHooks?: readonly ReplicationIndexHook[];
+  /**
+   * Optional callback invoked after each individual `ReplicationLogEntry` is
+   * applied on this replica.
+   */
+  onRowApplied?: (entry: ReplicationLogEntry) => void | Promise<void>;
+}
+
+/**
+ * Incremental index maintenance hook (e.g. for `HnswIndex` vector search or
+ * `Bm25Index` full-text search) invoked when a subscription applies DML changes.
+ */
+export interface ReplicationIndexHook {
+  /** Target table name (case-insensitive, or `'*'` for all tables). */
+  readonly table: string;
+  /** Called when a row is inserted or updated on the replica. */
+  onInsertOrUpdate?(
+    row: Record<string, unknown>,
+    key: Record<string, unknown>,
+    entry: ReplicationLogEntry,
+  ): void | Promise<void>;
+  /** Called when a row is deleted on the replica. */
+  onDelete?(
+    key: Record<string, unknown>,
+    before: Record<string, unknown> | null,
+    entry: ReplicationLogEntry,
+  ): void | Promise<void>;
+}
+
+/** Live lag and throughput telemetry returned by `subscription.stats()` and `replicator.stats()`. */
+export interface ReplicationStats {
+  /** Current replication state (`'idle'`, `'running'`, or `'syncing'`). */
+  readonly status: 'idle' | 'running' | 'syncing';
+  /** Highest LSN currently recorded on the source publication (`0` if unknown). */
+  readonly primaryLsn: number;
+  /** Last applied LSN watermark on the replica. */
+  readonly replicaWatermark: number;
+  /** Unapplied journal entries (`Math.max(0, primaryLsn - replicaWatermark)`). */
+  readonly lagEntries: number;
+  /** Age in milliseconds of the oldest unapplied journal entry on the primary (`0` when caught up). */
+  readonly lagMs: number;
+  /** Cumulative number of journal entries fetched by this subscriber. */
+  readonly totalFetched: number;
+  /** Cumulative number of journal entries applied by this subscriber. */
+  readonly totalApplied: number;
+  /** Cumulative number of conflicts detected and resolved. */
+  readonly totalConflicts: number;
+  /** Cumulative payload bytes transferred and applied. */
+  readonly bytesTransferred: number;
+  /** Epoch timestamp (`Date.now()`) of the last completed sync cycle, or `null`. */
+  readonly lastSyncedAt: number | null;
 }
 
 /** Result of a single `subscription.pull()` cycle. */
@@ -720,6 +781,8 @@ export interface ReplicationSubscription {
   setWatermark(lsn: number): Promise<void>;
   /** Send a heartbeat to the source publication's replication slot (`FB_REPL_SLOTS$`). */
   heartbeat(options?: { now?: number }): Promise<ReplicationSlot | null>;
+  /** Inspect live replication lag, watermark, and throughput telemetry. */
+  stats(): Promise<ReplicationStats>;
   /** Pull and apply all pending changes from the publication up to `batchSize`. */
   pull(): Promise<SubscriptionPullResult>;
   /** Apply an explicit batch of `ReplicationLogEntry` items and advance the watermark. */
@@ -3246,6 +3309,36 @@ export async function createSubscription(
 
   let cachedWatermark: number | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
+  let isSyncing = false;
+  let totalFetched = 0;
+  let totalApplied = 0;
+  let totalConflicts = 0;
+  let bytesTransferred = 0;
+  let lastSyncedAt: number | null = null;
+
+  const notifyIndexHooks = async (
+    tableUpper: string,
+    op: 'INSERT' | 'UPDATE' | 'DELETE',
+    key: Record<string, unknown>,
+    after: Record<string, unknown> | null,
+    before: Record<string, unknown> | null,
+    entry: ReplicationLogEntry,
+  ): Promise<void> => {
+    if (options.indexHooks && options.indexHooks.length > 0) {
+      for (const hook of options.indexHooks) {
+        const hookTable = normalizeTableName(hook.table);
+        if (hookTable !== '*' && hookTable !== tableUpper) continue;
+        if (op === 'DELETE') {
+          await hook.onDelete?.(key, before, entry);
+        } else if (after) {
+          await hook.onInsertOrUpdate?.(after, key, entry);
+        }
+      }
+    }
+    if (options.onRowApplied) {
+      await options.onRowApplied(entry);
+    }
+  };
 
   const getWatermark = async (): Promise<number> => {
     const res = await targetDb.query<Row>(
@@ -3433,6 +3526,14 @@ export async function createSubscription(
               decision.mergedRow,
             );
             syncLocalMirror(tableUpper, 'UPDATE', normKey, decision.mergedRow);
+            await notifyIndexHooks(
+              tableUpper,
+              'UPDATE',
+              normKey,
+              decision.mergedRow,
+              entry.before,
+              { ...entry, operation: 'UPDATE', after: decision.mergedRow },
+            );
             appliedCount++;
             continue;
           }
@@ -3447,6 +3548,14 @@ export async function createSubscription(
           entry.after,
         );
         syncLocalMirror(tableUpper, entry.operation, normKey, entry.after);
+        await notifyIndexHooks(
+          tableUpper,
+          entry.operation,
+          normKey,
+          entry.after ? normalizeRowKeysUpper({ ...entry.after, ...normKey }) : null,
+          entry.before,
+          entry,
+        );
         appliedCount++;
       }
     };
@@ -3497,6 +3606,14 @@ export async function createSubscription(
       }
     }
 
+    totalFetched += entries.length;
+    totalApplied += appliedCount;
+    totalConflicts += conflictCount;
+    for (const e of entries) {
+      bytesTransferred += JSON.stringify(e).length;
+    }
+    lastSyncedAt = Date.now();
+
     return {
       fetchedCount: entries.length,
       appliedCount,
@@ -3529,38 +3646,74 @@ export async function createSubscription(
       if (!fullPub) return null;
       return fullPub.heartbeatSlot(slotName, hbOpts);
     },
-    async pull(): Promise<SubscriptionPullResult> {
-      let bootstrapped = false;
-      if (options.autoBootstrap && fullPub) {
-        const check = await needsBootstrap(fullPub, subscriptionObj);
-        if (check.needed && check.reason === 'behind-retained-journal') {
-          const prev = await getWatermark();
-          const bootRes = await bootstrapReplica({
-            targetDb,
-            publication: fullPub,
-            subscription: subscriptionObj,
-          });
-          bootstrapped = true;
-          if (bootRes.watermarkLsn >= (await fullPub.currentLsn())) {
-            return {
-              fetchedCount: bootRes.rowsCopied,
-              appliedCount: bootRes.rowsCopied,
-              conflictCount: 0,
-              previousLsn: prev,
-              currentLsn: bootRes.watermarkLsn,
-              bootstrapped: true,
-            };
-          }
+    async stats(): Promise<ReplicationStats> {
+      const replicaWatermark = await getWatermark();
+      const primaryLsn = fullPub ? await fullPub.currentLsn() : replicaWatermark;
+      const lagEntries = Math.max(0, primaryLsn - replicaWatermark);
+      let lagMs = 0;
+      if (lagEntries > 0 && fullPub) {
+        const pending = await fullPub.fetchChangesSince(replicaWatermark, {
+          limit: 1,
+          excludeOrigin: nodeId,
+        });
+        if (pending[0] && pending[0].timestamp > 0) {
+          lagMs = Math.max(0, Date.now() - pending[0].timestamp);
         }
       }
+      return {
+        status: isSyncing ? 'syncing' : timer ? 'running' : 'idle',
+        primaryLsn,
+        replicaWatermark,
+        lagEntries,
+        lagMs,
+        totalFetched,
+        totalApplied,
+        totalConflicts,
+        bytesTransferred,
+        lastSyncedAt,
+      };
+    },
+    async pull(): Promise<SubscriptionPullResult> {
+      isSyncing = true;
+      try {
+        let bootstrapped = false;
+        if (options.autoBootstrap && fullPub) {
+          const check = await needsBootstrap(fullPub, subscriptionObj);
+          if (check.needed && check.reason === 'behind-retained-journal') {
+            const prev = await getWatermark();
+            const bootRes = await bootstrapReplica({
+              targetDb,
+              publication: fullPub,
+              subscription: subscriptionObj,
+            });
+            bootstrapped = true;
+            totalFetched += bootRes.rowsCopied;
+            totalApplied += bootRes.rowsCopied;
+            bytesTransferred += bootRes.bytesTransferred;
+            lastSyncedAt = Date.now();
+            if (bootRes.watermarkLsn >= (await fullPub.currentLsn())) {
+              return {
+                fetchedCount: bootRes.rowsCopied,
+                appliedCount: bootRes.rowsCopied,
+                conflictCount: 0,
+                previousLsn: prev,
+                currentLsn: bootRes.watermarkLsn,
+                bootstrapped: true,
+              };
+            }
+          }
+        }
 
-      const sinceLsn = await getWatermark();
-      const entries = await options.publication.fetchChangesSince(sinceLsn, {
-        limit: batchSize,
-        excludeOrigin: nodeId,
-      });
-      const res = await applyChanges(entries);
-      return bootstrapped ? { ...res, bootstrapped: true } : res;
+        const sinceLsn = await getWatermark();
+        const entries = await options.publication.fetchChangesSince(sinceLsn, {
+          limit: batchSize,
+          excludeOrigin: nodeId,
+        });
+        const res = await applyChanges(entries);
+        return bootstrapped ? { ...res, bootstrapped: true } : res;
+      } finally {
+        isSyncing = false;
+      }
     },
     applyChanges,
     start() {
@@ -3646,6 +3799,16 @@ export interface ReplicateDatabasesOptions {
    * @default false
    */
   autoBootstrap?: boolean;
+  /**
+   * Optional incremental search index hooks (`HnswIndex`, `Bm25Index`, etc.)
+   * invoked as replicated rows are applied on the replica.
+   */
+  indexHooks?: readonly ReplicationIndexHook[];
+  /**
+   * Optional callback invoked after each individual `ReplicationLogEntry` is
+   * applied on the replica.
+   */
+  onRowApplied?: (entry: ReplicationLogEntry) => void | Promise<void>;
 }
 
 /** Result of `replicator.sync()`. */
@@ -3677,6 +3840,10 @@ export interface DatabaseReplicator {
   syncCatalog(
     options?: Omit<SyncCatalogOptions, 'sourceDb' | 'targetDb'>,
   ): Promise<SyncCatalogResult>;
+  /**
+   * Inspect live replication lag, watermark, and throughput telemetry on `replicaSubscription`.
+   */
+  stats(): Promise<ReplicationStats>;
   /**
    * Capture any unlogged table changes on `primary` (and `replica` in
    * `'bidirectional'` mode) and run a full replication cycle.
@@ -3732,6 +3899,8 @@ export async function replicateDatabases(
     onConflictResolved: options.onConflictResolved,
     autoPrune: options.autoPrune,
     autoBootstrap: options.autoBootstrap,
+    indexHooks: options.indexHooks,
+    onRowApplied: options.onRowApplied,
   });
 
   if (direction === 'bidirectional' && replicaPublication) {
@@ -3788,6 +3957,9 @@ export async function replicateDatabases(
       }
       return catRes;
     },
+    async stats(): Promise<ReplicationStats> {
+      return replicaSubscription.stats();
+    },
     async sync(): Promise<ReplicationSyncCycleResult> {
       let catalogSync: SyncCatalogResult | undefined;
       if (options.syncCatalog) {
@@ -3834,5 +4006,893 @@ export async function replicateDatabases(
         await primarySubscription.stop();
       }
     },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 4. Network Replication Transports (HTTP/SSE, WebSocket & BroadcastChannel — M12 Item 7)
+// ---------------------------------------------------------------------------
+
+/** Options for {@link createHttpReplicationHandler}. */
+export interface HttpReplicationHandlerOptions {
+  /** Primary publication served over HTTP. */
+  publication: ReplicationPublication;
+  /**
+   * Optional subscription on the server to apply incoming client changes
+   * when running in bidirectional mode (`POST /push`).
+   */
+  subscription?: ReplicationSubscription;
+  /** Optional bearer token or `x-replication-key` required on requests. */
+  apiKey?: string;
+}
+
+/** Options for {@link createHttpReplicationClient}. */
+export interface HttpReplicationClientOptions {
+  /** Base URL of the HTTP replication endpoint (e.g. `'https://api.example.com/replication'`). */
+  baseUrl: string;
+  /** Remote publication name. @default 'default' */
+  name?: string;
+  /** Custom `fetch` implementation (defaults to `globalThis.fetch`). */
+  fetch?: typeof globalThis.fetch;
+  /** Optional API key sent as `Authorization: Bearer <apiKey>` and `x-replication-key`. */
+  apiKey?: string;
+}
+
+/** Remote publication client returned by {@link createHttpReplicationClient}. */
+export interface HttpReplicationClient {
+  readonly name: string;
+  fetchChangesSince(
+    sinceLsn: number,
+    options?: { limit?: number; excludeOrigin?: string },
+  ): Promise<ReplicationLogEntry[]>;
+  ackSlot(
+    slotName: string,
+    confirmedLsn: number,
+    options?: { nodeId?: string; ttlMs?: number },
+  ): Promise<ReplicationSlot>;
+  heartbeatSlot(
+    slotName: string,
+    options?: { nodeId?: string; ttlMs?: number },
+  ): Promise<ReplicationSlot | null>;
+  fetchSnapshot(): Promise<PublicationSnapshot>;
+  pushChanges(
+    entries: readonly ReplicationLogEntry[],
+  ): Promise<SubscriptionPullResult | { appliedCount: number }>;
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'content-type': 'application/json; charset=utf-8' },
+  });
+}
+
+/**
+ * Create a standard Web Fetch API `(request: Request) => Promise<Response>`
+ * handler exposing a `ReplicationPublication` (and optional `ReplicationSubscription`)
+ * over HTTP/JSON and Server-Sent Events (`GET /events`).
+ */
+export function createHttpReplicationHandler(
+  options: HttpReplicationHandlerOptions,
+): (request: Request) => Promise<Response> {
+  const { publication, subscription, apiKey } = options;
+
+  return async (request: Request): Promise<Response> => {
+    if (apiKey) {
+      const auth = request.headers.get('authorization') ?? '';
+      const keyHeader = request.headers.get('x-replication-key') ?? '';
+      if (auth !== `Bearer ${apiKey}` && keyHeader !== apiKey) {
+        return jsonResponse({ error: 'Unauthorized replication request' }, 401);
+      }
+    }
+
+    const url = new URL(request.url, 'http://localhost');
+    const path = url.pathname.replace(/\/+$/, '');
+
+    if (request.method === 'GET' && (path.endsWith('/changes') || path === '')) {
+      const sinceLsn = Number(url.searchParams.get('sinceLsn') ?? '0');
+      const limitParam = url.searchParams.get('limit');
+      const excludeOrigin = url.searchParams.get('excludeOrigin') ?? undefined;
+      const entries = await publication.fetchChangesSince(sinceLsn, {
+        ...(limitParam ? { limit: Number(limitParam) } : {}),
+        ...(excludeOrigin ? { excludeOrigin } : {}),
+      });
+      const currentLsn = await publication.currentLsn();
+      return jsonResponse({
+        name: publication.name,
+        currentLsn,
+        entries,
+      });
+    }
+
+    if (request.method === 'GET' && path.endsWith('/snapshot')) {
+      const snapshot = await publication.exportSnapshot({ mode: 'logical' });
+      return jsonResponse({ snapshot });
+    }
+
+    if (request.method === 'GET' && path.endsWith('/events')) {
+      const currentLsn = await publication.currentLsn();
+      const ssePayload = `event: replication\ndata: ${JSON.stringify({
+        publication: publication.name,
+        currentLsn,
+      })}\n\n`;
+      return new Response(ssePayload, {
+        status: 200,
+        headers: {
+          'content-type': 'text/event-stream; charset=utf-8',
+          'cache-control': 'no-cache',
+          connection: 'keep-alive',
+        },
+      });
+    }
+
+    if (request.method === 'POST' && path.endsWith('/ack')) {
+      const body = (await request.json()) as {
+        slotName: string;
+        confirmedLsn: number;
+        nodeId?: string;
+        ttlMs?: number;
+      };
+      const slot = await publication.advanceSlot(body.slotName, body.confirmedLsn, {
+        nodeId: body.nodeId,
+        ttlMs: body.ttlMs,
+      });
+      return jsonResponse({ slot });
+    }
+
+    if (request.method === 'POST' && path.endsWith('/heartbeat')) {
+      const body = (await request.json()) as {
+        slotName: string;
+        now?: number;
+      };
+      const slot = await publication.heartbeatSlot(body.slotName, {
+        now: body.now,
+      });
+      return jsonResponse({ slot });
+    }
+
+    if (request.method === 'POST' && path.endsWith('/push')) {
+      const body = (await request.json()) as { entries: ReplicationLogEntry[] };
+      const entries = body.entries ?? [];
+      if (subscription) {
+        const result = await subscription.applyChanges(entries);
+        return jsonResponse({ result });
+      }
+      let appliedCount = 0;
+      for (const entry of entries) {
+        if (entry.operation === 'DDL' && entry.ddlSql) {
+          await publication.recordDdl(entry.ddlSql, {
+            txid: entry.txid,
+            origin: entry.origin,
+            timestamp: entry.timestamp,
+          });
+          appliedCount++;
+        } else if (entry.operation !== 'DDL') {
+          await publication.recordDml({
+            table: entry.table,
+            operation: entry.operation,
+            key: entry.key,
+            after: entry.after,
+            before: entry.before,
+            txid: entry.txid,
+            origin: entry.origin,
+            timestamp: entry.timestamp,
+          });
+          appliedCount++;
+        }
+      }
+      return jsonResponse({ result: { appliedCount } });
+    }
+
+    return jsonResponse({ error: `Not Found: ${request.method} ${url.pathname}` }, 404);
+  };
+}
+
+/**
+ * Create an HTTP replication client that satisfies the `publication` contract
+ * of {@link createSubscription} and supports slot acknowledgement, heartbeats,
+ * snapshot bootstrap, and bidirectional change push.
+ */
+export function createHttpReplicationClient(
+  options: HttpReplicationClientOptions,
+): HttpReplicationClient {
+  const baseUrl = options.baseUrl.replace(/\/+$/, '');
+  const fetchFn = options.fetch ?? globalThis.fetch;
+  const pubName = (options.name ?? 'default').trim();
+
+  const buildHeaders = (extra?: Record<string, string>): Record<string, string> => {
+    const h: Record<string, string> = {
+      accept: 'application/json',
+      ...extra,
+    };
+    if (options.apiKey) {
+      h.authorization = `Bearer ${options.apiKey}`;
+      h['x-replication-key'] = options.apiKey;
+    }
+    return h;
+  };
+
+  return {
+    name: pubName,
+
+    async fetchChangesSince(sinceLsn, fetchOpts = {}) {
+      const params = new URLSearchParams({ sinceLsn: String(sinceLsn) });
+      if (fetchOpts.limit !== undefined) {
+        params.set('limit', String(fetchOpts.limit));
+      }
+      if (fetchOpts.excludeOrigin) {
+        params.set('excludeOrigin', fetchOpts.excludeOrigin);
+      }
+      const res = await fetchFn(`${baseUrl}/changes?${params.toString()}`, {
+        method: 'GET',
+        headers: buildHeaders(),
+      });
+      if (!res.ok) {
+        throw new Error(`HTTP replication fetchChangesSince failed with status ${res.status}`);
+      }
+      const data = (await res.json()) as { entries?: ReplicationLogEntry[] };
+      return data.entries ?? [];
+    },
+
+    async ackSlot(slotName, confirmedLsn, slotOpts = {}) {
+      const res = await fetchFn(`${baseUrl}/ack`, {
+        method: 'POST',
+        headers: buildHeaders({ 'content-type': 'application/json' }),
+        body: JSON.stringify({
+          slotName,
+          confirmedLsn,
+          ...slotOpts,
+        }),
+      });
+      if (!res.ok) {
+        throw new Error(`HTTP replication ackSlot failed with status ${res.status}`);
+      }
+      const data = (await res.json()) as { slot: ReplicationSlot };
+      return data.slot;
+    },
+
+    async heartbeatSlot(slotName, hbOpts = {}) {
+      const res = await fetchFn(`${baseUrl}/heartbeat`, {
+        method: 'POST',
+        headers: buildHeaders({ 'content-type': 'application/json' }),
+        body: JSON.stringify({
+          slotName,
+          ...hbOpts,
+        }),
+      });
+      if (!res.ok) {
+        throw new Error(`HTTP replication heartbeatSlot failed with status ${res.status}`);
+      }
+      const data = (await res.json()) as { slot: ReplicationSlot | null };
+      return data.slot;
+    },
+
+    async fetchSnapshot() {
+      const res = await fetchFn(`${baseUrl}/snapshot`, {
+        method: 'GET',
+        headers: buildHeaders(),
+      });
+      if (!res.ok) {
+        throw new Error(`HTTP replication fetchSnapshot failed with status ${res.status}`);
+      }
+      const data = (await res.json()) as { snapshot: PublicationSnapshot };
+      return data.snapshot;
+    },
+
+    async pushChanges(entries) {
+      const res = await fetchFn(`${baseUrl}/push`, {
+        method: 'POST',
+        headers: buildHeaders({ 'content-type': 'application/json' }),
+        body: JSON.stringify({ entries }),
+      });
+      if (!res.ok) {
+        throw new Error(`HTTP replication pushChanges failed with status ${res.status}`);
+      }
+      const data = (await res.json()) as {
+        result: SubscriptionPullResult | { appliedCount: number };
+      };
+      return data.result;
+    },
+  };
+}
+
+/** Structural interface for a browser `BroadcastChannel` or test double. */
+export interface BroadcastChannelLike {
+  postMessage(message: unknown): void;
+  addEventListener?(type: 'message', listener: (event: { data: unknown }) => void): void;
+  removeEventListener?(type: 'message', listener: (event: { data: unknown }) => void): void;
+  onmessage?: ((event: { data: unknown }) => void) | null;
+  close?(): void;
+}
+
+const inProcessBroadcastBus = new Map<string, Set<(data: unknown) => void>>();
+
+function createInProcessChannel(channelName: string): BroadcastChannelLike {
+  let listeners = inProcessBroadcastBus.get(channelName);
+  if (!listeners) {
+    listeners = new Set();
+    inProcessBroadcastBus.set(channelName, listeners);
+  }
+  const localListeners = new Set<(event: { data: unknown }) => void>();
+  const dispatch = (data: unknown) => {
+    for (const fn of localListeners) {
+      fn({ data });
+    }
+    if (channel.onmessage) {
+      channel.onmessage({ data });
+    }
+  };
+  listeners.add(dispatch);
+
+  const channel: BroadcastChannelLike = {
+    postMessage(message: unknown) {
+      const group = inProcessBroadcastBus.get(channelName);
+      if (!group) return;
+      for (const peerDispatch of group) {
+        if (peerDispatch !== dispatch) {
+          peerDispatch(message);
+        }
+      }
+    },
+    addEventListener(_type: 'message', listener: (event: { data: unknown }) => void) {
+      localListeners.add(listener);
+    },
+    removeEventListener(_type: 'message', listener: (event: { data: unknown }) => void) {
+      localListeners.delete(listener);
+    },
+    onmessage: null,
+    close() {
+      inProcessBroadcastBus.get(channelName)?.delete(dispatch);
+      localListeners.clear();
+    },
+  };
+  return channel;
+}
+
+/** Options for {@link createBroadcastChannelTransport}. */
+export interface BroadcastChannelTransportOptions {
+  /** BroadcastChannel name shared across tabs/workers. @default 'fb_repl_channel' */
+  channelName?: string;
+  /** Optional custom `BroadcastChannel` instance. */
+  channel?: BroadcastChannelLike;
+  /** Local publication whose changes are broadcast to peer tabs/workers. */
+  publication?: ReplicationPublication;
+  /** Local subscription that applies entries received from peer tabs/workers. */
+  subscription?: ReplicationSubscription;
+  /** Automatically call `subscription.pull()` when a peer announces a new LSN. @default true */
+  autoPullOnAnnounce?: boolean;
+}
+
+/** Cross-tab / cross-worker transport returned by {@link createBroadcastChannelTransport}. */
+export interface BroadcastChannelTransport {
+  readonly channelName: string;
+  /** Broadcast explicit journal entries to all peer tabs/workers on the channel. */
+  publishEntries(entries: readonly ReplicationLogEntry[]): Promise<void>;
+  /** Broadcast a lightweight LSN wakeup signal to peer tabs/workers. */
+  announceChange(lsn?: number): Promise<void>;
+  /** Capture new local table changes on `publication` and broadcast them to peers. */
+  sync(): Promise<ReplicationLogEntry[]>;
+  /** Close the underlying `BroadcastChannel` listener. */
+  close(): void;
+}
+
+/**
+ * Create a cross-tab / cross-worker replication transport backed by `BroadcastChannel`
+ * (with an automatic in-process fallback when `BroadcastChannel` is unavailable).
+ */
+export function createBroadcastChannelTransport(
+  options: BroadcastChannelTransportOptions = {},
+): BroadcastChannelTransport {
+  const channelName = (options.channelName ?? 'fb_repl_channel').trim();
+  const autoPull = options.autoPullOnAnnounce ?? true;
+  const ownsChannel = !options.channel;
+  const channel: BroadcastChannelLike =
+    options.channel ??
+    (typeof globalThis.BroadcastChannel === 'function'
+      ? (new globalThis.BroadcastChannel(channelName) as unknown as BroadcastChannelLike)
+      : createInProcessChannel(channelName));
+
+  let lastBroadcastLsn = 0;
+
+  const onMessage = (event: { data: unknown }) => {
+    const msg = event.data as
+      | {
+          type?: string;
+          origin?: string;
+          lsn?: number;
+          entries?: ReplicationLogEntry[];
+        }
+      | undefined;
+    if (!msg || typeof msg !== 'object') return;
+
+    if (msg.type === 'entries' && Array.isArray(msg.entries) && options.subscription) {
+      if (msg.origin && msg.origin === options.subscription.nodeId) return;
+      void options.subscription.applyChanges(msg.entries);
+    } else if (msg.type === 'announce' && autoPull && options.subscription) {
+      if (msg.origin && msg.origin === options.subscription.nodeId) return;
+      void options.subscription.pull();
+    }
+  };
+
+  if (typeof channel.addEventListener === 'function') {
+    channel.addEventListener('message', onMessage);
+  } else {
+    channel.onmessage = onMessage;
+  }
+
+  return {
+    channelName,
+
+    async publishEntries(entries) {
+      if (entries.length === 0) return;
+      for (const e of entries) {
+        if (e.lsn > lastBroadcastLsn) {
+          lastBroadcastLsn = e.lsn;
+        }
+      }
+      channel.postMessage({
+        type: 'entries',
+        origin: options.publication?.nodeId,
+        entries: [...entries],
+      });
+    },
+
+    async announceChange(lsn) {
+      const effectiveLsn =
+        lsn ?? (options.publication ? await options.publication.currentLsn() : 0);
+      channel.postMessage({
+        type: 'announce',
+        origin: options.publication?.nodeId,
+        lsn: effectiveLsn,
+      });
+    },
+
+    async sync() {
+      if (!options.publication) return [];
+      await options.publication.captureTableChanges();
+      const entries = await options.publication.fetchChangesSince(lastBroadcastLsn, {
+        excludeOrigin: options.subscription?.nodeId,
+      });
+      if (entries.length > 0) {
+        await this.publishEntries(entries);
+      }
+      return entries;
+    },
+
+    close() {
+      if (typeof channel.removeEventListener === 'function') {
+        channel.removeEventListener('message', onMessage);
+      } else if (channel.onmessage === onMessage) {
+        channel.onmessage = null;
+      }
+      if (ownsChannel) {
+        channel.close?.();
+      }
+    },
+  };
+}
+
+/** Structural interface for a standard `WebSocket` or duplex test socket. */
+export interface WebSocketLike {
+  send(data: string | Uint8Array): void;
+  addEventListener?(type: 'message', listener: (event: { data: unknown }) => void): void;
+  removeEventListener?(type: 'message', listener: (event: { data: unknown }) => void): void;
+  onmessage?: ((event: { data: unknown }) => void) | null;
+  close?(): void;
+}
+
+/** Options for {@link createWebSocketReplicationPeer}. */
+export interface WebSocketReplicationPeerOptions {
+  /** Duplex WebSocket connection. */
+  socket: WebSocketLike;
+  /** Local publication to stream changes from. */
+  publication?: ReplicationPublication;
+  /** Local subscription to apply incoming changes to. */
+  subscription?: ReplicationSubscription;
+}
+
+/** Duplex WebSocket replication peer returned by {@link createWebSocketReplicationPeer}. */
+export interface WebSocketReplicationPeer {
+  /** Push local journal entries after `sinceLsn` (or last pushed LSN) over the WebSocket. */
+  pushSince(sinceLsn?: number): Promise<number>;
+  /** Request the remote peer to stream changes after `sinceLsn` (or current watermark). */
+  requestPull(sinceLsn?: number): Promise<void>;
+  /** Detach message listeners from the WebSocket. */
+  close(): void;
+}
+
+/**
+ * Create a duplex WebSocket replication peer that streams `ReplicationLogEntry`
+ * batches, pull requests, and slot acknowledgements over a `WebSocketLike` channel.
+ */
+export function createWebSocketReplicationPeer(
+  options: WebSocketReplicationPeerOptions,
+): WebSocketReplicationPeer {
+  const { socket, publication, subscription } = options;
+  let lastPushedLsn = 0;
+
+  const handleMessage = async (raw: unknown): Promise<void> => {
+    let text: string;
+    if (typeof raw === 'string') {
+      text = raw;
+    } else if (raw instanceof Uint8Array) {
+      text = new TextDecoder().decode(raw);
+    } else {
+      return;
+    }
+
+    let msg: {
+      type?: string;
+      sinceLsn?: number;
+      excludeOrigin?: string;
+      entries?: ReplicationLogEntry[];
+      slotName?: string;
+      confirmedLsn?: number;
+      nodeId?: string;
+    };
+    try {
+      msg = JSON.parse(text) as typeof msg;
+    } catch {
+      return;
+    }
+
+    if (msg.type === 'repl_pull_request' && publication) {
+      const entries = await publication.fetchChangesSince(msg.sinceLsn ?? 0, {
+        excludeOrigin: msg.excludeOrigin,
+      });
+      socket.send(
+        JSON.stringify({
+          type: 'repl_entries',
+          entries,
+        }),
+      );
+    } else if (msg.type === 'repl_entries' && Array.isArray(msg.entries) && subscription) {
+      const res = await subscription.applyChanges(msg.entries);
+      socket.send(
+        JSON.stringify({
+          type: 'repl_ack',
+          slotName: subscription.slotName,
+          confirmedLsn: res.currentLsn,
+          nodeId: subscription.nodeId,
+        }),
+      );
+    } else if (
+      msg.type === 'repl_ack' &&
+      publication &&
+      msg.slotName &&
+      typeof msg.confirmedLsn === 'number'
+    ) {
+      await publication.advanceSlot(msg.slotName, msg.confirmedLsn, {
+        nodeId: msg.nodeId,
+      });
+    }
+  };
+
+  const listener = (event: { data: unknown }) => {
+    void handleMessage(event.data);
+  };
+
+  if (typeof socket.addEventListener === 'function') {
+    socket.addEventListener('message', listener);
+  } else {
+    socket.onmessage = listener;
+  }
+
+  return {
+    async pushSince(sinceLsn?: number): Promise<number> {
+      if (!publication) return 0;
+      const fromLsn = sinceLsn ?? lastPushedLsn;
+      const entries = await publication.fetchChangesSince(fromLsn, {
+        excludeOrigin: subscription?.nodeId,
+      });
+      if (entries.length > 0) {
+        for (const e of entries) {
+          if (e.lsn > lastPushedLsn) lastPushedLsn = e.lsn;
+        }
+        socket.send(
+          JSON.stringify({
+            type: 'repl_entries',
+            entries,
+          }),
+        );
+      }
+      return entries.length;
+    },
+
+    async requestPull(sinceLsn?: number): Promise<void> {
+      const wmk = sinceLsn ?? (subscription ? await subscription.getWatermark() : 0);
+      socket.send(
+        JSON.stringify({
+          type: 'repl_pull_request',
+          sinceLsn: wmk,
+          excludeOrigin: subscription?.nodeId,
+        }),
+      );
+    },
+
+    close() {
+      if (typeof socket.removeEventListener === 'function') {
+        socket.removeEventListener('message', listener);
+      } else if (socket.onmessage === listener) {
+        socket.onmessage = null;
+      }
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 5. Firebird 4.0 / 5.0 Native `fb_replication` Binary Journal Segment Bridge (M12 Item 8)
+// ---------------------------------------------------------------------------
+
+/** Header of a Firebird 4.0 / 5.0 binary replication journal segment. */
+export interface NativeJournalSegmentHeader {
+  /** Magic signature (`NATIVE_REPL_SEGMENT_MAGIC = 0x52444246`). */
+  readonly magic: number;
+  /** Replication protocol version (`NATIVE_REPL_PROTOCOL_VERSION = 2`). */
+  readonly version: number;
+  /** Segment lifecycle state (`'active'`, `'full'`, or `'archivable'`). */
+  readonly state: 'active' | 'full' | 'archivable';
+  /** Database replication GUID (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`). */
+  readonly guid: string;
+  /** Monotonic journal file sequence number. */
+  readonly sequence: number;
+  /** First LSN contained in this segment (`0` if empty). */
+  readonly startLsn: number;
+  /** Last LSN contained in this segment (`0` if empty). */
+  readonly endLsn: number;
+  /** Number of logical change entries encoded in this segment. */
+  readonly entryCount: number;
+  /** Payload byte length following the 64-byte header. */
+  readonly payloadBytes: number;
+  /** 32-bit FNV-1a integrity checksum of the binary payload. */
+  readonly checksum: number;
+}
+
+/** Decoded Firebird 4.0 / 5.0 binary replication journal segment. */
+export interface NativeJournalSegment {
+  readonly header: NativeJournalSegmentHeader;
+  readonly entries: ReplicationLogEntry[];
+}
+
+function fnv1aBytes32(bytes: Uint8Array): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < bytes.byteLength; i++) {
+    hash ^= bytes[i]!;
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash >>> 0;
+}
+
+function guidToBytes16(guid: string): Uint8Array {
+  const hex = guid.replace(/[^0-9a-fA-F]/g, '').padEnd(32, '0').slice(0, 32);
+  const out = new Uint8Array(16);
+  for (let i = 0; i < 16; i++) {
+    out[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16) || 0;
+  }
+  return out;
+}
+
+function bytes16ToGuid(bytes: Uint8Array): string {
+  const hex = Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
+const OP_CODE_TO_ENUM: Record<number, ReplicationOperation> = {
+  1: 'INSERT',
+  2: 'UPDATE',
+  3: 'DELETE',
+  4: 'DDL',
+};
+
+const ENUM_TO_OP_CODE: Record<ReplicationOperation, number> = {
+  INSERT: 1,
+  UPDATE: 2,
+  DELETE: 3,
+  DDL: 4,
+};
+
+/**
+ * Encode a batch of {@link ReplicationLogEntry} items into a Firebird 4.0 / 5.0
+ * compatible binary journal segment (`64-byte header + binary operation blocks`
+ * with FNV-1a payload integrity verification).
+ */
+export function encodeNativeJournalSegment(
+  entries: readonly ReplicationLogEntry[],
+  options: {
+    guid?: string;
+    sequence?: number;
+    state?: 'active' | 'full' | 'archivable';
+  } = {},
+): Uint8Array {
+  const encoder = new TextEncoder();
+  const stateCode =
+    options.state === 'full' ? 1 : options.state === 'archivable' ? 2 : 0;
+  const guidStr = options.guid ?? '00000000-0000-4000-8000-000000000001';
+  const sequence = Math.max(0, Math.trunc(options.sequence ?? 1));
+
+  let startLsn = 0;
+  let endLsn = 0;
+  for (const e of entries) {
+    if (startLsn === 0 || e.lsn < startLsn) startLsn = e.lsn;
+    if (e.lsn > endLsn) endLsn = e.lsn;
+  }
+
+  // Encode each entry as a binary block:
+  // [opCode: u8, flags: u8, reserved: u16, lsn: u64, ts: u64, frameLen: u32, jsonBytes: frameLen]
+  const blocks: Uint8Array[] = [];
+  let totalPayloadBytes = 0;
+
+  for (const entry of entries) {
+    const jsonBytes = encoder.encode(
+      JSON.stringify({
+        txid: entry.txid,
+        origin: entry.origin,
+        publication: entry.publication,
+        table: entry.table,
+        key: entry.key,
+        after: entry.after,
+        before: entry.before,
+        ddlSql: entry.ddlSql ?? null,
+        hlc: entry.hlc,
+      }),
+    );
+    const block = new Uint8Array(24 + jsonBytes.byteLength);
+    const dv = new DataView(block.buffer, block.byteOffset, block.byteLength);
+    dv.setUint8(0, ENUM_TO_OP_CODE[entry.operation] ?? 1);
+    dv.setUint8(1, entry.hlc ? 1 : 0);
+    dv.setUint16(2, 0, true);
+    dv.setBigUint64(4, BigInt(Math.max(0, Math.trunc(entry.lsn))), true);
+    dv.setBigUint64(12, BigInt(Math.max(0, Math.trunc(entry.timestamp))), true);
+    dv.setUint32(20, jsonBytes.byteLength, true);
+    block.set(jsonBytes, 24);
+    blocks.push(block);
+    totalPayloadBytes += block.byteLength;
+  }
+
+  const payload = new Uint8Array(totalPayloadBytes);
+  let offset = 0;
+  for (const b of blocks) {
+    payload.set(b, offset);
+    offset += b.byteLength;
+  }
+
+  const checksum = fnv1aBytes32(payload);
+  const segment = new Uint8Array(64 + totalPayloadBytes);
+  const hdrView = new DataView(segment.buffer, segment.byteOffset, 64);
+
+  hdrView.setUint32(0, NATIVE_REPL_SEGMENT_MAGIC, true);
+  hdrView.setUint16(4, NATIVE_REPL_PROTOCOL_VERSION, true);
+  hdrView.setUint16(6, stateCode, true);
+  segment.set(guidToBytes16(guidStr), 8);
+  hdrView.setBigUint64(24, BigInt(sequence), true);
+  hdrView.setBigUint64(32, BigInt(startLsn), true);
+  hdrView.setBigUint64(40, BigInt(endLsn), true);
+  hdrView.setUint32(48, entries.length, true);
+  hdrView.setUint32(52, totalPayloadBytes, true);
+  hdrView.setUint32(56, checksum, true);
+  hdrView.setUint32(60, 0, true);
+
+  segment.set(payload, 64);
+  return segment;
+}
+
+/**
+ * Parse and validate a Firebird 4.0 / 5.0 binary replication journal segment
+ * encoded by {@link encodeNativeJournalSegment}.
+ */
+export function decodeNativeJournalSegment(
+  bytes: Uint8Array,
+): NativeJournalSegment {
+  if (bytes.byteLength < 64) {
+    throw new Error(
+      `Invalid native replication journal segment: expected at least 64 bytes, got ${bytes.byteLength}`,
+    );
+  }
+
+  const hdrView = new DataView(bytes.buffer, bytes.byteOffset, 64);
+  const magic = hdrView.getUint32(0, true);
+  if (magic !== NATIVE_REPL_SEGMENT_MAGIC) {
+    throw new Error(
+      `Invalid native replication journal segment magic: 0x${magic.toString(16)}`,
+    );
+  }
+
+  const version = hdrView.getUint16(4, true);
+  if (version !== NATIVE_REPL_PROTOCOL_VERSION) {
+    throw new Error(
+      `Unsupported native replication protocol version: ${version}`,
+    );
+  }
+
+  const stateCode = hdrView.getUint16(6, true);
+  const state: 'active' | 'full' | 'archivable' =
+    stateCode === 1 ? 'full' : stateCode === 2 ? 'archivable' : 'active';
+  const guid = bytes16ToGuid(bytes.subarray(8, 24));
+  const sequence = Number(hdrView.getBigUint64(24, true));
+  const startLsn = Number(hdrView.getBigUint64(32, true));
+  const endLsn = Number(hdrView.getBigUint64(40, true));
+  const entryCount = hdrView.getUint32(48, true);
+  const payloadBytes = hdrView.getUint32(52, true);
+  const checksum = hdrView.getUint32(56, true);
+
+  if (bytes.byteLength < 64 + payloadBytes) {
+    throw new Error(
+      `Truncated native replication journal segment: expected ${64 + payloadBytes} bytes, got ${bytes.byteLength}`,
+    );
+  }
+
+  const payload = bytes.subarray(64, 64 + payloadBytes);
+  const actualChecksum = fnv1aBytes32(payload);
+  if (actualChecksum !== checksum) {
+    throw new Error(
+      `Native replication journal segment checksum mismatch: expected 0x${checksum.toString(16)}, got 0x${actualChecksum.toString(16)}`,
+    );
+  }
+
+  const decoder = new TextDecoder();
+  const entries: ReplicationLogEntry[] = [];
+  let pos = 0;
+
+  for (let i = 0; i < entryCount; i++) {
+    if (pos + 24 > payload.byteLength) {
+      throw new Error('Truncated binary block inside native replication journal segment');
+    }
+    const dv = new DataView(payload.buffer, payload.byteOffset + pos, 24);
+    const opCode = dv.getUint8(0);
+    const lsn = Number(dv.getBigUint64(4, true));
+    const timestamp = Number(dv.getBigUint64(12, true));
+    const frameLen = dv.getUint32(20, true);
+    pos += 24;
+
+    if (pos + frameLen > payload.byteLength) {
+      throw new Error('Truncated JSON frame inside native replication journal segment');
+    }
+    const meta = JSON.parse(
+      decoder.decode(payload.subarray(pos, pos + frameLen)),
+    ) as {
+      txid: string;
+      origin: string;
+      publication: string;
+      table: string;
+      key: Record<string, unknown>;
+      after: Record<string, unknown> | null;
+      before: Record<string, unknown> | null;
+      ddlSql?: string | null;
+      hlc?: string;
+    };
+    pos += frameLen;
+
+    entries.push({
+      lsn,
+      txid: meta.txid,
+      origin: meta.origin,
+      publication: meta.publication,
+      table: meta.table,
+      operation: OP_CODE_TO_ENUM[opCode] ?? 'INSERT',
+      key: meta.key ?? {},
+      after: meta.after ?? null,
+      before: meta.before ?? null,
+      ddlSql: meta.ddlSql ?? null,
+      timestamp,
+      ...(meta.hlc ? { hlc: meta.hlc } : {}),
+    });
+  }
+
+  return {
+    header: {
+      magic,
+      version,
+      state,
+      guid,
+      sequence,
+      startLsn,
+      endLsn,
+      entryCount,
+      payloadBytes,
+      checksum,
+    },
+    entries,
   };
 }

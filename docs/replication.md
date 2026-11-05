@@ -355,6 +355,68 @@ console.log(pruneResult);
 // { expiredSlots: [], activeSlotCount: 2, safeLsn: 42, prunedEntries: 42 }
 ```
 
+### 5.6 Phase 6 — Network Transports (HTTP/SSE, WebSocket & `BroadcastChannel`)
+
+Connect `FirebirdLite` (server) and `FirebirdBrowser` (WASM) across HTTP/SSE, duplex WebSockets, or browser tabs:
+
+```ts
+import {
+  createHttpReplicationHandler,
+  createHttpReplicationClient,
+  createBroadcastChannelTransport,
+  createWebSocketReplicationPeer,
+  createSubscription,
+} from 'firebird-wasm/replication';
+
+// 1. Server HTTP/SSE endpoint (Web Fetch API Request -> Response)
+const handler = createHttpReplicationHandler({
+  publication: primaryPublication,
+  apiKey: process.env.REPL_SECRET,
+});
+
+// 2. Browser HTTP client + subscription
+const client = createHttpReplicationClient({
+  baseUrl: 'https://api.example.com/replication',
+  name: 'pub_primary',
+  apiKey: '...',
+});
+const browserSub = await createSubscription(browserDb, {
+  name: 'browser_sub',
+  publication: client,
+});
+
+// 3. Cross-tab BroadcastChannel sync
+const tabTransport = createBroadcastChannelTransport({
+  channelName: 'app_repl_bus',
+  publication: localPub,
+  subscription: browserSub,
+});
+```
+
+### 5.7 Phase 7 — Firebird 4.0/5.0 Native Binary Journal Segments, Index Hooks & `replicator.stats()`
+
+Encode/decode binary journal segments (`0x52444246` `'FBDR'` header + FNV-1a checksum), keep local `HnswIndex` / `Bm25Index` search indexes updated incrementally via `indexHooks`, and monitor live replication lag via `replicator.stats()`:
+
+```ts
+import {
+  encodeNativeJournalSegment,
+  decodeNativeJournalSegment,
+} from 'firebird-wasm/replication';
+
+// Live lag & throughput telemetry:
+const telemetry = await replicator.stats();
+console.log(telemetry.lagEntries, telemetry.lagMs, telemetry.bytesTransferred);
+
+// Binary journal segment round-trip:
+const entries = await primaryPublication.fetchChangesSince(0);
+const segmentBytes = encodeNativeJournalSegment(entries, {
+  guid: 'a1b2c3d4-e5f6-4789-8012-3456789abcde',
+  sequence: 1,
+  state: 'archivable',
+});
+const decoded = decodeNativeJournalSegment(segmentBytes);
+```
+
 ---
 
 ## 6. Replication Use Cases
@@ -399,3 +461,9 @@ console.log(pruneResult);
 | `createHlc(nodeId, options?)` | Creates a monotonic Hybrid Logical Clock (`<wallMs>:<counter>:<nodeId>`). |
 | `mergeCrdtRow(ctx, config?)` | Per-column CRDT conflict merger (`'lww'`, `'pn-counter'`, `'set-union'`, `'g-set'`, `'max'`, `'min'`). |
 | `createCrdtConflictResolver(config?)` | Returns a pluggable `onConflict` resolver callback backed by `mergeCrdtRow()`. |
+| `createHttpReplicationHandler(options)` | Web Fetch API `(Request) => Promise<Response>` handler serving `/changes`, `/ack`, `/heartbeat`, `/snapshot`, `/push`, and `/events` (SSE). |
+| `createHttpReplicationClient(options)` | Remote HTTP replication client compatible with `createSubscription()`. |
+| `createBroadcastChannelTransport(options?)` | Cross-tab / cross-worker replication transport backed by `BroadcastChannel`. |
+| `createWebSocketReplicationPeer(options)` | Duplex WebSocket replication peer streaming entries, pull requests, and slot acks. |
+| `encodeNativeJournalSegment(entries, opts?)` | Encodes journal entries into a Firebird 4.0/5.0 binary journal segment (`0x52444246`). |
+| `decodeNativeJournalSegment(bytes)` | Validates FNV-1a checksum and decodes a Firebird 4.0/5.0 binary journal segment. |

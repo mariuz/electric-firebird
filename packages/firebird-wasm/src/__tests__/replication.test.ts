@@ -24,7 +24,16 @@ import {
   createHlc,
   mergeCrdtRow,
   createCrdtConflictResolver,
+  createHttpReplicationHandler,
+  createHttpReplicationClient,
+  createBroadcastChannelTransport,
+  createWebSocketReplicationPeer,
+  encodeNativeJournalSegment,
+  decodeNativeJournalSegment,
+  NATIVE_REPL_SEGMENT_MAGIC,
+  NATIVE_REPL_PROTOCOL_VERSION,
   type ReplicableDatabase,
+  type WebSocketLike,
 } from '../replication';
 import type { QueryParams, QueryResult, Row } from '../types';
 
@@ -987,5 +996,253 @@ describe('firebird-wasm/replication – Logical & Journal-Based Database Replica
       'beta',
       'gamma',
     ]);
+  });
+
+  it('replicates over HTTP/SSE, BroadcastChannel, and duplex WebSocket transports', async () => {
+    // 1. HTTP Handler & Client
+    const serverDb = createMockReplDb();
+    const clientDb = createMockReplDb();
+
+    const serverPub = await createPublication(serverDb, {
+      name: 'http_pub',
+      nodeId: 'server-node',
+      tables: [{ table: 'NOTES', primaryKey: 'ID' }],
+    });
+    await serverPub.recordDml({
+      table: 'NOTES',
+      operation: 'INSERT',
+      after: { ID: 1, BODY: 'Hello from HTTP Primary' },
+    });
+
+    const handler = createHttpReplicationHandler({
+      publication: serverPub,
+      apiKey: 'secret-token',
+    });
+
+    const httpClient = createHttpReplicationClient({
+      baseUrl: 'http://localhost/repl',
+      name: 'http_pub',
+      apiKey: 'secret-token',
+      fetch: (input, init) => {
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+        return handler(new Request(url, init));
+      },
+    });
+
+    const clientSub = await createSubscription(clientDb, {
+      name: 'http_sub',
+      nodeId: 'browser-client-1',
+      publication: httpClient,
+    });
+
+    const pullRes = await clientSub.pull();
+    expect(pullRes.appliedCount).toBe(1);
+    expect(clientDb.tables.get('NOTES')).toEqual([
+      { ID: 1, BODY: 'Hello from HTTP Primary' },
+    ]);
+
+    // Acknowledge slot and push a client change back to server
+    const slotAck = await httpClient.ackSlot('slot_http_client', pullRes.currentLsn, {
+      nodeId: 'browser-client-1',
+    });
+    expect(slotAck.confirmedFlushLsn).toBe(1);
+
+    await httpClient.pushChanges([
+      {
+        lsn: 1,
+        txid: 'client-tx-1',
+        origin: 'browser-client-1',
+        publication: 'http_pub',
+        table: 'NOTES',
+        operation: 'INSERT',
+        key: { ID: 2 },
+        after: { ID: 2, BODY: 'Pushed from Browser' },
+        before: null,
+        timestamp: Date.now(),
+      },
+    ]);
+    expect(serverDb.tables.get('NOTES')).toHaveLength(2);
+
+    // 2. BroadcastChannel cross-tab transport
+    const tabADb = createMockReplDb();
+    const tabBDb = createMockReplDb();
+    const tabAPub = await createPublication(tabADb, {
+      name: 'tab_pub',
+      nodeId: 'tab-a',
+      tables: [{ table: 'TABS', primaryKey: 'ID' }],
+    });
+    const tabBSub = await createSubscription(tabBDb, {
+      name: 'tab_sub',
+      nodeId: 'tab-b',
+      publication: tabAPub,
+    });
+
+    const bcA = createBroadcastChannelTransport({
+      channelName: 'test_fb_repl_tabs',
+      publication: tabAPub,
+    });
+    const bcB = createBroadcastChannelTransport({
+      channelName: 'test_fb_repl_tabs',
+      subscription: tabBSub,
+    });
+
+    await tabAPub.recordDml({
+      table: 'TABS',
+      operation: 'INSERT',
+      after: { ID: 10, TITLE: 'Synced via BroadcastChannel' },
+    });
+    await bcA.sync();
+    // Allow microtask queue to settle
+    await new Promise((r) => setTimeout(r, 15));
+    expect(tabBDb.tables.get('TABS')).toEqual([
+      { ID: 10, TITLE: 'Synced via BroadcastChannel' },
+    ]);
+    bcA.close();
+    bcB.close();
+
+    // 3. Duplex WebSocket peer transport
+    const wsPrimaryDb = createMockReplDb();
+    const wsReplicaDb = createMockReplDb();
+    const wsPub = await createPublication(wsPrimaryDb, {
+      name: 'ws_pub',
+      nodeId: 'ws-primary',
+      tables: [{ table: 'EVENTS', primaryKey: 'ID' }],
+    });
+    const wsSub = await createSubscription(wsReplicaDb, {
+      name: 'ws_sub',
+      nodeId: 'ws-replica',
+      publication: wsPub,
+    });
+
+    // Linked in-memory WebSocket pair
+    let onMessageA: ((ev: { data: unknown }) => void) | null = null;
+    let onMessageB: ((ev: { data: unknown }) => void) | null = null;
+    const sockA: WebSocketLike = {
+      send(data) {
+        onMessageB?.({ data });
+      },
+      addEventListener(_t, fn) {
+        onMessageA = fn;
+      },
+      removeEventListener() {
+        onMessageA = null;
+      },
+    };
+    const sockB: WebSocketLike = {
+      send(data) {
+        onMessageA?.({ data });
+      },
+      addEventListener(_t, fn) {
+        onMessageB = fn;
+      },
+      removeEventListener() {
+        onMessageB = null;
+      },
+    };
+
+    const peerA = createWebSocketReplicationPeer({
+      socket: sockA,
+      publication: wsPub,
+    });
+    const peerB = createWebSocketReplicationPeer({
+      socket: sockB,
+      subscription: wsSub,
+    });
+
+    await wsPub.recordDml({
+      table: 'EVENTS',
+      operation: 'INSERT',
+      after: { ID: 77, KIND: 'ws_stream' },
+    });
+    await peerB.requestPull(0);
+    await new Promise((r) => setTimeout(r, 15));
+    expect(wsReplicaDb.tables.get('EVENTS')).toEqual([{ ID: 77, KIND: 'ws_stream' }]);
+    peerA.close();
+    peerB.close();
+  });
+
+  it('encodes/decodes Firebird 4/5 native binary journal segments, maintains indexHooks, and reports replicator.stats()', async () => {
+    const primary = createMockReplDb();
+    const replica = createMockReplDb();
+
+    const indexedDocs = new Map<number, string>();
+
+    const replicator = await replicateDatabases({
+      primary,
+      replica,
+      tables: [{ table: 'DOCS', primaryKey: 'ID' }],
+      indexHooks: [
+        {
+          table: 'DOCS',
+          onInsertOrUpdate(row, key) {
+            indexedDocs.set(Number(key.ID), String(row.CONTENT ?? ''));
+          },
+          onDelete(key) {
+            indexedDocs.delete(Number(key.ID));
+          },
+        },
+      ],
+    });
+
+    await replicator.primaryPublication.recordDml({
+      table: 'DOCS',
+      operation: 'INSERT',
+      after: { ID: 1, CONTENT: 'Firebird 5 vector search' },
+    });
+    await replicator.primaryPublication.recordDml({
+      table: 'DOCS',
+      operation: 'INSERT',
+      after: { ID: 2, CONTENT: 'Hybrid logical clocks' },
+    });
+
+    // Check lag telemetry before sync()
+    const statsBefore = await replicator.stats();
+    expect(statsBefore.primaryLsn).toBe(2);
+    expect(statsBefore.replicaWatermark).toBe(0);
+    expect(statsBefore.lagEntries).toBe(2);
+
+    await replicator.sync();
+
+    const statsAfter = await replicator.stats();
+    expect(statsAfter.lagEntries).toBe(0);
+    expect(statsAfter.replicaWatermark).toBe(2);
+    expect(statsAfter.totalFetched).toBe(2);
+    expect(statsAfter.totalApplied).toBe(2);
+    expect(statsAfter.bytesTransferred).toBeGreaterThan(0);
+    expect(indexedDocs.get(1)).toBe('Firebird 5 vector search');
+    expect(indexedDocs.get(2)).toBe('Hybrid logical clocks');
+
+    // Delete doc 1 and verify indexHook.onDelete fires on replica
+    await replicator.primaryPublication.recordDml({
+      table: 'DOCS',
+      operation: 'DELETE',
+      key: { ID: 1 },
+    });
+    await replicator.sync();
+    expect(indexedDocs.has(1)).toBe(false);
+
+    // Encode and decode Firebird 4/5 native binary journal segment
+    const entries = await replicator.primaryPublication.fetchChangesSince(0);
+    const segmentBytes = encodeNativeJournalSegment(entries, {
+      guid: 'a1b2c3d4-e5f6-4789-8012-3456789abcde',
+      sequence: 9,
+      state: 'archivable',
+    });
+
+    const decoded = decodeNativeJournalSegment(segmentBytes);
+    expect(decoded.header.magic).toBe(NATIVE_REPL_SEGMENT_MAGIC);
+    expect(decoded.header.version).toBe(NATIVE_REPL_PROTOCOL_VERSION);
+    expect(decoded.header.state).toBe('archivable');
+    expect(decoded.header.guid).toBe('a1b2c3d4-e5f6-4789-8012-3456789abcde');
+    expect(decoded.header.sequence).toBe(9);
+    expect(decoded.header.startLsn).toBe(1);
+    expect(decoded.header.endLsn).toBe(3);
+    expect(decoded.header.entryCount).toBe(3);
+    expect(decoded.entries).toEqual(entries);
+
+    // Tampering with payload triggers checksum verification error
+    const corrupted = new Uint8Array(segmentBytes);
+    corrupted[corrupted.byteLength - 1]! ^= 0xff;
+    expect(() => decodeNativeJournalSegment(corrupted)).toThrow(/checksum mismatch/i);
   });
 });
