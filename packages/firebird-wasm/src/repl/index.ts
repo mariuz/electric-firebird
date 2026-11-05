@@ -29,6 +29,15 @@ import {
   DEFAULT_MIGRATIONS_TABLE,
   introspect as introspectCatalog,
 } from '../browser/schema';
+import {
+  computeTableIoBreakdown,
+  parseQueryPlan,
+  type ParsedQueryPlan,
+  type PlanAccessMethod,
+  type PlanOperatorKind,
+  type PlanTreeNode,
+  type TableIoStats,
+} from './plan-tree';
 import type {
   AppliedMigration,
   ArrayRow,
@@ -44,8 +53,18 @@ import type {
   SweepResult,
 } from '../types';
 
-/** Active tab in the `<firebird-repl>` Schema Inspector, Migration Viewer & Profiler sidebar. */
-export type ReplInspectorTab = 'schema' | 'migrations' | 'profiler';
+export {
+  computeTableIoBreakdown,
+  parseQueryPlan,
+  type ParsedQueryPlan,
+  type PlanAccessMethod,
+  type PlanOperatorKind,
+  type PlanTreeNode,
+  type TableIoStats,
+};
+
+/** Active tab in the `<firebird-repl>` Schema Inspector, Migration Viewer, Profiler & Query Plan Explorer sidebar. */
+export type ReplInspectorTab = 'schema' | 'migrations' | 'profiler' | 'plan';
 
 /** What the console needs of a database: `FirebirdBrowser` has it. */
 export interface ReplDatabase {
@@ -89,6 +108,7 @@ export interface ReplEntry {
   rows?: ArrayRow[];
   affectedRows?: number;
   plan?: string;
+  planTree?: ParsedQueryPlan;
   info?: DatabaseInfo;
   sweep?: SweepResult;
   schema?: SchemaIntrospection;
@@ -105,7 +125,7 @@ export interface FirebirdReplElement extends HTMLElement {
   value: string;
   /** Whether the Schema Inspector & Migration Viewer sidebar is open. */
   inspectorOpen: boolean;
-  /** Currently active sidebar tab (`'schema'`, `'migrations'`, or `'profiler'`). */
+  /** Currently active sidebar tab (`'schema'`, `'migrations'`, `'profiler'`, or `'plan'`). */
   inspectorTab: ReplInspectorTab;
   /** Run `script` (default: the editor's text); resolves with what each statement did. */
   run(script?: string): Promise<ReplEntry[]>;
@@ -123,9 +143,9 @@ export interface FirebirdReplElement extends HTMLElement {
   ): Promise<ReplEntry | undefined>;
   /** Inspect query telemetry and `MON$` monitoring counters, open/update the Profiler tab, and log a profiler entry. */
   profiler(): Promise<ReplEntry | undefined>;
-  /** Toggle (or switch to `tab` in) the interactive Schema Inspector, Migration Viewer & Profiler sidebar. */
+  /** Toggle (or switch to `tab` in) the interactive Schema Inspector, Migration Viewer, Profiler & Plan Explorer sidebar. */
   toggleInspector(tab?: ReplInspectorTab): Promise<void>;
-  /** Refresh the interactive Schema Inspector, Migration Viewer & Profiler sidebar from the database. */
+  /** Refresh the interactive Schema Inspector, Migration Viewer, Profiler & Plan Explorer sidebar from the database. */
   refreshInspector(): Promise<void>;
   /** Empty the output. */
   clear(): void;
@@ -157,7 +177,7 @@ const STYLE = `
 .workspace { display: flex; flex: 1; min-height: 0; overflow: hidden; }
 .output { flex: 1; overflow: auto; padding: 0.5rem 0.75rem; min-width: 0; }
 .inspector {
-  width: 22rem; max-width: 50%; border-left: 1px solid var(--firebird-repl-border);
+  width: 24rem; max-width: 50%; border-left: 1px solid var(--firebird-repl-border);
   display: flex; flex-direction: column; min-height: 0; overflow: hidden;
 }
 .inspector[hidden] { display: none; }
@@ -165,9 +185,9 @@ const STYLE = `
   display: flex; align-items: center; border-bottom: 1px solid var(--firebird-repl-border);
   min-height: 2rem;
 }
-.inspector-tabs { display: flex; flex: 1; }
+.inspector-tabs { display: flex; flex: 1; overflow-x: auto; }
 .inspector-header button {
-  padding: 0.25rem 0.65rem; border-left: 0; border-right: 1px solid var(--firebird-repl-border);
+  padding: 0.25rem 0.6rem; border-left: 0; border-right: 1px solid var(--firebird-repl-border);
 }
 .inspector-header button.active {
   font-weight: 600; text-decoration: underline;
@@ -183,12 +203,15 @@ const STYLE = `
   font-weight: 600; margin: 0.5rem 0 0.25rem; font-size: 12px;
   text-transform: uppercase; color: var(--firebird-repl-muted);
 }
-details.schema-table, details.schema-view {
+details.schema-table, details.schema-view, details.plan-node {
   border: 1px solid var(--firebird-repl-border); border-radius: 4px;
-  margin: 0 0 0.4rem; padding: 0.2rem 0.45rem;
+  margin: 0 0 0.35rem; padding: 0.2rem 0.45rem;
 }
-summary.schema-item-header {
-  cursor: pointer; display: flex; align-items: center; gap: 0.4rem; font-weight: 600;
+details.plan-node details.plan-node {
+  margin-top: 0.25rem; margin-left: 0.4rem;
+}
+summary.schema-item-header, summary.plan-node-header {
+  cursor: pointer; display: flex; align-items: center; gap: 0.35rem; font-weight: 600; flex-wrap: wrap;
 }
 summary.schema-item-header button.schema-query-btn {
   margin-left: auto; border: 1px solid var(--firebird-repl-border); border-radius: 3px;
@@ -211,9 +234,26 @@ li.schema-col:first-child, li.schema-meta-item:first-child, li.migration-item:fi
 }
 .col-name, .migration-version { font-weight: 600; }
 .col-type { color: var(--firebird-repl-muted); }
-.col-flag {
+.col-flag, .plan-badge-warn {
   font-size: 11px; padding: 0 0.25rem; border: 1px solid var(--firebird-repl-border);
   border-radius: 3px; color: var(--firebird-repl-accent);
+}
+.plan-badge-index {
+  font-size: 11px; padding: 0 0.25rem; border: 1px solid var(--firebird-repl-border);
+  border-radius: 3px; color: var(--firebird-repl-fg);
+}
+.flamegraph {
+  display: flex; flex-direction: column; gap: 0.2rem; margin: 0.25rem 0 0.5rem;
+}
+.flame-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 0.4rem;
+  padding: 0.15rem 0.4rem; border: 1px solid var(--firebird-repl-border); border-radius: 3px;
+  font-size: 11px; background: color-mix(in srgb, var(--firebird-repl-accent) 14%, transparent);
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+}
+.flame-bar.natural {
+  background: color-mix(in srgb, var(--firebird-repl-error) 22%, transparent);
+  border-color: var(--firebird-repl-error);
 }
 .schema-view-source {
   white-space: pre-wrap; margin: 0.2rem 0 0; font-size: 11px; color: var(--firebird-repl-muted);
@@ -260,6 +300,7 @@ export function defineFirebirdRepl(
     private readonly tabSchemaBtn: HTMLButtonElement;
     private readonly tabMigrationsBtn: HTMLButtonElement;
     private readonly tabProfilerBtn: HTMLButtonElement;
+    private readonly tabPlanBtn: HTMLButtonElement;
     private readonly inspectorRefreshBtn: HTMLButtonElement;
     private readonly inspectorCloseBtn: HTMLButtonElement;
     private readonly editor: HTMLTextAreaElement;
@@ -280,6 +321,7 @@ export function defineFirebirdRepl(
     private lastSchema: SchemaIntrospection | null = null;
     private lastMigrations: AppliedMigration[] = [];
     private lastStats: MonitorStats | null = null;
+    private lastPlans: Array<{ sql: string; parsed: ParsedQueryPlan }> = [];
 
     constructor() {
       super();
@@ -294,7 +336,10 @@ export function defineFirebirdRepl(
 
       this.inspector = el('div', 'inspector');
       this.inspector.hidden = true;
-      this.inspector.setAttribute('aria-label', 'Schema, migrations, and profiler inspector');
+      this.inspector.setAttribute(
+        'aria-label',
+        'Schema, migrations, profiler, and query plan inspector',
+      );
 
       const inspectorHeader = el('div', 'inspector-header');
       const inspectorTabs = el('div', 'inspector-tabs');
@@ -312,10 +357,17 @@ export function defineFirebirdRepl(
       this.tabProfilerBtn.type = 'button';
       this.tabProfilerBtn.className = 'tab-profiler';
       this.tabProfilerBtn.textContent = 'Profiler';
+
+      this.tabPlanBtn = document.createElement('button');
+      this.tabPlanBtn.type = 'button';
+      this.tabPlanBtn.className = 'tab-plan';
+      this.tabPlanBtn.textContent = 'Plan';
+
       inspectorTabs.append(
         this.tabSchemaBtn,
         this.tabMigrationsBtn,
         this.tabProfilerBtn,
+        this.tabPlanBtn,
       );
 
       const inspectorActions = el('div', 'inspector-actions');
@@ -323,7 +375,7 @@ export function defineFirebirdRepl(
       this.inspectorRefreshBtn.type = 'button';
       this.inspectorRefreshBtn.className = 'inspector-refresh';
       this.inspectorRefreshBtn.textContent = 'Refresh';
-      this.inspectorRefreshBtn.title = 'Refresh schema and migrations';
+      this.inspectorRefreshBtn.title = 'Refresh schema, migrations, profiler, and plan';
 
       this.inspectorCloseBtn = document.createElement('button');
       this.inspectorCloseBtn.type = 'button';
@@ -417,6 +469,10 @@ export function defineFirebirdRepl(
         this.inspectorTab = 'profiler';
         void this.refreshInspector();
       });
+      this.tabPlanBtn.addEventListener('click', () => {
+        this.inspectorTab = 'plan';
+        void this.refreshInspector();
+      });
       this.inspectorRefreshBtn.addEventListener(
         'click',
         () => void this.refreshInspector(),
@@ -473,7 +529,14 @@ export function defineFirebirdRepl(
           ? 'migrations'
           : tab === 'profiler'
             ? 'profiler'
-            : 'schema';
+            : tab === 'plan'
+              ? 'plan'
+              : 'schema';
+      this.updateActiveTabButtons();
+      this.renderInspector();
+    }
+
+    private updateActiveTabButtons(): void {
       this.tabSchemaBtn.classList.toggle('active', this.activeTab === 'schema');
       this.tabMigrationsBtn.classList.toggle(
         'active',
@@ -483,7 +546,7 @@ export function defineFirebirdRepl(
         'active',
         this.activeTab === 'profiler',
       );
-      this.renderInspector();
+      this.tabPlanBtn.classList.toggle('active', this.activeTab === 'plan');
     }
 
     private setButtonsDisabled(disabled: boolean): void {
@@ -530,7 +593,7 @@ export function defineFirebirdRepl(
           this.lastSchema = await this.fetchSchema();
         } else if (this.activeTab === 'migrations') {
           this.lastMigrations = await this.fetchMigrations();
-        } else {
+        } else if (this.activeTab === 'profiler' || this.activeTab === 'plan') {
           this.lastStats = await this.fetchStats();
         }
       } catch {
@@ -634,12 +697,118 @@ export function defineFirebirdRepl(
       return null;
     }
 
+    private renderPlanTreeNode(node: PlanTreeNode): HTMLElement {
+      const details = el('details', 'plan-node');
+      details.open = true;
+
+      const summaryNode = el('summary', 'plan-node-header');
+      const labelSpan = el('span', 'plan-node-label');
+      labelSpan.textContent = node.label;
+      summaryNode.append(labelSpan);
+
+      if (node.accessMethod === 'NATURAL') {
+        const warnBadge = el('span', 'plan-badge-warn');
+        warnBadge.textContent = 'NATURAL SCAN';
+        summaryNode.append(warnBadge);
+      } else if (node.accessMethod && node.indexNames.length > 0) {
+        const idxBadge = el('span', 'plan-badge-index');
+        idxBadge.textContent = `${node.accessMethod}: ${node.indexNames.join(', ')}`;
+        summaryNode.append(idxBadge);
+      }
+
+      const pct = Math.round(node.weightFraction * 100);
+      const weightBadge = el('span', 'schema-badge plan-node-weight');
+      weightBadge.textContent = `${pct}% (w:${node.estimatedWeight})`;
+      summaryNode.append(weightBadge);
+
+      if (node.tableIo) {
+        const ioBadge = el('span', 'schema-badge plan-node-io');
+        ioBadge.textContent = `fetches:${node.tableIo.fetches} reads:${node.tableIo.reads}`;
+        summaryNode.append(ioBadge);
+      }
+
+      details.append(summaryNode);
+
+      if (node.warnings.length > 0) {
+        for (const w of node.warnings) {
+          const warnEl = el('p', 'inspector-summary plan-warning');
+          warnEl.textContent = `⚠ ${w}`;
+          details.append(warnEl);
+        }
+      }
+
+      for (const child of node.children) {
+        details.append(this.renderPlanTreeNode(child));
+      }
+
+      return details;
+    }
+
+    private renderPlanExplorerPanel(): HTMLElement {
+      const panel = el('div', 'inspector-plan');
+      if (this.lastPlans.length === 0) {
+        const empty = el('p', 'inspector-empty');
+        empty.textContent = 'No query plan explained yet. Click Explain to analyze a query.';
+        panel.append(empty);
+        return panel;
+      }
+
+      for (const item of this.lastPlans) {
+        const parsed = item.parsed;
+        const sqlHeader = el('div', 'schema-group-title');
+        sqlHeader.textContent = item.sql;
+        panel.append(sqlHeader);
+
+        const summaryEl = el('p', 'inspector-summary');
+        summaryEl.textContent =
+          `${parsed.format} plan · ${parsed.nodes.length} ${parsed.nodes.length === 1 ? 'node' : 'nodes'} · ` +
+          `${parsed.indexScanCount} index ${parsed.indexScanCount === 1 ? 'scan' : 'scans'} · ` +
+          `${parsed.naturalScanCount} natural ${parsed.naturalScanCount === 1 ? 'scan' : 'scans'}`;
+        panel.append(summaryEl);
+
+        // 1. Flamegraph visualization
+        const flameTitle = el('div', 'schema-sub-label');
+        flameTitle.textContent = 'Cost Flamegraph:';
+        panel.append(flameTitle);
+
+        const flameWrap = el('div', 'flamegraph');
+        for (const n of parsed.nodes) {
+          const pct = Math.max(8, Math.round(n.weightFraction * 100));
+          const bar = el(
+            'div',
+            `flame-bar${n.accessMethod === 'NATURAL' ? ' natural' : ''}`,
+          );
+          bar.setAttribute('style', `width: ${pct}%; margin-left: ${n.depth * 6}px`);
+          const nameSpan = el('span', 'flame-label');
+          nameSpan.textContent = n.label;
+          const pctSpan = el('span', 'schema-badge flame-pct');
+          pctSpan.textContent = `${Math.round(n.weightFraction * 100)}%`;
+          bar.append(nameSpan, pctSpan);
+          flameWrap.append(bar);
+        }
+        panel.append(flameWrap);
+
+        // 2. Interactive collapsible Plan Tree
+        const treeTitle = el('div', 'schema-sub-label');
+        treeTitle.textContent = 'Plan Tree:';
+        panel.append(treeTitle);
+        panel.append(this.renderPlanTreeNode(parsed.root));
+      }
+
+      return panel;
+    }
+
     private renderInspector(): void {
       this.inspectorBody.replaceChildren();
       if (!this.db) {
         const empty = el('p', 'inspector-empty');
         empty.textContent = 'No database connected.';
         this.inspectorBody.append(empty);
+        return;
+      }
+
+      if (this.activeTab === 'plan') {
+        this.inspectorBody.append(this.renderPlanExplorerPanel());
         return;
       }
 
@@ -693,6 +862,38 @@ export function defineFirebirdRepl(
         ioDiv.append(ioList);
         panel.append(ioDiv);
 
+        // Per-Table Page I/O Flamegraph Breakdown
+        const tableIoBreakdown = computeTableIoBreakdown(
+          stats,
+          this.lastSchema?.tables.map((t) => t.name) ?? [],
+        );
+        if (tableIoBreakdown.size > 0) {
+          const tblIoTitle = el('div', 'schema-group-title');
+          tblIoTitle.textContent = 'Per-Table Page I/O Flamegraph';
+          panel.append(tblIoTitle);
+
+          const flameWrap = el('div', 'flamegraph profiler-table-io');
+          const sortedTables = [...tableIoBreakdown.values()].sort(
+            (a, b) =>
+              b.fetches + b.reads - (a.fetches + a.reads) ||
+              b.totalDurationMs - a.totalDurationMs,
+          );
+          for (const tStat of sortedTables) {
+            const pct = Math.max(10, Math.round(tStat.ioShare * 100));
+            const bar = el('div', 'flame-bar table-io-bar');
+            bar.setAttribute('style', `width: ${pct}%`);
+            const nameSpan = el('span', 'col-name');
+            nameSpan.textContent = tStat.tableName;
+            const detailSpan = el('span', 'schema-badge');
+            detailSpan.textContent =
+              `fetches: ${tStat.fetches} · reads: ${tStat.reads} · ` +
+              `writes: ${tStat.writes} · ${tStat.totalDurationMs.toFixed(1)} ms`;
+            bar.append(nameSpan, detailSpan);
+            flameWrap.append(bar);
+          }
+          panel.append(flameWrap);
+        }
+
         const recentTitle = el('div', 'schema-group-title');
         recentTitle.textContent = `Recent Queries (${stats.recentQueries.length})`;
         panel.append(recentTitle);
@@ -710,7 +911,10 @@ export function defineFirebirdRepl(
             const sqlSpan = el('span', 'migration-name');
             sqlSpan.textContent = q.sql;
             const badge = el('span', 'schema-badge');
-            badge.textContent = `${q.kind} · ${q.rowCount} rows${q.cacheHit ? ' · cached' : ''}`;
+            const ioSummary = q.io
+              ? ` · fetches:${q.io.fetches} reads:${q.io.reads}`
+              : '';
+            badge.textContent = `${q.kind} · ${q.rowCount} rows${q.cacheHit ? ' · cached' : ''}${ioSummary}`;
             li.append(dur, sqlSpan, badge);
             qList.append(li);
           }
@@ -1062,6 +1266,15 @@ export function defineFirebirdRepl(
           entries.push(entry);
           this.show(entry);
         }
+
+        // Refresh stats if available so table I/O can be attributed to plan nodes
+        try {
+          this.lastStats = await this.fetchStats();
+        } catch {
+          // Ignore if monitorStats is unavailable
+        }
+
+        const explainedPlans: Array<{ sql: string; parsed: ParsedQueryPlan }> = [];
         for (const statement of statements) {
           const started = performance.now();
           const entry: ReplEntry = {
@@ -1071,6 +1284,11 @@ export function defineFirebirdRepl(
           };
           try {
             entry.plan = await this.db.explain(statement.sql, options);
+            entry.planTree = parseQueryPlan(entry.plan, this.lastStats);
+            explainedPlans.push({
+              sql: statement.sql,
+              parsed: entry.planTree,
+            });
           } catch (err) {
             entry.error = asError(err);
           }
@@ -1078,6 +1296,14 @@ export function defineFirebirdRepl(
           entries.push(entry);
           this.show(entry);
           if (entry.error) break;
+        }
+
+        if (explainedPlans.length > 0) {
+          this.lastPlans = explainedPlans;
+          this.activeTab = 'plan';
+          this.updateActiveTabButtons();
+          this.inspectorOpen = true;
+          this.renderInspector();
         }
       } finally {
         this.busy = false;
@@ -1197,9 +1423,7 @@ export function defineFirebirdRepl(
         entry.schema = result;
         this.lastSchema = result;
         this.activeTab = 'schema';
-        this.tabSchemaBtn.classList.add('active');
-        this.tabMigrationsBtn.classList.remove('active');
-        this.tabProfilerBtn.classList.remove('active');
+        this.updateActiveTabButtons();
         this.inspectorOpen = true;
         this.renderInspector();
       } catch (err) {
@@ -1244,9 +1468,7 @@ export function defineFirebirdRepl(
         entry.migrations = list;
         this.lastMigrations = list;
         this.activeTab = 'migrations';
-        this.tabMigrationsBtn.classList.add('active');
-        this.tabSchemaBtn.classList.remove('active');
-        this.tabProfilerBtn.classList.remove('active');
+        this.updateActiveTabButtons();
         this.inspectorOpen = true;
         this.renderInspector();
       } catch (err) {
@@ -1299,9 +1521,7 @@ export function defineFirebirdRepl(
           this.lastStats = stats;
         }
         this.activeTab = 'profiler';
-        this.tabProfilerBtn.classList.add('active');
-        this.tabSchemaBtn.classList.remove('active');
-        this.tabMigrationsBtn.classList.remove('active');
+        this.updateActiveTabButtons();
         this.inspectorOpen = true;
         this.renderInspector();
       } catch (err) {
@@ -1375,6 +1595,11 @@ export function defineFirebirdRepl(
           const plan = el('pre', 'plan');
           plan.textContent = entry.plan || '(no plan)';
           block.append(plan);
+          if (entry.planTree && entry.planTree.format !== 'empty') {
+            const treeWrap = el('div', 'entry-plan-tree');
+            treeWrap.append(this.renderPlanTreeNode(entry.planTree.root));
+            block.append(treeWrap);
+          }
         }
         if (entry.info !== undefined) {
           const d = entry.info;

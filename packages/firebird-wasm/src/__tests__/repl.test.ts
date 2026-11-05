@@ -1,15 +1,18 @@
 /**
  * repl.test.ts – unit tests for the <firebird-repl> custom element, including
- * the Interactive Schema Inspector & Migration Viewer.
+ * the Interactive Schema Inspector, Migration Viewer, Profiler & Visual Query
+ * Plan / Flamegraph Explorer.
  */
 
 import type { FirebirdBrowser } from '../browser/firebird-browser';
-import type {
-  FirebirdReplElement,
-  ReplDatabase,
-  ReplEntry,
+import {
+  parseQueryPlan,
+  computeTableIoBreakdown,
+  type FirebirdReplElement,
+  type ReplDatabase,
+  type ReplEntry,
 } from '../repl';
-import type { SchemaIntrospection } from '../types';
+import type { MonitorStats, SchemaIntrospection } from '../types';
 
 const fits: (db: FirebirdBrowser) => ReplDatabase = (db) => db;
 void fits;
@@ -126,7 +129,94 @@ describe('firebird-wasm/repl', () => {
     expect(typeof repl.defineFirebirdRepl).toBe('function');
   });
 
-  it('renders the interactive Schema Inspector & Migration Viewer sidebar and logs schema/migration entries', async () => {
+  it('parses both legacy PLAN (...) and Firebird 3.0+/5.0 explained -> trees with per-table I/O attribution', () => {
+    const sampleStats: MonitorStats = {
+      totalQueries: 2,
+      totalExecs: 0,
+      totalErrors: 0,
+      totalDurationMs: 10,
+      avgDurationMs: 5,
+      maxDurationMs: 7,
+      slowestSql: 'SELECT * FROM ORDERS',
+      prepareCacheHits: 1,
+      prepareCacheMisses: 1,
+      prepareCacheHitRate: 0.5,
+      io: {
+        reads: 12,
+        writes: 0,
+        fetches: 140,
+        marks: 0,
+        pageBuffers: 2048,
+        currentMemory: 1024,
+        maxMemory: 2048,
+      },
+      transactions: {
+        oldestTransaction: 1,
+        oldestActive: 2,
+        oldestSnapshot: 2,
+        nextTransaction: 3,
+        transactionGap: 1,
+      },
+      activeStatements: 0,
+      recentQueries: [
+        {
+          sql: 'SELECT * FROM USERS u JOIN ORDERS o ON o.USER_ID = u.ID',
+          params: [],
+          kind: 'query',
+          durationMs: 8.4,
+          rowCount: 15,
+          cacheHit: false,
+          timestamp: 1000,
+          io: { reads: 10, writes: 0, fetches: 100, marks: 0 },
+        },
+      ],
+    };
+
+    // 1. Legacy PLAN expression
+    const legacy = parseQueryPlan(
+      'PLAN SORT (JOIN (USERS U INDEX (PK_USERS), ORDERS O NATURAL))',
+      sampleStats,
+    );
+    expect(legacy.format).toBe('legacy');
+    expect(legacy.root.kind).toBe('sort');
+    expect(legacy.tables).toEqual(['USERS', 'ORDERS']);
+    expect(legacy.indexes).toEqual(['PK_USERS']);
+    expect(legacy.naturalScanCount).toBe(1);
+    expect(legacy.indexScanCount).toBe(1);
+
+    const ordersNode = legacy.nodes.find((n) => n.tableName === 'ORDERS');
+    expect(ordersNode?.accessMethod).toBe('NATURAL');
+    expect(ordersNode?.warnings[0]).toContain('Full table scan (NATURAL) on ORDERS');
+    expect(ordersNode?.tableIo?.fetches).toBe(50);
+
+    // 2. Firebird 5.0 explained indentation plan
+    const explainedText = [
+      'Select Expression',
+      '    -> Sort (record length: 64, key length: 12)',
+      '        -> Nested Loop Join (inner)',
+      '            -> Table "USERS" as "U" Access By ID',
+      '                -> Bitmap',
+      '                    -> Index "PK_USERS" Unique Scan',
+      '            -> Filter',
+      '                -> Table "ORDERS" as "O" Full Scan',
+    ].join('\n');
+
+    const explained = parseQueryPlan(explainedText, sampleStats);
+    expect(explained.format).toBe('explained');
+    expect(explained.root.kind).toBe('select');
+    expect(explained.tables).toEqual(['USERS', 'ORDERS']);
+    expect(explained.indexes).toEqual(['PK_USERS']);
+    expect(explained.naturalScanCount).toBe(1);
+
+    const usersExplained = explained.nodes.find((n) => n.tableName === 'USERS');
+    expect(usersExplained?.indexNames).toEqual(['PK_USERS']);
+
+    const breakdown = computeTableIoBreakdown(sampleStats);
+    expect(breakdown.get('USERS')?.fetches).toBe(50);
+    expect(breakdown.get('ORDERS')?.reads).toBe(5);
+  });
+
+  it('renders the interactive Schema Inspector, Migration Viewer, Profiler & Visual Query Plan / Flamegraph Explorer', async () => {
     const g = globalThis as Record<string, unknown>;
     const registry = new Map<string, unknown>();
 
@@ -272,6 +362,10 @@ describe('firebird-wasm/repl', () => {
 
       const fakeDb: ReplDatabase = {
         describeQuery: vi.fn(async () => ({ hasResultSet: true })),
+        explain: vi.fn(
+          async () =>
+            'PLAN JOIN (USERS INDEX (IDX_USERS_EMAIL), ORGS NATURAL)',
+        ),
         introspect: vi.fn(async () => fakeSchema),
         monitorStats: vi.fn(async () => ({
           totalQueries: 2,
@@ -310,7 +404,7 @@ describe('firebird-wasm/repl', () => {
               rowCount: 2,
               cacheHit: true,
               timestamp: 1000,
-              io: { reads: 0, writes: 0, fetches: 4, marks: 0 },
+              io: { reads: 2, writes: 0, fetches: 18, marks: 0 },
             },
           ],
         })),
@@ -400,7 +494,7 @@ describe('firebird-wasm/repl', () => {
       expect(inspectorNode.allText()).toContain('create_users');
       expect(inspectorNode.allText()).toContain('add_email_index');
 
-      // 3. Inspect profiler telemetry via el.profiler()
+      // 3. Inspect profiler telemetry & Per-Table Page I/O Flamegraph via el.profiler()
       let profilerEventDetail: ReplEntry | undefined;
       el.addEventListener('firebird-repl-profiler', ((ev: {
         detail: ReplEntry;
@@ -417,11 +511,27 @@ describe('firebird-wasm/repl', () => {
       expect(el.inspectorTab).toBe('profiler');
       expect(inspectorNode.allText()).toContain('3 queries');
       expect(inspectorNode.allText()).toContain('cache 66.7% (2/3)');
+      expect(inspectorNode.allText()).toContain('Per-Table Page I/O Flamegraph');
+      expect(inspectorNode.allText()).toContain('fetches: 18 · reads: 2');
       expect(inspectorNode.allText()).toContain('SELECT * FROM USERS');
       expect(inspectorNode.allText()).toContain('cached');
 
-      // 4. Toggle inspector closed
-      await el.toggleInspector('profiler');
+      // 4. Explain query -> opens 'plan' tab with interactive Plan Tree + Cost Flamegraph
+      const explainEntries = await el.explain(
+        'SELECT * FROM USERS JOIN ORGS ON ORGS.ID = USERS.ID;',
+      );
+      expect(explainEntries).toHaveLength(1);
+      expect(explainEntries[0]?.planTree?.tables).toEqual(['USERS', 'ORGS']);
+      expect(el.inspectorOpen).toBe(true);
+      expect(el.inspectorTab).toBe('plan');
+      expect(inspectorNode.allText()).toContain('Cost Flamegraph:');
+      expect(inspectorNode.allText()).toContain('Plan Tree:');
+      expect(inspectorNode.allText()).toContain('NATURAL SCAN');
+      expect(inspectorNode.allText()).toContain('INDEX: IDX_USERS_EMAIL');
+      expect(inspectorNode.allText()).toContain('Full table scan (NATURAL) on ORGS');
+
+      // 5. Toggle inspector closed
+      await el.toggleInspector('plan');
       expect(el.inspectorOpen).toBe(false);
       expect(inspectorNode.hidden).toBe(true);
     } finally {

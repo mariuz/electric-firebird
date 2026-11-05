@@ -1415,7 +1415,7 @@ Next-horizon milestones for `v0.17.0`:
       Official adapters bridging `db.live()`, `syncShapes`, and
       `createWriteQueue` with TanStack Query cache invalidation and local-first
       state managers.
-- [ ] **Visual Query Plan & Flamegraph Explorer in `<firebird-repl>`.**
+- [x] **Visual Query Plan & Flamegraph Explorer in `<firebird-repl>`.**
       Render `db.explain()` plan trees and `db.monitorStats()` per-table page
       reads/fetches as an interactive tree inside the `<firebird-repl>`
       Inspector.
