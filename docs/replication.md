@@ -2,7 +2,7 @@
 
 `firebird-wasm/replication` provides logical and journal-based database replication between `FirebirdLite` (Node.js / server / desktop) and `FirebirdBrowser` (WebAssembly / OPFS / IndexedDB), as well as peer-to-peer across browser tabs or edge workers.
 
-> **Interactive Simulator & Live Demo**: Try the [Firebird WASM Replication Simulator & Live Demo](https://anas599.github.io/electric-firebird/replication.html) (`demo/public/replication.html`) to inspect live `FB_REPL_JOURNAL$` LSN streams, trigger capture, network partitions, and 3-way conflict resolution in real time.
+> **Interactive Simulator & Live Demo**: Try the [Firebird WASM Replication Simulator & Live Demo](https://mariuz.github.io/electric-firebird/replication.html) (`demo/public/replication.html`) to inspect live `FB_REPL_JOURNAL$` LSN streams, trigger capture, network partitions, and 3-way conflict resolution in real time.
 
 ---
 

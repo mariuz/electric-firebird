@@ -14,7 +14,7 @@ This monorepo contains:
 
 ## Try it
 
-**[Open the SQL Console Demo →](https://anas599.github.io/electric-firebird/)** · **[Open the Replication Simulator & Demo →](https://anas599.github.io/electric-firebird/replication.html)**
+**[Open the SQL Console Demo →](https://mariuz.github.io/electric-firebird/)** · **[Open the Replication Simulator & Demo →](https://mariuz.github.io/electric-firebird/replication.html)**
 
 A SQL console running the real engine in your browser — no server, nothing
 uploaded. It ships worked examples for joins and aggregates, bound parameters,
