@@ -4896,3 +4896,914 @@ export function decodeNativeJournalSegment(
     entries,
   };
 }
+
+// ---------------------------------------------------------------------------
+// 6. Automatic Failover & Replica-to-Primary Promotion (`promoteReplica`) (M13 Item 3)
+// ---------------------------------------------------------------------------
+
+/** Options for {@link promoteReplica}. */
+export interface PromoteReplicaOptions {
+  /** The replica database being promoted to the new primary. */
+  replicaDb: ReplicableDatabase;
+  /**
+   * Optional active subscription on the replica. When provided, `promoteReplica`
+   * attempts a final `pull()` to drain pending changes, validates replication
+   * lag against `maxAllowedLagEntries`, and stops the subscription.
+   */
+  subscription?: ReplicationSubscription;
+  /**
+   * Optional reachable previous primary database. When provided, sequence
+   * watermarks are synchronized from `previousPrimaryDb` to `replicaDb` before
+   * promotion so new sequence values do not collide.
+   */
+  previousPrimaryDb?: ReplicableDatabase;
+  /**
+   * Maximum allowed unapplied journal entries (`lagEntries`) before promotion
+   * is refused (unless `force: true`).
+   */
+  maxAllowedLagEntries?: number;
+  /**
+   * When `true`, proceeds with promotion even if the final `subscription.pull()`
+   * fails (e.g. dead old primary) or lag exceeds `maxAllowedLagEntries`.
+   *
+   * @default false
+   */
+  force?: boolean;
+  /**
+   * Node identifier for the newly promoted primary publication.
+   * Defaults to `subscription?.nodeId ?? 'promoted_primary'`.
+   */
+  promotedNodeId?: string;
+  /**
+   * Publication name created on the promoted primary.
+   *
+   * @default 'default'
+   */
+  publicationName?: string;
+  /**
+   * Tables to publish on the promoted primary. When omitted, discovers and
+   * publishes all user tables via `publishAllTables: true`.
+   */
+  tables?: ReadonlyArray<string | PublishedTableConfig>;
+  /**
+   * When `true`, installs `FB_REPL_TRG$<table>` PSQL triggers on the promoted
+   * primary and clears any `'REPLICA'` role context variable.
+   *
+   * @default false
+   */
+  installTriggers?: boolean;
+  /**
+   * Optional safety increment added to all sequences on the promoted primary
+   * so newly allocated IDs never collide with in-flight IDs from the old primary.
+   *
+   * @default 0
+   */
+  sequenceBuffer?: number;
+  /**
+   * Optional peer subscriptions to re-seed (`peer.setWatermark(promotedStartingLsn)`)
+   * so remaining replicas seamlessly follow the newly promoted primary.
+   */
+  peerSubscriptions?: readonly ReplicationSubscription[];
+}
+
+/** Result returned by {@link promoteReplica}. */
+export interface PromoteReplicaResult {
+  /** Node identifier assigned to the promoted primary. */
+  readonly promotedNodeId: string;
+  /** Active `ReplicationPublication` created on the promoted primary. */
+  readonly publication: ReplicationPublication;
+  /** Final replica LSN watermark from the old primary before promotion. */
+  readonly finalReplicaWatermark: number;
+  /** Starting LSN of the publication on the newly promoted primary. */
+  readonly promotedStartingLsn: number;
+  /** Result of the final `subscription.pull()` drain, or `null` if skipped/unreachable. */
+  readonly finalPullResult: SubscriptionPullResult | null;
+  /** Number of Firebird sequences synchronized / bumped on the promoted primary. */
+  readonly sequencesSynced: number;
+  /** Upper-case table names published on the promoted primary. */
+  readonly publishedTables: readonly string[];
+  /** Number of PSQL triggers installed on the promoted primary. */
+  readonly triggersInstalled: number;
+  /** Whether the `FB_REPL_ROLE` session context variable was reset to `'PRIMARY'`. */
+  readonly roleContextCleared: boolean;
+}
+
+/**
+ * Promote a replica database to a primary database (`M13 Item 3`):
+ * 1. Drains any final changes from `subscription.pull()` (tolerating an unreachable
+ *    old primary when `force: true`), checks `maxAllowedLagEntries`, and stops the subscription.
+ * 2. Synchronizes sequence watermarks from `previousPrimaryDb` (or existing replica
+ *    sequences) with an optional `sequenceBuffer` safety margin.
+ * 3. Resets `RDB$SET_CONTEXT('USER_SESSION', 'FB_REPL_ROLE', 'PRIMARY')` so triggers
+ *    capture local writes on the promoted node.
+ * 4. Creates a `ReplicationPublication` on `replicaDb`, captures the baseline mirror
+ *    snapshot, and optionally re-seeds `peerSubscriptions` watermarks.
+ */
+export async function promoteReplica(
+  options: PromoteReplicaOptions,
+): Promise<PromoteReplicaResult> {
+  const {
+    replicaDb,
+    subscription,
+    previousPrimaryDb,
+    maxAllowedLagEntries,
+    force = false,
+    publicationName = 'default',
+    tables,
+    installTriggers = false,
+    sequenceBuffer = 0,
+    peerSubscriptions = [],
+  } = options;
+
+  const promotedNodeId =
+    options.promotedNodeId?.trim() ||
+    subscription?.nodeId ||
+    'promoted_primary';
+
+  let finalPullResult: SubscriptionPullResult | null = null;
+  let finalReplicaWatermark = 0;
+
+  if (subscription) {
+    try {
+      finalPullResult = await subscription.pull();
+    } catch (err) {
+      if (!force) {
+        throw err;
+      }
+    }
+
+    const st = await subscription.stats();
+    finalReplicaWatermark = st.replicaWatermark;
+
+    if (
+      maxAllowedLagEntries !== undefined &&
+      !force &&
+      st.lagEntries > maxAllowedLagEntries
+    ) {
+      throw new Error(
+        `Cannot promote replica "${promotedNodeId}": lagEntries (${st.lagEntries}) exceeds maxAllowedLagEntries (${maxAllowedLagEntries})`,
+      );
+    }
+
+    await subscription.stop();
+  }
+
+  let sequencesSynced = 0;
+  const seqSource = previousPrimaryDb ?? replicaDb;
+  try {
+    const seqs = await exportSequences(seqSource);
+    if (seqs.length > 0) {
+      const bumped =
+        sequenceBuffer > 0
+          ? seqs.map((s) => ({ ...s, currentValue: s.currentValue + sequenceBuffer }))
+          : seqs;
+      sequencesSynced = await applySequences(replicaDb, bumped);
+    }
+  } catch (err) {
+    if (!force && previousPrimaryDb) {
+      throw err;
+    }
+  }
+
+  let roleContextCleared = false;
+  try {
+    await replicaDb.query(
+      `SELECT RDB$SET_CONTEXT('USER_SESSION', '${escapeSqlLiteral(DEFAULT_REPL_ROLE_CONTEXT_VAR)}', 'PRIMARY') AS CTX FROM RDB$DATABASE`,
+    );
+    roleContextCleared = true;
+  } catch {
+    roleContextCleared = false;
+  }
+
+  const publication = await createPublication(replicaDb, {
+    name: publicationName,
+    nodeId: promotedNodeId,
+    tables: tables && tables.length > 0 ? tables : '*',
+    installTriggers,
+  });
+
+  // Prime the mirror table on the promoted primary so existing replicated rows
+  // are treated as baseline state rather than re-emitted as new INSERTs, while
+  // keeping the journal clean at promotedStartingLsn.
+  const preCaptureLsn = await publication.currentLsn();
+  const baselineEntries = await publication.captureTableChanges();
+  if (baselineEntries.length > 0 && preCaptureLsn === 0) {
+    const latestLsn = await publication.currentLsn();
+    await publication.pruneJournal(latestLsn);
+  }
+  const promotedStartingLsn = await publication.currentLsn();
+
+  for (const peer of peerSubscriptions) {
+    await peer.setWatermark(promotedStartingLsn);
+  }
+
+  const pubTables = [...publication.tables.keys()];
+  return {
+    promotedNodeId,
+    publication,
+    finalReplicaWatermark,
+    promotedStartingLsn,
+    finalPullResult,
+    sequencesSynced,
+    publishedTables: pubTables,
+    triggersInstalled: installTriggers ? pubTables.length : 0,
+    roleContextCleared,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 7. Encrypted & Compressed Replication Journal Segments (AES-256-GCM + Gzip) (M13 Item 4)
+// ---------------------------------------------------------------------------
+
+/**
+ * Magic signature for encrypted and/or Gzip-compressed replication journal segments
+ * (`'FBDS'` little-endian `0x53444246`).
+ */
+export const NATIVE_REPL_ENCRYPTED_SEGMENT_MAGIC = 0x53444246;
+
+/** Options for {@link encodeEncryptedJournalSegment}. */
+export interface EncryptedJournalSegmentOptions {
+  /**
+   * Optional encryption key:
+   * - 32-byte `Uint8Array` raw AES-256 key
+   * - WebCrypto `CryptoKey` (`AES-GCM`)
+   * - Passphrase `string` (derived via PBKDF2-HMAC-SHA256 with a 16-byte salt)
+   */
+  key?: Uint8Array | CryptoKey | string;
+  /**
+   * When `true` (the default), compresses the inner binary journal segment with
+   * Gzip (`CompressionStream('gzip')`) prior to encryption.
+   *
+   * @default true
+   */
+  compress?: boolean;
+  /** Optional explicit 12-byte AES-GCM initialization vector (generated randomly if omitted). */
+  iv?: Uint8Array;
+  /** Optional explicit 16-byte PBKDF2 salt when `key` is a passphrase string. */
+  salt?: Uint8Array;
+  /** Optional Additional Authenticated Data (AAD) bound to the AES-256-GCM authentication tag. */
+  aad?: Uint8Array | string;
+  /** Segment database replication GUID. */
+  guid?: string;
+  /** Monotonic journal segment sequence number. */
+  sequence?: number;
+  /** Segment lifecycle state. */
+  state?: 'active' | 'full' | 'archivable';
+}
+
+/** Options for {@link decodeEncryptedJournalSegment}. */
+export interface DecodeEncryptedJournalSegmentOptions {
+  /** Decryption key (32-byte `Uint8Array`, WebCrypto `CryptoKey`, or passphrase `string`). */
+  key?: Uint8Array | CryptoKey | string;
+  /** Additional Authenticated Data (AAD) expected by AES-256-GCM. */
+  aad?: Uint8Array | string;
+}
+
+/** Result returned by {@link decodeEncryptedJournalSegment}. */
+export interface DecodedEncryptedJournalSegment {
+  /** Decoded inner native journal segment (`header` + `entries`). */
+  readonly segment: NativeJournalSegment;
+  /** Whether the segment payload was Gzip-compressed on the wire. */
+  readonly compressed: boolean;
+  /** Whether the segment payload was encrypted with AES-256-GCM on the wire. */
+  readonly encrypted: boolean;
+  /** Uncompressed inner binary segment byte size. */
+  readonly uncompressedBytes: number;
+  /** Total wire envelope byte size. */
+  readonly wireBytes: number;
+}
+
+async function gzipBytes(input: Uint8Array): Promise<Uint8Array> {
+  if (typeof CompressionStream === 'undefined') {
+    throw new Error('CompressionStream is not available in this runtime');
+  }
+  const cs = new CompressionStream('gzip');
+  const writer = cs.writable.getWriter();
+  await writer.write(new Uint8Array(input));
+  await writer.close();
+  const buf = await new Response(cs.readable).arrayBuffer();
+  return new Uint8Array(buf);
+}
+
+async function gunzipBytes(input: Uint8Array): Promise<Uint8Array> {
+  if (typeof DecompressionStream === 'undefined') {
+    throw new Error('DecompressionStream is not available in this runtime');
+  }
+  const ds = new DecompressionStream('gzip');
+  const writer = ds.writable.getWriter();
+  await writer.write(new Uint8Array(input));
+  await writer.close();
+  const buf = await new Response(ds.readable).arrayBuffer();
+  return new Uint8Array(buf);
+}
+
+async function resolveAesGcmCryptoKey(
+  keyInput: Uint8Array | CryptoKey | string,
+  salt: Uint8Array,
+  usage: 'encrypt' | 'decrypt',
+): Promise<CryptoKey> {
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle) {
+    throw new Error('WebCrypto (crypto.subtle) is required for AES-256-GCM journal encryption');
+  }
+  if (typeof keyInput === 'string') {
+    const enc = new TextEncoder();
+    const baseKey = await subtle.importKey(
+      'raw',
+      enc.encode(keyInput),
+      'PBKDF2',
+      false,
+      ['deriveKey'],
+    );
+    return subtle.deriveKey(
+      {
+        name: 'PBKDF2',
+        salt: new Uint8Array(salt),
+        iterations: 100_000,
+        hash: 'SHA-256',
+      },
+      baseKey,
+      { name: 'AES-GCM', length: 256 },
+      false,
+      [usage],
+    );
+  }
+  if (keyInput instanceof Uint8Array) {
+    if (keyInput.byteLength !== 32) {
+      throw new Error(
+        `Invalid AES-256-GCM key length: expected 32 bytes, got ${keyInput.byteLength}`,
+      );
+    }
+    return subtle.importKey(
+      'raw',
+      new Uint8Array(keyInput),
+      { name: 'AES-GCM', length: 256 },
+      false,
+      [usage],
+    );
+  }
+  return keyInput;
+}
+
+/**
+ * Encode a batch of {@link ReplicationLogEntry} items into an optionally
+ * Gzip-compressed and WebCrypto AES-256-GCM encrypted binary journal segment
+ * (`0x53444246` `'FBDS'` envelope).
+ */
+export async function encodeEncryptedJournalSegment(
+  entries: readonly ReplicationLogEntry[],
+  options: EncryptedJournalSegmentOptions = {},
+): Promise<Uint8Array> {
+  const rawSegment = encodeNativeJournalSegment(entries, {
+    guid: options.guid,
+    sequence: options.sequence,
+    state: options.state,
+  });
+  const uncompressedBytes = rawSegment.byteLength;
+  const shouldCompress = options.compress !== false;
+  const shouldEncrypt = options.key !== undefined;
+  const isPassphrase = typeof options.key === 'string';
+
+  let payload: Uint8Array = shouldCompress
+    ? await gzipBytes(rawSegment)
+    : rawSegment;
+
+  const iv =
+    options.iv && options.iv.byteLength === 12
+      ? new Uint8Array(options.iv)
+      : shouldEncrypt
+        ? globalThis.crypto.getRandomValues(new Uint8Array(12))
+        : new Uint8Array(12);
+
+  const salt =
+    options.salt && options.salt.byteLength === 16
+      ? new Uint8Array(options.salt)
+      : isPassphrase
+        ? globalThis.crypto.getRandomValues(new Uint8Array(16))
+        : new Uint8Array(16);
+
+  if (shouldEncrypt && options.key !== undefined) {
+    const cryptoKey = await resolveAesGcmCryptoKey(options.key, salt, 'encrypt');
+    const aadBytes =
+      typeof options.aad === 'string'
+        ? new TextEncoder().encode(options.aad)
+        : options.aad;
+    const encryptedBuf = await globalThis.crypto.subtle.encrypt(
+      {
+        name: 'AES-GCM',
+        iv,
+        ...(aadBytes ? { additionalData: new Uint8Array(aadBytes) } : {}),
+      },
+      cryptoKey,
+      new Uint8Array(payload),
+    );
+    payload = new Uint8Array(encryptedBuf);
+  }
+
+  let flags = 0;
+  if (shouldCompress) flags |= 1;
+  if (shouldEncrypt) flags |= 2;
+  if (isPassphrase) flags |= 4;
+
+  // 40-byte envelope header:
+  // [0..4]   magic (0x53444246 'FBDS')
+  // [4..6]   version (1)
+  // [6..8]   flags (bit0=gzip, bit1=aes-256-gcm, bit2=pbkdf2-passphrase)
+  // [8..20]  12-byte AES-GCM IV
+  // [20..36] 16-byte PBKDF2 salt
+  // [36..40] uncompressedBytes (u32)
+  const out = new Uint8Array(40 + payload.byteLength);
+  const dv = new DataView(out.buffer, out.byteOffset, 40);
+  dv.setUint32(0, NATIVE_REPL_ENCRYPTED_SEGMENT_MAGIC, true);
+  dv.setUint16(4, 1, true);
+  dv.setUint16(6, flags, true);
+  out.set(iv, 8);
+  out.set(salt, 20);
+  dv.setUint32(36, uncompressedBytes, true);
+  out.set(payload, 40);
+  return out;
+}
+
+/**
+ * Decode and verify an encrypted and/or Gzip-compressed replication journal
+ * segment (`0x53444246` `'FBDS'`), or transparently decode an unencrypted
+ * native segment (`0x52444246` `'FBDR'`).
+ */
+export async function decodeEncryptedJournalSegment(
+  wireBytes: Uint8Array,
+  options: DecodeEncryptedJournalSegmentOptions = {},
+): Promise<DecodedEncryptedJournalSegment> {
+  if (wireBytes.byteLength >= 4) {
+    const peekMagic = new DataView(
+      wireBytes.buffer,
+      wireBytes.byteOffset,
+      4,
+    ).getUint32(0, true);
+    if (peekMagic === NATIVE_REPL_SEGMENT_MAGIC) {
+      const segment = decodeNativeJournalSegment(wireBytes);
+      return {
+        segment,
+        compressed: false,
+        encrypted: false,
+        uncompressedBytes: wireBytes.byteLength,
+        wireBytes: wireBytes.byteLength,
+      };
+    }
+  }
+
+  if (wireBytes.byteLength < 40) {
+    throw new Error(
+      `Invalid encrypted replication journal segment: expected at least 40 bytes, got ${wireBytes.byteLength}`,
+    );
+  }
+
+  const dv = new DataView(wireBytes.buffer, wireBytes.byteOffset, 40);
+  const magic = dv.getUint32(0, true);
+  if (magic !== NATIVE_REPL_ENCRYPTED_SEGMENT_MAGIC) {
+    throw new Error(
+      `Invalid encrypted replication journal segment magic: 0x${magic.toString(16)}`,
+    );
+  }
+  const version = dv.getUint16(4, true);
+  if (version !== 1) {
+    throw new Error(
+      `Unsupported encrypted replication segment version: ${version}`,
+    );
+  }
+  const flags = dv.getUint16(6, true);
+  const compressed = (flags & 1) !== 0;
+  const encrypted = (flags & 2) !== 0;
+  const iv = wireBytes.subarray(8, 20);
+  const salt = wireBytes.subarray(20, 36);
+  const uncompressedBytes = dv.getUint32(36, true);
+  let payload: Uint8Array = wireBytes.subarray(40);
+
+  if (encrypted) {
+    if (options.key === undefined) {
+      throw new Error(
+        'Cannot decode encrypted replication journal segment: missing decryption key',
+      );
+    }
+    const cryptoKey = await resolveAesGcmCryptoKey(options.key, salt, 'decrypt');
+    const aadBytes =
+      typeof options.aad === 'string'
+        ? new TextEncoder().encode(options.aad)
+        : options.aad;
+    try {
+      const plainBuf = await globalThis.crypto.subtle.decrypt(
+        {
+          name: 'AES-GCM',
+          iv: new Uint8Array(iv),
+          ...(aadBytes ? { additionalData: new Uint8Array(aadBytes) } : {}),
+        },
+        cryptoKey,
+        new Uint8Array(payload),
+      );
+      payload = new Uint8Array(plainBuf);
+    } catch {
+      throw new Error(
+        'Failed to decrypt replication journal segment: invalid key, corrupted ciphertext, or AAD mismatch',
+      );
+    }
+  }
+
+  if (compressed) {
+    payload = await gunzipBytes(payload);
+  }
+
+  const segment = decodeNativeJournalSegment(payload);
+  return {
+    segment,
+    compressed,
+    encrypted,
+    uncompressedBytes,
+    wireBytes: wireBytes.byteLength,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 8. Time-Travel & Point-in-Time Querying over the Replication Journal (`asOfLsn` / `rewindToLsn`) (M13 Item 5)
+// ---------------------------------------------------------------------------
+
+/** Point-in-time target specification for {@link asOfLsn} and {@link rewindToLsn}. */
+export interface TimeTravelTarget {
+  /** Reconstruct or rewind state as of `entry.lsn <= lsn`. */
+  lsn?: number;
+  /** Reconstruct or rewind state as of `entry.timestamp <= timestamp`. */
+  timestamp?: number;
+  /** Reconstruct or rewind state as of `compareHlc(entry.hlc, hlc) <= 0`. */
+  hlc?: string | HlcTimestamp;
+  /** Optional single table filter (case-insensitive). */
+  table?: string;
+  /** Custom replication journal table name. @default 'FB_REPL_JOURNAL$' */
+  journalTable?: string;
+}
+
+/** Point-in-time table snapshot returned by {@link asOfLsn}. */
+export interface TimeTravelSnapshot {
+  /** Highest journal LSN included in the reconstructed state (`0` if before all entries). */
+  readonly targetLsn: number;
+  /** Current head LSN in `FB_REPL_JOURNAL$`. */
+  readonly currentLsn: number;
+  /** Total journal entries evaluated to reconstruct this snapshot. */
+  readonly entriesEvaluated: number;
+  /** Map of upper-case table name -> reconstructed array of rows at the target point in time. */
+  readonly tables: Readonly<Record<string, ReadonlyArray<Record<string, unknown>>>>;
+}
+
+/** Options for {@link rewindToLsn}. */
+export interface RewindToLsnOptions {
+  /** Target LSN number or point-in-time target (`lsn`, `timestamp`, or `hlc`). */
+  target: number | TimeTravelTarget;
+  /** Optional subset of tables to rewind (defaults to all tables affected after the target point). */
+  tables?: readonly string[];
+  /**
+   * When `true` (the default), deletes undone journal entries (`LSN > rewoundToLsn`)
+   * from `FB_REPL_JOURNAL$` and updates `FB_REPL_MIRROR$` to match the rewound state.
+   *
+   * @default true
+   */
+  truncateJournal?: boolean;
+  /** Custom replication journal table name. @default 'FB_REPL_JOURNAL$' */
+  journalTable?: string;
+  /** Custom mirror table name. @default 'FB_REPL_MIRROR$' */
+  mirrorTable?: string;
+}
+
+/** Result returned by {@link rewindToLsn}. */
+export interface RewindToLsnResult {
+  /** Head LSN in `FB_REPL_JOURNAL$` prior to rewinding. */
+  readonly previousHeadLsn: number;
+  /** Target LSN to which the database was rewound. */
+  readonly rewoundToLsn: number;
+  /** Number of DML operations inverted in reverse chronological order. */
+  readonly entriesUndone: number;
+  /** Number of journal entries removed from `FB_REPL_JOURNAL$`. */
+  readonly journalEntriesRemoved: number;
+  /** Upper-case table names modified during the rewind. */
+  readonly tablesAffected: readonly string[];
+}
+
+function normalizeTimeTravelTarget(
+  target: number | TimeTravelTarget,
+): TimeTravelTarget {
+  if (typeof target === 'number') {
+    return { lsn: target };
+  }
+  return target;
+}
+
+function entryMatchesTimeTravelCutoff(
+  entry: ReplicationLogEntry,
+  spec: TimeTravelTarget,
+): boolean {
+  if (spec.lsn !== undefined && entry.lsn > spec.lsn) {
+    return false;
+  }
+  if (spec.timestamp !== undefined && entry.timestamp > spec.timestamp) {
+    return false;
+  }
+  if (spec.hlc !== undefined) {
+    if (!entry.hlc) return false;
+    if (compareHlc(entry.hlc, spec.hlc) > 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+async function loadAllJournalEntries(
+  db: ReplicableDatabase,
+  journalTableName = DEFAULT_REPL_JOURNAL_TABLE,
+): Promise<ReplicationLogEntry[]> {
+  const jTable = quoteIdent(journalTableName);
+  const res = await db.query(
+    `SELECT LSN, TXID, ORIGIN, PUBLICATION, TABLE_NAME, OP, KEY_JSON, AFTER_JSON, BEFORE_JSON, DDL_SQL, TS FROM ${jTable} WHERE LSN > ? ORDER BY LSN ASC`,
+    [0],
+  );
+  return res.rows.map((r) => {
+    const row = r as Record<string, unknown>;
+    const lsn = Number(row.LSN ?? row.lsn ?? 0);
+    const origin = String(row.ORIGIN ?? row.origin ?? '');
+    const timestamp = Number(row.TS ?? row.ts ?? 0);
+    return {
+      lsn,
+      txid: String(row.TXID ?? row.txid ?? ''),
+      origin,
+      publication: String(row.PUBLICATION ?? row.publication ?? 'default'),
+      table: String(row.TABLE_NAME ?? row.table_name ?? ''),
+      operation: String(row.OP ?? row.op ?? 'INSERT') as ReplicationOperation,
+      key: decodeJson(row.KEY_JSON ?? row.key_json) ?? {},
+      after: decodeJson(row.AFTER_JSON ?? row.after_json),
+      before: decodeJson(row.BEFORE_JSON ?? row.before_json),
+      ddlSql:
+        row.DDL_SQL !== null && row.DDL_SQL !== undefined
+          ? String(row.DDL_SQL)
+          : row.ddl_sql !== null && row.ddl_sql !== undefined
+            ? String(row.ddl_sql)
+            : null,
+      timestamp,
+      hlc: formatHlc({ wallMs: timestamp, counter: 0, nodeId: origin }),
+    };
+  });
+}
+
+function canonicalRowKeyString(keyObj: Record<string, unknown>): string {
+  const norm = normalizeRowKeysUpper(keyObj);
+  const sortedKeys = Object.keys(norm).sort();
+  return JSON.stringify(sortedKeys.map((k) => [k, norm[k]]));
+}
+
+/**
+ * Reconstruct historical table rows at any past LSN, timestamp, or HLC
+ * (`M13 Item 5`) without mutating the live database.
+ *
+ * Uses the `AFTER_JSON` / `BEFORE_JSON` audit trail in `FB_REPL_JOURNAL$`
+ * to compute the exact row state of one or all published tables as of `target`.
+ */
+export async function asOfLsn(
+  db: ReplicableDatabase,
+  target: number | TimeTravelTarget,
+): Promise<TimeTravelSnapshot> {
+  const spec = normalizeTimeTravelTarget(target);
+  const allEntries = await loadAllJournalEntries(
+    db,
+    spec.journalTable ?? DEFAULT_REPL_JOURNAL_TABLE,
+  );
+  const currentLsn =
+    allEntries.length > 0 ? allEntries[allEntries.length - 1]!.lsn : 0;
+
+  const filterTable = spec.table ? normalizeTableName(spec.table) : null;
+  const tableRowMaps = new Map<string, Map<string, Record<string, unknown>>>();
+
+  let targetLsn = 0;
+  let entriesEvaluated = 0;
+
+  for (const entry of allEntries) {
+    if (!entryMatchesTimeTravelCutoff(entry, spec)) {
+      continue;
+    }
+    if (entry.lsn > targetLsn) {
+      targetLsn = entry.lsn;
+    }
+    if (entry.operation === 'DDL') {
+      continue;
+    }
+    const tbl = normalizeTableName(entry.table);
+    if (filterTable && tbl !== filterTable) {
+      continue;
+    }
+    entriesEvaluated++;
+
+    let rowMap = tableRowMaps.get(tbl);
+    if (!rowMap) {
+      rowMap = new Map();
+      tableRowMaps.set(tbl, rowMap);
+    }
+
+    const rowKey = canonicalRowKeyString(entry.key);
+    if (entry.operation === 'DELETE') {
+      rowMap.delete(rowKey);
+    } else if (entry.after) {
+      rowMap.set(rowKey, { ...normalizeRowKeysUpper(entry.after) });
+    }
+  }
+
+  const tables: Record<string, ReadonlyArray<Record<string, unknown>>> = {};
+  if (filterTable && !tableRowMaps.has(filterTable)) {
+    tables[filterTable] = [];
+  }
+  for (const [tbl, rowMap] of tableRowMaps.entries()) {
+    tables[tbl] = [...rowMap.values()];
+  }
+
+  return {
+    targetLsn,
+    currentLsn,
+    entriesEvaluated,
+    tables,
+  };
+}
+
+/**
+ * Roll back a database to a historical LSN, timestamp, or HLC (`M13 Item 5`)
+ * by applying inverse DML operations (`INSERT` -> `DELETE`, `UPDATE` -> restore
+ * `BEFORE_JSON`, `DELETE` -> re-insert `BEFORE_JSON`) in reverse `LSN DESC` order.
+ */
+export async function rewindToLsn(
+  db: ReplicableDatabase,
+  targetOrOptions: number | RewindToLsnOptions,
+): Promise<RewindToLsnResult> {
+  const opts: RewindToLsnOptions =
+    typeof targetOrOptions === 'number'
+      ? { target: targetOrOptions }
+      : targetOrOptions;
+  const spec = normalizeTimeTravelTarget(opts.target);
+  const journalTableName =
+    opts.journalTable ?? spec.journalTable ?? DEFAULT_REPL_JOURNAL_TABLE;
+  const mirrorTableName = opts.mirrorTable ?? DEFAULT_REPL_MIRROR_TABLE;
+  const truncateJournal = opts.truncateJournal !== false;
+
+  const allowedTables =
+    opts.tables && opts.tables.length > 0
+      ? new Set(opts.tables.map((t) => normalizeTableName(t)))
+      : spec.table
+        ? new Set([normalizeTableName(spec.table)])
+        : null;
+
+  const allEntries = await loadAllJournalEntries(db, journalTableName);
+  const previousHeadLsn =
+    allEntries.length > 0 ? allEntries[allEntries.length - 1]!.lsn : 0;
+
+  let rewoundToLsn = 0;
+  const toUndo: ReplicationLogEntry[] = [];
+
+  for (const entry of allEntries) {
+    if (entryMatchesTimeTravelCutoff(entry, spec)) {
+      if (entry.lsn > rewoundToLsn) {
+        rewoundToLsn = entry.lsn;
+      }
+    } else {
+      toUndo.push(entry);
+    }
+  }
+
+  // Apply inverse operations in reverse chronological order (highest LSN first)
+  toUndo.sort((a, b) => b.lsn - a.lsn);
+
+  const affectedSet = new Set<string>();
+  let entriesUndone = 0;
+
+  const runUndo = async (tx: {
+    query<R extends Row = Row>(sql: string, params?: QueryParams): Promise<QueryResult<R>>;
+    execute?(sql: string, params?: QueryParams): Promise<{ changes?: number } | void>;
+    exec?(sql: string, params?: QueryParams): Promise<unknown>;
+  }) => {
+    try {
+      await tx.query(
+        `SELECT RDB$SET_CONTEXT('USER_SESSION', '${escapeSqlLiteral(DEFAULT_REPL_ROLE_CONTEXT_VAR)}', 'REPLICA') AS CTX FROM RDB$DATABASE`,
+      );
+    } catch {
+      // Ignore if test double doesn't implement RDB$SET_CONTEXT
+    }
+
+    for (const entry of toUndo) {
+      if (entry.operation === 'DDL') continue;
+      const tbl = normalizeTableName(entry.table);
+      if (allowedTables && !allowedTables.has(tbl)) continue;
+
+      const quotedTbl = quoteIdent(tbl);
+      const pkEntries = Object.entries(normalizeRowKeysUpper(entry.key));
+      if (pkEntries.length === 0) continue;
+
+      if (entry.operation === 'INSERT') {
+        const whereClause = pkEntries
+          .map(([col]) => `${quoteIdent(col)} = ?`)
+          .join(' AND ');
+        const whereParams = pkEntries.map(([, val]) => val);
+        await execStatement(
+          tx,
+          `DELETE FROM ${quotedTbl} WHERE ${whereClause}`,
+          whereParams as QueryParams,
+        );
+        affectedSet.add(tbl);
+        entriesUndone++;
+      } else if (entry.operation === 'UPDATE' && entry.before) {
+        const beforeNorm = normalizeRowKeysUpper(entry.before);
+        const setEntries = Object.entries(beforeNorm);
+        if (setEntries.length > 0) {
+          const setClause = setEntries
+            .map(([col]) => `${quoteIdent(col)} = ?`)
+            .join(', ');
+          const whereClause = pkEntries
+            .map(([col]) => `${quoteIdent(col)} = ?`)
+            .join(' AND ');
+          const params = [
+            ...setEntries.map(([, val]) => val),
+            ...pkEntries.map(([, val]) => val),
+          ];
+          await execStatement(
+            tx,
+            `UPDATE ${quotedTbl} SET ${setClause} WHERE ${whereClause}`,
+            params as QueryParams,
+          );
+          affectedSet.add(tbl);
+          entriesUndone++;
+        }
+      } else if (entry.operation === 'DELETE' && entry.before) {
+        const beforeNorm = normalizeRowKeysUpper(entry.before);
+        const colEntries = Object.entries(beforeNorm);
+        if (colEntries.length > 0) {
+          const colsSql = colEntries.map(([col]) => quoteIdent(col)).join(', ');
+          const placeholders = colEntries.map(() => '?').join(', ');
+          const params = colEntries.map(([, val]) => val);
+          await execStatement(
+            tx,
+            `INSERT INTO ${quotedTbl} (${colsSql}) VALUES (${placeholders})`,
+            params as QueryParams,
+          );
+          affectedSet.add(tbl);
+          entriesUndone++;
+        }
+      }
+    }
+  };
+
+  if (typeof db.transaction === 'function') {
+    await db.transaction(runUndo);
+  } else {
+    await runUndo(db);
+  }
+
+  let journalEntriesRemoved = 0;
+  if (truncateJournal && toUndo.length > 0) {
+    const jTable = quoteIdent(journalTableName);
+    const remaining = allEntries.filter((e) => e.lsn <= rewoundToLsn);
+    journalEntriesRemoved = allEntries.length - remaining.length;
+
+    // Delete entries with LSN <= previousHeadLsn and re-insert kept entries if
+    // the underlying database double only supports `DELETE ... WHERE LSN <= ?`,
+    // or use `DELETE FROM ... WHERE LSN > ?` directly.
+    await execStatement(
+      db,
+      `DELETE FROM ${jTable} WHERE LSN > ?`,
+      [rewoundToLsn],
+    );
+
+    // Sync FB_REPL_MIRROR$ for affected tables so future captureTableChanges() matches rewound state
+    const mTable = quoteIdent(mirrorTableName);
+    const snapshot = await asOfLsn(db, {
+      lsn: rewoundToLsn,
+      journalTable: journalTableName,
+    });
+    for (const tbl of affectedSet) {
+      try {
+        await execStatement(
+          db,
+          `DELETE FROM ${mTable} WHERE PUBLICATION = ? AND TABLE_NAME = ?`,
+          ['default', tbl],
+        );
+        const rows = snapshot.tables[tbl] ?? [];
+        for (const r of rows) {
+          const idVal = r.ID ?? Object.values(r)[0];
+          const rowKey = JSON.stringify([idVal]);
+          await execStatement(
+            db,
+            `INSERT INTO ${mTable} (PUBLICATION, TABLE_NAME, ROW_KEY, ROW_JSON) VALUES (?, ?, ?, ?)`,
+            ['default', tbl, rowKey, encodeJson(r)],
+          );
+        }
+      } catch {
+        // Mirror table may not exist if triggers were used exclusively
+      }
+    }
+  }
+
+  return {
+    previousHeadLsn,
+    rewoundToLsn,
+    entriesUndone,
+    journalEntriesRemoved,
+    tablesAffected: [...affectedSet],
+  };
+}

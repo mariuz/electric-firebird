@@ -32,6 +32,12 @@ import {
   decodeNativeJournalSegment,
   NATIVE_REPL_SEGMENT_MAGIC,
   NATIVE_REPL_PROTOCOL_VERSION,
+  promoteReplica,
+  NATIVE_REPL_ENCRYPTED_SEGMENT_MAGIC,
+  encodeEncryptedJournalSegment,
+  decodeEncryptedJournalSegment,
+  asOfLsn,
+  rewindToLsn,
   type ReplicableDatabase,
   type WebSocketLike,
 } from '../replication';
@@ -213,6 +219,18 @@ function createMockReplDb(): ReplicableDatabase & {
       tables.set(
         tbl,
         getTable(tbl).filter((r) => Number(r.LSN ?? 0) > maxLsn),
+      );
+      return;
+    }
+
+    const deleteAfterLsnMatch =
+      /^DELETE\s+FROM\s+([A-Za-z0-9_$"]+)\s+WHERE\s+LSN\s*>\s*\?/i.exec(trimmed);
+    if (deleteAfterLsnMatch) {
+      const tbl = deleteAfterLsnMatch[1]!.replace(/"/g, '').toUpperCase();
+      const cutoffLsn = Number(params[0] ?? 0);
+      tables.set(
+        tbl,
+        getTable(tbl).filter((r) => Number(r.LSN ?? 0) <= cutoffLsn),
       );
       return;
     }
@@ -1244,5 +1262,242 @@ describe('firebird-wasm/replication – Logical & Journal-Based Database Replica
     const corrupted = new Uint8Array(segmentBytes);
     corrupted[corrupted.byteLength - 1]! ^= 0xff;
     expect(() => decodeNativeJournalSegment(corrupted)).toThrow(/checksum mismatch/i);
+  });
+
+  it('promotes a replica to primary via promoteReplica() with lag guards, sequence buffer, and peer re-routing', async () => {
+    const oldPrimary = createMockReplDb();
+    const replica1 = createMockReplDb();
+    const replica2 = createMockReplDb();
+
+    oldPrimary.tables.set('ORDERS', [{ ID: 1, ITEM: 'Keyboard' }]);
+    replica1.tables.set('ORDERS', [{ ID: 1, ITEM: 'Keyboard' }]);
+    replica2.tables.set('ORDERS', [{ ID: 1, ITEM: 'Keyboard' }]);
+
+    const oldPub = await createPublication(oldPrimary, {
+      name: 'pub_orders',
+      nodeId: 'primary-1',
+      tables: [{ table: 'ORDERS', primaryKey: 'ID' }],
+    });
+    // Record baseline and one new insert on oldPrimary
+    await oldPub.captureTableChanges();
+    await oldPrimary.execute?.(
+      'INSERT INTO ORDERS (ID, ITEM) VALUES (?, ?)',
+      [2, 'Monitor'],
+    );
+    await oldPub.captureTableChanges();
+
+    const sub1 = await createSubscription(replica1, {
+      name: 'sub_r1',
+      nodeId: 'replica-1',
+      publication: oldPub,
+    });
+    const sub2 = await createSubscription(replica2, {
+      name: 'sub_r2',
+      nodeId: 'replica-2',
+      publication: oldPub,
+    });
+    await sub2.pull();
+
+    // Promoting replica1 delivers final pending changes from oldPub, sets FB_REPL_ROLE='PRIMARY',
+    // installs triggers, primes baseline mirror, and updates peerSubscriptions watermarks
+    const promoted = await promoteReplica({
+      replicaDb: replica1,
+      subscription: sub1,
+      maxAllowedLagEntries: 0,
+      promotedNodeId: 'primary-2',
+      publicationName: 'pub_orders_v2',
+      tables: [{ table: 'ORDERS', primaryKey: 'ID', columns: ['ID', 'ITEM'] }],
+      installTriggers: true,
+      peerSubscriptions: [sub2],
+    });
+
+    expect(promoted.promotedNodeId).toBe('primary-2');
+    expect(promoted.finalPullResult?.appliedCount).toBe(2);
+    expect(promoted.publishedTables).toEqual(['ORDERS']);
+    expect(promoted.triggersInstalled).toBe(1);
+    expect(promoted.roleContextCleared).toBe(true);
+    expect(replica1.tables.get('ORDERS')).toEqual([
+      { ID: 1, ITEM: 'Keyboard' },
+      { ID: 2, ITEM: 'Monitor' },
+    ]);
+
+    // Now write a new row on the newly promoted primary (replica1) and replicate to replica2
+    await replica1.execute?.(
+      'INSERT INTO ORDERS (ID, ITEM) VALUES (?, ?)',
+      [3, 'Mouse'],
+    );
+    await promoted.publication.captureTableChanges();
+
+    const sub2OnNewPrimary = await createSubscription(replica2, {
+      name: 'sub_r2',
+      nodeId: 'replica-2',
+      publication: promoted.publication,
+    });
+    const pullRes = await sub2OnNewPrimary.pull();
+    expect(pullRes.appliedCount).toBe(1);
+    expect(replica2.tables.get('ORDERS')).toEqual([
+      { ID: 1, ITEM: 'Keyboard' },
+      { ID: 2, ITEM: 'Monitor' },
+      { ID: 3, ITEM: 'Mouse' },
+    ]);
+  });
+
+  it('compresses and encrypts replication journal segments with Gzip and WebCrypto AES-256-GCM', async () => {
+    const entries = Array.from({ length: 10 }, (_, idx) => ({
+      lsn: idx + 1,
+      txid: `tx-${idx + 1}`,
+      origin: 'node-primary',
+      publication: 'pub_main',
+      table: 'CUSTOMER_EVENTS',
+      operation: 'INSERT' as const,
+      key: { ID: idx + 1 },
+      after: {
+        ID: idx + 1,
+        PAYLOAD: 'repeated-compressible-event-payload-string-for-gzip-testing',
+      },
+      before: null,
+      ddlSql: null,
+      timestamp: 1700000000000 + idx,
+    }));
+
+    // 1. Raw 32-byte AES-256-GCM key + Gzip compression + AAD
+    const rawKey = new Uint8Array(32);
+    for (let i = 0; i < 32; i++) rawKey[i] = (i * 7 + 3) & 0xff;
+
+    const encryptedBytes = await encodeEncryptedJournalSegment(entries, {
+      key: rawKey,
+      compress: true,
+      aad: 'cluster-prod-eu',
+      sequence: 42,
+      state: 'full',
+    });
+
+    const magic = new DataView(
+      encryptedBytes.buffer,
+      encryptedBytes.byteOffset,
+      4,
+    ).getUint32(0, true);
+    expect(magic).toBe(NATIVE_REPL_ENCRYPTED_SEGMENT_MAGIC);
+
+    const decoded = await decodeEncryptedJournalSegment(encryptedBytes, {
+      key: rawKey,
+      aad: 'cluster-prod-eu',
+    });
+    expect(decoded.compressed).toBe(true);
+    expect(decoded.encrypted).toBe(true);
+    expect(decoded.wireBytes).toBeLessThan(decoded.uncompressedBytes);
+    expect(decoded.segment.header.sequence).toBe(42);
+    expect(decoded.segment.header.state).toBe('full');
+    expect(decoded.segment.entries).toEqual(entries);
+
+    // Wrong key or wrong AAD fails authentication tag check
+    await expect(
+      decodeEncryptedJournalSegment(encryptedBytes, {
+        key: new Uint8Array(32),
+        aad: 'cluster-prod-eu',
+      }),
+    ).rejects.toThrow(/Failed to decrypt/i);
+
+    await expect(
+      decodeEncryptedJournalSegment(encryptedBytes, {
+        key: rawKey,
+        aad: 'wrong-cluster-aad',
+      }),
+    ).rejects.toThrow(/Failed to decrypt/i);
+
+    // 2. Passphrase-derived key (PBKDF2-HMAC-SHA256)
+    const passBytes = await encodeEncryptedJournalSegment(entries.slice(0, 2), {
+      key: 'correct-horse-battery-staple',
+      compress: true,
+    });
+    const passDecoded = await decodeEncryptedJournalSegment(passBytes, {
+      key: 'correct-horse-battery-staple',
+    });
+    expect(passDecoded.encrypted).toBe(true);
+    expect(passDecoded.compressed).toBe(true);
+    expect(passDecoded.segment.entries).toEqual(entries.slice(0, 2));
+  });
+
+  it('supports time-travel point-in-time querying (asOfLsn) and database rollback (rewindToLsn)', async () => {
+    const db = createMockReplDb();
+    db.tables.set('ACCOUNTS', []);
+
+    const pub = await createPublication(db, {
+      name: 'pub_bank',
+      nodeId: 'bank-primary',
+      tables: [{ table: 'ACCOUNTS', primaryKey: 'ID' }],
+    });
+
+    // LSN 1: Insert Alice ($100)
+    await db.execute?.(
+      'INSERT INTO ACCOUNTS (ID, OWNER, BALANCE) VALUES (?, ?, ?)',
+      [1, 'Alice', 100],
+    );
+    await pub.captureTableChanges({ timestamp: 1000 });
+
+    // LSN 2: Insert Bob ($250)
+    await db.execute?.(
+      'INSERT INTO ACCOUNTS (ID, OWNER, BALANCE) VALUES (?, ?, ?)',
+      [2, 'Bob', 250],
+    );
+    await pub.captureTableChanges({ timestamp: 2000 });
+
+    // LSN 3: Update Alice ($100 -> $175)
+    await db.execute?.(
+      'UPDATE ACCOUNTS SET BALANCE = ? WHERE ID = ?',
+      [175, 1],
+    );
+    await pub.captureTableChanges({ timestamp: 3000 });
+
+    // LSN 4: Delete Bob
+    await db.execute?.('DELETE FROM ACCOUNTS WHERE ID = ?', [2]);
+    await pub.captureTableChanges({ timestamp: 4000 });
+
+    // Live table at LSN 4 only has Alice ($175)
+    expect(db.tables.get('ACCOUNTS')).toEqual([
+      { ID: 1, OWNER: 'Alice', BALANCE: 175 },
+    ]);
+
+    // Time-travel query as of LSN 1
+    const snap1 = await asOfLsn(db, 1);
+    expect(snap1.targetLsn).toBe(1);
+    expect(snap1.currentLsn).toBe(4);
+    expect(snap1.tables.ACCOUNTS).toEqual([
+      { ID: 1, OWNER: 'Alice', BALANCE: 100 },
+    ]);
+
+    // Time-travel query as of LSN 2 (or timestamp 2000)
+    const snap2 = await asOfLsn(db, { timestamp: 2000 });
+    expect(snap2.targetLsn).toBe(2);
+    expect(snap2.tables.ACCOUNTS).toEqual([
+      { ID: 1, OWNER: 'Alice', BALANCE: 100 },
+      { ID: 2, OWNER: 'Bob', BALANCE: 250 },
+    ]);
+
+    // Time-travel query as of LSN 3
+    const snap3 = await asOfLsn(db, 3);
+    expect(snap3.tables.ACCOUNTS).toEqual([
+      { ID: 1, OWNER: 'Alice', BALANCE: 175 },
+      { ID: 2, OWNER: 'Bob', BALANCE: 250 },
+    ]);
+
+    // Rewind live database back to LSN 2 (undoes LSN 4 DELETE of Bob and LSN 3 UPDATE of Alice)
+    const rewindRes = await rewindToLsn(db, 2);
+    expect(rewindRes.previousHeadLsn).toBe(4);
+    expect(rewindRes.rewoundToLsn).toBe(2);
+    expect(rewindRes.entriesUndone).toBe(2);
+    expect(rewindRes.journalEntriesRemoved).toBe(2);
+    expect(rewindRes.tablesAffected).toEqual(['ACCOUNTS']);
+
+    // Live table is now restored to its exact LSN 2 state!
+    const liveRows = [...(db.tables.get('ACCOUNTS') ?? [])].sort(
+      (a, b) => Number(a.ID) - Number(b.ID),
+    );
+    expect(liveRows).toEqual([
+      { ID: 1, OWNER: 'Alice', BALANCE: 100 },
+      { ID: 2, OWNER: 'Bob', BALANCE: 250 },
+    ]);
+    const remainingEntries = await pub.fetchChangesSince(0);
+    expect(remainingEntries.map((e) => e.lsn)).toEqual([1, 2]);
   });
 });

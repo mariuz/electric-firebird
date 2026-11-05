@@ -1490,15 +1490,15 @@ Next-horizon milestones (`v0.19.0`):
       additive deltas & `Set-Union`), Multi-Tenant Row/Column Filtering (`where` /
       `excludeColumns`), Replication Slots & Safe Auto-Pruning (`pruneAcked`), and a
       Firebird 4.0/5.0 Native Binary Segment (`0x52444246`) Hex Inspector.
-- [ ] **3. Automatic Failover & Replica-to-Primary Promotion (`promoteReplica`).**
+- [x] **3. Automatic Failover & Replica-to-Primary Promotion (`promoteReplica`).**
       Provide a one-call `promoteReplica()` workflow that verifies minimal lag,
       synchronizes sequence watermarks (`syncCatalog`), flips replica triggers to
       active primary mode, and re-routes peer subscriptions to the promoted node.
-- [ ] **4. Encrypted & Compressed Replication Journal Segments (AES-256-GCM + Gzip).**
+- [x] **4. Encrypted & Compressed Replication Journal Segments (AES-256-GCM + Gzip).**
       Support end-to-end payload encryption (`WebCrypto` AES-256-GCM) and streaming
       compression on `encodeNativeJournalSegment` / `decodeNativeJournalSegment` and
       HTTP/WebSocket replication transports.
-- [ ] **5. Time-Travel & Point-in-Time Querying over the Replication Journal (`asOfLsn` / `rewindToLsn`).**
+- [x] **5. Time-Travel & Point-in-Time Querying over the Replication Journal (`asOfLsn` / `rewindToLsn`).**
       Reconstruct historical table/row states or roll back a database to any past
       LSN or HLC timestamp using the `BEFORE_JSON` / `AFTER_JSON` audit trail in
       `FB_REPL_JOURNAL$`.

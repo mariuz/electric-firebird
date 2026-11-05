@@ -417,6 +417,64 @@ const segmentBytes = encodeNativeJournalSegment(entries, {
 const decoded = decodeNativeJournalSegment(segmentBytes);
 ```
 
+### 5.8 Phase 8 — Automatic Failover & Replica-to-Primary Promotion (`promoteReplica`)
+
+Promote a standby replica to the new primary in a single call — draining pending changes, validating replication lag against `maxAllowedLagEntries`, bumping sequence watermarks (`sequenceBuffer`), resetting `FB_REPL_ROLE` to `'PRIMARY'`, installing triggers, and re-seeding peer subscriptions:
+
+```ts
+import { promoteReplica } from 'firebird-wasm/replication';
+
+const promoted = await promoteReplica({
+  replicaDb: replica1,
+  subscription: sub1,
+  previousPrimaryDb: oldPrimary, // optional if reachable
+  maxAllowedLagEntries: 0,
+  sequenceBuffer: 100,
+  promotedNodeId: 'primary-2',
+  installTriggers: true,
+  peerSubscriptions: [sub2],
+});
+console.log(promoted.promotedNodeId, promoted.publishedTables);
+```
+
+### 5.9 Phase 9 — Encrypted & Gzip-Compressed Journal Segments (AES-256-GCM)
+
+Compress journal segments with Gzip (`CompressionStream('gzip')`) and encrypt them end-to-end with WebCrypto AES-256-GCM (`0x53444246` `'FBDS'` envelope) using a 32-byte key, `CryptoKey`, or PBKDF2 passphrase:
+
+```ts
+import {
+  encodeEncryptedJournalSegment,
+  decodeEncryptedJournalSegment,
+} from 'firebird-wasm/replication';
+
+const encryptedWireBytes = await encodeEncryptedJournalSegment(entries, {
+  key: 'cluster-replication-passphrase',
+  compress: true,
+  aad: 'prod-eu-west',
+});
+
+const { segment, compressed, encrypted } = await decodeEncryptedJournalSegment(
+  encryptedWireBytes,
+  { key: 'cluster-replication-passphrase', aad: 'prod-eu-west' },
+);
+```
+
+### 5.10 Phase 10 — Time-Travel Querying (`asOfLsn`) & Point-in-Time Rollback (`rewindToLsn`)
+
+Reconstruct historical table state at any past LSN, timestamp, or HLC without mutating the live database via `asOfLsn()`, or roll back the live database in reverse chronological order via `rewindToLsn()`:
+
+```ts
+import { asOfLsn, rewindToLsn } from 'firebird-wasm/replication';
+
+// 1. Non-destructive point-in-time snapshot at LSN 42 (or { timestamp } / { hlc }):
+const historical = await asOfLsn(db, 42);
+console.log(historical.tables.ACCOUNTS);
+
+// 2. Roll back the live database to LSN 42 using BEFORE_JSON / AFTER_JSON inverse DML:
+const rewindResult = await rewindToLsn(db, 42);
+console.log(`Undid ${rewindResult.entriesUndone} operations back to LSN ${rewindResult.rewoundToLsn}`);
+```
+
 ---
 
 ## 6. Replication Use Cases
@@ -467,3 +525,8 @@ const decoded = decodeNativeJournalSegment(segmentBytes);
 | `createWebSocketReplicationPeer(options)` | Duplex WebSocket replication peer streaming entries, pull requests, and slot acks. |
 | `encodeNativeJournalSegment(entries, opts?)` | Encodes journal entries into a Firebird 4.0/5.0 binary journal segment (`0x52444246`). |
 | `decodeNativeJournalSegment(bytes)` | Validates FNV-1a checksum and decodes a Firebird 4.0/5.0 binary journal segment. |
+| `promoteReplica(options)` | Drains lag, syncs sequence watermarks, resets `FB_REPL_ROLE='PRIMARY'`, installs triggers, and promotes a replica to primary. |
+| `encodeEncryptedJournalSegment(entries, opts?)` | Gzip-compresses and encrypts a journal segment with WebCrypto AES-256-GCM (`0x53444246`). |
+| `decodeEncryptedJournalSegment(bytes, opts?)` | Decrypts and decompresses an encrypted journal segment (or transparently decodes raw `0x52444246` segments). |
+| `asOfLsn(db, target)` | Non-destructively reconstructs historical table rows at any past LSN, timestamp, or HLC. |
+| `rewindToLsn(db, targetOrOptions)` | Rolls back a live database to a historical LSN, timestamp, or HLC using inverse DML from `BEFORE_JSON`. |

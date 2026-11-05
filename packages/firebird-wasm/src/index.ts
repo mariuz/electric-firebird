@@ -273,6 +273,12 @@ export {
   createWebSocketReplicationPeer,
   encodeNativeJournalSegment,
   decodeNativeJournalSegment,
+  promoteReplica,
+  NATIVE_REPL_ENCRYPTED_SEGMENT_MAGIC,
+  encodeEncryptedJournalSegment,
+  decodeEncryptedJournalSegment,
+  asOfLsn,
+  rewindToLsn,
 } from './replication';
 export type {
   ReplicableDatabase,
@@ -322,6 +328,15 @@ export type {
   WebSocketReplicationPeer,
   NativeJournalSegmentHeader,
   NativeJournalSegment,
+  PromoteReplicaOptions,
+  PromoteReplicaResult,
+  EncryptedJournalSegmentOptions,
+  DecodeEncryptedJournalSegmentOptions,
+  DecodedEncryptedJournalSegment,
+  TimeTravelTarget,
+  TimeTravelSnapshot,
+  RewindToLsnOptions,
+  RewindToLsnResult,
 } from './replication';
 export {
   ENCRYPTED_PAGE_MAGIC,
