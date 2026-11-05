@@ -9,6 +9,8 @@ import {
   buildReplicationTriggerDdl,
   installReplicationTriggers,
   dropReplicationTriggers,
+  needsBootstrap,
+  bootstrapReplica,
   type ReplicableDatabase,
 } from '../replication';
 import type { QueryParams, QueryResult, Row } from '../types';
@@ -474,5 +476,153 @@ describe('firebird-wasm/replication – Logical & Journal-Based Database Replica
     expect(
       await installReplicationTriggers(primary, { tables: ['TASKS'], publication: 'default' }),
     ).toHaveLength(1);
+  });
+
+  it('tracks replication slots (FB_REPL_SLOTS$), heartbeats, TTL expiration, and safe pruneAcked()', async () => {
+    const primary = createMockReplDb();
+    const replicaA = createMockReplDb();
+    const replicaB = createMockReplDb();
+
+    const pub = await createPublication(primary, {
+      name: 'slots_pub',
+      nodeId: 'primary-1',
+      tables: [{ table: 'ITEMS', primaryKey: 'ID' }],
+    });
+
+    const subA = await createSubscription(replicaA, {
+      name: 'sub_a',
+      nodeId: 'replica-a',
+      slotName: 'slot_a',
+      slotTtlMs: 60_000,
+      publication: pub,
+    });
+
+    const subB = await createSubscription(replicaB, {
+      name: 'sub_b',
+      nodeId: 'replica-b',
+      slotName: 'slot_b',
+      slotTtlMs: 1_000, // short TTL to test expiration
+      publication: pub,
+    });
+    expect(subB.slotName).toBe('slot_b');
+
+    // Record 4 changes on primary
+    for (let i = 1; i <= 4; i++) {
+      await pub.recordDml({
+        table: 'ITEMS',
+        operation: 'INSERT',
+        after: { ID: i, NAME: `Item ${i}` },
+      });
+    }
+
+    // Replica A pulls all 4 changes -> slot_a confirmedFlushLsn = 4
+    await subA.pull();
+    // Replica B only acknowledges LSN 2 at t = 1000
+    await pub.advanceSlot('slot_b', 2, { nodeId: 'replica-b', ttlMs: 1_000, now: 1_000 });
+
+    const slotsBefore = await pub.listSlots();
+    expect(slotsBefore).toHaveLength(2);
+
+    // At t = 1500 (slot_b still alive), safeLsn = MIN(4, 2) = 2
+    const prune1 = await pub.pruneAcked({ now: 1_500 });
+    expect(prune1.expiredSlots).toEqual([]);
+    expect(prune1.activeSlotCount).toBe(2);
+    expect(prune1.safeLsn).toBe(2);
+    expect(prune1.prunedEntries).toBe(2);
+    expect(await pub.minRetainedLsn()).toBe(3);
+
+    // Heartbeat slot_a
+    const hb = await subA.heartbeat({ now: Date.now() });
+    expect(hb?.slotName).toBe('slot_a');
+
+    // At t = Date.now() + 5000 (slot_b has expired past its 1000ms TTL from t=1000),
+    // slot_b is expired and removed, so safeLsn advances to slot_a's LSN (4)!
+    const prune2 = await pub.pruneAcked({ now: Date.now() + 5_000 });
+    expect(prune2.expiredSlots).toEqual(['slot_b']);
+    expect(prune2.activeSlotCount).toBe(1);
+    expect(prune2.safeLsn).toBe(4);
+    expect(prune2.prunedEntries).toBe(2);
+    expect(await pub.minRetainedLsn()).toBeNull();
+  });
+
+  it('bootstraps new and fallen-behind replicas via exportSnapshot, bootstrapReplica, and autoBootstrap', async () => {
+    const primary = createMockReplDb();
+    const replica = createMockReplDb();
+
+    const pub = await createPublication(primary, {
+      name: 'boot_pub',
+      nodeId: 'primary-1',
+      tables: [{ table: 'PRODUCTS', primaryKey: 'ID' }],
+    });
+
+    await pub.recordDml({
+      table: 'PRODUCTS',
+      operation: 'INSERT',
+      after: { ID: 1, NAME: 'Keyboard', PRICE: 120 },
+    });
+    await pub.recordDml({
+      table: 'PRODUCTS',
+      operation: 'INSERT',
+      after: { ID: 2, NAME: 'Monitor', PRICE: 350 },
+    });
+    await pub.recordDml({
+      table: 'PRODUCTS',
+      operation: 'UPDATE',
+      key: { ID: 1 },
+      after: { NAME: 'Mechanical Keyboard', PRICE: 145 },
+    });
+
+    // Prune journal up to LSN 2 so a new replica at watermark 0 is behind the retained journal
+    await pub.pruneJournal(2);
+    expect(await pub.minRetainedLsn()).toBe(3);
+
+    const sub = await createSubscription(replica, {
+      name: 'sub_boot',
+      nodeId: 'replica-boot',
+      publication: pub,
+      autoBootstrap: true,
+    });
+
+    const check = await needsBootstrap(pub, sub);
+    expect(check.needed).toBe(true);
+    expect(check.reason).toBe('behind-retained-journal');
+
+    // Calling pull() with autoBootstrap: true automatically seeds from exportSnapshot()
+    const pullRes = await sub.pull();
+    expect(pullRes.bootstrapped).toBe(true);
+    expect(pullRes.currentLsn).toBe(3);
+    expect(await sub.getWatermark()).toBe(3);
+    expect(replica.tables.get('PRODUCTS')).toEqual([
+      { ID: 1, NAME: 'Mechanical Keyboard', PRICE: 145 },
+      { ID: 2, NAME: 'Monitor', PRICE: 350 },
+    ]);
+
+    // Subsequent incremental DML after bootstrap replays normally
+    await pub.recordDml({
+      table: 'PRODUCTS',
+      operation: 'INSERT',
+      after: { ID: 3, NAME: 'Mouse', PRICE: 65 },
+    });
+    const pullNext = await sub.pull();
+    expect(pullNext.bootstrapped).toBeUndefined();
+    expect(pullNext.appliedCount).toBe(1);
+    expect(pullNext.currentLsn).toBe(4);
+    expect(replica.tables.get('PRODUCTS')).toHaveLength(3);
+
+    // Explicit bootstrapReplica call also works directly
+    const replica2 = createMockReplDb();
+    const sub2 = await createSubscription(replica2, {
+      name: 'sub_boot_2',
+      nodeId: 'replica-boot-2',
+      publication: pub,
+    });
+    const manualBoot = await bootstrapReplica({
+      targetDb: replica2,
+      publication: pub,
+      subscription: sub2,
+    });
+    expect(manualBoot.watermarkLsn).toBe(4);
+    expect(manualBoot.rowsCopied).toBe(3);
+    expect(replica2.tables.get('PRODUCTS')).toHaveLength(3);
   });
 });

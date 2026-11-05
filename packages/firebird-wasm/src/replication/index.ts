@@ -52,6 +52,12 @@ export const DEFAULT_REPL_ROLE_CONTEXT_VAR = 'FB_REPL_ROLE';
 /** Firebird `USER_SESSION` context variable holding the originating node ID. */
 export const DEFAULT_REPL_ORIGIN_CONTEXT_VAR = 'FB_REPL_ORIGIN';
 
+/** Default replication slot tracking table name on the primary. */
+export const DEFAULT_REPL_SLOTS_TABLE = 'FB_REPL_SLOTS$';
+
+/** Default replication slot TTL in milliseconds (7 days). */
+export const DEFAULT_REPL_SLOT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
 /**
  * Minimal structural interface satisfied by `FirebirdBrowser`, `FirebirdLite`,
  * and test doubles.
@@ -203,6 +209,118 @@ export interface InstallReplicationTriggersOptions {
   sequenceName?: string;
 }
 
+// ---------------------------------------------------------------------------
+// Replication Slots & Snapshot Bootstrap Types (M12 Items 2 & 3)
+// ---------------------------------------------------------------------------
+
+/** A registered replica slot tracked in `FB_REPL_SLOTS$` on a primary database. */
+export interface ReplicationSlot {
+  /** Unique slot identifier (e.g. `'slot_replica_1'`). */
+  readonly slotName: string;
+  /** Publication name this slot belongs to. */
+  readonly publication: string;
+  /** Subscriber node identifier. */
+  readonly nodeId: string;
+  /** Highest LSN durably applied and acknowledged by this subscriber. */
+  readonly confirmedFlushLsn: number;
+  /** Epoch timestamp (`Date.now()`) of the subscriber's last heartbeat or LSN ack. */
+  readonly lastSeenAt: number;
+  /** Slot time-to-live in milliseconds (`0` = never expires). */
+  readonly ttlMs: number;
+}
+
+/** Options for `publication.registerSlot()`. */
+export interface RegisterReplicationSlotOptions {
+  /** Unique slot name. */
+  slotName: string;
+  /** Subscriber node identifier. @default slotName */
+  nodeId?: string;
+  /** Initial confirmed LSN watermark. @default 0 */
+  initialLsn?: number;
+  /** Slot TTL in milliseconds before it is considered stale by `pruneAcked()`. @default 604800000 */
+  ttlMs?: number;
+  /** Explicit timestamp override (for deterministic testing). */
+  now?: number;
+}
+
+/** Result returned by `publication.pruneAcked()`. */
+export interface PruneAckedResult {
+  /** Names of stale slots whose `lastSeenAt + ttlMs < now` that were expired and removed. */
+  readonly expiredSlots: readonly string[];
+  /** Number of active (non-expired) slots remaining for this publication. */
+  readonly activeSlotCount: number;
+  /** Minimum `confirmedFlushLsn` across all active slots (`null` if no active slots exist). */
+  readonly safeLsn: number | null;
+  /** Number of journal entries deleted (`LSN <= safeLsn`). */
+  readonly prunedEntries: number;
+}
+
+/** Consistent logical dump of a single published table at a specific LSN watermark. */
+export interface LogicalTableSnapshot {
+  /** Upper-case table name. */
+  readonly table: string;
+  /** Primary key column names. */
+  readonly primaryKey: readonly string[];
+  /** Optional `CREATE TABLE` DDL statement for provisioning the table on a replica. */
+  readonly ddlSql?: string | null;
+  /** Snapshot rows at `watermarkLsn`. */
+  readonly rows: readonly Row[];
+}
+
+/** Consistent snapshot of a publication at `watermarkLsn` (logical rows or binary page diff). */
+export interface PublicationSnapshot {
+  /** Publication name. */
+  readonly publication: string;
+  /** Originating node identifier. */
+  readonly origin: string;
+  /** Exact journal LSN watermark corresponding to this snapshot state. */
+  readonly watermarkLsn: number;
+  /** Epoch timestamp when the snapshot was exported. */
+  readonly timestamp: number;
+  /** Snapshot payload format (`'logical'` or `'page-diff'`). */
+  readonly mode: 'logical' | 'page-diff';
+  /** Table snapshots when `mode === 'logical'`. */
+  readonly tables: readonly LogicalTableSnapshot[];
+  /** Binary page-diff payload (`FBDF\x01`) when `mode === 'page-diff'`. */
+  readonly pageDiffBytes?: Uint8Array | null;
+}
+
+/** Options for {@link bootstrapReplica}. */
+export interface BootstrapReplicaOptions {
+  /** Target replica database (`FirebirdBrowser` or `FirebirdLite`). */
+  targetDb: ReplicableDatabase & {
+    applyDiff?(diffBytes: Uint8Array, options?: { pageSize?: number }): Promise<Uint8Array>;
+  };
+  /** Source publication to export snapshot from (ignored if `snapshot` is passed directly). */
+  publication: ReplicationPublication;
+  /** Target subscription whose watermark (and slot) will be aligned to the snapshot LSN. */
+  subscription: ReplicationSubscription;
+  /** Optional pre-exported `PublicationSnapshot`. */
+  snapshot?: PublicationSnapshot;
+  /** Bootstrap mode (`'logical'` or `'page-diff'`). @default 'logical' */
+  mode?: 'logical' | 'page-diff';
+  /** Base snapshot or raw `.fdb` image when `mode === 'page-diff'`. */
+  baseSnapshot?: Uint8Array;
+  /** Optional `CREATE TABLE` DDL statements keyed by table name for provisioning missing tables on `targetDb`. */
+  tableDdl?: Readonly<Record<string, string>>;
+  /** Whether to clear existing rows in published tables on `targetDb` before loading the logical snapshot. @default true */
+  truncateExisting?: boolean;
+}
+
+/** Result returned by {@link bootstrapReplica}. */
+export interface BootstrapReplicaResult {
+  /** Bootstrap mode used (`'logical'` or `'page-diff'`). */
+  readonly mode: 'logical' | 'page-diff';
+  /** Watermark LSN aligned on the replica subscription and primary slot. */
+  readonly watermarkLsn: number;
+  /** Number of published tables bootstrapped. */
+  readonly tablesBootstrapped: number;
+  /** Total number of rows copied into `targetDb`. */
+  readonly rowsCopied: number;
+  /** Approximate payload size in bytes. */
+  readonly bytesTransferred: number;
+}
+
 /** Options for {@link createPublication}. */
 export interface CreatePublicationOptions {
   /** Logical name of the publication (e.g. `'main_pub'`). @default 'default' */
@@ -215,6 +333,10 @@ export interface CreatePublicationOptions {
   journalTable?: string;
   /** Custom mirror table name for `captureTableChanges()`. @default 'FB_REPL_MIRROR$' */
   mirrorTable?: string;
+  /** Custom replication slots table name. @default 'FB_REPL_SLOTS$' */
+  slotsTable?: string;
+  /** Default replication slot TTL in milliseconds. @default 604800000 */
+  defaultSlotTtlMs?: number;
   /** Custom sequence name for trigger LSN generation. @default 'FB_REPL_LSN_GEN$' */
   sequenceName?: string;
   /**
@@ -240,6 +362,11 @@ export interface ReplicationPublication {
   /** Return the highest LSN currently recorded in the journal. */
   currentLsn(): Promise<number>;
   /**
+   * Return the lowest `LSN` currently retained in `FB_REPL_JOURNAL$` for this publication,
+   * or `null` if the journal is empty.
+   */
+  minRetainedLsn(): Promise<number | null>;
+  /**
    * Generate and install `AFTER INSERT OR UPDATE OR DELETE` Firebird PSQL triggers
    * (`FB_REPL_TRG$<table>`) on all published tables so direct SQL writes are
    * captured atomically inside the committing transaction.
@@ -249,6 +376,44 @@ export interface ReplicationPublication {
    * Drop the replication triggers previously installed for this publication.
    */
   dropTriggers(): Promise<string[]>;
+  /**
+   * Register or update a subscriber replication slot in `FB_REPL_SLOTS$`.
+   */
+  registerSlot(options: string | RegisterReplicationSlotOptions): Promise<ReplicationSlot>;
+  /**
+   * Advance `confirmedFlushLsn` and refresh `lastSeenAt` for a subscriber slot in `FB_REPL_SLOTS$`.
+   */
+  advanceSlot(
+    slotName: string,
+    confirmedFlushLsn: number,
+    options?: { nodeId?: string; ttlMs?: number; now?: number },
+  ): Promise<ReplicationSlot>;
+  /**
+   * Refresh `lastSeenAt` for an existing subscriber slot without changing its `confirmedFlushLsn`.
+   */
+  heartbeatSlot(slotName: string, options?: { now?: number }): Promise<ReplicationSlot | null>;
+  /**
+   * Drop a subscriber slot from `FB_REPL_SLOTS$`.
+   */
+  dropSlot(slotName: string): Promise<boolean>;
+  /**
+   * List all registered subscriber slots for this publication in `FB_REPL_SLOTS$`.
+   */
+  listSlots(): Promise<ReplicationSlot[]>;
+  /**
+   * Expire stale slots past their `ttlMs`, compute `MIN(confirmedFlushLsn)` across
+   * all remaining active slots, and prune journal entries `<= safeLsn`.
+   */
+  pruneAcked(options?: { now?: number; pruneWhenNoSlots?: boolean }): Promise<PruneAckedResult>;
+  /**
+   * Export a consistent logical table dump or binary page-diff (`FBDF\x01`) snapshot
+   * tagged with the publication's current LSN watermark for replica bootstrapping.
+   */
+  exportSnapshot(options?: {
+    mode?: 'logical' | 'page-diff';
+    baseSnapshot?: Uint8Array;
+    tableDdl?: Readonly<Record<string, string>>;
+  }): Promise<PublicationSnapshot>;
   /**
    * Record a single row DML mutation (`INSERT`, `UPDATE`, `DELETE`) in the
    * replication journal (`FB_REPL_JOURNAL$`), optionally applying it to the
@@ -309,6 +474,28 @@ export interface CreateSubscriptionOptions {
   name?: string;
   /** Unique node identifier for the replica database. */
   nodeId?: string;
+  /**
+   * Optional replication slot name on the source publication (`FB_REPL_SLOTS$`).
+   * When set (or when `publication` is a full `ReplicationPublication`), `pull()` and
+   * `applyChanges()` automatically acknowledge the replica's new watermark LSN to this slot.
+   */
+  slotName?: string;
+  /** Slot TTL in milliseconds when registering/advancing the slot on the publication. @default 604800000 */
+  slotTtlMs?: number;
+  /**
+   * When `true`, automatically calls `publication.pruneAcked()` after acknowledging
+   * a new watermark LSN on the publication slot.
+   *
+   * @default false
+   */
+  autoPrune?: boolean;
+  /**
+   * When `true`, automatically bootstraps the replica via {@link bootstrapReplica}
+   * if the replica has fallen behind the publication's `minRetainedLsn()`.
+   *
+   * @default false
+   */
+  autoBootstrap?: boolean;
   /** Source publication (or a remote pull callback returning `ReplicationLogEntry[]`). */
   publication:
     | ReplicationPublication
@@ -353,6 +540,8 @@ export interface SubscriptionPullResult {
   readonly previousLsn: number;
   /** New watermark LSN persisted in `FB_REPL_WATERMARKS$`. */
   readonly currentLsn: number;
+  /** `true` if `autoBootstrap` triggered an automatic snapshot re-seed before pulling. */
+  readonly bootstrapped?: boolean;
 }
 
 /** A logical replication subscription on a target/replica database. */
@@ -361,10 +550,14 @@ export interface ReplicationSubscription {
   readonly name: string;
   /** Replica node identifier. */
   readonly nodeId: string;
+  /** Registered replication slot name on the source publication. */
+  readonly slotName: string;
   /** Read the last applied LSN watermark from `FB_REPL_WATERMARKS$`. */
   getWatermark(): Promise<number>;
   /** Explicitly set the LSN watermark in `FB_REPL_WATERMARKS$`. */
   setWatermark(lsn: number): Promise<void>;
+  /** Send a heartbeat to the source publication's replication slot (`FB_REPL_SLOTS$`). */
+  heartbeat(options?: { now?: number }): Promise<ReplicationSlot | null>;
   /** Pull and apply all pending changes from the publication up to `batchSize`. */
   pull(): Promise<SubscriptionPullResult>;
   /** Apply an explicit batch of `ReplicationLogEntry` items and advance the watermark. */
@@ -919,6 +1112,8 @@ export async function createPublication(
   const pubName = (options.name ?? 'default').trim();
   const nodeId = (options.nodeId ?? `node_${pubName}`).trim();
   const journalTable = quoteIdent(options.journalTable ?? DEFAULT_REPL_JOURNAL_TABLE);
+  const slotsTable = quoteIdent(options.slotsTable ?? DEFAULT_REPL_SLOTS_TABLE);
+  const defaultSlotTtlMs = options.defaultSlotTtlMs ?? DEFAULT_REPL_SLOT_TTL_MS;
 
   const tablesMap = new Map<
     string,
@@ -963,6 +1158,19 @@ export async function createPublication(
       BEFORE_JSON VARCHAR(8191),
       DDL_SQL VARCHAR(8191),
       TS BIGINT NOT NULL
+    )`,
+  );
+
+  // Provision replication slots table
+  await ensureTableSafe(
+    db,
+    `CREATE TABLE ${slotsTable} (
+      SLOT_NAME VARCHAR(128) NOT NULL PRIMARY KEY,
+      PUBLICATION VARCHAR(128) NOT NULL,
+      NODE_ID VARCHAR(128) NOT NULL,
+      CONFIRMED_LSN BIGINT NOT NULL,
+      LAST_SEEN_AT BIGINT NOT NULL,
+      TTL_MS BIGINT NOT NULL
     )`,
   );
 
@@ -1057,6 +1265,24 @@ export async function createPublication(
       return lsnCounter;
     },
 
+    async minRetainedLsn(): Promise<number | null> {
+      try {
+        const res = await db.query<Row>(
+          `SELECT LSN, PUBLICATION FROM ${journalTable} WHERE LSN > ? ORDER BY LSN ASC`,
+          [0],
+        );
+        for (const r of res.rows) {
+          const pub = String(r.PUBLICATION ?? r.publication ?? pubName);
+          if (pub === pubName) {
+            return Number(r.LSN ?? r.lsn ?? 0);
+          }
+        }
+      } catch {
+        // Ignore
+      }
+      return null;
+    },
+
     async installTriggers(): Promise<InstalledReplicationTrigger[]> {
       return installReplicationTriggers(db, {
         tables: Array.from(tablesMap.values()),
@@ -1072,6 +1298,258 @@ export async function createPublication(
         tables: Array.from(tablesMap.values()),
         publication: pubName,
       });
+    },
+
+    async registerSlot(slotOpts): Promise<ReplicationSlot> {
+      const cfg: RegisterReplicationSlotOptions =
+        typeof slotOpts === 'string' ? { slotName: slotOpts } : slotOpts;
+      const slotName = cfg.slotName.trim();
+      const slotNodeId = (cfg.nodeId ?? slotName).trim();
+      const initialLsn = cfg.initialLsn ?? 0;
+      const ttlMs = cfg.ttlMs ?? defaultSlotTtlMs;
+      const now = cfg.now ?? Date.now();
+
+      const existing = await db.query<Row>(
+        `SELECT * FROM ${slotsTable} WHERE SLOT_NAME = ?`,
+        [slotName],
+      );
+      if (existing.rows.length > 0) {
+        const prev = existing.rows[0]!;
+        const prevLsn = Number(prev.CONFIRMED_LSN ?? prev.confirmed_lsn ?? 0);
+        const nextLsn = Math.max(prevLsn, initialLsn);
+        await execStatement(
+          db,
+          `UPDATE ${slotsTable} SET PUBLICATION = ?, NODE_ID = ?, CONFIRMED_LSN = ?, LAST_SEEN_AT = ?, TTL_MS = ? WHERE SLOT_NAME = ?`,
+          [pubName, slotNodeId, nextLsn, now, ttlMs, slotName],
+        );
+        return {
+          slotName,
+          publication: pubName,
+          nodeId: slotNodeId,
+          confirmedFlushLsn: nextLsn,
+          lastSeenAt: now,
+          ttlMs,
+        };
+      }
+
+      await execStatement(
+        db,
+        `INSERT INTO ${slotsTable} (SLOT_NAME, PUBLICATION, NODE_ID, CONFIRMED_LSN, LAST_SEEN_AT, TTL_MS) VALUES (?, ?, ?, ?, ?, ?)`,
+        [slotName, pubName, slotNodeId, initialLsn, now, ttlMs],
+      );
+      return {
+        slotName,
+        publication: pubName,
+        nodeId: slotNodeId,
+        confirmedFlushLsn: initialLsn,
+        lastSeenAt: now,
+        ttlMs,
+      };
+    },
+
+    async advanceSlot(slotName, confirmedFlushLsn, advOpts = {}): Promise<ReplicationSlot> {
+      const cleanName = slotName.trim();
+      const now = advOpts.now ?? Date.now();
+      const existing = await db.query<Row>(
+        `SELECT * FROM ${slotsTable} WHERE SLOT_NAME = ?`,
+        [cleanName],
+      );
+      if (existing.rows.length === 0) {
+        return publication.registerSlot({
+          slotName: cleanName,
+          nodeId: advOpts.nodeId ?? cleanName,
+          initialLsn: confirmedFlushLsn,
+          ttlMs: advOpts.ttlMs ?? defaultSlotTtlMs,
+          now,
+        });
+      }
+
+      const prev = existing.rows[0]!;
+      const prevLsn = Number(prev.CONFIRMED_LSN ?? prev.confirmed_lsn ?? 0);
+      const nextLsn = Math.max(prevLsn, confirmedFlushLsn);
+      const slotNodeId = String(advOpts.nodeId ?? prev.NODE_ID ?? prev.node_id ?? cleanName);
+      const ttlMs = Number(advOpts.ttlMs ?? prev.TTL_MS ?? prev.ttl_ms ?? defaultSlotTtlMs);
+
+      await execStatement(
+        db,
+        `UPDATE ${slotsTable} SET CONFIRMED_LSN = ?, LAST_SEEN_AT = ?, NODE_ID = ?, TTL_MS = ? WHERE SLOT_NAME = ?`,
+        [nextLsn, now, slotNodeId, ttlMs, cleanName],
+      );
+      return {
+        slotName: cleanName,
+        publication: pubName,
+        nodeId: slotNodeId,
+        confirmedFlushLsn: nextLsn,
+        lastSeenAt: now,
+        ttlMs,
+      };
+    },
+
+    async heartbeatSlot(slotName, hbOpts = {}): Promise<ReplicationSlot | null> {
+      const cleanName = slotName.trim();
+      const now = hbOpts.now ?? Date.now();
+      const existing = await db.query<Row>(
+        `SELECT * FROM ${slotsTable} WHERE SLOT_NAME = ?`,
+        [cleanName],
+      );
+      if (existing.rows.length === 0) {
+        return null;
+      }
+      const prev = existing.rows[0]!;
+      await execStatement(
+        db,
+        `UPDATE ${slotsTable} SET LAST_SEEN_AT = ? WHERE SLOT_NAME = ?`,
+        [now, cleanName],
+      );
+      return {
+        slotName: cleanName,
+        publication: String(prev.PUBLICATION ?? prev.publication ?? pubName),
+        nodeId: String(prev.NODE_ID ?? prev.node_id ?? cleanName),
+        confirmedFlushLsn: Number(prev.CONFIRMED_LSN ?? prev.confirmed_lsn ?? 0),
+        lastSeenAt: now,
+        ttlMs: Number(prev.TTL_MS ?? prev.ttl_ms ?? defaultSlotTtlMs),
+      };
+    },
+
+    async dropSlot(slotName): Promise<boolean> {
+      const cleanName = slotName.trim();
+      const existing = await db.query<Row>(
+        `SELECT * FROM ${slotsTable} WHERE SLOT_NAME = ?`,
+        [cleanName],
+      );
+      if (existing.rows.length === 0) {
+        return false;
+      }
+      await execStatement(
+        db,
+        `DELETE FROM ${slotsTable} WHERE SLOT_NAME = ?`,
+        [cleanName],
+      );
+      return true;
+    },
+
+    async listSlots(): Promise<ReplicationSlot[]> {
+      const res = await db.query<Row>(`SELECT * FROM ${slotsTable}`);
+      const out: ReplicationSlot[] = [];
+      for (const r of res.rows) {
+        const pub = String(r.PUBLICATION ?? r.publication ?? pubName);
+        if (pub !== pubName) continue;
+        out.push({
+          slotName: String(r.SLOT_NAME ?? r.slot_name ?? ''),
+          publication: pub,
+          nodeId: String(r.NODE_ID ?? r.node_id ?? ''),
+          confirmedFlushLsn: Number(r.CONFIRMED_LSN ?? r.confirmed_lsn ?? 0),
+          lastSeenAt: Number(r.LAST_SEEN_AT ?? r.last_seen_at ?? 0),
+          ttlMs: Number(r.TTL_MS ?? r.ttl_ms ?? defaultSlotTtlMs),
+        });
+      }
+      return out;
+    },
+
+    async pruneAcked(pruneOpts = {}): Promise<PruneAckedResult> {
+      const now = pruneOpts.now ?? Date.now();
+      const allSlots = await publication.listSlots();
+      const expiredSlots: string[] = [];
+      const activeSlots: ReplicationSlot[] = [];
+
+      for (const slot of allSlots) {
+        if (slot.ttlMs > 0 && now - slot.lastSeenAt > slot.ttlMs) {
+          await publication.dropSlot(slot.slotName);
+          expiredSlots.push(slot.slotName);
+        } else {
+          activeSlots.push(slot);
+        }
+      }
+
+      if (activeSlots.length === 0) {
+        if (pruneOpts.pruneWhenNoSlots) {
+          const curLsn = await publication.currentLsn();
+          const prunedEntries = curLsn > 0 ? await publication.pruneJournal(curLsn) : 0;
+          return {
+            expiredSlots,
+            activeSlotCount: 0,
+            safeLsn: curLsn,
+            prunedEntries,
+          };
+        }
+        return {
+          expiredSlots,
+          activeSlotCount: 0,
+          safeLsn: null,
+          prunedEntries: 0,
+        };
+      }
+
+      const safeLsn = Math.min(...activeSlots.map((s) => s.confirmedFlushLsn));
+      const prunedEntries = safeLsn > 0 ? await publication.pruneJournal(safeLsn) : 0;
+      return {
+        expiredSlots,
+        activeSlotCount: activeSlots.length,
+        safeLsn,
+        prunedEntries,
+      };
+    },
+
+    async exportSnapshot(snapOpts = {}): Promise<PublicationSnapshot> {
+      await publication.captureTableChanges();
+      const watermarkLsn = await publication.currentLsn();
+      const mode = snapOpts.mode ?? 'logical';
+      const ts = Date.now();
+
+      if (mode === 'page-diff') {
+        const diffCapable = db as ReplicableDatabase & {
+          exportDiff?(baseSnapshot: unknown): Promise<Uint8Array>;
+          exportDatabase?(): Promise<Uint8Array>;
+        };
+        let pageDiffBytes: Uint8Array | null = null;
+        if (typeof diffCapable.exportDiff === 'function') {
+          pageDiffBytes = await diffCapable.exportDiff(
+            snapOpts.baseSnapshot ?? new Uint8Array(0),
+          );
+        } else if (typeof diffCapable.exportDatabase === 'function') {
+          pageDiffBytes = await diffCapable.exportDatabase();
+        }
+        return {
+          publication: pubName,
+          origin: nodeId,
+          watermarkLsn,
+          timestamp: ts,
+          mode: 'page-diff',
+          tables: [],
+          pageDiffBytes,
+        };
+      }
+
+      const tableSnapshots: LogicalTableSnapshot[] = [];
+      for (const [tableUpper, cfg] of tablesMap.entries()) {
+        let rows: Row[] = [];
+        try {
+          const res = await db.query<Row>(`SELECT * FROM ${quoteIdent(tableUpper)}`);
+          rows = res.rows.map((r) => normalizeRowKeysUpper(r));
+        } catch {
+          rows = [];
+        }
+        const ddlSql =
+          snapOpts.tableDdl?.[tableUpper] ??
+          snapOpts.tableDdl?.[tableUpper.toLowerCase()] ??
+          null;
+        tableSnapshots.push({
+          table: tableUpper,
+          primaryKey: cfg.primaryKey,
+          ddlSql,
+          rows,
+        });
+      }
+
+      return {
+        publication: pubName,
+        origin: nodeId,
+        watermarkLsn,
+        timestamp: ts,
+        mode: 'logical',
+        tables: tableSnapshots,
+        pageDiffBytes: null,
+      };
     },
 
     async recordDml(params): Promise<ReplicationLogEntry> {
@@ -1397,6 +1875,212 @@ async function evaluateConflictResolution(
 }
 
 /**
+ * Check whether a replica subscription needs an initial or catch-up snapshot
+ * bootstrap (either because `watermark === 0` while the publication already has
+ * changes, or because `watermark < minRetainedLsn - 1` after journal pruning).
+ */
+export async function needsBootstrap(
+  publication: ReplicationPublication,
+  subscription: ReplicationSubscription,
+): Promise<{
+  readonly needed: boolean;
+  readonly reason: 'uninitialized' | 'behind-retained-journal' | 'up-to-date';
+  readonly replicaWatermark: number;
+  readonly minRetainedLsn: number | null;
+  readonly currentLsn: number;
+}> {
+  const [replicaWatermark, minRetainedLsn, currentLsn] = await Promise.all([
+    subscription.getWatermark(),
+    publication.minRetainedLsn(),
+    publication.currentLsn(),
+  ]);
+
+  if (minRetainedLsn !== null && replicaWatermark < minRetainedLsn - 1) {
+    return {
+      needed: true,
+      reason: 'behind-retained-journal',
+      replicaWatermark,
+      minRetainedLsn,
+      currentLsn,
+    };
+  }
+
+  if (replicaWatermark === 0 && currentLsn > 0 && minRetainedLsn === null) {
+    return {
+      needed: true,
+      reason: 'behind-retained-journal',
+      replicaWatermark,
+      minRetainedLsn,
+      currentLsn,
+    };
+  }
+
+  if (replicaWatermark === 0 && currentLsn > 0) {
+    return {
+      needed: true,
+      reason: 'uninitialized',
+      replicaWatermark,
+      minRetainedLsn,
+      currentLsn,
+    };
+  }
+
+  return {
+    needed: false,
+    reason: 'up-to-date',
+    replicaWatermark,
+    minRetainedLsn,
+    currentLsn,
+  };
+}
+
+/**
+ * Seed or re-seed a replica database from a consistent `PublicationSnapshot`
+ * (either logical table rows + optional DDL or binary page diff `FBDF\x01`)
+ * and align both the replica's LSN watermark and the primary's replication slot.
+ */
+export async function bootstrapReplica(
+  options: BootstrapReplicaOptions,
+): Promise<BootstrapReplicaResult> {
+  const mode = options.mode ?? options.snapshot?.mode ?? 'logical';
+  const truncateExisting = options.truncateExisting ?? true;
+
+  const snapshot =
+    options.snapshot ??
+    (await options.publication.exportSnapshot({
+      mode,
+      baseSnapshot: options.baseSnapshot,
+      tableDdl: options.tableDdl,
+    }));
+
+  let rowsCopied = 0;
+  let bytesTransferred = 0;
+
+  if (snapshot.mode === 'page-diff' && snapshot.pageDiffBytes) {
+    bytesTransferred = snapshot.pageDiffBytes.byteLength;
+    if (typeof options.targetDb.applyDiff === 'function') {
+      await options.targetDb.applyDiff(snapshot.pageDiffBytes);
+    }
+  } else {
+    const syncLocalMirror = (
+      table: string,
+      op: 'INSERT' | 'UPDATE' | 'DELETE',
+      key: Record<string, unknown>,
+      after: Record<string, unknown> | null,
+    ) => {
+      const internalPub = (options.subscription as unknown as {
+        _localPublication?: ReplicationPublication & {
+          _syncMirrorFromRemote?: (
+            t: string,
+            o: 'INSERT' | 'UPDATE' | 'DELETE',
+            k: Record<string, unknown>,
+            a: Record<string, unknown> | null,
+          ) => void;
+        };
+      })._localPublication;
+      internalPub?._syncMirrorFromRemote?.(table, op, key, after);
+    };
+
+    const applySnapshotTables = async (runner: {
+      query<T extends Row = Row>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
+      execute?(sql: string, params?: QueryParams): Promise<{ changes?: number } | void>;
+      exec?(sql: string, params?: QueryParams): Promise<unknown>;
+    }) => {
+      try {
+        await runner.query(
+          `SELECT RDB$SET_CONTEXT('USER_SESSION', '${DEFAULT_REPL_ROLE_CONTEXT_VAR}', 'REPLICA') FROM RDB$DATABASE`,
+        );
+      } catch {
+        // Ignore on test doubles
+      }
+
+      try {
+        for (const tbl of snapshot.tables) {
+          const tableUpper = normalizeTableName(tbl.table);
+          const ddl =
+            tbl.ddlSql ??
+            options.tableDdl?.[tableUpper] ??
+            options.tableDdl?.[tableUpper.toLowerCase()];
+          if (ddl) {
+            await ensureTableSafe(options.targetDb, ddl);
+          }
+
+          if (truncateExisting) {
+            try {
+              const existing = await runner.query<Row>(
+                `SELECT * FROM ${quoteIdent(tableUpper)}`,
+              );
+              for (const r of existing.rows) {
+                const normR = normalizeRowKeysUpper(r);
+                const keyRec = extractKeyRecord(normR, tbl.primaryKey);
+                await applyRowMutationToTable(
+                  runner,
+                  tableUpper,
+                  tbl.primaryKey,
+                  'DELETE',
+                  keyRec,
+                  null,
+                );
+                syncLocalMirror(tableUpper, 'DELETE', keyRec, null);
+              }
+            } catch {
+              // Table may not exist yet or be empty
+            }
+          }
+
+          for (const row of tbl.rows) {
+            const normRow = normalizeRowKeysUpper(row);
+            const keyRec = extractKeyRecord(normRow, tbl.primaryKey);
+            await applyRowMutationToTable(
+              runner,
+              tableUpper,
+              tbl.primaryKey,
+              'INSERT',
+              keyRec,
+              normRow,
+            );
+            syncLocalMirror(tableUpper, 'INSERT', keyRec, normRow);
+            rowsCopied++;
+            bytesTransferred += JSON.stringify(normRow).length;
+          }
+        }
+      } finally {
+        try {
+          await runner.query(
+            `SELECT RDB$SET_CONTEXT('USER_SESSION', '${DEFAULT_REPL_ROLE_CONTEXT_VAR}', 'PRIMARY') FROM RDB$DATABASE`,
+          );
+        } catch {
+          // Ignore
+        }
+      }
+    };
+
+    if (typeof options.targetDb.transaction === 'function') {
+      await options.targetDb.transaction(applySnapshotTables);
+    } else {
+      await applySnapshotTables(options.targetDb);
+    }
+  }
+
+  await options.subscription.setWatermark(snapshot.watermarkLsn);
+  if (typeof options.publication.advanceSlot === 'function') {
+    await options.publication.advanceSlot(
+      options.subscription.slotName,
+      snapshot.watermarkLsn,
+      { nodeId: options.subscription.nodeId },
+    );
+  }
+
+  return {
+    mode: snapshot.mode,
+    watermarkLsn: snapshot.watermarkLsn,
+    tablesBootstrapped: snapshot.tables.length,
+    rowsCopied,
+    bytesTransferred,
+  };
+}
+
+/**
  * Create a logical replication subscription on `targetDb`.
  */
 export async function createSubscription(
@@ -1405,10 +2089,18 @@ export async function createSubscription(
 ): Promise<ReplicationSubscription> {
   const subName = (options.name ?? `sub_${options.publication.name}`).trim();
   const nodeId = (options.nodeId ?? `replica_${subName}`).trim();
+  const slotName = (options.slotName ?? `slot_${subName}`).trim();
+  const slotTtlMs = options.slotTtlMs ?? DEFAULT_REPL_SLOT_TTL_MS;
   const watermarkTable = quoteIdent(options.watermarkTable ?? DEFAULT_REPL_WATERMARK_TABLE);
   const batchSize = options.batchSize ?? 500;
   const pollIntervalMs = options.pollIntervalMs ?? 1000;
   const conflictStrategy = options.onConflict ?? 'remote-wins';
+
+  const fullPub =
+    'registerSlot' in options.publication &&
+    typeof options.publication.registerSlot === 'function'
+      ? (options.publication as ReplicationPublication)
+      : undefined;
 
   await ensureTableSafe(
     targetDb,
@@ -1643,6 +2335,15 @@ export async function createSubscription(
 
     if (highestLsn > previousLsn) {
       await setWatermark(highestLsn);
+      if (fullPub) {
+        await fullPub.advanceSlot(slotName, highestLsn, {
+          nodeId,
+          ttlMs: slotTtlMs,
+        });
+        if (options.autoPrune) {
+          await fullPub.pruneAcked();
+        }
+      }
     }
 
     return {
@@ -1654,26 +2355,67 @@ export async function createSubscription(
     };
   };
 
-  const pull = async (): Promise<SubscriptionPullResult> => {
-    const sinceLsn = await getWatermark();
-    const entries = await options.publication.fetchChangesSince(sinceLsn, {
-      limit: batchSize,
-      excludeOrigin: nodeId,
+  if (fullPub) {
+    const initialWmk = await getWatermark();
+    await fullPub.registerSlot({
+      slotName,
+      nodeId,
+      initialLsn: initialWmk,
+      ttlMs: slotTtlMs,
     });
-    return applyChanges(entries);
-  };
+  }
 
-  return {
+  const subscriptionObj: ReplicationSubscription & {
+    _localPublication?: ReplicationPublication;
+  } = {
     name: subName,
     nodeId,
+    slotName,
+    _localPublication: options.localPublication,
     getWatermark,
     setWatermark,
-    pull,
+    async heartbeat(hbOpts) {
+      if (!fullPub) return null;
+      return fullPub.heartbeatSlot(slotName, hbOpts);
+    },
+    async pull(): Promise<SubscriptionPullResult> {
+      let bootstrapped = false;
+      if (options.autoBootstrap && fullPub) {
+        const check = await needsBootstrap(fullPub, subscriptionObj);
+        if (check.needed && check.reason === 'behind-retained-journal') {
+          const prev = await getWatermark();
+          const bootRes = await bootstrapReplica({
+            targetDb,
+            publication: fullPub,
+            subscription: subscriptionObj,
+          });
+          bootstrapped = true;
+          if (bootRes.watermarkLsn >= (await fullPub.currentLsn())) {
+            return {
+              fetchedCount: bootRes.rowsCopied,
+              appliedCount: bootRes.rowsCopied,
+              conflictCount: 0,
+              previousLsn: prev,
+              currentLsn: bootRes.watermarkLsn,
+              bootstrapped: true,
+            };
+          }
+        }
+      }
+
+      const sinceLsn = await getWatermark();
+      const entries = await options.publication.fetchChangesSince(sinceLsn, {
+        limit: batchSize,
+        excludeOrigin: nodeId,
+      });
+      const res = await applyChanges(entries);
+      return bootstrapped ? { ...res, bootstrapped: true } : res;
+    },
     applyChanges,
     start() {
       if (timer) return;
       timer = setInterval(() => {
-        void pull().catch(() => undefined);
+        void subscriptionObj.pull().catch(() => undefined);
       }, pollIntervalMs);
     },
     async stop() {
@@ -1683,6 +2425,8 @@ export async function createSubscription(
       }
     },
   };
+
+  return subscriptionObj;
 }
 
 // ---------------------------------------------------------------------------
@@ -1723,6 +2467,20 @@ export interface ReplicateDatabasesOptions {
    * @default false
    */
   installTriggers?: boolean;
+  /**
+   * When `true`, automatically prunes acknowledged journal entries (`pruneAcked()`)
+   * after each sync cycle.
+   *
+   * @default false
+   */
+  autoPrune?: boolean;
+  /**
+   * When `true`, automatically bootstraps a fallen-behind replica from a snapshot
+   * if its watermark lags behind `minRetainedLsn()`.
+   *
+   * @default false
+   */
+  autoBootstrap?: boolean;
 }
 
 /** Result of `replicator.sync()`. */
@@ -1737,6 +2495,15 @@ export interface DatabaseReplicator {
   readonly replicaSubscription: ReplicationSubscription;
   readonly replicaPublication?: ReplicationPublication;
   readonly primarySubscription?: ReplicationSubscription;
+  /**
+   * Seed or re-seed the replica from `primaryPublication` via {@link bootstrapReplica}.
+   */
+  bootstrap(options?: {
+    mode?: 'logical' | 'page-diff';
+    baseSnapshot?: Uint8Array;
+    tableDdl?: Readonly<Record<string, string>>;
+    truncateExisting?: boolean;
+  }): Promise<BootstrapReplicaResult>;
   /**
    * Capture any unlogged table changes on `primary` (and `replica` in
    * `'bidirectional'` mode) and run a full replication cycle.
@@ -1788,6 +2555,8 @@ export async function replicateDatabases(
     localPublication: replicaPublication,
     onConflict: conflictStrategy,
     onConflictResolved: options.onConflictResolved,
+    autoPrune: options.autoPrune,
+    autoBootstrap: options.autoBootstrap,
   });
 
   if (direction === 'bidirectional' && replicaPublication) {
@@ -1808,6 +2577,8 @@ export async function replicateDatabases(
       localPublication: primaryPublication,
       onConflict: reverseStrategy,
       onConflictResolved: options.onConflictResolved,
+      autoPrune: options.autoPrune,
+      autoBootstrap: options.autoBootstrap,
     });
   }
 
@@ -1816,6 +2587,17 @@ export async function replicateDatabases(
     replicaSubscription,
     ...(replicaPublication ? { replicaPublication } : {}),
     ...(primarySubscription ? { primarySubscription } : {}),
+    async bootstrap(bootOpts = {}): Promise<BootstrapReplicaResult> {
+      return bootstrapReplica({
+        targetDb: options.replica,
+        publication: primaryPublication,
+        subscription: replicaSubscription,
+        mode: bootOpts.mode,
+        baseSnapshot: bootOpts.baseSnapshot,
+        tableDdl: bootOpts.tableDdl,
+        truncateExisting: bootOpts.truncateExisting,
+      });
+    },
     async sync(): Promise<ReplicationSyncCycleResult> {
       await primaryPublication.captureTableChanges();
       if (replicaPublication) {

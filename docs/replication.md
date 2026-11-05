@@ -254,24 +254,24 @@ sequenceDiagram
   R->>R: sub.applyChanges(entries) & advance watermark
 ```
 
-### 5.1 Phase 1 — Initial Snapshot or Binary Page-Diff (`exportDiff` / `applyDiff`) Bootstrap
+### 5.1 Phase 1 — Initial Snapshot or Binary Page-Diff (`bootstrapReplica` & `exportSnapshot`)
+
+Use `bootstrapReplica()` (or enable `autoBootstrap: true` on `createSubscription()` / `replicateDatabases()`) to automatically seed a brand-new replica or catch up a replica whose watermark has fallen behind a pruned journal (`watermark < minRetainedLsn`):
 
 ```ts
-// 1. Capture the primary's current LSN and binary image
-const currentLsn = await primaryPublication.currentLsn();
-const baseImage = await primary.exportDatabase();
+import { bootstrapReplica, needsBootstrap } from 'firebird-wasm/replication';
 
-// 2. Hydrate the replica from the binary image and align its watermark
-const replica = await FirebirdBrowser.create({
-  database: 'replica.fdb',
-  initialData: baseImage,
-});
-await replicaSubscription.setWatermark(currentLsn);
-
-// Or, when catching up a replica between two Copy-on-Write snapshots:
-const diffBytes = await primary.exportDiff(olderSnapshot);
-await replica.applyDiff(diffBytes);
-await replicaSubscription.setWatermark(await primaryPublication.currentLsn());
+// Check if the replica needs bootstrapping (e.g. watermark === 0 or behind minRetainedLsn)
+const check = await needsBootstrap(primaryPublication, replicaSubscription);
+if (check.needed) {
+  const boot = await bootstrapReplica({
+    targetDb: replica,
+    publication: primaryPublication,
+    subscription: replicaSubscription,
+    mode: 'logical', // or 'page-diff' for binary FBDF\x01 page diff
+  });
+  console.log(`Bootstrapped ${boot.rowsCopied} rows at LSN ${boot.watermarkLsn}`);
+}
 ```
 
 ### 5.2 Phase 2 — Automatic Schema Evolution (`diffSchema` + `generateMigration`)
@@ -288,13 +288,15 @@ if (!schemaDiff.isEmpty) {
 }
 ```
 
-### 5.3 Phase 3 — Journal Pruning & Watermark Management
+### 5.3 Phase 3 — Replication Slots (`FB_REPL_SLOTS$`) & Safe Auto-Pruning (`pruneAcked`)
 
-Once all active subscribers have advanced past a given LSN, reclaim storage on the primary:
+Each subscriber registers a slot in `FB_REPL_SLOTS$` (`slotName`, `nodeId`, `confirmedFlushLsn`, `lastSeenAt`, `ttlMs`). Calling `publication.pruneAcked()` expires stale slots past their TTL and safely deletes only journal entries `<= MIN(confirmedFlushLsn)` across all active subscribers:
 
 ```ts
-const minConfirmedLsn = await replicaSubscription.getWatermark();
-const deletedRows = await primaryPublication.pruneJournal(minConfirmedLsn);
+// Automatically expire stale slots and prune journal entries acknowledged by all active replicas:
+const pruneResult = await primaryPublication.pruneAcked();
+console.log(pruneResult);
+// { expiredSlots: [], activeSlotCount: 2, safeLsn: 42, prunedEntries: 42 }
 ```
 
 ---

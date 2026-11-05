@@ -1439,12 +1439,12 @@ Next-horizon milestones for full end-to-end replication (`v0.18.0`):
       that serialize row keys and column values into `FB_REPL_JOURNAL$` inside the
       committing transaction, using `RDB$GET_CONTEXT('USER_SESSION', 'FB_REPL_ROLE')`
       to bypass triggers during replica replay and `POST_EVENT` for instant wakeups.
-- [ ] **2. Replication Slots, Heartbeats & Safe Auto-Pruning (`FB_REPL_SLOTS$`).**
+- [x] **2. Replication Slots, Heartbeats & Safe Auto-Pruning (`FB_REPL_SLOTS$`).**
       Track registered replica slots (`slotName`, `nodeId`, `confirmedFlushLsn`,
       `lastSeenAt`, `ttlMs`) on the primary so `publication.pruneAcked()` safely
       reclaims journal entries `<= MIN(confirmedFlushLsn)` across all active
       subscribers while expiring stale slots past their TTL.
-- [ ] **3. Initial Snapshot Seeding & Automatic Catch-Up (`bootstrapReplica`).**
+- [x] **3. Initial Snapshot Seeding & Automatic Catch-Up (`bootstrapReplica`).**
       Automatically bootstrap a new or fallen-behind replica (`watermark === 0` or
       `watermark < minRetainedLsn`) via either consistent logical table+catalog
       snapshots or binary Copy-on-Write page diffs (`exportDiff` / `applyDiff`)
