@@ -1411,7 +1411,7 @@ Next-horizon milestones for `v0.17.0`:
       Compare two `DatabaseSchema` snapshots (or a live database against a target
       DDL / Drizzle schema) and emit forward + rollback Firebird `ALTER TABLE` /
       `CREATE INDEX` migration SQL.
-- [ ] **TanStack Query / TanStack DB & RxDB Storage Adapters.**
+- [x] **TanStack Query / TanStack DB & RxDB Storage Adapters.**
       Official adapters bridging `db.live()`, `syncShapes`, and
       `createWriteQueue` with TanStack Query cache invalidation and local-first
       state managers.

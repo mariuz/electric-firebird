@@ -34,6 +34,14 @@
       "types": "./dist/solid/index.d.ts",
       "default": "./dist/solid/index.js"
     },
+    "./tanstack": {
+      "types": "./dist/tanstack/index.d.ts",
+      "default": "./dist/tanstack/index.js"
+    },
+    "./rxdb": {
+      "types": "./dist/rxdb/index.d.ts",
+      "default": "./dist/rxdb/index.js"
+    },
     "./repl": {
       "types": "./dist/repl/index.d.ts",
       "default": "./dist/repl/index.js"
@@ -91,9 +99,12 @@
   },
   "peerDependencies": {
     "@electric-sql/client": ">=1.5",
+    "@tanstack/db": ">=0.1",
+    "@tanstack/query-core": ">=5.0",
     "drizzle-orm": ">=0.30",
     "kysely": ">=0.27",
     "react": ">=18",
+    "rxdb": ">=15.0",
     "solid-js": ">=1.7",
     "svelte": ">=4.0.0 || >=5.0.0",
     "vue": ">=3.3"
@@ -109,6 +120,15 @@
       "optional": true
     },
     "solid-js": {
+      "optional": true
+    },
+    "@tanstack/query-core": {
+      "optional": true
+    },
+    "@tanstack/db": {
+      "optional": true
+    },
+    "rxdb": {
       "optional": true
     },
     "@electric-sql/client": {
