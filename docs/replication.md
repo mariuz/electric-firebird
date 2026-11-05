@@ -274,21 +274,77 @@ if (check.needed) {
 }
 ```
 
-### 5.2 Phase 2 — Automatic Schema Evolution (`diffSchema` + `generateMigration`)
+### 5.2 Phase 2 — Whole-Database Publication (`publishAllTables`) & Catalog Sync (`syncCatalog`)
 
-Before applying DML batches after a schema upgrade, you can either replicate DDL via `publication.recordDdl(sql)` or automatically diff and migrate the replica catalog using `diffSchema()` and `generateMigration()`:
+Publish every user table (`tables: '*'`) and keep replica schemas + Firebird sequence/generator watermarks (`RDB$GENERATORS`) synchronized via `syncCatalog()`:
 
 ```ts
-import { diffSchema, generateMigration, migrate } from 'firebird-wasm/browser';
+import { publishAllTables, syncCatalog } from 'firebird-wasm/replication';
 
-const schemaDiff = await diffSchema(replica, primary);
-if (!schemaDiff.isEmpty) {
-  const migration = generateMigration(schemaDiff, { version: Date.now(), name: 'auto_replica_sync' });
-  await migrate(replica, [migration]);
-}
+// Publish all user tables (excluding scratch/audit tables)
+const pub = await publishAllTables(primary, {
+  name: 'full_pub',
+  excludeTables: ['AUDIT_SCRATCH'],
+  installTriggers: true,
+});
+
+// Synchronize schema DDL (via diffSchema + generateMigration) and sequence watermarks:
+const catResult = await syncCatalog({
+  sourceDb: primary,
+  targetDb: replica,
+  excludeTables: ['AUDIT_SCRATCH'],
+});
+console.log(catResult.discoveredTables, catResult.sequencesSynced);
 ```
 
-### 5.3 Phase 3 — Replication Slots (`FB_REPL_SLOTS$`) & Safe Auto-Pruning (`pruneAcked`)
+### 5.3 Phase 3 — Multi-Tenant Row/Column Filtering & Topological Foreign-Key Replay
+
+Slice publications per tenant with `where` predicates and `columns` / `excludeColumns` projections, and declare foreign-key `references` so multi-table transactions (`txid`) replay parents before children on `INSERT`/`UPDATE` and children before parents on `DELETE`:
+
+```ts
+const tenantPub = await createPublication(primary, {
+  name: 'tenant_acme_pub',
+  tables: [
+    {
+      table: 'USERS',
+      primaryKey: 'ID',
+      excludeColumns: ['PASSWORD_HASH'],
+      where: "TENANT_ID = 'acme'",
+    },
+    {
+      table: 'ORDERS',
+      primaryKey: 'ID',
+      where: "TENANT_ID = 'acme'",
+      references: ['USERS'],
+    },
+  ],
+});
+```
+
+### 5.4 Phase 4 — Hybrid Logical Clocks (`createHlc`) & Per-Column CRDTs (`createCrdtConflictResolver`)
+
+Use `createHlc()` for skew-tolerant causal ordering (`<wallMs>:<counter>:<nodeId>`) and `createCrdtConflictResolver()` to combine per-column CRDT strategies (`'pn-counter'`, `'set-union'`, `'g-set'`, `'max'`, `'min'`, `'lww'`):
+
+```ts
+import { replicateDatabases, createCrdtConflictResolver } from 'firebird-wasm/replication';
+
+const replicator = await replicateDatabases({
+  primary: nodeA,
+  replica: nodeB,
+  tables: [{ table: 'PRODUCTS', primaryKey: 'ID' }],
+  direction: 'bidirectional',
+  onConflict: createCrdtConflictResolver({
+    columns: {
+      STOCK: 'pn-counter', // additive delta merge: base + localDelta + remoteDelta
+      TAGS: 'set-union',   // 2P/OR-Set union with removal tracking
+      HIGH_BID: 'max',     // join-semilattice max
+      TITLE: 'lww',        // HLC-ordered Last-Write-Wins
+    },
+  }),
+});
+```
+
+### 5.5 Phase 5 — Replication Slots (`FB_REPL_SLOTS$`) & Safe Auto-Pruning (`pruneAcked`)
 
 Each subscriber registers a slot in `FB_REPL_SLOTS$` (`slotName`, `nodeId`, `confirmedFlushLsn`, `lastSeenAt`, `ttlMs`). Calling `publication.pruneAcked()` expires stale slots past their TTL and safely deletes only journal entries `<= MIN(confirmedFlushLsn)` across all active subscribers:
 
@@ -333,3 +389,13 @@ console.log(pruneResult);
 | `replicationTriggerName(table, pub?)` | Deterministic ≤31-char Firebird trigger name (`FB_REPL_TRG$<TABLE>`). |
 | `replicationEventName(pub?)` | Deterministic ≤31-char Firebird `POST_EVENT` name (`fb_repl_<pub>`). |
 | `mergeReplicatedRow(before, local, remote)` | 3-way field-level merge helper used by the `'merge'` conflict strategy. |
+| `bootstrapReplica(options)` | Seeds or re-seeds a replica from a logical or binary page-diff `PublicationSnapshot`. |
+| `needsBootstrap(pub, sub)` | Checks whether a replica is uninitialized or behind `pub.minRetainedLsn()`. |
+| `publishAllTables(db, options?)` | Whole-database publication (`tables: '*'`) discovering all user tables via `discoverUserTables()`. |
+| `syncCatalog(options)` | Synchronizes schema DDL (`generateMigration`) and generator/sequence watermarks (`exportSequences` + `applySequences`). |
+| `projectReplicatedRow(row, pk, cols?, excl?)` | Projects a row according to `columns` whitelist and `excludeColumns` blacklist. |
+| `matchesRowFilter(row, where?)` | Evaluates a SQL `WHERE` predicate string or filter function against a row. |
+| `orderEntriesByTopology(entries, deps?)` | Groups journal entries by `txid` and orders parent/child tables topologically. |
+| `createHlc(nodeId, options?)` | Creates a monotonic Hybrid Logical Clock (`<wallMs>:<counter>:<nodeId>`). |
+| `mergeCrdtRow(ctx, config?)` | Per-column CRDT conflict merger (`'lww'`, `'pn-counter'`, `'set-union'`, `'g-set'`, `'max'`, `'min'`). |
+| `createCrdtConflictResolver(config?)` | Returns a pluggable `onConflict` resolver callback backed by `mergeCrdtRow()`. |

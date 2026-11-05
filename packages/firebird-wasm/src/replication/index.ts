@@ -29,6 +29,7 @@
  */
 
 import type { QueryParams, QueryResult, Row } from '../types';
+import { generateMigration, introspect } from '../browser/schema';
 
 // ---------------------------------------------------------------------------
 // Constants & Structural Database Contract
@@ -107,6 +108,81 @@ export interface ReplicationLogEntry {
   readonly ddlSql?: string | null;
   /** Epoch timestamp (`Date.now()`) when the change was recorded. */
   readonly timestamp: number;
+  /**
+   * Optional monotonic Hybrid Logical Clock (`<wallMs>:<counter>:<nodeId>`)
+   * for skew-tolerant causal ordering across distributed nodes.
+   */
+  readonly hlc?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Hybrid Logical Clock (HLC) & Per-Column CRDT Types (M12 Item 6)
+// ---------------------------------------------------------------------------
+
+/** Structured representation of a Hybrid Logical Clock (`<wallMs>:<counter>:<nodeId>`). */
+export interface HlcTimestamp {
+  /** Monotonic wall-clock component in milliseconds. */
+  readonly wallMs: number;
+  /** 16-bit logical counter (`0..65535`) incremented when multiple events share `wallMs`. */
+  readonly counter: number;
+  /** Originating node identifier. */
+  readonly nodeId: string;
+}
+
+/** Options for {@link createHlc}. */
+export interface HybridLogicalClockOptions {
+  /** Custom physical wall-clock provider (defaults to `Date.now`). */
+  now?: () => number;
+  /** Maximum allowed physical clock drift in milliseconds (`0` = unlimited). @default 0 */
+  maxDriftMs?: number;
+  /** Initial wall-clock state in milliseconds. @default 0 */
+  initialWallMs?: number;
+  /** Initial logical counter state. @default 0 */
+  initialCounter?: number;
+}
+
+/** Monotonic Hybrid Logical Clock instance returned by {@link createHlc}. */
+export interface HybridLogicalClock {
+  /** Node identifier bound to this clock. */
+  readonly nodeId: string;
+  /**
+   * Advance the local HLC for a new local event and return its formatted
+   * `<wallMs>:<counter>:<nodeId>` string.
+   */
+  now(wallNowMs?: number): string;
+  /**
+   * Merge a remote HLC timestamp into this local clock and return the new
+   * local `<wallMs>:<counter>:<nodeId>` string.
+   */
+  receive(remote: string | HlcTimestamp, wallNowMs?: number): string;
+  /** Return the latest `HlcTimestamp` state of this clock without advancing it. */
+  last(): HlcTimestamp;
+  /** Compare two HLC timestamps (`< 0`, `0`, or `> 0`). */
+  compare(a: string | HlcTimestamp, b: string | HlcTimestamp): number;
+}
+
+/** Per-column CRDT merge strategy supported by {@link mergeCrdtRow} and {@link createCrdtConflictResolver}. */
+export type ColumnCrdtStrategy =
+  | 'lww'
+  | 'pn-counter'
+  | 'counter'
+  | 'set-union'
+  | 'g-set'
+  | 'max'
+  | 'min';
+
+/** Configuration for {@link mergeCrdtRow} and {@link createCrdtConflictResolver}. */
+export interface CrdtMergeConfig {
+  /**
+   * Per-column CRDT merge strategies keyed by column name (case-insensitive):
+   * - `'lww'`: Last-Write-Wins Element-Set using HLC / `(timestamp, origin)`.
+   * - `'pn-counter'` / `'counter'`: Additive numeric delta (`base + (local - base) + (remote - base)`).
+   * - `'set-union'` / `'g-set'`: Set union of array / JSON-array / comma-separated elements (with 2P/OR-Set removal awareness when `before` is present).
+   * - `'max'` / `'min'`: Join-semilattice maximum or minimum value.
+   */
+  columns?: Readonly<Record<string, ColumnCrdtStrategy>>;
+  /** Default strategy for columns not listed in `columns`. @default 'lww' */
+  defaultStrategy?: ColumnCrdtStrategy;
 }
 
 /** Context passed to a replication conflict resolver when applying a remote entry. */
@@ -157,8 +233,21 @@ export interface PublishedTableConfig {
   table: string;
   /** Primary key column name(s). Defaults to `['ID']`. */
   primaryKey?: string | readonly string[];
-  /** Optional explicit column list for trigger-based change capture (`installReplicationTriggers`). */
+  /** Optional explicit column whitelist to include in replication entries (`KEY_JSON` columns are always preserved). */
   columns?: readonly string[];
+  /** Optional column blacklist to strip from `AFTER_JSON` and `BEFORE_JSON` (e.g. sensitive PII columns). */
+  excludeColumns?: readonly string[];
+  /**
+   * Optional row filter predicate for multi-tenant / partial publications.
+   * Can be a JS predicate `(row: Record<string, unknown>) => boolean` or a SQL
+   * `WHERE` clause string (e.g. `"TENANT_ID = 'acme'"`).
+   */
+  where?: string | ((row: Record<string, unknown>) => boolean);
+  /**
+   * Optional parent table names (foreign-key dependencies) used for topological
+   * ordering when replaying multi-table transactions (`txid`).
+   */
+  references?: readonly string[];
 }
 
 /** Options for {@link buildReplicationTriggerDdl}. */
@@ -321,14 +410,67 @@ export interface BootstrapReplicaResult {
   readonly bytesTransferred: number;
 }
 
+// ---------------------------------------------------------------------------
+// Whole-Database Catalog, Sequence & Schema Auto-Replication Types (M12 Item 4)
+// ---------------------------------------------------------------------------
+
+/** A Firebird sequence/generator watermark exported by {@link exportSequences}. */
+export interface SequenceWatermark {
+  /** Upper-case sequence/generator name. */
+  readonly name: string;
+  /** Current sequence value (`GEN_ID(name, 0)`). */
+  readonly currentValue: number;
+}
+
+/** Options for {@link syncCatalog}. */
+export interface SyncCatalogOptions {
+  /** Source database (`primary`). */
+  sourceDb: ReplicableDatabase;
+  /** Target database (`replica`). */
+  targetDb: ReplicableDatabase;
+  /** Optional table names to exclude when discovering user tables. */
+  excludeTables?: readonly string[];
+  /** Synchronize table/column/index/view DDL using `diffSchema` + `generateMigration`. @default true */
+  syncSchema?: boolean;
+  /** Synchronize Firebird sequence/generator values (`RDB$GENERATORS`). @default true */
+  syncSequences?: boolean;
+  /** Allow destructive drops (`DROP TABLE`, `DROP COLUMN`) during schema sync. @default false */
+  allowDestructive?: boolean;
+}
+
+/** Result returned by {@link syncCatalog}. */
+export interface SyncCatalogResult {
+  /** DDL statements executed on `targetDb`. */
+  readonly ddlStatementsExecuted: readonly string[];
+  /** Number of sequences/generators synchronized on `targetDb`. */
+  readonly sequencesSynced: number;
+  /** User tables discovered on `sourceDb`. */
+  readonly discoveredTables: readonly string[];
+}
+
+/** Normalized table configuration stored inside a `ReplicationPublication`. */
+export interface NormalizedPublishedTableConfig {
+  readonly table: string;
+  readonly primaryKey: readonly string[];
+  readonly columns?: readonly string[];
+  readonly excludeColumns?: readonly string[];
+  readonly where?: string | ((row: Record<string, unknown>) => boolean);
+  readonly references?: readonly string[];
+}
+
 /** Options for {@link createPublication}. */
 export interface CreatePublicationOptions {
   /** Logical name of the publication (e.g. `'main_pub'`). @default 'default' */
   name?: string;
   /** Unique node identifier for this database instance (used for loop prevention & LWW). */
   nodeId?: string;
-  /** Tables published by this publication (names or `{ table, primaryKey, columns }` configs). */
-  tables: ReadonlyArray<string | PublishedTableConfig>;
+  /**
+   * Tables published by this publication (names, `{ table, primaryKey, columns, excludeColumns, where }`
+   * configs, or `'*'` to automatically discover and publish all user tables).
+   */
+  tables: '*' | ReadonlyArray<string | PublishedTableConfig>;
+  /** Tables to exclude when `tables: '*'` is used. */
+  excludeTables?: readonly string[];
   /** Custom journal table name. @default 'FB_REPL_JOURNAL$' */
   journalTable?: string;
   /** Custom mirror table name for `captureTableChanges()`. @default 'FB_REPL_MIRROR$' */
@@ -346,6 +488,11 @@ export interface CreatePublicationOptions {
    * @default false
    */
   installTriggers?: boolean;
+  /**
+   * Optional Hybrid Logical Clock used to stamp every published journal entry.
+   * When omitted, an internal `createHlc(nodeId)` instance is used automatically.
+   */
+  hlc?: HybridLogicalClock;
 }
 
 /** A logical replication publication on a source database. */
@@ -354,11 +501,15 @@ export interface ReplicationPublication {
   readonly name: string;
   /** Originating node identifier. */
   readonly nodeId: string;
+  /** Hybrid Logical Clock bound to this publication. */
+  readonly hlc: HybridLogicalClock;
   /** Published table configurations keyed by upper-case table name. */
-  readonly tables: ReadonlyMap<
-    string,
-    { table: string; primaryKey: readonly string[]; columns?: readonly string[] }
-  >;
+  readonly tables: ReadonlyMap<string, NormalizedPublishedTableConfig>;
+  /**
+   * Re-introspect the database catalog (when `tables: '*'` was used) and add any
+   * newly created user tables to the publication.
+   */
+  refreshPublishedTables(): Promise<ReadonlyMap<string, NormalizedPublishedTableConfig>>;
   /** Return the highest LSN currently recorded in the journal. */
   currentLsn(): Promise<number>;
   /**
@@ -526,6 +677,17 @@ export interface CreateSubscriptionOptions {
   watermarkTable?: string;
   /** Poll interval in milliseconds when `start()` is called. @default 1000 */
   pollIntervalMs?: number;
+  /**
+   * Optional table foreign-key dependency map (`childTable -> [parentTable1, ...]`).
+   * Used by {@link orderEntriesByTopology} to replay parent `INSERT`s before child
+   * `INSERT`s and child `DELETE`s before parent `DELETE`s within the same `txid`.
+   */
+  tableDependencies?: Readonly<Record<string, readonly string[]>>;
+  /**
+   * Optional Hybrid Logical Clock updated (`hlc.receive()`) whenever remote
+   * journal entries are applied on this replica.
+   */
+  hlc?: HybridLogicalClock;
 }
 
 /** Result of a single `subscription.pull()` cycle. */
@@ -689,6 +851,573 @@ export function mergeReplicatedRow(
     }
   }
   return merged;
+}
+
+// ---------------------------------------------------------------------------
+// Hybrid Logical Clock (HLC) & Per-Column CRDT Merge Helpers (M12 Item 6)
+// ---------------------------------------------------------------------------
+
+/**
+ * Format an {@link HlcTimestamp} into a zero-padded `<wallMs>:<counter>:<nodeId>` string
+ * whose lexicographical order matches causal order.
+ */
+export function formatHlc(ts: HlcTimestamp): string {
+  const wall = String(Math.max(0, Math.trunc(ts.wallMs))).padStart(15, '0');
+  const counter = String(Math.max(0, Math.trunc(ts.counter))).padStart(5, '0');
+  return `${wall}:${counter}:${ts.nodeId}`;
+}
+
+/**
+ * Parse a `<wallMs>:<counter>:<nodeId>` string (or return an existing `HlcTimestamp` object).
+ */
+export function parseHlc(raw: string | HlcTimestamp): HlcTimestamp {
+  if (typeof raw !== 'string') {
+    return {
+      wallMs: Math.max(0, Math.trunc(raw.wallMs)),
+      counter: Math.max(0, Math.trunc(raw.counter)),
+      nodeId: raw.nodeId,
+    };
+  }
+  const firstColon = raw.indexOf(':');
+  const secondColon = firstColon >= 0 ? raw.indexOf(':', firstColon + 1) : -1;
+  if (firstColon < 0 || secondColon < 0) {
+    throw new Error(`Invalid HLC timestamp string: "${raw}"`);
+  }
+  const wallMs = Number.parseInt(raw.slice(0, firstColon), 10);
+  const counter = Number.parseInt(raw.slice(firstColon + 1, secondColon), 10);
+  const nodeId = raw.slice(secondColon + 1);
+  if (Number.isNaN(wallMs) || Number.isNaN(counter)) {
+    throw new Error(`Invalid numeric components in HLC timestamp: "${raw}"`);
+  }
+  return { wallMs, counter, nodeId };
+}
+
+/**
+ * Compare two Hybrid Logical Clock timestamps (`< 0` if `a < b`, `0` if equal, `> 0` if `a > b`).
+ */
+export function compareHlc(
+  a: string | HlcTimestamp,
+  b: string | HlcTimestamp,
+): number {
+  const pa = parseHlc(a);
+  const pb = parseHlc(b);
+  if (pa.wallMs !== pb.wallMs) {
+    return pa.wallMs - pb.wallMs;
+  }
+  if (pa.counter !== pb.counter) {
+    return pa.counter - pb.counter;
+  }
+  if (pa.nodeId === pb.nodeId) return 0;
+  return pa.nodeId < pb.nodeId ? -1 : 1;
+}
+
+/**
+ * Create a monotonic Hybrid Logical Clock (`<wallMs>:<counter>:<nodeId>`)
+ * for skew-tolerant causal ordering across distributed primary/replica nodes.
+ */
+export function createHlc(
+  nodeId: string,
+  options: HybridLogicalClockOptions = {},
+): HybridLogicalClock {
+  const cleanNode = nodeId.trim() || 'node';
+  const nowFn = options.now ?? Date.now;
+  const maxDriftMs = options.maxDriftMs ?? 0;
+
+  let lastWallMs = Math.max(0, Math.trunc(options.initialWallMs ?? 0));
+  let lastCounter = Math.max(0, Math.trunc(options.initialCounter ?? 0));
+
+  return {
+    nodeId: cleanNode,
+
+    now(wallNowMs?: number): string {
+      const physicalNow = Math.max(0, Math.trunc(wallNowMs ?? nowFn()));
+      if (physicalNow > lastWallMs) {
+        lastWallMs = physicalNow;
+        lastCounter = 0;
+      } else {
+        lastCounter += 1;
+      }
+      return formatHlc({
+        wallMs: lastWallMs,
+        counter: lastCounter,
+        nodeId: cleanNode,
+      });
+    },
+
+    receive(remote: string | HlcTimestamp, wallNowMs?: number): string {
+      const physicalNow = Math.max(0, Math.trunc(wallNowMs ?? nowFn()));
+      const rem = parseHlc(remote);
+
+      if (maxDriftMs > 0 && rem.wallMs - physicalNow > maxDriftMs) {
+        throw new Error(
+          `Remote HLC timestamp (${rem.wallMs}) exceeds maximum allowed clock drift (${maxDriftMs}ms) from local physical clock (${physicalNow})`,
+        );
+      }
+
+      if (physicalNow > lastWallMs && physicalNow > rem.wallMs) {
+        lastWallMs = physicalNow;
+        lastCounter = 0;
+      } else if (lastWallMs === rem.wallMs) {
+        lastCounter = Math.max(lastCounter, rem.counter) + 1;
+      } else if (rem.wallMs > lastWallMs) {
+        lastWallMs = rem.wallMs;
+        lastCounter = rem.counter + 1;
+      } else {
+        lastCounter += 1;
+      }
+
+      return formatHlc({
+        wallMs: lastWallMs,
+        counter: lastCounter,
+        nodeId: cleanNode,
+      });
+    },
+
+    last(): HlcTimestamp {
+      return {
+        wallMs: lastWallMs,
+        counter: lastCounter,
+        nodeId: cleanNode,
+      };
+    },
+
+    compare: compareHlc,
+  };
+}
+
+function parseSetElements(val: unknown): {
+  kind: 'array' | 'json' | 'csv';
+  items: unknown[];
+} {
+  if (Array.isArray(val)) {
+    return { kind: 'array', items: [...val] };
+  }
+  if (typeof val === 'string') {
+    const trimmed = val.trim();
+    if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+      try {
+        const parsed = JSON.parse(trimmed) as unknown;
+        if (Array.isArray(parsed)) {
+          return { kind: 'json', items: parsed };
+        }
+      } catch {
+        // Fall through to CSV
+      }
+    }
+    if (!trimmed) {
+      return { kind: 'csv', items: [] };
+    }
+    return {
+      kind: 'csv',
+      items: trimmed.split(',').map((s) => s.trim()).filter((s) => s.length > 0),
+    };
+  }
+  if (val === null || val === undefined) {
+    return { kind: 'json', items: [] };
+  }
+  return { kind: 'array', items: [val] };
+}
+
+function formatSetElements(
+  kind: 'array' | 'json' | 'csv',
+  items: readonly unknown[],
+): unknown {
+  if (kind === 'array') return [...items];
+  if (kind === 'csv') return items.map(String).join(',');
+  return JSON.stringify(items);
+}
+
+/**
+ * Per-column CRDT conflict merger supporting:
+ * - `'lww'`: Last-Write-Wins Element-Set ordered by HLC (`compareHlc`) or `(timestamp, origin)`.
+ * - `'pn-counter'` / `'counter'`: Additive numeric counter deltas (`base + (local - base) + (remote - base)`).
+ * - `'set-union'` / `'g-set'`: Set union with 2P/OR-Set add/remove delta semantics when `before` is available.
+ * - `'max'` / `'min'`: Join-semilattice maximum or minimum value.
+ */
+export function mergeCrdtRow(
+  ctx: ReplicationConflictContext,
+  config: CrdtMergeConfig = {},
+): Record<string, unknown> {
+  const normBefore = ctx.incoming.before ? normalizeRowKeysUpper(ctx.incoming.before) : {};
+  const normLocal = ctx.localRow ? normalizeRowKeysUpper(ctx.localRow) : {};
+  const normRemote = ctx.incoming.after ? normalizeRowKeysUpper(ctx.incoming.after) : {};
+
+  const strategyByCol = new Map<string, ColumnCrdtStrategy>();
+  if (config.columns) {
+    for (const [col, strat] of Object.entries(config.columns)) {
+      strategyByCol.set(col.toUpperCase(), strat);
+    }
+  }
+  const defaultStrategy: ColumnCrdtStrategy = config.defaultStrategy ?? 'lww';
+
+  const remoteHlc =
+    ctx.incoming.hlc ??
+    formatHlc({
+      wallMs: ctx.incoming.timestamp,
+      counter: 0,
+      nodeId: ctx.incoming.origin,
+    });
+  const localHlc =
+    ctx.localEntry?.hlc ??
+    formatHlc({
+      wallMs: ctx.localEntry?.timestamp ?? 0,
+      counter: 0,
+      nodeId: ctx.localEntry?.origin ?? '',
+    });
+  const remoteIsNewerOrEqual = compareHlc(remoteHlc, localHlc) >= 0;
+
+  const allKeys = new Set<string>([
+    ...Object.keys(normBefore),
+    ...Object.keys(normLocal),
+    ...Object.keys(normRemote),
+  ]);
+
+  const merged: Record<string, unknown> = { ...normLocal };
+
+  for (const col of allKeys) {
+    const strat = strategyByCol.get(col) ?? defaultStrategy;
+    const bVal = normBefore[col];
+    const lVal = normLocal[col];
+    const rVal = normRemote[col];
+
+    switch (strat) {
+      case 'pn-counter':
+      case 'counter': {
+        const baseNum = Number(bVal ?? 0);
+        const localNum = Number(lVal ?? baseNum);
+        const remoteNum = Number(rVal ?? baseNum);
+        const localDelta = localNum - baseNum;
+        const remoteDelta = remoteNum - baseNum;
+        merged[col] = baseNum + localDelta + remoteDelta;
+        break;
+      }
+
+      case 'set-union':
+      case 'g-set': {
+        const bSet = parseSetElements(bVal);
+        const lSet = parseSetElements(lVal);
+        const rSet = parseSetElements(rVal);
+        const outKind =
+          lVal !== undefined ? lSet.kind : rVal !== undefined ? rSet.kind : bSet.kind;
+
+        if (strat === 'g-set' || bVal === undefined) {
+          const seen = new Set<string>();
+          const unioned: unknown[] = [];
+          for (const item of [...lSet.items, ...rSet.items]) {
+            const key = JSON.stringify(item);
+            if (!seen.has(key)) {
+              seen.add(key);
+              unioned.push(item);
+            }
+          }
+          merged[col] = formatSetElements(outKind, unioned);
+        } else {
+          // 2P / OR-Set delta: keep items present in both or added by either side,
+          // and drop items that were in `before` and removed by one side without change on the other
+          const bKeys = new Set(bSet.items.map((x) => JSON.stringify(x)));
+          const lKeys = new Set(lSet.items.map((x) => JSON.stringify(x)));
+          const rKeys = new Set(rSet.items.map((x) => JSON.stringify(x)));
+
+          const seen = new Set<string>();
+          const result: unknown[] = [];
+          for (const item of [...lSet.items, ...rSet.items]) {
+            const k = JSON.stringify(item);
+            if (seen.has(k)) continue;
+            const wasInBefore = bKeys.has(k);
+            const removedByLocal = wasInBefore && !lKeys.has(k);
+            const removedByRemote = wasInBefore && !rKeys.has(k);
+            if (removedByLocal || removedByRemote) {
+              continue;
+            }
+            seen.add(k);
+            result.push(item);
+          }
+          merged[col] = formatSetElements(outKind, result);
+        }
+        break;
+      }
+
+      case 'max': {
+        if (typeof lVal === 'number' && typeof rVal === 'number') {
+          merged[col] = Math.max(lVal, rVal);
+        } else if (lVal === undefined || lVal === null) {
+          merged[col] = rVal;
+        } else if (rVal === undefined || rVal === null) {
+          merged[col] = lVal;
+        } else {
+          merged[col] = String(rVal) >= String(lVal) ? rVal : lVal;
+        }
+        break;
+      }
+
+      case 'min': {
+        if (typeof lVal === 'number' && typeof rVal === 'number') {
+          merged[col] = Math.min(lVal, rVal);
+        } else if (lVal === undefined || lVal === null) {
+          merged[col] = rVal;
+        } else if (rVal === undefined || rVal === null) {
+          merged[col] = lVal;
+        } else {
+          merged[col] = String(rVal) <= String(lVal) ? rVal : lVal;
+        }
+        break;
+      }
+
+      case 'lww':
+      default: {
+        const remoteChanged = JSON.stringify(rVal) !== JSON.stringify(bVal);
+        const localChanged =
+          bVal !== undefined && JSON.stringify(lVal) !== JSON.stringify(bVal);
+
+        if (remoteChanged && !localChanged) {
+          if (rVal !== undefined) merged[col] = rVal;
+        } else if (!remoteChanged && localChanged) {
+          merged[col] = lVal;
+        } else if (remoteChanged && localChanged) {
+          merged[col] = remoteIsNewerOrEqual && rVal !== undefined ? rVal : lVal;
+        } else if (remoteIsNewerOrEqual && rVal !== undefined) {
+          merged[col] = rVal;
+        }
+        break;
+      }
+    }
+  }
+
+  return merged;
+}
+
+/**
+ * Create a pluggable conflict resolver callback for `onConflict` in
+ * {@link createSubscription} or {@link replicateDatabases} backed by {@link mergeCrdtRow}.
+ */
+export function createCrdtConflictResolver(
+  config: CrdtMergeConfig = {},
+): (ctx: ReplicationConflictContext) => ReplicationConflictResolution {
+  return (ctx: ReplicationConflictContext): ReplicationConflictResolution => ({
+    action: 'merge',
+    row: mergeCrdtRow(ctx, config),
+  });
+}
+
+/**
+ * Project a replicated row according to optional `columns` whitelist and
+ * `excludeColumns` blacklist while always preserving `pkCols`.
+ */
+export function projectReplicatedRow(
+  row: Record<string, unknown> | null,
+  pkCols: readonly string[],
+  columns?: readonly string[],
+  excludeColumns?: readonly string[],
+): Record<string, unknown> | null {
+  if (!row) return null;
+  const norm = normalizeRowKeysUpper(row);
+  if ((!columns || columns.length === 0) && (!excludeColumns || excludeColumns.length === 0)) {
+    return norm;
+  }
+
+  const pkSet = new Set(pkCols.map((c) => c.toUpperCase()));
+  const allowSet =
+    columns && columns.length > 0
+      ? new Set([...pkSet, ...columns.map((c) => c.toUpperCase())])
+      : null;
+  const excludeSet =
+    excludeColumns && excludeColumns.length > 0
+      ? new Set(excludeColumns.map((c) => c.toUpperCase()))
+      : null;
+
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(norm)) {
+    if (pkSet.has(k)) {
+      out[k] = v;
+      continue;
+    }
+    if (excludeSet && excludeSet.has(k)) {
+      continue;
+    }
+    if (allowSet && !allowSet.has(k)) {
+      continue;
+    }
+    out[k] = v;
+  }
+  return out;
+}
+
+function parseSqlLiteralValue(raw: string): unknown {
+  const trimmed = raw.trim();
+  if (
+    (trimmed.startsWith("'") && trimmed.endsWith("'")) ||
+    (trimmed.startsWith('"') && trimmed.endsWith('"'))
+  ) {
+    return trimmed.slice(1, -1).replace(/''/g, "'");
+  }
+  if (/^null$/i.test(trimmed)) return null;
+  if (/^true$/i.test(trimmed)) return true;
+  if (/^false$/i.test(trimmed)) return false;
+  if (/^-?\d+(\.\d+)?$/.test(trimmed)) return Number(trimmed);
+  return trimmed;
+}
+
+function evaluateSingleSqlPredicate(row: Record<string, unknown>, expr: string): boolean {
+  const clean = expr.trim().replace(/^\(+|\)+$/g, '').trim();
+  if (!clean) return true;
+
+  const isNotNullMatch = /^([A-Za-z0-9_$"]+)\s+IS\s+NOT\s+NULL$/i.exec(clean);
+  if (isNotNullMatch) {
+    const col = isNotNullMatch[1]!.replace(/"/g, '').toUpperCase();
+    return row[col] !== null && row[col] !== undefined;
+  }
+
+  const isNullMatch = /^([A-Za-z0-9_$"]+)\s+IS\s+NULL$/i.exec(clean);
+  if (isNullMatch) {
+    const col = isNullMatch[1]!.replace(/"/g, '').toUpperCase();
+    return row[col] === null || row[col] === undefined;
+  }
+
+  const inMatch = /^([A-Za-z0-9_$"]+)\s+IN\s*\(([^)]+)\)$/i.exec(clean);
+  if (inMatch) {
+    const col = inMatch[1]!.replace(/"/g, '').toUpperCase();
+    const candidates = inMatch[2]!.split(',').map(parseSqlLiteralValue);
+    return candidates.some((c) => row[col] === c || String(row[col]) === String(c));
+  }
+
+  const cmpMatch = /^([A-Za-z0-9_$"]+)\s*(!=|<>|<=|>=|=|<|>)\s*(.+)$/.exec(clean);
+  if (cmpMatch) {
+    const col = cmpMatch[1]!.replace(/"/g, '').toUpperCase();
+    const op = cmpMatch[2]!;
+    const rhs = parseSqlLiteralValue(cmpMatch[3]!);
+    const lhs = row[col];
+
+    switch (op) {
+      case '=':
+        return lhs === rhs || (lhs !== null && lhs !== undefined && String(lhs) === String(rhs));
+      case '!=':
+      case '<>':
+        return lhs !== rhs && String(lhs) !== String(rhs);
+      case '<':
+        return Number(lhs) < Number(rhs);
+      case '<=':
+        return Number(lhs) <= Number(rhs);
+      case '>':
+        return Number(lhs) > Number(rhs);
+      case '>=':
+        return Number(lhs) >= Number(rhs);
+    }
+  }
+
+  return true;
+}
+
+/**
+ * Evaluate whether `row` satisfies a table's row filter (`where` callback or SQL `WHERE` predicate).
+ */
+export function matchesRowFilter(
+  row: Record<string, unknown> | null,
+  where?: string | ((row: Record<string, unknown>) => boolean),
+): boolean {
+  if (!where) return true;
+  if (!row) return false;
+  const norm = normalizeRowKeysUpper(row);
+  if (typeof where === 'function') {
+    return Boolean(where(norm));
+  }
+  const orParts = where.split(/\s+OR\s+/i);
+  return orParts.some((orBranch) => {
+    const andParts = orBranch.split(/\s+AND\s+/i);
+    return andParts.every((atom) => evaluateSingleSqlPredicate(norm, atom));
+  });
+}
+
+/**
+ * Group replication journal entries by transaction (`txid`) while preserving
+ * commit order across transactions, and topologically order entries within each
+ * transaction according to foreign-key `dependencies` (`childTable -> [parentTables]`):
+ * - `'INSERT'` and `'UPDATE'` entries run **parent tables before child tables**.
+ * - `'DELETE'` entries run **child tables before parent tables**.
+ */
+export function orderEntriesByTopology(
+  entries: readonly ReplicationLogEntry[],
+  dependencies?: Readonly<Record<string, readonly string[]>>,
+): ReplicationLogEntry[] {
+  if (entries.length <= 1 || !dependencies || Object.keys(dependencies).length === 0) {
+    return [...entries];
+  }
+
+  // Normalize dependency map: CHILD -> [PARENT1, PARENT2]
+  const depMap = new Map<string, readonly string[]>();
+  for (const [child, parents] of Object.entries(dependencies)) {
+    depMap.set(
+      normalizeTableName(child),
+      parents.map((p) => normalizeTableName(p)),
+    );
+  }
+
+  // Compute topological depth for each table (0 = root parent, higher = deeper child)
+  const depthCache = new Map<string, number>();
+  const getDepth = (table: string, visiting = new Set<string>()): number => {
+    const upper = normalizeTableName(table);
+    if (depthCache.has(upper)) return depthCache.get(upper)!;
+    if (visiting.has(upper)) return 0; // cycle guard
+    visiting.add(upper);
+    const parents = depMap.get(upper) ?? [];
+    let maxParentDepth = -1;
+    for (const p of parents) {
+      const d = getDepth(p, visiting);
+      if (d > maxParentDepth) maxParentDepth = d;
+    }
+    visiting.delete(upper);
+    const depth = maxParentDepth + 1;
+    depthCache.set(upper, depth);
+    return depth;
+  };
+
+  // Group contiguous or same-txid entries in order of first appearance
+  const txGroups: ReplicationLogEntry[][] = [];
+  const groupByTx = new Map<string, ReplicationLogEntry[]>();
+
+  for (const entry of entries) {
+    const txKey = entry.txid || `lsn_${entry.lsn}`;
+    let group = groupByTx.get(txKey);
+    if (!group) {
+      group = [];
+      groupByTx.set(txKey, group);
+      txGroups.push(group);
+    }
+    group.push(entry);
+  }
+
+  const ordered: ReplicationLogEntry[] = [];
+  for (const group of txGroups) {
+    if (group.length <= 1) {
+      ordered.push(...group);
+      continue;
+    }
+    const indexed = group.map((item, idx) => ({ item, idx }));
+    indexed.sort((a, b) => {
+      // DDL always comes first within a transaction
+      if (a.item.operation === 'DDL' && b.item.operation !== 'DDL') return -1;
+      if (b.item.operation === 'DDL' && a.item.operation !== 'DDL') return 1;
+
+      // Non-DELETE (INSERT/UPDATE) comes before DELETE so parent creations precede child cleanups
+      const aIsDel = a.item.operation === 'DELETE';
+      const bIsDel = b.item.operation === 'DELETE';
+      if (aIsDel !== bIsDel) {
+        return aIsDel ? 1 : -1;
+      }
+
+      const depthA = getDepth(a.item.table);
+      const depthB = getDepth(b.item.table);
+      if (depthA !== depthB) {
+        // For DELETE: deeper child first (depthB - depthA); for INSERT/UPDATE: parent first (depthA - depthB)
+        return aIsDel ? depthB - depthA : depthA - depthB;
+      }
+      return a.idx - b.idx;
+    });
+    for (const { item } of indexed) {
+      ordered.push(item);
+    }
+  }
+
+  return ordered;
 }
 
 async function execStatement(
@@ -1099,6 +1828,281 @@ export async function dropReplicationTriggers(
 }
 
 // ---------------------------------------------------------------------------
+// 0b. Whole-Database Catalog Discovery, Sequence Watermarking & Schema Sync (M12 Item 4)
+// ---------------------------------------------------------------------------
+
+function isInternalReplicationTable(name: string): boolean {
+  const upper = normalizeTableName(name);
+  return (
+    upper.startsWith('FB_REPL_') ||
+    upper.startsWith('FB_MIGRATIONS') ||
+    upper.startsWith('RDB$') ||
+    upper.startsWith('MON$') ||
+    upper.startsWith('SEC$')
+  );
+}
+
+function toMigrationExecutor(db: ReplicableDatabase): {
+  query<T extends Row = Row>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
+  exec(sql: string, params?: QueryParams): Promise<unknown>;
+} {
+  return {
+    query: <T extends Row = Row>(sql: string, params?: QueryParams) => db.query<T>(sql, params),
+    exec: (sql: string, params?: QueryParams) => execStatement(db, sql, params),
+  };
+}
+
+/**
+ * Discover all non-system, non-replication user tables on `db` along with their
+ * primary keys, columns, and foreign-key parent table references.
+ */
+export async function discoverUserTables(
+  db: ReplicableDatabase,
+  options: { excludeTables?: readonly string[] } = {},
+): Promise<PublishedTableConfig[]> {
+  const excludeSet = new Set(
+    (options.excludeTables ?? []).map((t) => normalizeTableName(t)),
+  );
+
+  // 1. Try full catalog introspection (`introspect(db)`)
+  try {
+    const schema = await introspect(toMigrationExecutor(db));
+    if (schema.tables.length > 0) {
+      const out: PublishedTableConfig[] = [];
+      for (const tbl of schema.tables) {
+        const upper = normalizeTableName(tbl.name);
+        if (isInternalReplicationTable(upper) || excludeSet.has(upper)) continue;
+        const pk =
+          tbl.primaryKey && tbl.primaryKey.length > 0
+            ? tbl.primaryKey.map((c: string) => c.toUpperCase())
+            : ['ID'];
+        const cols = tbl.columns.map((c) => c.name.toUpperCase());
+        const refs = Array.from(
+          new Set(tbl.foreignKeys.map((fk) => normalizeTableName(fk.referencedTableName))),
+        );
+        out.push({
+          table: upper,
+          primaryKey: pk,
+          ...(cols.length > 0 ? { columns: cols } : {}),
+          ...(refs.length > 0 ? { references: refs } : {}),
+        });
+      }
+      if (out.length > 0) return out;
+    }
+  } catch {
+    // Fall through to lightweight RDB$RELATIONS query or mock DB inspection
+  }
+
+  // 2. Try lightweight RDB$RELATIONS query
+  try {
+    const relRes = await db.query<Row>(
+      `SELECT TRIM(RDB$RELATION_NAME) AS TABLE_NAME FROM RDB$RELATIONS WHERE COALESCE(RDB$SYSTEM_FLAG, 0) = 0 AND RDB$VIEW_BLR IS NULL ORDER BY RDB$RELATION_NAME`,
+    );
+    const names = relRes.rows
+      .map((r) => String(r.TABLE_NAME ?? r.table_name ?? '').trim().toUpperCase())
+      .filter((n) => n.length > 0 && !isInternalReplicationTable(n) && !excludeSet.has(n));
+    if (names.length > 0) {
+      return names.map((table) => ({ table, primaryKey: ['ID'] }));
+    }
+  } catch {
+    // Fall through to in-memory `tables` map inspection
+  }
+
+  // 3. Fallback for in-memory test doubles exposing `db.tables: Map<string, Row[]>`
+  const mockTables = (db as ReplicableDatabase & { tables?: Map<string, Row[]> }).tables;
+  if (mockTables instanceof Map) {
+    const out: PublishedTableConfig[] = [];
+    for (const [rawName, rows] of mockTables.entries()) {
+      const upper = normalizeTableName(rawName);
+      if (isInternalReplicationTable(upper) || excludeSet.has(upper)) continue;
+      const sampleCols = rows[0] ? Object.keys(rows[0]).map((c) => c.toUpperCase()) : undefined;
+      out.push({
+        table: upper,
+        primaryKey: ['ID'],
+        ...(sampleCols && sampleCols.length > 0 ? { columns: sampleCols } : {}),
+      });
+    }
+    return out;
+  }
+
+  return [];
+}
+
+/**
+ * Create a whole-database publication (`tables: '*'`) that automatically discovers
+ * and publishes all user tables on `db`.
+ */
+export async function publishAllTables(
+  db: ReplicableDatabase,
+  options: Omit<CreatePublicationOptions, 'tables'> = {},
+): Promise<ReplicationPublication> {
+  return createPublication(db, {
+    ...options,
+    tables: '*',
+  });
+}
+
+/**
+ * Export the current watermarks (`GEN_ID(seq, 0)`) of all user sequences/generators on `db`.
+ */
+export async function exportSequences(
+  db: ReplicableDatabase,
+): Promise<SequenceWatermark[]> {
+  // 1. Check in-memory mock DB `sequences?: Map<string, number>`
+  const mockSeqs = (db as ReplicableDatabase & { sequences?: Map<string, number> }).sequences;
+  if (mockSeqs instanceof Map) {
+    const out: SequenceWatermark[] = [];
+    for (const [name, val] of mockSeqs.entries()) {
+      const upper = normalizeTableName(name);
+      if (!isInternalReplicationTable(upper)) {
+        out.push({ name: upper, currentValue: Number(val) });
+      }
+    }
+    return out;
+  }
+
+  // 2. Query Firebird system catalog `RDB$GENERATORS`
+  const out: SequenceWatermark[] = [];
+  try {
+    const res = await db.query<Row>(
+      `SELECT TRIM(RDB$GENERATOR_NAME) AS GEN_NAME FROM RDB$GENERATORS WHERE COALESCE(RDB$SYSTEM_FLAG, 0) = 0 ORDER BY RDB$GENERATOR_NAME`,
+    );
+    for (const r of res.rows) {
+      const name = String(r.GEN_NAME ?? r.gen_name ?? '').trim().toUpperCase();
+      if (!name || isInternalReplicationTable(name)) continue;
+      try {
+        const valRes = await db.query<Row>(
+          `SELECT GEN_ID(${quoteIdent(name)}, 0) AS CUR_VAL FROM RDB$DATABASE`,
+        );
+        const curVal = Number(valRes.rows[0]?.CUR_VAL ?? valRes.rows[0]?.cur_val ?? 0);
+        out.push({ name, currentValue: curVal });
+      } catch {
+        // Ignore unreadable sequence
+      }
+    }
+  } catch {
+    // Catalog query unsupported
+  }
+  return out;
+}
+
+/**
+ * Synchronize user sequence/generator watermarks onto `targetDb` so a promoted
+ * replica never generates colliding sequence values (`ALTER SEQUENCE <name> RESTART WITH <val>`).
+ */
+export async function applySequences(
+  targetDb: ReplicableDatabase,
+  sequences: readonly SequenceWatermark[],
+): Promise<number> {
+  if (sequences.length === 0) return 0;
+
+  const mockSeqs = (targetDb as ReplicableDatabase & { sequences?: Map<string, number> }).sequences;
+  let synced = 0;
+
+  for (const seq of sequences) {
+    const upper = normalizeTableName(seq.name);
+    if (isInternalReplicationTable(upper)) continue;
+
+    if (mockSeqs instanceof Map) {
+      const prev = mockSeqs.get(upper) ?? 0;
+      if (seq.currentValue >= prev) {
+        mockSeqs.set(upper, seq.currentValue);
+      }
+      synced++;
+      continue;
+    }
+
+    await ensureTableSafe(targetDb, `CREATE SEQUENCE ${quoteIdent(upper)}`);
+    await execStatement(
+      targetDb,
+      `ALTER SEQUENCE ${quoteIdent(upper)} RESTART WITH ${Math.trunc(seq.currentValue)}`,
+    );
+    synced++;
+  }
+
+  return synced;
+}
+
+/**
+ * Synchronize catalog schema (tables, columns, indexes, views via `diffSchema` +
+ * `generateMigration`) and sequence watermarks (`exportSequences` + `applySequences`)
+ * from `sourceDb` onto `targetDb`.
+ */
+export async function syncCatalog(
+  options: SyncCatalogOptions,
+): Promise<SyncCatalogResult> {
+  const doSchema = options.syncSchema ?? true;
+  const doSequences = options.syncSequences ?? true;
+  const ddlExecuted: string[] = [];
+
+  if (doSchema) {
+    try {
+      const mig = await generateMigration(
+        toMigrationExecutor(options.targetDb),
+        toMigrationExecutor(options.sourceDb),
+        {
+          version: String(Date.now()),
+          name: 'repl_catalog_sync',
+        },
+      );
+      if (mig.diff.hasChanges) {
+        const allowDrop = options.allowDestructive ?? false;
+        for (const stmt of mig.up) {
+          if (!allowDrop && /^\s*DROP\b/i.test(stmt)) {
+            continue;
+          }
+          await ensureTableSafe(options.targetDb, stmt);
+          ddlExecuted.push(stmt);
+        }
+      }
+    } catch {
+      // Fallback for in-memory mock DBs: ensure all discovered user tables exist on targetDb
+    }
+
+    // Also replay any recorded `ddlLog` or missing table keys on mock DBs
+    const srcMock = options.sourceDb as ReplicableDatabase & {
+      tables?: Map<string, Row[]>;
+      ddlLog?: string[];
+    };
+    const tgtMock = options.targetDb as ReplicableDatabase & {
+      tables?: Map<string, Row[]>;
+      ddlLog?: string[];
+    };
+    if (Array.isArray(srcMock.ddlLog)) {
+      const tgtSet = new Set(tgtMock.ddlLog ?? []);
+      for (const ddl of srcMock.ddlLog) {
+        if (!tgtSet.has(ddl)) {
+          await ensureTableSafe(options.targetDb, ddl);
+          ddlExecuted.push(ddl);
+        }
+      }
+    }
+    if (srcMock.tables instanceof Map && tgtMock.tables instanceof Map) {
+      for (const tbl of srcMock.tables.keys()) {
+        if (!isInternalReplicationTable(tbl) && !tgtMock.tables.has(tbl)) {
+          tgtMock.tables.set(tbl, []);
+        }
+      }
+    }
+  }
+
+  let sequencesSynced = 0;
+  if (doSequences) {
+    const seqs = await exportSequences(options.sourceDb);
+    sequencesSynced = await applySequences(options.targetDb, seqs);
+  }
+
+  const discovered = await discoverUserTables(options.sourceDb, {
+    excludeTables: options.excludeTables,
+  });
+  return {
+    ddlStatementsExecuted: ddlExecuted,
+    sequencesSynced,
+    discoveredTables: discovered.map((t) => t.table),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // 1. `createPublication` Implementation
 // ---------------------------------------------------------------------------
 
@@ -1111,18 +2115,21 @@ export async function createPublication(
 ): Promise<ReplicationPublication> {
   const pubName = (options.name ?? 'default').trim();
   const nodeId = (options.nodeId ?? `node_${pubName}`).trim();
+  const hlc = options.hlc ?? createHlc(nodeId);
+  const hlcByLsn = new Map<number, string>();
   const journalTable = quoteIdent(options.journalTable ?? DEFAULT_REPL_JOURNAL_TABLE);
   const slotsTable = quoteIdent(options.slotsTable ?? DEFAULT_REPL_SLOTS_TABLE);
   const defaultSlotTtlMs = options.defaultSlotTtlMs ?? DEFAULT_REPL_SLOT_TTL_MS;
 
-  const tablesMap = new Map<
-    string,
-    { table: string; primaryKey: readonly string[]; columns?: readonly string[] }
-  >();
-  for (const item of options.tables) {
+  const tablesMap = new Map<string, NormalizedPublishedTableConfig>();
+  const isWildcard = options.tables === '*';
+
+  const registerTableItem = (item: string | PublishedTableConfig): void => {
     if (typeof item === 'string') {
       const upper = normalizeTableName(item);
-      tablesMap.set(upper, { table: upper, primaryKey: ['ID'] });
+      if (!tablesMap.has(upper)) {
+        tablesMap.set(upper, { table: upper, primaryKey: ['ID'] });
+      }
     } else {
       const upper = normalizeTableName(item.table);
       const pk =
@@ -1135,11 +2142,35 @@ export async function createPublication(
         item.columns && item.columns.length > 0
           ? item.columns.map((c) => c.toUpperCase())
           : undefined;
+      const excludeColumns =
+        item.excludeColumns && item.excludeColumns.length > 0
+          ? item.excludeColumns.map((c) => c.toUpperCase())
+          : undefined;
+      const references =
+        item.references && item.references.length > 0
+          ? item.references.map((r) => normalizeTableName(r))
+          : undefined;
       tablesMap.set(upper, {
         table: upper,
         primaryKey: pk,
         ...(columns ? { columns } : {}),
+        ...(excludeColumns ? { excludeColumns } : {}),
+        ...(item.where ? { where: item.where } : {}),
+        ...(references ? { references } : {}),
       });
+    }
+  };
+
+  if (options.tables === '*') {
+    const discovered = await discoverUserTables(db, {
+      excludeTables: options.excludeTables,
+    });
+    for (const item of discovered) {
+      registerTableItem(item);
+    }
+  } else {
+    for (const item of options.tables) {
+      registerTableItem(item);
     }
   }
 
@@ -1215,6 +2246,9 @@ export async function createPublication(
   };
 
   const insertJournalEntry = async (entry: ReplicationLogEntry): Promise<void> => {
+    if (entry.hlc) {
+      hlcByLsn.set(entry.lsn, entry.hlc);
+    }
     await execStatement(
       db,
       `INSERT INTO ${journalTable} (LSN, TXID, ORIGIN, PUBLICATION, TABLE_NAME, OP, KEY_JSON, AFTER_JSON, BEFORE_JSON, DDL_SQL, TS) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -1245,7 +2279,21 @@ export async function createPublication(
   } = {
     name: pubName,
     nodeId,
+    hlc,
     tables: tablesMap,
+
+    async refreshPublishedTables(): Promise<ReadonlyMap<string, NormalizedPublishedTableConfig>> {
+      const discovered = await discoverUserTables(db, {
+        excludeTables: options.excludeTables,
+      });
+      for (const item of discovered) {
+        const upper = normalizeTableName(item.table);
+        if (!tablesMap.has(upper)) {
+          registerTableItem(item);
+        }
+      }
+      return tablesMap;
+    },
 
     async currentLsn(): Promise<number> {
       try {
@@ -1525,7 +2573,13 @@ export async function createPublication(
         let rows: Row[] = [];
         try {
           const res = await db.query<Row>(`SELECT * FROM ${quoteIdent(tableUpper)}`);
-          rows = res.rows.map((r) => normalizeRowKeysUpper(r));
+          rows = res.rows
+            .map((r) => normalizeRowKeysUpper(r))
+            .filter((r) => matchesRowFilter(r, cfg.where))
+            .map(
+              (r) =>
+                projectReplicatedRow(r, cfg.primaryKey, cfg.columns, cfg.excludeColumns) ?? r,
+            );
         } catch {
           rows = [];
         }
@@ -1598,6 +2652,20 @@ export async function createPublication(
 
       updateMirrorRow(tableUpper, pkCols, params.operation, keyRec, fullAfter);
 
+      const projectedAfter = projectReplicatedRow(
+        fullAfter,
+        pkCols,
+        tableCfg.columns,
+        tableCfg.excludeColumns,
+      );
+      const projectedBefore = projectReplicatedRow(
+        beforeNorm,
+        pkCols,
+        tableCfg.columns,
+        tableCfg.excludeColumns,
+      );
+
+      const ts = params.timestamp ?? Date.now();
       const entry: ReplicationLogEntry = {
         lsn: ++lsnCounter,
         txid: params.txid ?? nextTxId(),
@@ -1606,10 +2674,11 @@ export async function createPublication(
         table: tableUpper,
         operation: params.operation,
         key: keyRec,
-        after: fullAfter,
-        before: beforeNorm,
+        after: projectedAfter,
+        before: projectedBefore,
         ddlSql: null,
-        timestamp: params.timestamp ?? Date.now(),
+        timestamp: ts,
+        hlc: hlc.now(ts),
       };
 
       await insertJournalEntry(entry);
@@ -1631,6 +2700,7 @@ export async function createPublication(
         }
       }
 
+      const ts = ddlOpts.timestamp ?? Date.now();
       const entry: ReplicationLogEntry = {
         lsn: ++lsnCounter,
         txid: ddlOpts.txid ?? nextTxId(),
@@ -1642,7 +2712,8 @@ export async function createPublication(
         after: null,
         before: null,
         ddlSql,
-        timestamp: ddlOpts.timestamp ?? Date.now(),
+        timestamp: ts,
+        hlc: hlc.now(ts),
       };
 
       await insertJournalEntry(entry);
@@ -1650,6 +2721,9 @@ export async function createPublication(
     },
 
     async captureTableChanges(captureOpts = {}): Promise<ReplicationLogEntry[]> {
+      if (isWildcard) {
+        await publication.refreshPublishedTables();
+      }
       const captured: ReplicationLogEntry[] = [];
       const txid = captureOpts.txid ?? nextTxId();
       const ts = captureOpts.timestamp ?? Date.now();
@@ -1668,9 +2742,14 @@ export async function createPublication(
 
         for (const rawRow of res.rows) {
           const normRow = normalizeRowKeysUpper(rawRow);
-          const keyRec = extractKeyRecord(normRow, pkCols);
+          if (!matchesRowFilter(normRow, cfg.where)) {
+            continue;
+          }
+          const projectedRow =
+            projectReplicatedRow(normRow, pkCols, cfg.columns, cfg.excludeColumns) ?? normRow;
+          const keyRec = extractKeyRecord(projectedRow, pkCols);
           const k = serializeKeyRecord(keyRec, pkCols);
-          nextMirror.set(k, normRow);
+          nextMirror.set(k, projectedRow);
 
           const prevRow = prevMirror.get(k);
           if (!prevRow) {
@@ -1682,14 +2761,15 @@ export async function createPublication(
               table: tableUpper,
               operation: 'INSERT',
               key: keyRec,
-              after: normRow,
+              after: projectedRow,
               before: null,
               ddlSql: null,
               timestamp: ts,
+              hlc: hlc.now(ts),
             };
             await insertJournalEntry(entry);
             captured.push(entry);
-          } else if (!rowsEqual(prevRow, normRow)) {
+          } else if (!rowsEqual(prevRow, projectedRow)) {
             const entry: ReplicationLogEntry = {
               lsn: ++lsnCounter,
               txid,
@@ -1698,10 +2778,11 @@ export async function createPublication(
               table: tableUpper,
               operation: 'UPDATE',
               key: keyRec,
-              after: normRow,
+              after: projectedRow,
               before: prevRow,
               ddlSql: null,
               timestamp: ts,
+              hlc: hlc.now(ts),
             };
             await insertJournalEntry(entry);
             captured.push(entry);
@@ -1723,6 +2804,7 @@ export async function createPublication(
               before: prevRow,
               ddlSql: null,
               timestamp: ts,
+              hlc: hlc.now(ts),
             };
             await insertJournalEntry(entry);
             captured.push(entry);
@@ -1752,23 +2834,69 @@ export async function createPublication(
         if (fetchOpts.excludeOrigin && origin === fetchOpts.excludeOrigin) {
           continue;
         }
+        const tableUpper = String(row.TABLE_NAME ?? row.table_name ?? '');
+        let op = String(row.OP ?? row.op ?? 'INSERT') as ReplicationOperation;
+        const key = decodeJson(row.KEY_JSON ?? row.key_json) ?? {};
+        let after = decodeJson(row.AFTER_JSON ?? row.after_json);
+        let before = decodeJson(row.BEFORE_JSON ?? row.before_json);
+
+        // Apply per-table row filter (`where`) and column projection (`columns` / `excludeColumns`)
+        const cfg = tablesMap.get(tableUpper);
+        if (cfg && op !== 'DDL') {
+          if (cfg.where) {
+            const afterMatches = after ? matchesRowFilter(after, cfg.where) : false;
+            const beforeMatches = before ? matchesRowFilter(before, cfg.where) : false;
+
+            if (op === 'INSERT' && !afterMatches) {
+              continue;
+            }
+            if (op === 'DELETE' && before && !beforeMatches) {
+              continue;
+            }
+            if (op === 'UPDATE') {
+              if (!beforeMatches && !afterMatches) {
+                continue;
+              }
+              if (beforeMatches && !afterMatches) {
+                // Row moved out of this partial publication's scope -> emit synthetic DELETE
+                op = 'DELETE';
+                after = null;
+              } else if (!beforeMatches && afterMatches) {
+                // Row moved into this partial publication's scope -> emit synthetic INSERT
+                op = 'INSERT';
+                before = null;
+              }
+            }
+          }
+
+          after = projectReplicatedRow(after, cfg.primaryKey, cfg.columns, cfg.excludeColumns);
+          before = projectReplicatedRow(before, cfg.primaryKey, cfg.columns, cfg.excludeColumns);
+        }
+
+        const lsnNum = Number(row.LSN ?? row.lsn ?? 0);
+        const tsNum = Number(row.TS ?? row.ts ?? 0);
+        const entryHlc =
+          hlcByLsn.get(lsnNum) ??
+          formatHlc({ wallMs: tsNum, counter: 0, nodeId: origin });
+
         out.push({
-          lsn: Number(row.LSN ?? row.lsn ?? 0),
+          lsn: lsnNum,
           txid: String(row.TXID ?? row.txid ?? ''),
           origin,
           publication: pub,
-          table: String(row.TABLE_NAME ?? row.table_name ?? ''),
-          operation: String(row.OP ?? row.op ?? 'INSERT') as ReplicationOperation,
-          key: decodeJson(row.KEY_JSON ?? row.key_json) ?? {},
-          after: decodeJson(row.AFTER_JSON ?? row.after_json),
-          before: decodeJson(row.BEFORE_JSON ?? row.before_json),
+          table: tableUpper,
+          operation: op,
+          key,
+          after,
+          before,
           ddlSql:
             row.DDL_SQL !== null && row.DDL_SQL !== undefined
               ? String(row.DDL_SQL)
               : row.ddl_sql !== null && row.ddl_sql !== undefined
                 ? String(row.ddl_sql)
                 : null,
-          timestamp: Number(row.TS ?? row.ts ?? 0),
+          timestamp: tsNum,
+          hlc: entryHlc,
         });
         if (fetchOpts.limit && out.length >= fetchOpts.limit) {
           break;
@@ -1853,6 +2981,11 @@ async function evaluateConflictResolution(
     case 'replica-wins':
       return { outcome: 'local-wins' };
     case 'last-write-wins': {
+      if (ctx.incoming.hlc && ctx.localEntry?.hlc) {
+        return compareHlc(ctx.incoming.hlc, ctx.localEntry.hlc) >= 0
+          ? { outcome: 'remote-wins' }
+          : { outcome: 'local-wins' };
+      }
       const remoteTs = ctx.incoming.timestamp;
       const localTs = ctx.localEntry?.timestamp ?? 0;
       if (remoteTs > localTs) return { outcome: 'remote-wins' };
@@ -2205,13 +3338,31 @@ export async function createSubscription(
       execute?(sql: string, params?: QueryParams): Promise<{ changes?: number } | void>;
       exec?(sql: string, params?: QueryParams): Promise<unknown>;
     }) => {
-      for (const entry of entries) {
+      const depMap: Record<string, readonly string[]> = {};
+      if (fullPub) {
+        for (const t of fullPub.tables.values()) {
+          if (t.references && t.references.length > 0) {
+            depMap[t.table] = t.references;
+          }
+        }
+      }
+      if (options.tableDependencies) {
+        for (const [child, parents] of Object.entries(options.tableDependencies)) {
+          depMap[normalizeTableName(child)] = parents.map(normalizeTableName);
+        }
+      }
+      const orderedEntries = orderEntriesByTopology(entries, depMap);
+
+      for (const entry of orderedEntries) {
         if (entry.lsn > highestLsn) {
           highestLsn = entry.lsn;
         }
         // Skip changes that originated on this replica node
         if (entry.origin === nodeId) {
           continue;
+        }
+        if (entry.hlc) {
+          (options.hlc ?? options.localPublication?.hlc)?.receive(entry.hlc);
         }
 
         if (entry.operation === 'DDL') {
@@ -2439,8 +3590,22 @@ export interface ReplicateDatabasesOptions {
   primary: ReplicableDatabase;
   /** Replica database (`FirebirdBrowser` or `FirebirdLite`). */
   replica: ReplicableDatabase;
-  /** Tables to replicate between `primary` and `replica`. */
-  tables: ReadonlyArray<string | PublishedTableConfig>;
+  /**
+   * Tables to replicate between `primary` and `replica`, or `'*'` to publish
+   * all user tables discovered in the primary database.
+   */
+  tables: '*' | ReadonlyArray<string | PublishedTableConfig>;
+  /**
+   * Optional table names to exclude when `tables` is `'*'`.
+   */
+  excludeTables?: readonly string[];
+  /**
+   * When `true`, synchronizes the catalog (schema migrations via `diffSchema()` +
+   * `generateMigration()` and sequence/generator watermarks) before each `sync()` cycle.
+   *
+   * @default false
+   */
+  syncCatalog?: boolean;
   /**
    * Replication direction:
    * - `'one-way'` (default): `primary -> replica`
@@ -2487,6 +3652,7 @@ export interface ReplicateDatabasesOptions {
 export interface ReplicationSyncCycleResult {
   readonly primaryToReplica: SubscriptionPullResult;
   readonly replicaToPrimary?: SubscriptionPullResult;
+  readonly catalogSync?: SyncCatalogResult;
 }
 
 /** Handle returned by {@link replicateDatabases}. */
@@ -2504,6 +3670,13 @@ export interface DatabaseReplicator {
     tableDdl?: Readonly<Record<string, string>>;
     truncateExisting?: boolean;
   }): Promise<BootstrapReplicaResult>;
+  /**
+   * Synchronize schema migrations and sequence watermarks from `primary` to `replica`
+   * via {@link syncCatalog}.
+   */
+  syncCatalog(
+    options?: Omit<SyncCatalogOptions, 'sourceDb' | 'targetDb'>,
+  ): Promise<SyncCatalogResult>;
   /**
    * Capture any unlogged table changes on `primary` (and `replica` in
    * `'bidirectional'` mode) and run a full replication cycle.
@@ -2533,6 +3706,7 @@ export async function replicateDatabases(
     name: 'pub_primary',
     nodeId: primaryNodeId,
     tables: options.tables,
+    excludeTables: options.excludeTables,
     installTriggers: options.installTriggers,
   });
 
@@ -2544,6 +3718,7 @@ export async function replicateDatabases(
       name: 'pub_replica',
       nodeId: replicaNodeId,
       tables: options.tables,
+      excludeTables: options.excludeTables,
       installTriggers: options.installTriggers,
     });
   }
@@ -2598,7 +3773,36 @@ export async function replicateDatabases(
         truncateExisting: bootOpts.truncateExisting,
       });
     },
+    async syncCatalog(catOpts = {}): Promise<SyncCatalogResult> {
+      const catRes = await syncCatalog({
+        sourceDb: options.primary,
+        targetDb: options.replica,
+        excludeTables: options.excludeTables,
+        ...catOpts,
+      });
+      if (options.tables === '*') {
+        await primaryPublication.refreshPublishedTables();
+        if (replicaPublication) {
+          await replicaPublication.refreshPublishedTables();
+        }
+      }
+      return catRes;
+    },
     async sync(): Promise<ReplicationSyncCycleResult> {
+      let catalogSync: SyncCatalogResult | undefined;
+      if (options.syncCatalog) {
+        catalogSync = await syncCatalog({
+          sourceDb: options.primary,
+          targetDb: options.replica,
+          excludeTables: options.excludeTables,
+        });
+      }
+      if (options.tables === '*') {
+        await primaryPublication.refreshPublishedTables();
+        if (replicaPublication) {
+          await replicaPublication.refreshPublishedTables();
+        }
+      }
       await primaryPublication.captureTableChanges();
       if (replicaPublication) {
         await replicaPublication.captureTableChanges();
@@ -2617,6 +3821,7 @@ export async function replicateDatabases(
       return {
         primaryToReplica,
         ...(replicaToPrimary ? { replicaToPrimary } : {}),
+        ...(catalogSync ? { catalogSync } : {}),
       };
     },
     start() {

@@ -1449,18 +1449,18 @@ Next-horizon milestones for full end-to-end replication (`v0.18.0`):
       `watermark < minRetainedLsn`) via either consistent logical table+catalog
       snapshots or binary Copy-on-Write page diffs (`exportDiff` / `applyDiff`)
       tagged with the exact LSN watermark where incremental journal replay resumes.
-- [ ] **4. Whole-Database ("Full") Catalog, Sequence & Schema Auto-Replication (`publishAllTables` & `syncCatalog`).**
+- [x] **4. Whole-Database ("Full") Catalog, Sequence & Schema Auto-Replication (`publishAllTables` & `syncCatalog`).**
       Support `tables: '*'` (all user tables discovered via `introspect()`),
       automatic schema evolution on replicas using `diffSchema()` +
       `generateMigration()` before DML replay, and generator/sequence watermark
       synchronization (`RDB$GENERATORS` / `ALTER SEQUENCE ... RESTART WITH`) so
       replicas can seamlessly promote to primary on failover.
-- [ ] **5. Row & Column Filtering (Multi-Tenant Partial Publications) & Atomic `txid` Replay.**
+- [x] **5. Row & Column Filtering (Multi-Tenant Partial Publications) & Atomic `txid` Replay.**
       Support per-table row predicates (`where`) and column projections
       (`columns` / `excludeColumns`) for multi-tenant edge/browser slicing, and
       group replayed journal entries by `txid` with foreign-key topological
       ordering inside atomic replica transactions.
-- [ ] **6. Hybrid Logical Clocks (`HLC`) & Per-Column CRDT Conflict Resolution.**
+- [x] **6. Hybrid Logical Clocks (`HLC`) & Per-Column CRDT Conflict Resolution.**
       Provide a monotonic Hybrid Logical Clock (`<wallMs>:<counter>:<nodeId>`)
       for skew-tolerant causal ordering, plus per-column LWW-Element-Set,
       additive numeric counter deltas (`PN-Counter`), and set-union merges.

@@ -11,6 +11,19 @@ import {
   dropReplicationTriggers,
   needsBootstrap,
   bootstrapReplica,
+  publishAllTables,
+  exportSequences,
+  applySequences,
+  syncCatalog,
+  projectReplicatedRow,
+  matchesRowFilter,
+  orderEntriesByTopology,
+  formatHlc,
+  parseHlc,
+  compareHlc,
+  createHlc,
+  mergeCrdtRow,
+  createCrdtConflictResolver,
   type ReplicableDatabase,
 } from '../replication';
 import type { QueryParams, QueryResult, Row } from '../types';
@@ -21,11 +34,13 @@ import type { QueryParams, QueryResult, Row } from '../types';
 
 function createMockReplDb(): ReplicableDatabase & {
   tables: Map<string, Row[]>;
+  sequences: Map<string, number>;
   ddlLog: string[];
   triggerDdlLog: string[];
   contextLog: string[];
 } {
   const tables = new Map<string, Row[]>();
+  const sequences = new Map<string, number>();
   const ddlLog: string[] = [];
   const triggerDdlLog: string[] = [];
   const contextLog: string[] = [];
@@ -210,6 +225,7 @@ function createMockReplDb(): ReplicableDatabase & {
 
   const db = {
     tables,
+    sequences,
     ddlLog,
     triggerDdlLog,
     contextLog,
@@ -624,5 +640,352 @@ describe('firebird-wasm/replication – Logical & Journal-Based Database Replica
     expect(manualBoot.watermarkLsn).toBe(4);
     expect(manualBoot.rowsCopied).toBe(3);
     expect(replica2.tables.get('PRODUCTS')).toHaveLength(3);
+  });
+
+  it('supports whole-database tables: "*", publishAllTables, sequence watermarks, and syncCatalog', async () => {
+    const primary = createMockReplDb();
+    const replica = createMockReplDb();
+
+    await primary.execute!('CREATE TABLE CUSTOMERS (ID INTEGER PRIMARY KEY, NAME VARCHAR(64))');
+    await primary.execute!('CREATE TABLE INVOICES (ID INTEGER PRIMARY KEY, TOTAL INTEGER)');
+    primary.sequences.set('GEN_CUSTOMER_ID', 42);
+    primary.sequences.set('GEN_INVOICE_ID', 108);
+
+    const pub = await publishAllTables(primary, {
+      name: 'full_pub',
+      nodeId: 'primary-full',
+      excludeTables: ['AUDIT_SCRATCH'],
+    });
+    expect(Array.from(pub.tables.keys()).sort()).toEqual(['CUSTOMERS', 'INVOICES']);
+
+    // Create a new table dynamically after initial publication and verify refreshPublishedTables()
+    await primary.execute!('CREATE TABLE PAYMENTS (ID INTEGER PRIMARY KEY, AMOUNT INTEGER)');
+    await primary.execute!('CREATE TABLE AUDIT_SCRATCH (ID INTEGER PRIMARY KEY)');
+    await primary.execute!('INSERT INTO CUSTOMERS (ID, NAME) VALUES (?, ?)', [1, 'Acme Corp']);
+    await primary.execute!('INSERT INTO PAYMENTS (ID, AMOUNT) VALUES (?, ?)', [10, 500]);
+
+    const catRes = await syncCatalog({
+      sourceDb: primary,
+      targetDb: replica,
+      excludeTables: ['AUDIT_SCRATCH'],
+    });
+    expect(catRes.sequencesSynced).toBe(2);
+    expect(replica.sequences.get('GEN_CUSTOMER_ID')).toBe(42);
+    expect(replica.sequences.get('GEN_INVOICE_ID')).toBe(108);
+    expect(catRes.discoveredTables).toEqual(['CUSTOMERS', 'INVOICES', 'PAYMENTS']);
+
+    const seqs = await exportSequences(primary);
+    expect(seqs).toEqual([
+      { name: 'GEN_CUSTOMER_ID', currentValue: 42 },
+      { name: 'GEN_INVOICE_ID', currentValue: 108 },
+    ]);
+    await applySequences(replica, [{ name: 'GEN_CUSTOMER_ID', currentValue: 99 }]);
+    expect(replica.sequences.get('GEN_CUSTOMER_ID')).toBe(99);
+
+    // Replicate with tables: '*' and syncCatalog: true
+    const replicator = await replicateDatabases({
+      primary,
+      replica,
+      tables: '*',
+      excludeTables: ['AUDIT_SCRATCH'],
+      syncCatalog: true,
+    });
+    const cycle = await replicator.sync();
+    expect(cycle.catalogSync?.discoveredTables).toEqual(['CUSTOMERS', 'INVOICES', 'PAYMENTS']);
+    expect(replica.tables.get('CUSTOMERS')).toEqual([{ ID: 1, NAME: 'Acme Corp' }]);
+    expect(replica.tables.get('PAYMENTS')).toEqual([{ ID: 10, AMOUNT: 500 }]);
+  });
+
+  it('supports row filtering (where), column projection (columns/excludeColumns), and topological FK replay', async () => {
+    const primary = createMockReplDb();
+    const replica = createMockReplDb();
+
+    // Direct helper unit checks
+    expect(
+      projectReplicatedRow(
+        { ID: 1, NAME: 'Alice', SECRET_HASH: 'xyz', TENANT_ID: 7 },
+        ['ID'],
+        ['NAME', 'TENANT_ID'],
+        ['SECRET_HASH'],
+      ),
+    ).toEqual({ ID: 1, NAME: 'Alice', TENANT_ID: 7 });
+    expect(matchesRowFilter({ ID: 1, TENANT_ID: 7, ACTIVE: 1 }, 'TENANT_ID = 7 AND ACTIVE = 1')).toBe(
+      true,
+    );
+    expect(matchesRowFilter({ ID: 2, TENANT_ID: 8, ACTIVE: 1 }, 'TENANT_ID = 7 AND ACTIVE = 1')).toBe(
+      false,
+    );
+
+    const pub = await createPublication(primary, {
+      name: 'tenant_pub',
+      nodeId: 'primary-1',
+      tables: [
+        {
+          table: 'USERS',
+          primaryKey: 'ID',
+          excludeColumns: ['PASSWORD_HASH'],
+          where: "TENANT_ID = 't1'",
+        },
+      ],
+    });
+
+    const sub = await createSubscription(replica, {
+      name: 'tenant_sub',
+      nodeId: 'edge-t1',
+      publication: pub,
+    });
+
+    // Row for t1 (in scope) and row for t2 (out of scope)
+    await pub.recordDml({
+      table: 'USERS',
+      operation: 'INSERT',
+      after: { ID: 1, NAME: 'Alice', TENANT_ID: 't1', PASSWORD_HASH: 'secret1' },
+    });
+    await pub.recordDml({
+      table: 'USERS',
+      operation: 'INSERT',
+      after: { ID: 2, NAME: 'Bob', TENANT_ID: 't2', PASSWORD_HASH: 'secret2' },
+    });
+
+    await sub.pull();
+    expect(replica.tables.get('USERS')).toEqual([
+      { ID: 1, NAME: 'Alice', TENANT_ID: 't1' },
+    ]);
+
+    // Updating row 1 from TENANT_ID = 't1' to 't2' moves it out of filter scope -> synthetic DELETE on replica
+    await pub.recordDml({
+      table: 'USERS',
+      operation: 'UPDATE',
+      key: { ID: 1 },
+      after: { NAME: 'Alice', TENANT_ID: 't2', PASSWORD_HASH: 'secret1' },
+    });
+    // Updating row 2 from TENANT_ID = 't2' to 't1' moves it into filter scope -> synthetic INSERT on replica
+    await pub.recordDml({
+      table: 'USERS',
+      operation: 'UPDATE',
+      key: { ID: 2 },
+      after: { NAME: 'Bob', TENANT_ID: 't1', PASSWORD_HASH: 'secret2' },
+    });
+
+    await sub.pull();
+    expect(replica.tables.get('USERS')).toEqual([
+      { ID: 2, NAME: 'Bob', TENANT_ID: 't1' },
+    ]);
+
+    // Topological FK ordering within the same txid:
+    // Child ORDER_ITEMS references Parent ORDERS
+    const orderedInsert = orderEntriesByTopology(
+      [
+        {
+          lsn: 10,
+          txid: 'tx-fk-1',
+          origin: 'p',
+          publication: 'pub',
+          table: 'ORDER_ITEMS',
+          operation: 'INSERT',
+          key: { ID: 100 },
+          after: { ID: 100, ORDER_ID: 1 },
+          before: null,
+          timestamp: 1,
+        },
+        {
+          lsn: 11,
+          txid: 'tx-fk-1',
+          origin: 'p',
+          publication: 'pub',
+          table: 'ORDERS',
+          operation: 'INSERT',
+          key: { ID: 1 },
+          after: { ID: 1, TOTAL: 50 },
+          before: null,
+          timestamp: 1,
+        },
+      ],
+      { ORDER_ITEMS: ['ORDERS'] },
+    );
+    expect(orderedInsert.map((e) => e.table)).toEqual(['ORDERS', 'ORDER_ITEMS']);
+
+    const orderedDelete = orderEntriesByTopology(
+      [
+        {
+          lsn: 12,
+          txid: 'tx-fk-2',
+          origin: 'p',
+          publication: 'pub',
+          table: 'ORDERS',
+          operation: 'DELETE',
+          key: { ID: 1 },
+          after: null,
+          before: { ID: 1, TOTAL: 50 },
+          timestamp: 2,
+        },
+        {
+          lsn: 13,
+          txid: 'tx-fk-2',
+          origin: 'p',
+          publication: 'pub',
+          table: 'ORDER_ITEMS',
+          operation: 'DELETE',
+          key: { ID: 100 },
+          after: null,
+          before: { ID: 100, ORDER_ID: 1 },
+          timestamp: 2,
+        },
+      ],
+      { ORDER_ITEMS: ['ORDERS'] },
+    );
+    expect(orderedDelete.map((e) => e.table)).toEqual(['ORDER_ITEMS', 'ORDERS']);
+  });
+
+  it('provides monotonic Hybrid Logical Clocks (HLC) and per-column CRDT conflict resolution', async () => {
+    const hlcA = createHlc('node-a', { initialWallMs: 1_000 });
+    const hlcB = createHlc('node-b', { initialWallMs: 1_000 });
+
+    // Same millisecond advances logical counter monotonically
+    const t1 = hlcA.now(1_000);
+    const t2 = hlcA.now(1_000);
+    expect(parseHlc(t1)).toEqual({ wallMs: 1_000, counter: 1, nodeId: 'node-a' });
+    expect(parseHlc(t2)).toEqual({ wallMs: 1_000, counter: 2, nodeId: 'node-a' });
+    expect(compareHlc(t1, t2)).toBeLessThan(0);
+
+    // Even when node-b's physical clock lags at 950ms, receiving t2 advances node-b causally past t2
+    const t3 = hlcB.receive(t2, 950);
+    expect(parseHlc(t3)).toEqual({ wallMs: 1_000, counter: 3, nodeId: 'node-b' });
+    expect(compareHlc(t2, t3)).toBeLessThan(0);
+    expect(formatHlc(parseHlc(t3))).toBe(t3);
+
+    // Per-column CRDT conflict resolution:
+    // -STOCK: 'pn-counter' (additive deltas: base 100, local -5 = 95, remote +20 = 120 -> merged 115)
+    // -TAGS: 'set-union' (JSON array 2P/OR-Set: base ['sale','featured'], local adds 'clearance', remote removes 'sale' & adds 'popular' -> ['featured','clearance','popular'])
+    // -HIGH_BID: 'max' (local 240 vs remote 310 -> 310)
+    // -LOW_ASK: 'min' (local 180 vs remote 195 -> 180)
+    // -TITLE: 'lww' (remote HLC t3 > local HLC t2 -> remote wins)
+    const merged = mergeCrdtRow(
+      {
+        incoming: {
+          lsn: 5,
+          txid: 'tx-b',
+          origin: 'node-b',
+          publication: 'pub',
+          table: 'LISTINGS',
+          operation: 'UPDATE',
+          key: { ID: 1 },
+          before: {
+            ID: 1,
+            TITLE: 'Original Title',
+            STOCK: 100,
+            TAGS: JSON.stringify(['sale', 'featured']),
+            HIGH_BID: 200,
+            LOW_ASK: 200,
+          },
+          after: {
+            ID: 1,
+            TITLE: 'Remote Title',
+            STOCK: 120,
+            TAGS: JSON.stringify(['featured', 'popular']),
+            HIGH_BID: 310,
+            LOW_ASK: 195,
+          },
+          timestamp: 1_000,
+          hlc: t3,
+        },
+        localRow: {
+          ID: 1,
+          TITLE: 'Local Title',
+          STOCK: 95,
+          TAGS: JSON.stringify(['sale', 'featured', 'clearance']),
+          HIGH_BID: 240,
+          LOW_ASK: 180,
+        },
+        localEntry: {
+          lsn: 4,
+          txid: 'tx-a',
+          origin: 'node-a',
+          publication: 'pub',
+          table: 'LISTINGS',
+          operation: 'UPDATE',
+          key: { ID: 1 },
+          before: {
+            ID: 1,
+            TITLE: 'Original Title',
+            STOCK: 100,
+            TAGS: JSON.stringify(['sale', 'featured']),
+            HIGH_BID: 200,
+            LOW_ASK: 200,
+          },
+          after: {
+            ID: 1,
+            TITLE: 'Local Title',
+            STOCK: 95,
+            TAGS: JSON.stringify(['sale', 'featured', 'clearance']),
+            HIGH_BID: 240,
+            LOW_ASK: 180,
+          },
+          timestamp: 1_000,
+          hlc: t2,
+        },
+      },
+      {
+        columns: {
+          STOCK: 'pn-counter',
+          TAGS: 'set-union',
+          HIGH_BID: 'max',
+          LOW_ASK: 'min',
+          TITLE: 'lww',
+        },
+      },
+    );
+
+    expect(merged).toEqual({
+      ID: 1,
+      TITLE: 'Remote Title',
+      STOCK: 115,
+      TAGS: JSON.stringify(['featured', 'clearance', 'popular']),
+      HIGH_BID: 310,
+      LOW_ASK: 180,
+    });
+
+    // End-to-end bidirectional replication using createCrdtConflictResolver
+    const nodeA = createMockReplDb();
+    const nodeB = createMockReplDb();
+    const replicator = await replicateDatabases({
+      primary: nodeA,
+      replica: nodeB,
+      tables: [{ table: 'COUNTERS', primaryKey: 'ID' }],
+      direction: 'bidirectional',
+      onConflict: createCrdtConflictResolver({
+        columns: { VIEWS: 'pn-counter', TAGS: 'g-set' },
+      }),
+    });
+
+    await replicator.primaryPublication.recordDml({
+      table: 'COUNTERS',
+      operation: 'INSERT',
+      after: { ID: 1, VIEWS: 10, TAGS: 'alpha' },
+    });
+    await replicator.sync();
+
+    // Concurrent updates on nodeA (+7 views, 'beta' tag) and nodeB (+12 views, 'gamma' tag)
+    await replicator.primaryPublication.recordDml({
+      table: 'COUNTERS',
+      operation: 'UPDATE',
+      key: { ID: 1 },
+      after: { VIEWS: 17, TAGS: 'alpha,beta' },
+    });
+    await replicator.replicaPublication!.recordDml({
+      table: 'COUNTERS',
+      operation: 'UPDATE',
+      key: { ID: 1 },
+      after: { VIEWS: 22, TAGS: 'alpha,gamma' },
+    });
+
+    await replicator.sync();
+    expect(nodeA.tables.get('COUNTERS')?.[0]?.VIEWS).toBe(29);
+    expect(nodeB.tables.get('COUNTERS')?.[0]?.VIEWS).toBe(29);
+    expect(String(nodeA.tables.get('COUNTERS')?.[0]?.TAGS).split(',').sort()).toEqual([
+      'alpha',
+      'beta',
+      'gamma',
+    ]);
   });
 });
