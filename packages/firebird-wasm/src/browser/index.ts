@@ -187,6 +187,43 @@ export {
   QueryProfiler,
   DEFAULT_MAX_RECENT_QUERIES,
 } from './profiler';
+export {
+  DEFAULT_REPL_JOURNAL_TABLE,
+  DEFAULT_REPL_WATERMARK_TABLE,
+  DEFAULT_REPL_MIRROR_TABLE,
+  DEFAULT_REPL_LSN_SEQUENCE,
+  DEFAULT_REPL_ROLE_CONTEXT_VAR,
+  DEFAULT_REPL_ORIGIN_CONTEXT_VAR,
+  replicationTriggerName,
+  replicationEventName,
+  buildReplicationTriggerDdl,
+  installReplicationTriggers,
+  dropReplicationTriggers,
+  mergeReplicatedRow,
+  createPublication,
+  createSubscription,
+  replicateDatabases,
+} from '../replication';
+export type {
+  ReplicableDatabase,
+  ReplicationOperation,
+  ReplicationLogEntry,
+  ReplicationConflictContext,
+  ReplicationConflictResolution,
+  ReplicationConflictStrategy,
+  PublishedTableConfig,
+  BuildReplicationTriggerDdlOptions,
+  InstalledReplicationTrigger,
+  InstallReplicationTriggersOptions,
+  CreatePublicationOptions,
+  ReplicationPublication,
+  CreateSubscriptionOptions,
+  SubscriptionPullResult,
+  ReplicationSubscription,
+  ReplicateDatabasesOptions,
+  ReplicationSyncCycleResult,
+  DatabaseReplicator,
+} from '../replication';
 export type { ScriptStatement } from './sql-script';
 
 export { DirectTransport } from './engine-transport';

@@ -4,6 +4,11 @@ import {
   createSubscription,
   replicateDatabases,
   mergeReplicatedRow,
+  replicationTriggerName,
+  replicationEventName,
+  buildReplicationTriggerDdl,
+  installReplicationTriggers,
+  dropReplicationTriggers,
   type ReplicableDatabase,
 } from '../replication';
 import type { QueryParams, QueryResult, Row } from '../types';
@@ -15,9 +20,13 @@ import type { QueryParams, QueryResult, Row } from '../types';
 function createMockReplDb(): ReplicableDatabase & {
   tables: Map<string, Row[]>;
   ddlLog: string[];
+  triggerDdlLog: string[];
+  contextLog: string[];
 } {
   const tables = new Map<string, Row[]>();
   const ddlLog: string[] = [];
+  const triggerDdlLog: string[] = [];
+  const contextLog: string[] = [];
 
   const getTable = (name: string): Row[] => {
     const upper = name.replace(/"/g, '').toUpperCase();
@@ -31,6 +40,11 @@ function createMockReplDb(): ReplicableDatabase & {
 
   const runSelect = (sql: string, params: QueryParams = []): QueryResult<Row> => {
     const trimmed = sql.trim();
+
+    if (/RDB\$SET_CONTEXT\s*\(/i.test(trimmed)) {
+      contextLog.push(trimmed);
+      return { rows: [{ RESULT: 1 }] };
+    }
 
     // MAX(LSN)
     const maxMatch = /SELECT\s+MAX\(LSN\)\s+AS\s+MAX_LSN\s+FROM\s+([A-Za-z0-9_$"]+)/i.exec(
@@ -105,6 +119,15 @@ function createMockReplDb(): ReplicableDatabase & {
 
   const runMutation = (sql: string, params: QueryParams = []): void => {
     const trimmed = sql.trim();
+
+    if (/^\s*CREATE\s+OR\s+ALTER\s+TRIGGER\b/i.test(trimmed) || /^\s*DROP\s+TRIGGER\b/i.test(trimmed)) {
+      triggerDdlLog.push(trimmed);
+      return;
+    }
+
+    if (/^\s*CREATE\s+SEQUENCE\b/i.test(trimmed)) {
+      return;
+    }
 
     if (/^\s*(CREATE|ALTER)\s+TABLE\s+([A-Za-z0-9_$"]+)/i.test(trimmed)) {
       const m = /^\s*(CREATE|ALTER)\s+TABLE\s+([A-Za-z0-9_$"]+)/i.exec(trimmed)!;
@@ -186,6 +209,8 @@ function createMockReplDb(): ReplicableDatabase & {
   const db = {
     tables,
     ddlLog,
+    triggerDdlLog,
+    contextLog,
     async query<T extends Row = Row>(
       sql: string,
       params: QueryParams = [],
@@ -381,5 +406,73 @@ describe('firebird-wasm/replication – Logical & Journal-Based Database Replica
       DONE: 1,
       PRIORITY: 'high',
     });
+  });
+
+  it('generates and installs Firebird SQL replication triggers (installReplicationTriggers) and sets RDB$SET_CONTEXT on replica apply', async () => {
+    const primary = createMockReplDb();
+    const replica = createMockReplDb();
+
+    // Seed sample row so column discovery detects ID, TITLE, STATUS
+    primary.tables.set('TASKS', [{ ID: 1, TITLE: 'Ship M12', STATUS: 'active' }]);
+
+    const pub = await createPublication(primary, {
+      name: 'default',
+      nodeId: 'primary-node',
+      tables: [{ table: 'TASKS', primaryKey: 'ID', columns: ['ID', 'TITLE', 'STATUS'] }],
+      installTriggers: true,
+    });
+
+    expect(primary.triggerDdlLog.length).toBe(1);
+    const ddl = primary.triggerDdlLog[0]!;
+    expect(ddl).toContain('CREATE OR ALTER TRIGGER FB_REPL_TRG$TASKS FOR TASKS');
+    expect(ddl).toContain(`RDB$GET_CONTEXT('USER_SESSION', 'FB_REPL_ROLE') IS DISTINCT FROM 'REPLICA'`);
+    expect(ddl).toContain('NEXT VALUE FOR FB_REPL_LSN_GEN$');
+    expect(ddl).toContain(`POST_EVENT 'fb_repl_default'`);
+
+    // Verify deterministic identifier helpers stay <= 31 characters
+    expect(replicationTriggerName('TASKS').length).toBeLessThanOrEqual(31);
+    expect(
+      replicationTriggerName('VERY_LONG_ENTERPRISE_DOCUMENT_ITEMS_TABLE_NAME', 'custom_pub').length,
+    ).toBeLessThanOrEqual(31);
+    expect(
+      replicationEventName('very_long_publication_identifier_exceeding_31_bytes').length,
+    ).toBeLessThanOrEqual(31);
+
+    const built = buildReplicationTriggerDdl({
+      table: 'ORDERS',
+      primaryKey: ['ORDER_ID'],
+      columns: ['ORDER_ID', 'TOTAL'],
+      publication: 'orders_pub',
+      nodeId: 'edge-1',
+    });
+    expect(built.triggerName.length).toBeLessThanOrEqual(31);
+    expect(built.ddl).toContain('NEW.ORDER_ID');
+    expect(built.ddl).toContain('OLD.ORDER_ID');
+
+    // Verify replica subscription sets and resets RDB$SET_CONTEXT('USER_SESSION', 'FB_REPL_ROLE', ...)
+    const sub = await createSubscription(replica, {
+      name: 'sub_tasks',
+      nodeId: 'replica-node',
+      publication: pub,
+    });
+
+    await pub.recordDml({
+      table: 'TASKS',
+      operation: 'INSERT',
+      after: { ID: 2, TITLE: 'Test Trigger Context', STATUS: 'done' },
+    });
+
+    await sub.pull();
+    expect(replica.contextLog.some((c) => c.includes(`'REPLICA'`))).toBe(true);
+    expect(replica.contextLog.some((c) => c.includes(`'PRIMARY'`))).toBe(true);
+
+    const dropped = await pub.dropTriggers();
+    expect(dropped).toEqual(['FB_REPL_TRG$TASKS']);
+    expect(
+      await dropReplicationTriggers(primary, { tables: ['TASKS'], publication: 'default' }),
+    ).toEqual(['FB_REPL_TRG$TASKS']);
+    expect(
+      await installReplicationTriggers(primary, { tables: ['TASKS'], publication: 'default' }),
+    ).toHaveLength(1);
   });
 });

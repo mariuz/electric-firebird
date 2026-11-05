@@ -1433,7 +1433,7 @@ Next-horizon milestones for `v0.17.0`:
 
 Next-horizon milestones for full end-to-end replication (`v0.18.0`):
 
-- [ ] **1. Native Firebird SQL Trigger-Based Change Capture (`installReplicationTriggers`).**
+- [x] **1. Native Firebird SQL Trigger-Based Change Capture (`installReplicationTriggers`).**
       Generate and install idempotent `AFTER INSERT OR UPDATE OR DELETE` PSQL
       triggers (`FB_REPL_TRG$<table>`) and an atomic generator (`FB_REPL_LSN_GEN$`)
       that serialize row keys and column values into `FB_REPL_JOURNAL$` inside the

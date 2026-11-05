@@ -14,7 +14,7 @@ This monorepo contains:
 
 ## Try it
 
-**[Open the demo →](https://mariuz.github.io/electric-firebird/)**
+**[Open the SQL Console Demo →](https://anas599.github.io/electric-firebird/)** · **[Open the Replication Simulator & Demo →](https://anas599.github.io/electric-firebird/replication.html)**
 
 A SQL console running the real engine in your browser — no server, nothing
 uploaded. It ships worked examples for joins and aggregates, bound parameters,
@@ -123,8 +123,11 @@ function Items() {
 | `firebird-wasm/kysely` | Kysely dialect (`FirebirdBrowserDialect`) & TypeScript codegen (`generateKyselyTypes`) |
 | `firebird-wasm/drizzle` | Drizzle-style query builder (`drizzle`) & schema codegen (`generateDrizzleSchema`) |
 | `firebird-wasm/vector` | Float32/Int8 vector codec, SQL UDR registration (`COSINE_DISTANCE`, `L2_DISTANCE`, `DOT_PRODUCT`), and `vectorSearch` |
+| `firebird-wasm/replication` | Logical & journal replication (`createPublication`, `createSubscription`, `replicateDatabases`, `installReplicationTriggers`) |
+| `firebird-wasm/tanstack` | TanStack Query (`createFirebirdQueryOptions`) & TanStack DB (`firebirdCollectionOptions`) adapters |
+| `firebird-wasm/rxdb` | RxDB storage adapter (`getRxStorageFirebird`) backed by Firebird SQL |
 
-See [docs/integration.md](./docs/integration.md) and [docs/api.md](./docs/api.md) for full details and usage examples.
+See [docs/integration.md](./docs/integration.md), [docs/replication.md](./docs/replication.md), and [docs/api.md](./docs/api.md) for full details and usage examples.
 
 The two engine builds, with threads and without, are compared (with
 diagrams) in [docs/builds.md](./docs/builds.md).

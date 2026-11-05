@@ -43,6 +43,15 @@ export const DEFAULT_REPL_WATERMARK_TABLE = 'FB_REPL_WATERMARKS$';
 /** Default table snapshot mirror used by `captureTableChanges()`. */
 export const DEFAULT_REPL_MIRROR_TABLE = 'FB_REPL_MIRROR$';
 
+/** Default Firebird sequence/generator used by replication triggers for atomic LSNs. */
+export const DEFAULT_REPL_LSN_SEQUENCE = 'FB_REPL_LSN_GEN$';
+
+/** Firebird `USER_SESSION` context variable set to `'REPLICA'` during replica replay to bypass triggers. */
+export const DEFAULT_REPL_ROLE_CONTEXT_VAR = 'FB_REPL_ROLE';
+
+/** Firebird `USER_SESSION` context variable holding the originating node ID. */
+export const DEFAULT_REPL_ORIGIN_CONTEXT_VAR = 'FB_REPL_ORIGIN';
+
 /**
  * Minimal structural interface satisfied by `FirebirdBrowser`, `FirebirdLite`,
  * and test doubles.
@@ -142,6 +151,56 @@ export interface PublishedTableConfig {
   table: string;
   /** Primary key column name(s). Defaults to `['ID']`. */
   primaryKey?: string | readonly string[];
+  /** Optional explicit column list for trigger-based change capture (`installReplicationTriggers`). */
+  columns?: readonly string[];
+}
+
+/** Options for {@link buildReplicationTriggerDdl}. */
+export interface BuildReplicationTriggerDdlOptions {
+  /** Target user table name. */
+  table: string;
+  /** Primary key column name(s). Defaults to `['ID']`. */
+  primaryKey?: readonly string[];
+  /** Column names serialized into `AFTER_JSON` and `BEFORE_JSON`. Defaults to `primaryKey`. */
+  columns?: readonly string[];
+  /** Logical publication name. @default 'default' */
+  publication?: string;
+  /** Default origin node identifier if `RDB$GET_CONTEXT('USER_SESSION', 'FB_REPL_ORIGIN')` is unset. @default 'node_default' */
+  nodeId?: string;
+  /** Replication journal table name. @default 'FB_REPL_JOURNAL$' */
+  journalTable?: string;
+  /** Sequence/generator name for atomic LSNs. @default 'FB_REPL_LSN_GEN$' */
+  sequenceName?: string;
+}
+
+/** Metadata for a trigger installed by {@link installReplicationTriggers}. */
+export interface InstalledReplicationTrigger {
+  /** Normalized upper-case table name. */
+  readonly table: string;
+  /** Firebird trigger identifier (≤ 31 chars). */
+  readonly triggerName: string;
+  /** Firebird `POST_EVENT` name emitted on commit. */
+  readonly eventName: string;
+  /** Primary key columns serialized into `KEY_JSON`. */
+  readonly primaryKey: readonly string[];
+  /** Table columns serialized into `AFTER_JSON` / `BEFORE_JSON`. */
+  readonly columns: readonly string[];
+  /** Full `CREATE OR ALTER TRIGGER` PSQL DDL statement executed. */
+  readonly ddl: string;
+}
+
+/** Options for {@link installReplicationTriggers}. */
+export interface InstallReplicationTriggersOptions {
+  /** Tables to instrument with replication triggers. */
+  tables: ReadonlyArray<string | PublishedTableConfig>;
+  /** Logical publication name. @default 'default' */
+  publication?: string;
+  /** Originating node identifier. @default 'node_default' */
+  nodeId?: string;
+  /** Custom journal table name. @default 'FB_REPL_JOURNAL$' */
+  journalTable?: string;
+  /** Custom sequence name for atomic LSN assignment. @default 'FB_REPL_LSN_GEN$' */
+  sequenceName?: string;
 }
 
 /** Options for {@link createPublication}. */
@@ -150,12 +209,21 @@ export interface CreatePublicationOptions {
   name?: string;
   /** Unique node identifier for this database instance (used for loop prevention & LWW). */
   nodeId?: string;
-  /** Tables published by this publication (names or `{ table, primaryKey }` configs). */
+  /** Tables published by this publication (names or `{ table, primaryKey, columns }` configs). */
   tables: ReadonlyArray<string | PublishedTableConfig>;
   /** Custom journal table name. @default 'FB_REPL_JOURNAL$' */
   journalTable?: string;
   /** Custom mirror table name for `captureTableChanges()`. @default 'FB_REPL_MIRROR$' */
   mirrorTable?: string;
+  /** Custom sequence name for trigger LSN generation. @default 'FB_REPL_LSN_GEN$' */
+  sequenceName?: string;
+  /**
+   * When `true`, automatically generates and installs `AFTER INSERT OR UPDATE OR DELETE`
+   * PSQL triggers (`FB_REPL_TRG$<table>`) on all published tables during `createPublication()`.
+   *
+   * @default false
+   */
+  installTriggers?: boolean;
 }
 
 /** A logical replication publication on a source database. */
@@ -165,9 +233,22 @@ export interface ReplicationPublication {
   /** Originating node identifier. */
   readonly nodeId: string;
   /** Published table configurations keyed by upper-case table name. */
-  readonly tables: ReadonlyMap<string, { table: string; primaryKey: readonly string[] }>;
+  readonly tables: ReadonlyMap<
+    string,
+    { table: string; primaryKey: readonly string[]; columns?: readonly string[] }
+  >;
   /** Return the highest LSN currently recorded in the journal. */
   currentLsn(): Promise<number>;
+  /**
+   * Generate and install `AFTER INSERT OR UPDATE OR DELETE` Firebird PSQL triggers
+   * (`FB_REPL_TRG$<table>`) on all published tables so direct SQL writes are
+   * captured atomically inside the committing transaction.
+   */
+  installTriggers(): Promise<InstalledReplicationTrigger[]>;
+  /**
+   * Drop the replication triggers previously installed for this publication.
+   */
+  dropTriggers(): Promise<string[]>;
   /**
    * Record a single row DML mutation (`INSERT`, `UPDATE`, `DELETE`) in the
    * replication journal (`FB_REPL_JOURNAL$`), optionally applying it to the
@@ -520,6 +601,311 @@ async function applyRowMutationToTable(
 }
 
 // ---------------------------------------------------------------------------
+// 0. Native Firebird SQL Trigger-Based Change Capture (`installReplicationTriggers`)
+// ---------------------------------------------------------------------------
+
+function fnv1aHash8(input: string): string {
+  let hash = 0x811c9dc5;
+  for (const ch of input) {
+    hash ^= ch.codePointAt(0)!;
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, '0').toUpperCase();
+}
+
+/**
+ * Deterministic Firebird trigger identifier (≤ 31 chars) for a published table.
+ *
+ * Uses `FB_REPL_TRG$<TABLE>` when the sanitized table name fits within 31 characters
+ * for the `'default'` publication, or `FB_REPL_TRG$<PREFIX>_<HASH8>` otherwise.
+ */
+export function replicationTriggerName(table: string, publication = 'default'): string {
+  const cleanTable = normalizeTableName(table).replace(/[^A-Z0-9_$]/g, '_');
+  const cleanPub = publication.trim().toUpperCase();
+  if (cleanPub === 'DEFAULT' && cleanTable.length > 0 && `FB_REPL_TRG$${cleanTable}`.length <= 31) {
+    return `FB_REPL_TRG$${cleanTable}`;
+  }
+  const hash = fnv1aHash8(`${cleanPub}:${ normalizeTableName(table)}`);
+  const prefix = cleanTable.slice(0, 10);
+  return prefix.length > 0 ? `FB_REPL_TRG$${prefix}_${hash}` : `FB_REPL_TRG$${hash}`;
+}
+
+/**
+ * Deterministic Firebird `POST_EVENT` name (≤ 31 chars) for a publication.
+ */
+export function replicationEventName(publication = 'default'): string {
+  const clean = publication.trim().replace(/[^A-Za-z0-9_$]/g, '_');
+  const candidate = `fb_repl_${clean}`;
+  if (candidate.length <= 31) {
+    return candidate;
+  }
+  return `fb_repl_${fnv1aHash8(publication.trim().toUpperCase()).toLowerCase()}`;
+}
+
+function escapeSqlLiteral(val: string): string {
+  return val.replace(/'/g, "''");
+}
+
+function buildJsonObjectSqlExpr(
+  recordPrefix: 'NEW' | 'OLD',
+  cols: readonly string[],
+): string {
+  if (cols.length === 0) {
+    return `'{}'`;
+  }
+  const pairs = cols.map((col) => {
+    const upperCol = col.toUpperCase();
+    const quotedCol = quoteIdent(upperCol);
+    const keyLiteral = escapeSqlLiteral(`"${upperCol}":`);
+    const valRef = `${recordPrefix}.${quotedCol}`;
+    return (
+      `'${keyLiteral}' || IIF(${valRef} IS NULL, 'null', ` +
+      `'"' || REPLACE(REPLACE(CAST(${valRef} AS VARCHAR(4000)), '\\', '\\\\'), '"', '\\"') || '"')`
+    );
+  });
+  return `'{' || ${pairs.join(` || ',' || `)} || '}'`;
+}
+
+/**
+ * Build idempotent `CREATE OR ALTER TRIGGER` PSQL DDL for a published table.
+ *
+ * The generated trigger:
+ * 1. Checks `RDB$GET_CONTEXT('USER_SESSION', 'FB_REPL_ROLE') IS DISTINCT FROM 'REPLICA'`
+ *    so replica apply transactions bypass trigger logging (loop prevention).
+ * 2. Serializes `KEY_JSON`, `AFTER_JSON` (`NEW.*`), and `BEFORE_JSON` (`OLD.*`).
+ * 3. Inserts a row into `FB_REPL_JOURNAL$` using `NEXT VALUE FOR FB_REPL_LSN_GEN$`
+ *    and `CURRENT_TRANSACTION`.
+ * 4. Emits `POST_EVENT '<eventName>'` for instant subscriber wakeup.
+ */
+export function buildReplicationTriggerDdl(
+  options: BuildReplicationTriggerDdlOptions,
+): { triggerName: string; eventName: string; ddl: string } {
+  const tableUpper = normalizeTableName(options.table);
+  const pubName = (options.publication ?? 'default').trim();
+  const nodeId = (options.nodeId ?? `node_${pubName}`).trim();
+  const journalTable = quoteIdent(options.journalTable ?? DEFAULT_REPL_JOURNAL_TABLE);
+  const seqName = quoteIdent(options.sequenceName ?? DEFAULT_REPL_LSN_SEQUENCE);
+
+  const pkCols =
+    options.primaryKey && options.primaryKey.length > 0
+      ? options.primaryKey.map((c) => c.toUpperCase())
+      : ['ID'];
+  const allCols =
+    options.columns && options.columns.length > 0
+      ? Array.from(new Set([...pkCols, ...options.columns.map((c) => c.toUpperCase())]))
+      : pkCols;
+
+  const triggerName = replicationTriggerName(tableUpper, pubName);
+  const eventName = replicationEventName(pubName);
+
+  const newKeyExpr = buildJsonObjectSqlExpr('NEW', pkCols);
+  const oldKeyExpr = buildJsonObjectSqlExpr('OLD', pkCols);
+  const afterExpr = buildJsonObjectSqlExpr('NEW', allCols);
+  const beforeExpr = buildJsonObjectSqlExpr('OLD', allCols);
+
+  const ddl = [
+    `CREATE OR ALTER TRIGGER ${triggerName} FOR ${quoteIdent(tableUpper)}`,
+    `ACTIVE AFTER INSERT OR UPDATE OR DELETE POSITION 32000`,
+    `AS`,
+    `  DECLARE VARIABLE v_op VARCHAR(16);`,
+    `  DECLARE VARIABLE v_key VARCHAR(2000);`,
+    `  DECLARE VARIABLE v_after VARCHAR(8191);`,
+    `  DECLARE VARIABLE v_before VARCHAR(8191);`,
+    `  DECLARE VARIABLE v_origin VARCHAR(128);`,
+    `BEGIN`,
+    `  IF (RDB$GET_CONTEXT('USER_SESSION', '${DEFAULT_REPL_ROLE_CONTEXT_VAR}') IS DISTINCT FROM 'REPLICA') THEN`,
+    `  BEGIN`,
+    `    v_origin = COALESCE(RDB$GET_CONTEXT('USER_SESSION', '${DEFAULT_REPL_ORIGIN_CONTEXT_VAR}'), '${escapeSqlLiteral(nodeId)}');`,
+    `    IF (INSERTING) THEN`,
+    `    BEGIN`,
+    `      v_op = 'INSERT';`,
+    `      v_key = ${newKeyExpr};`,
+    `      v_after = ${afterExpr};`,
+    `      v_before = NULL;`,
+    `    END`,
+    `    ELSE IF (UPDATING) THEN`,
+    `    BEGIN`,
+    `      v_op = 'UPDATE';`,
+    `      v_key = ${newKeyExpr};`,
+    `      v_after = ${afterExpr};`,
+    `      v_before = ${beforeExpr};`,
+    `    END`,
+    `    ELSE`,
+    `    BEGIN`,
+    `      v_op = 'DELETE';`,
+    `      v_key = ${oldKeyExpr};`,
+    `      v_after = NULL;`,
+    `      v_before = ${beforeExpr};`,
+    `    END`,
+    `    INSERT INTO ${journalTable} (LSN, TXID, ORIGIN, PUBLICATION, TABLE_NAME, OP, KEY_JSON, AFTER_JSON, BEFORE_JSON, DDL_SQL, TS)`,
+    `    VALUES (`,
+    `      NEXT VALUE FOR ${seqName},`,
+    `      CAST(CURRENT_TRANSACTION AS VARCHAR(128)),`,
+    `      :v_origin,`,
+    `      '${escapeSqlLiteral(pubName)}',`,
+    `      '${escapeSqlLiteral(tableUpper)}',`,
+    `      :v_op,`,
+    `      :v_key,`,
+    `      :v_after,`,
+    `      :v_before,`,
+    `      NULL,`,
+    `      DATEDIFF(MILLISECOND FROM TIMESTAMP '1970-01-01 00:00:00' TO CURRENT_TIMESTAMP)`,
+    `    );`,
+    `    POST_EVENT '${escapeSqlLiteral(eventName)}';`,
+    `  END`,
+    `END`,
+  ].join('\n');
+
+  return { triggerName, eventName, ddl };
+}
+
+async function discoverTableColumns(
+  db: ReplicableDatabase,
+  tableUpper: string,
+  fallbackCols: readonly string[],
+): Promise<readonly string[]> {
+  // 1. Try Firebird system catalog RDB$RELATION_FIELDS
+  try {
+    const sysRes = await db.query<Row>(
+      `SELECT TRIM(RDB$FIELD_NAME) AS COL_NAME FROM RDB$RELATION_FIELDS WHERE TRIM(RDB$RELATION_NAME) = ? AND COALESCE(RDB$SYSTEM_FLAG, 0) = 0 ORDER BY RDB$FIELD_POSITION`,
+      [tableUpper],
+    );
+    const cols = sysRes.rows
+      .map((r) => String(r.COL_NAME ?? r.col_name ?? '').trim().toUpperCase())
+      .filter((c) => c.length > 0);
+    if (cols.length > 0) {
+      return cols;
+    }
+  } catch {
+    // System catalog query unsupported on mock DB; fall through
+  }
+
+  // 2. Try `SELECT * FROM <table>` metadata or sample row keys
+  try {
+    const sample = await db.query<Row>(`SELECT * FROM ${quoteIdent(tableUpper)}`);
+    if (sample.fields && sample.fields.length > 0) {
+      const cols = sample.fields
+        .map((f) => f.name.trim().toUpperCase())
+        .filter((c) => c.length > 0);
+      if (cols.length > 0) return cols;
+    }
+    if (sample.rows[0]) {
+      const cols = Object.keys(sample.rows[0]).map((k) => k.toUpperCase());
+      if (cols.length > 0) return cols;
+    }
+  } catch {
+    // Ignore and return fallback
+  }
+
+  return fallbackCols;
+}
+
+/**
+ * Generate and install idempotent `AFTER INSERT OR UPDATE OR DELETE` Firebird PSQL
+ * replication triggers (`FB_REPL_TRG$<table>`) and the atomic LSN generator
+ * (`FB_REPL_LSN_GEN$`) on `db`.
+ */
+export async function installReplicationTriggers(
+  db: ReplicableDatabase,
+  options: InstallReplicationTriggersOptions,
+): Promise<InstalledReplicationTrigger[]> {
+  const pubName = (options.publication ?? 'default').trim();
+  const nodeId = (options.nodeId ?? `node_${pubName}`).trim();
+  const journalTable = quoteIdent(options.journalTable ?? DEFAULT_REPL_JOURNAL_TABLE);
+  const seqName = quoteIdent(options.sequenceName ?? DEFAULT_REPL_LSN_SEQUENCE);
+
+  await ensureTableSafe(
+    db,
+    `CREATE TABLE ${journalTable} (
+      LSN BIGINT NOT NULL PRIMARY KEY,
+      TXID VARCHAR(128) NOT NULL,
+      ORIGIN VARCHAR(128) NOT NULL,
+      PUBLICATION VARCHAR(128) NOT NULL,
+      TABLE_NAME VARCHAR(128) NOT NULL,
+      OP VARCHAR(16) NOT NULL,
+      KEY_JSON VARCHAR(2000) NOT NULL,
+      AFTER_JSON VARCHAR(8191),
+      BEFORE_JSON VARCHAR(8191),
+      DDL_SQL VARCHAR(8191),
+      TS BIGINT NOT NULL
+    )`,
+  );
+
+  await ensureTableSafe(db, `CREATE SEQUENCE ${seqName}`);
+
+  const installed: InstalledReplicationTrigger[] = [];
+
+  for (const item of options.tables) {
+    const tableUpper = normalizeTableName(typeof item === 'string' ? item : item.table);
+    const pkCols =
+      typeof item === 'string'
+        ? ['ID']
+        : typeof item.primaryKey === 'string'
+          ? [item.primaryKey.toUpperCase()]
+          : item.primaryKey && item.primaryKey.length > 0
+            ? item.primaryKey.map((k) => k.toUpperCase())
+            : ['ID'];
+    const explicitCols =
+      typeof item !== 'string' && item.columns && item.columns.length > 0
+        ? item.columns.map((c) => c.toUpperCase())
+        : undefined;
+
+    const columns =
+      explicitCols ?? (await discoverTableColumns(db, tableUpper, pkCols));
+
+    const { triggerName, eventName, ddl } = buildReplicationTriggerDdl({
+      table: tableUpper,
+      primaryKey: pkCols,
+      columns,
+      publication: pubName,
+      nodeId,
+      journalTable: options.journalTable ?? DEFAULT_REPL_JOURNAL_TABLE,
+      sequenceName: options.sequenceName ?? DEFAULT_REPL_LSN_SEQUENCE,
+    });
+
+    await execStatement(db, ddl);
+
+    installed.push({
+      table: tableUpper,
+      triggerName,
+      eventName,
+      primaryKey: pkCols,
+      columns,
+      ddl,
+    });
+  }
+
+  return installed;
+}
+
+/**
+ * Drop the replication triggers previously installed by {@link installReplicationTriggers}.
+ */
+export async function dropReplicationTriggers(
+  db: ReplicableDatabase,
+  options: {
+    tables: ReadonlyArray<string | PublishedTableConfig>;
+    publication?: string;
+  },
+): Promise<string[]> {
+  const pubName = (options.publication ?? 'default').trim();
+  const dropped: string[] = [];
+
+  for (const item of options.tables) {
+    const tableUpper = normalizeTableName(typeof item === 'string' ? item : item.table);
+    const triggerName = replicationTriggerName(tableUpper, pubName);
+    try {
+      await execStatement(db, `DROP TRIGGER ${triggerName}`);
+      dropped.push(triggerName);
+    } catch {
+      // Ignore if trigger does not exist
+    }
+  }
+
+  return dropped;
+}
+
+// ---------------------------------------------------------------------------
 // 1. `createPublication` Implementation
 // ---------------------------------------------------------------------------
 
@@ -534,7 +920,10 @@ export async function createPublication(
   const nodeId = (options.nodeId ?? `node_${pubName}`).trim();
   const journalTable = quoteIdent(options.journalTable ?? DEFAULT_REPL_JOURNAL_TABLE);
 
-  const tablesMap = new Map<string, { table: string; primaryKey: readonly string[] }>();
+  const tablesMap = new Map<
+    string,
+    { table: string; primaryKey: readonly string[]; columns?: readonly string[] }
+  >();
   for (const item of options.tables) {
     if (typeof item === 'string') {
       const upper = normalizeTableName(item);
@@ -547,7 +936,15 @@ export async function createPublication(
           : item.primaryKey && item.primaryKey.length > 0
             ? item.primaryKey.map((k) => k.toUpperCase())
             : ['ID'];
-      tablesMap.set(upper, { table: upper, primaryKey: pk });
+      const columns =
+        item.columns && item.columns.length > 0
+          ? item.columns.map((c) => c.toUpperCase())
+          : undefined;
+      tablesMap.set(upper, {
+        table: upper,
+        primaryKey: pk,
+        ...(columns ? { columns } : {}),
+      });
     }
   }
 
@@ -643,7 +1040,38 @@ export async function createPublication(
     tables: tablesMap,
 
     async currentLsn(): Promise<number> {
+      try {
+        const res = await db.query<Row>(
+          `SELECT LSN FROM ${journalTable} ORDER BY LSN DESC`,
+        );
+        const top = res.rows[0];
+        if (top) {
+          const dbMax = Number(top.LSN ?? top.lsn ?? 0);
+          if (dbMax > lsnCounter) {
+            lsnCounter = dbMax;
+          }
+        }
+      } catch {
+        // Fallback to in-memory counter
+      }
       return lsnCounter;
+    },
+
+    async installTriggers(): Promise<InstalledReplicationTrigger[]> {
+      return installReplicationTriggers(db, {
+        tables: Array.from(tablesMap.values()),
+        publication: pubName,
+        nodeId,
+        journalTable: options.journalTable ?? DEFAULT_REPL_JOURNAL_TABLE,
+        sequenceName: options.sequenceName ?? DEFAULT_REPL_LSN_SEQUENCE,
+      });
+    },
+
+    async dropTriggers(): Promise<string[]> {
+      return dropReplicationTriggers(db, {
+        tables: Array.from(tablesMap.values()),
+        publication: pubName,
+      });
     },
 
     async recordDml(params): Promise<ReplicationLogEntry> {
@@ -896,6 +1324,10 @@ export async function createPublication(
       updateMirrorRow(tableUpper, cfg.primaryKey, op, key, after);
     },
   };
+
+  if (options.installTriggers) {
+    await publication.installTriggers();
+  }
 
   return publication;
 }
@@ -1176,10 +1608,37 @@ export async function createSubscription(
       }
     };
 
+    const setReplicaRoleContext = async (
+      runner: {
+        query<T extends Row = Row>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
+      },
+      role: 'REPLICA' | 'PRIMARY',
+    ) => {
+      try {
+        await runner.query(
+          `SELECT RDB$SET_CONTEXT('USER_SESSION', '${DEFAULT_REPL_ROLE_CONTEXT_VAR}', '${role}') FROM RDB$DATABASE`,
+        );
+      } catch {
+        // Ignore on test doubles that do not implement RDB$SET_CONTEXT
+      }
+    };
+
     if (typeof targetDb.transaction === 'function') {
-      await targetDb.transaction(runBatch);
+      await targetDb.transaction(async (tx) => {
+        await setReplicaRoleContext(tx, 'REPLICA');
+        try {
+          await runBatch(tx);
+        } finally {
+          await setReplicaRoleContext(tx, 'PRIMARY');
+        }
+      });
     } else {
-      await runBatch(targetDb);
+      await setReplicaRoleContext(targetDb, 'REPLICA');
+      try {
+        await runBatch(targetDb);
+      } finally {
+        await setReplicaRoleContext(targetDb, 'PRIMARY');
+      }
     }
 
     if (highestLsn > previousLsn) {
@@ -1257,6 +1716,13 @@ export interface ReplicateDatabasesOptions {
   primaryNodeId?: string;
   /** Optional custom node identifier for `replica` (default `'replica'`). */
   replicaNodeId?: string;
+  /**
+   * When `true`, automatically installs `AFTER INSERT OR UPDATE OR DELETE`
+   * Firebird PSQL triggers on published tables.
+   *
+   * @default false
+   */
+  installTriggers?: boolean;
 }
 
 /** Result of `replicator.sync()`. */
@@ -1300,6 +1766,7 @@ export async function replicateDatabases(
     name: 'pub_primary',
     nodeId: primaryNodeId,
     tables: options.tables,
+    installTriggers: options.installTriggers,
   });
 
   let replicaPublication: ReplicationPublication | undefined;
@@ -1310,6 +1777,7 @@ export async function replicateDatabases(
       name: 'pub_replica',
       nodeId: replicaNodeId,
       tables: options.tables,
+      installTriggers: options.installTriggers,
     });
   }
 
