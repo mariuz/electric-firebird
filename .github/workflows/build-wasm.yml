@@ -3,6 +3,7 @@ name: Build WASM
 on:
   push:
     branches: [main, master]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
     inputs:
@@ -336,3 +337,41 @@ jobs:
         env:
           FB_EXPECTED_ENGINE_PREFIX: '5.0.'
         run: npx vitest run src/__tests__/wasm-integration.test.ts src/__tests__/wasm-single-thread.test.ts
+
+  # Attach the WASM modules to the GitHub release when a v* tag is pushed.
+  # Only runs after the build and its integration tests have passed.
+  publish-release-assets:
+    name: Attach WASM to GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-wasm
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download WASM artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: firebird-wasm
+          path: wasm-dist
+
+      - name: Package assets
+        run: |
+          set -euo pipefail
+          cd wasm-dist
+          tar -czf "../firebird-wasm-${GITHUB_REF_NAME}.tar.gz" *
+          cd ..
+          cp wasm-dist/* .
+          sha256sum firebird-embedded* "firebird-wasm-${GITHUB_REF_NAME}.tar.gz" > SHA256SUMS.txt
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Create the release if the tag has none yet; ignore if it exists.
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
+          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
+            firebird-embedded.js firebird-embedded.wasm \
+            firebird-embedded-st.js firebird-embedded-st.wasm \
+            "firebird-wasm-${GITHUB_REF_NAME}.tar.gz" SHA256SUMS.txt
