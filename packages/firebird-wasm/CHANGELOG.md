@@ -4,6 +4,18 @@ All notable changes to `firebird-wasm`. This project follows
 [semantic versioning](https://semver.org/); while the major version is 0 the
 API may still move between minor releases.
 
+## 0.20.0 — 2026-11-06
+
+### Added
+
+- **Replication (`firebird-wasm/replication`)** — journal-based logical replication on top of `FB_REPL_JOURNAL$`: publications/subscriptions, replication slots, HLC + per-column CRDT conflict resolution, row filters and column projection, HTTP/SSE, BroadcastChannel and WebSocket transports, and Firebird 4/5 binary journal segments (`0x52444246`).
+- **Failover & time travel** — `promoteReplica()`, `asOfLsn()` and `rewindToLsn()`; AES-256-GCM + Gzip encrypted journal segments (`0x53444246`).
+- **Multi-node topologies** — `createReplicationMesh()` / `createReplicationHub()` with transitive origin routing, `watermarkMatrix()` and quorum `pruneQuorum()`.
+- **Dead-letter queue** — `FB_REPL_DLQ$`, `onApplyError`, `validateEntry`, `listDlq()`, `retryDlq()`, `discardDlq()`.
+- **PII masking & row transforms** — `transformRow` and `createPiiMaskingTransformer()`.
+- **PITR archives** — `exportJournalArchive()` / `applyJournalArchive()`.
+- **`<firebird-repl>` replication tab**, the Replication Simulator v2 demo (`replication.html`), `docs/replication.md`, and a Playwright E2E suite for the simulator.
+
 ## 0.16.0 — 2026-11-02
 
 ### Added
