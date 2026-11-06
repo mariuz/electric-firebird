@@ -235,6 +235,13 @@ export {
   decodeEncryptedJournalSegment,
   asOfLsn,
   rewindToLsn,
+  DEFAULT_REPL_DLQ_TABLE,
+  createReplicationMesh,
+  createReplicationHub,
+  createReplicationDlq,
+  createPiiMaskingTransformer,
+  exportJournalArchive,
+  applyJournalArchive,
 } from '../replication';
 export type {
   ReplicableDatabase,
@@ -293,6 +300,21 @@ export type {
   TimeTravelSnapshot,
   RewindToLsnOptions,
   RewindToLsnResult,
+  ReplicationMeshNodeConfig,
+  CreateReplicationMeshOptions,
+  ReplicationMeshSyncResult,
+  ReplicationMesh,
+  ReplicationDlqEntry,
+  ReplicationDlqOptions,
+  ReplicationDlq,
+  RowTransformContext,
+  RowTransformer,
+  PiiColumnMaskStrategy,
+  JournalArchiveSegment,
+  ReplicationJournalArchive,
+  ExportJournalArchiveOptions,
+  ApplyJournalArchiveOptions,
+  ApplyJournalArchiveResult,
 } from '../replication';
 export type { ScriptStatement } from './sql-script';
 

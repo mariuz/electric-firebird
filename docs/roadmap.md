@@ -1503,6 +1503,35 @@ Next-horizon milestones (`v0.19.0`):
       LSN or HLC timestamp using the `BEFORE_JSON` / `AFTER_JSON` audit trail in
       `FB_REPL_JOURNAL$`.
 
+### M14 — Multi-Node Mesh Replication, Dead-Letter Queues (`FB_REPL_DLQ$`), PII Row Masking Pipelines, PITR Journal Archives & Simulator E2E Suite
+
+Next-horizon milestones (`v0.20.0`):
+
+- [x] **1. Multi-Node Mesh & Hub-and-Spoke Replication Coordinator (`createReplicationMesh` / `createReplicationHub`).**
+      Coordinate $N \ge 3$ database nodes in star (1 hub ↔ $N$ edge/browser spokes)
+      or full-mesh topologies with automatic transitive origin routing, HLC
+      watermark matrices, and quorum-based `pruneAcked()`.
+- [x] **2. Dead-Letter Queue (`FB_REPL_DLQ$`) & Quarantine / Retry Policy for Replication.**
+      Isolate poison journal entries (e.g. constraint violations or custom
+      validator rejections on a replica) into `FB_REPL_DLQ$` with error
+      diagnostics, retry counts, `retryDlq()`, and `discardDlq()` so a single bad
+      row never blocks the replication stream.
+- [x] **3. Data Masking, PII Redaction & Row Transformation Pipelines (`transformRow`).**
+      Support pluggable outbound/inbound row transformers on publications and
+      subscriptions (e.g. deterministic SHA-256 email hashing, credit-card
+      masking, or computed fields) before entries leave a primary or land on an
+      untrusted browser/edge replica.
+- [x] **4. Journal Archival & Point-in-Time Recovery (PITR) Bundles (`exportJournalArchive` / `applyJournalArchive`).**
+      Package a base database snapshot (`PublicationSnapshot`) plus a chain of
+      encrypted/compressed `0x53444246` (`'FBDS'`) journal segments into a
+      portable PITR archive that can restore a database to any historical LSN,
+      timestamp, or HLC.
+- [x] **5. Playwright E2E Suite for `replication.html` Simulator (`e2e/tests/replication-demo.spec.ts`).**
+      Add automated Playwright end-to-end tests exercising the GitHub Pages
+      Replication Simulator (`demo/public/replication.html`), verifying all 8
+      guided scenarios, CRDT convergence, slot holdback/pruning, failover
+      promotion, and time-travel rewind.
+
 ---
 
 ## 5. Test coverage added alongside this review

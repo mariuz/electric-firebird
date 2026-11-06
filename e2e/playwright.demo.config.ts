@@ -25,7 +25,7 @@ const DEPLOYED = process.env['DEMO_BASE_URL'];
 
 export default defineConfig({
   testDir: './tests',
-  testMatch: ['**/demo.spec.ts'],
+  testMatch: ['**/demo.spec.ts', '**/replication-demo.spec.ts'],
   fullyParallel: false,
   forbidOnly: !!process.env['CI'],
   retries: process.env['CI'] ? 2 : 0,

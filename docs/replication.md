@@ -530,3 +530,120 @@ console.log(`Undid ${rewindResult.entriesUndone} operations back to LSN ${rewind
 | `decodeEncryptedJournalSegment(bytes, opts?)` | Decrypts and decompresses an encrypted journal segment (or transparently decodes raw `0x52444246` segments). |
 | `asOfLsn(db, target)` | Non-destructively reconstructs historical table rows at any past LSN, timestamp, or HLC. |
 | `rewindToLsn(db, targetOrOptions)` | Rolls back a live database to a historical LSN, timestamp, or HLC using inverse DML from `BEFORE_JSON`. |
+| `createReplicationMesh(options)` | Coordinates $N \ge 2$ database nodes in `'mesh'` or `'hub-and-spoke'` topologies with transitive routing, `watermarkMatrix()`, and `pruneQuorum()`. |
+| `createReplicationHub(options)` | Convenience wrapper creating a `'hub-and-spoke'` replication coordinator (`1` hub ↔ $N$ spokes). |
+| `createReplicationDlq(db, options?)` | Provisions `FB_REPL_DLQ$` for quarantining, inspecting, retrying, and discarding poison journal entries. |
+| `createPiiMaskingTransformer(rules, options?)` | Creates a declarative PII redaction / row transformation callback (`'email-mask'`, `'card-last4'`, `'hash-sha256'`, `'redact'`, etc.) for `transformRow`. |
+| `exportJournalArchive(pub, options?)` | Packages a base snapshot + chunked encrypted/compressed `0x53444246` journal segments into a portable PITR bundle. |
+| `applyJournalArchive(db, archive, options?)` | Restores a database from a `ReplicationJournalArchive` up to an optional target LSN, timestamp, or HLC. |
+
+---
+
+## 16. Multi-Node Mesh & Hub-and-Spoke Replication (`createReplicationMesh` / `createReplicationHub`)
+
+Coordinate $N \ge 2$ database nodes in either `'hub-and-spoke'` (1 central hub ↔ $N$ edge/browser spokes with automatic transitive origin forwarding) or full `'mesh'` ($N \times (N-1)$ peer links) topologies:
+
+```ts
+import { createReplicationHub, createCrdtConflictResolver } from 'firebird-wasm/replication';
+
+const hub = await createReplicationHub({
+  hubNodeId: 'cloud-hub',
+  nodes: [
+    { nodeId: 'cloud-hub', db: hubDb },
+    { nodeId: 'edge-eu', db: spokeEuDb },
+    { nodeId: 'edge-us', db: spokeUsDb },
+  ],
+  tables: [{ table: 'TASKS', primaryKey: 'ID' }],
+  onConflict: createCrdtConflictResolver({ columns: { STOCK: 'pn-counter' } }),
+});
+
+// Converges spoke-eu -> cloud-hub -> spoke-us and spoke-us -> cloud-hub -> spoke-eu
+await hub.sync();
+
+// Inspect watermarks[subscriberNodeId][publisherNodeId] and prune quorum-acknowledged entries
+const matrix = await hub.watermarkMatrix();
+const prunedByNode = await hub.pruneQuorum();
+```
+
+---
+
+## 17. Dead-Letter Queue (`FB_REPL_DLQ$`) & Quarantine / Retry Policy
+
+Configure `onApplyError: 'dlq'` (or a custom policy callback) and optional `validateEntry` on `createSubscription()` so a single poison row never stalls the replication stream:
+
+```ts
+import { createSubscription } from 'firebird-wasm/replication';
+
+const sub = await createSubscription(replicaDb, {
+  name: 'sub_orders',
+  nodeId: 'replica-1',
+  publication: primaryPub,
+  onApplyError: 'dlq',
+  validateEntry(entry) {
+    if (entry.after && Number(entry.after.TOTAL ?? 0) < 0) {
+      throw new Error('CHECK constraint violation: TOTAL must be non-negative');
+    }
+  },
+});
+
+await sub.pull();
+const quarantined = await sub.listDlq!();
+
+// Sanitize and re-apply quarantined entries from FB_REPL_DLQ$
+await sub.retryDlq!({
+  transformEntry: (e) => ({
+    ...e,
+    after: { ...e.after, TOTAL: Math.abs(Number(e.after?.TOTAL ?? 0)) },
+  }),
+});
+```
+
+---
+
+## 18. Data Masking, PII Redaction & Row Transformation Pipelines (`transformRow`)
+
+Attach `transformRow` (or `createPiiMaskingTransformer`) to a publication or subscription to redact sensitive columns before changes leave a primary or land on an analytics/browser replica:
+
+```ts
+import { createPublication, createPiiMaskingTransformer } from 'firebird-wasm/replication';
+
+const pub = await createPublication(primaryDb, {
+  name: 'pub_customers',
+  nodeId: 'prod-primary',
+  tables: [{ table: 'CUSTOMERS', primaryKey: 'ID' }],
+  transformRow: createPiiMaskingTransformer(
+    {
+      EMAIL: 'email-mask',       // 'jane.doe@example.com' -> 'j***e@example.com'
+      CARD_NUMBER: 'card-last4', // '4111-2222-3333-4444'  -> '************4444'
+      SSN: 'redact',             // '[REDACTED]'
+      PHONE: 'hash-sha256',      // salted SHA-256 hex digest
+      SECRET_TOKEN: 'null',      // null
+    },
+    { salt: 'prod-tenant-salt' },
+  ),
+});
+```
+
+---
+
+## 19. Journal Archival & Point-in-Time Recovery (PITR) Bundles (`exportJournalArchive` / `applyJournalArchive`)
+
+Export a publication's journal stream (and optional `baseSnapshot`) into a multi-segment Gzip + AES-256-GCM encrypted PITR archive, and restore any database up to a target LSN, timestamp, or HLC:
+
+```ts
+import { exportJournalArchive, applyJournalArchive } from 'firebird-wasm/replication';
+
+const archive = await exportJournalArchive(primaryPub, {
+  maxEntriesPerSegment: 100,
+  compress: true,
+  key: 'pitr-backup-passphrase',
+  aad: 'cluster-prod',
+});
+
+// Restore a fresh database stopping at historical LSN 42
+const result = await applyJournalArchive(recoveryDb, archive, {
+  key: 'pitr-backup-passphrase',
+  aad: 'cluster-prod',
+  target: { lsn: 42 },
+});
+```

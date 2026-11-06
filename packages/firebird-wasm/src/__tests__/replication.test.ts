@@ -38,6 +38,12 @@ import {
   decodeEncryptedJournalSegment,
   asOfLsn,
   rewindToLsn,
+  createReplicationMesh,
+  createReplicationHub,
+  createReplicationDlq,
+  createPiiMaskingTransformer,
+  exportJournalArchive,
+  applyJournalArchive,
   type ReplicableDatabase,
   type WebSocketLike,
 } from '../replication';
@@ -78,18 +84,21 @@ function createMockReplDb(): ReplicableDatabase & {
       return { rows: [{ RESULT: 1 }] };
     }
 
-    // MAX(LSN)
-    const maxMatch = /SELECT\s+MAX\(LSN\)\s+AS\s+MAX_LSN\s+FROM\s+([A-Za-z0-9_$"]+)/i.exec(
-      trimmed,
-    );
+    // MAX(col) AS alias
+    const maxMatch =
+      /SELECT\s+MAX\(([A-Za-z0-9_$"]+)\)\s+AS\s+([A-Za-z0-9_$"]+)\s+FROM\s+([A-Za-z0-9_$"]+)/i.exec(
+        trimmed,
+      );
     if (maxMatch) {
-      const rows = getTable(maxMatch[1]!);
+      const col = maxMatch[1]!.replace(/"/g, '').toUpperCase();
+      const alias = maxMatch[2]!.replace(/"/g, '').toUpperCase();
+      const rows = getTable(maxMatch[3]!);
       let max = 0;
       for (const r of rows) {
-        const lsn = Number(r.LSN ?? 0);
-        if (lsn > max) max = lsn;
+        const val = Number(r[col] ?? 0);
+        if (val > max) max = val;
       }
-      return { rows: [{ MAX_LSN: max }] };
+      return { rows: [{ [alias]: max }] };
     }
 
     // Journal WHERE LSN > ?
@@ -129,8 +138,9 @@ function createMockReplDb(): ReplicableDatabase & {
       return { rows };
     }
 
-    // Generic SELECT * FROM <table> [WHERE ...]
-    const fromMatch = /FROM\s+([A-Za-z0-9_$"]+)(?:\s+WHERE\s+(.+))?$/i.exec(trimmed);
+    // Generic SELECT * FROM <table> [WHERE ...] [ORDER BY ...]
+    const withoutOrder = trimmed.replace(/\s+ORDER\s+BY\s+.+$/i, '');
+    const fromMatch = /FROM\s+([A-Za-z0-9_$"]+)(?:\s+WHERE\s+(.+))?$/i.exec(withoutOrder);
     if (fromMatch) {
       const list = getTable(fromMatch[1]!);
       const wherePart = fromMatch[2];
@@ -247,6 +257,13 @@ function createMockReplDb(): ReplicableDatabase & {
         tbl,
         getTable(tbl).filter((r) => !whereCols.every((c, i) => r[c] === params[i])),
       );
+      return;
+    }
+
+    const deleteAllMatch = /^DELETE\s+FROM\s+([A-Za-z0-9_$"]+)$/i.exec(trimmed);
+    if (deleteAllMatch) {
+      const tbl = deleteAllMatch[1]!.replace(/"/g, '').toUpperCase();
+      tables.set(tbl, []);
     }
   };
 
@@ -1499,5 +1516,345 @@ describe('firebird-wasm/replication – Logical & Journal-Based Database Replica
     ]);
     const remainingEntries = await pub.fetchChangesSince(0);
     expect(remainingEntries.map((e) => e.lsn)).toEqual([1, 2]);
+  });
+
+  it('coordinates multi-node mesh and hub-and-spoke topologies with transitive routing and quorum pruning', async () => {
+    // 1. 3-node Hub-and-Spoke topology: spoke-a <-> hub <-> spoke-b
+    const hubDb = createMockReplDb();
+    const spokeADb = createMockReplDb();
+    const spokeBDb = createMockReplDb();
+
+    hubDb.tables.set('TASKS', []);
+    spokeADb.tables.set('TASKS', []);
+    spokeBDb.tables.set('TASKS', []);
+
+    const hubCoord = await createReplicationHub({
+      hubNodeId: 'hub',
+      nodes: [
+        { nodeId: 'hub', db: hubDb },
+        { nodeId: 'spoke-a', db: spokeADb },
+        { nodeId: 'spoke-b', db: spokeBDb },
+      ],
+      tables: [{ table: 'TASKS', primaryKey: 'ID' }],
+    });
+
+    // Insert on spoke-a -> routes spoke-a -> hub -> spoke-b in a single sync()
+    const pubSpokeA = hubCoord.publications.get('spoke-a')!;
+    await pubSpokeA.recordDml({
+      table: 'TASKS',
+      operation: 'INSERT',
+      after: { ID: 1, TITLE: 'Created on Spoke A', DONE: 0 },
+    });
+
+    // Insert on spoke-b -> routes spoke-b -> hub -> spoke-a
+    const pubSpokeB = hubCoord.publications.get('spoke-b')!;
+    await pubSpokeB.recordDml({
+      table: 'TASKS',
+      operation: 'INSERT',
+      after: { ID: 2, TITLE: 'Created on Spoke B', DONE: 1 },
+    });
+
+    const syncRes = await hubCoord.sync();
+    expect(syncRes.totalApplied).toBeGreaterThanOrEqual(4);
+
+    const sortById = (rows: Row[] = []) =>
+      [...rows].sort((a, b) => Number(a.ID) - Number(b.ID));
+
+    expect(sortById(hubDb.tables.get('TASKS'))).toEqual([
+      { ID: 1, TITLE: 'Created on Spoke A', DONE: 0 },
+      { ID: 2, TITLE: 'Created on Spoke B', DONE: 1 },
+    ]);
+    expect(sortById(spokeADb.tables.get('TASKS'))).toEqual([
+      { ID: 1, TITLE: 'Created on Spoke A', DONE: 0 },
+      { ID: 2, TITLE: 'Created on Spoke B', DONE: 1 },
+    ]);
+    expect(sortById(spokeBDb.tables.get('TASKS'))).toEqual([
+      { ID: 1, TITLE: 'Created on Spoke A', DONE: 0 },
+      { ID: 2, TITLE: 'Created on Spoke B', DONE: 1 },
+    ]);
+
+    const matrix = await hubCoord.watermarkMatrix();
+    expect(matrix['spoke-a']?.['hub']).toBeGreaterThan(0);
+    expect(matrix['spoke-b']?.['hub']).toBeGreaterThan(0);
+
+    // Quorum pruning across all nodes
+    const pruned = await hubCoord.pruneQuorum();
+    expect(pruned['hub']).toBeGreaterThanOrEqual(2);
+    expect(pruned['spoke-a']).toBe(1);
+    expect(pruned['spoke-b']).toBe(1);
+
+    // 2. 3-node full Mesh topology with CRDT conflict resolution
+    const mesh1 = createMockReplDb();
+    const mesh2 = createMockReplDb();
+    const mesh3 = createMockReplDb();
+
+    const mesh = await createReplicationMesh({
+      topology: 'mesh',
+      nodes: [
+        { nodeId: 'n1', db: mesh1 },
+        { nodeId: 'n2', db: mesh2 },
+        { nodeId: 'n3', db: mesh3 },
+      ],
+      tables: [{ table: 'METRICS', primaryKey: 'ID' }],
+      onConflict: createCrdtConflictResolver({
+        columns: { HITS: 'pn-counter' },
+      }),
+    });
+
+    await mesh.publications.get('n1')!.recordDml({
+      table: 'METRICS',
+      operation: 'INSERT',
+      after: { ID: 1, HITS: 10 },
+    });
+    await mesh.sync();
+
+    expect(mesh2.tables.get('METRICS')).toEqual([{ ID: 1, HITS: 10 }]);
+    expect(mesh3.tables.get('METRICS')).toEqual([{ ID: 1, HITS: 10 }]);
+  });
+
+  it('quarantines poison entries into FB_REPL_DLQ$ and supports retryDlq() and discardDlq()', async () => {
+    const primary = createMockReplDb();
+    const replica = createMockReplDb();
+
+    const pub = await createPublication(primary, {
+      name: 'pub_orders',
+      nodeId: 'primary-1',
+      tables: [{ table: 'ORDERS', primaryKey: 'ID' }],
+    });
+
+    // Valid order #1, poison order #2 (negative total), valid order #3
+    await pub.recordDml({
+      table: 'ORDERS',
+      operation: 'INSERT',
+      after: { ID: 1, CUSTOMER: 'Alice', TOTAL: 50 },
+    });
+    await pub.recordDml({
+      table: 'ORDERS',
+      operation: 'INSERT',
+      after: { ID: 2, CUSTOMER: 'Mallory', TOTAL: -999 },
+    });
+    await pub.recordDml({
+      table: 'ORDERS',
+      operation: 'INSERT',
+      after: { ID: 3, CUSTOMER: 'Bob', TOTAL: 120 },
+    });
+
+    const sub = await createSubscription(replica, {
+      name: 'sub_orders',
+      nodeId: 'replica-1',
+      publication: pub,
+      onApplyError: 'dlq',
+      validateEntry(entry) {
+        if (entry.after && Number(entry.after.TOTAL ?? 0) < 0) {
+          throw new Error('CHECK constraint violation: TOTAL must be non-negative');
+        }
+      },
+    });
+
+    // Pull batch: order #1 and #3 apply cleanly; order #2 is quarantined in FB_REPL_DLQ$
+    const pullRes = await sub.pull();
+    expect(pullRes.fetchedCount).toBe(3);
+    expect(pullRes.appliedCount).toBe(2);
+    expect(pullRes.dlqCount).toBe(1);
+    expect(pullRes.currentLsn).toBe(3);
+
+    expect(replica.tables.get('ORDERS')).toEqual([
+      { ID: 1, CUSTOMER: 'Alice', TOTAL: 50 },
+      { ID: 3, CUSTOMER: 'Bob', TOTAL: 120 },
+    ]);
+
+    const dlqItems = await sub.listDlq!();
+    expect(dlqItems).toHaveLength(1);
+    expect(dlqItems[0]!.lsn).toBe(2);
+    expect(dlqItems[0]!.errorMessage).toMatch(/TOTAL must be non-negative/);
+    expect(dlqItems[0]!.attempts).toBe(1);
+
+    // Retry without transform still fails validation and increments attempts
+    const failedRetry = await sub.retryDlq!();
+    expect(failedRetry.retried).toBe(1);
+    expect(failedRetry.succeeded).toBe(0);
+    expect(failedRetry.failed).toBe(1);
+    expect((await sub.listDlq!())[0]!.attempts).toBe(2);
+
+    // Retry with transformEntry sanitizing negative TOTAL -> applies row and clears DLQ
+    const fixedRetry = await sub.retryDlq!({
+      transformEntry(entry) {
+        return {
+          ...entry,
+          after: { ...entry.after, TOTAL: Math.abs(Number(entry.after?.TOTAL ?? 0)) },
+        };
+      },
+    });
+    expect(fixedRetry.succeeded).toBe(1);
+    expect(await sub.listDlq!()).toHaveLength(0);
+
+    const allOrders = [...(replica.tables.get('ORDERS') ?? [])].sort(
+      (a, b) => Number(a.ID) - Number(b.ID),
+    );
+    expect(allOrders).toEqual([
+      { ID: 1, CUSTOMER: 'Alice', TOTAL: 50 },
+      { ID: 2, CUSTOMER: 'Mallory', TOTAL: 999 },
+      { ID: 3, CUSTOMER: 'Bob', TOTAL: 120 },
+    ]);
+
+    // Direct DLQ manager test for discardDlq()
+    const dlq = await createReplicationDlq(replica);
+    await dlq.enqueue({
+      subscriptionName: 'sub_orders',
+      entry: {
+        lsn: 99,
+        txid: 'tx-99',
+        origin: 'primary-1',
+        publication: 'pub_orders',
+        table: 'ORDERS',
+        operation: 'INSERT',
+        key: { ID: 99 },
+        after: { ID: 99, TOTAL: -1 },
+        before: null,
+        timestamp: Date.now(),
+      },
+      errorMessage: 'manual test error',
+    });
+    expect(await dlq.list('sub_orders')).toHaveLength(1);
+    const discarded = await sub.discardDlq!();
+    expect(discarded).toBe(1);
+    expect(await dlq.list('sub_orders')).toHaveLength(0);
+  });
+
+  it('masks PII and transforms rows on outbound publications and inbound subscriptions', async () => {
+    const primary = createMockReplDb();
+    const analyticsReplica = createMockReplDb();
+
+    const piiMasker = createPiiMaskingTransformer(
+      {
+        EMAIL: 'email-mask',
+        CARD_NUMBER: 'card-last4',
+        SSN: 'redact',
+        PHONE: 'hash-sha256',
+        SECRET_TOKEN: 'null',
+        INTERNAL_SCORE: (val) => Number(val ?? 0) * 10,
+      },
+      { salt: 'tenant-salt-2026' },
+    );
+
+    const pub = await createPublication(primary, {
+      name: 'pub_users',
+      nodeId: 'prod-primary',
+      tables: [{ table: 'CUSTOMERS', primaryKey: 'ID' }],
+      transformRow: piiMasker,
+    });
+
+    await pub.recordDml({
+      table: 'CUSTOMERS',
+      operation: 'INSERT',
+      after: {
+        ID: 1,
+        NAME: 'Jane Doe',
+        EMAIL: 'jane.doe@example.com',
+        CARD_NUMBER: '4111-2222-3333-4444',
+        SSN: '123-45-6789',
+        PHONE: '+1-555-0199',
+        SECRET_TOKEN: 'tok_live_secret',
+        INTERNAL_SCORE: 7,
+      },
+    });
+
+    const sub = await createSubscription(analyticsReplica, {
+      name: 'sub_analytics',
+      nodeId: 'analytics-replica',
+      publication: pub,
+      // Inbound enrichment transformer adds a derived column
+      transformRow(row) {
+        return { ...row, ANONYMIZED: 1 };
+      },
+    });
+
+    await sub.pull();
+
+    const rows = analyticsReplica.tables.get('CUSTOMERS') ?? [];
+    expect(rows).toHaveLength(1);
+    const synced = rows[0]!;
+    expect(synced.ID).toBe(1);
+    expect(synced.NAME).toBe('Jane Doe');
+    expect(synced.EMAIL).toBe('j***e@example.com');
+    expect(synced.CARD_NUMBER).toBe('************4444');
+    expect(synced.SSN).toBe('[REDACTED]');
+    expect(String(synced.PHONE)).toMatch(/^[0-9a-f]{64}$/);
+    expect(synced.SECRET_TOKEN).toBeNull();
+    expect(synced.INTERNAL_SCORE).toBe(70);
+    expect(synced.ANONYMIZED).toBe(1);
+  });
+
+  it('exports and applies encrypted PITR journal archives to restore a database to a target LSN', async () => {
+    const primary = createMockReplDb();
+    primary.tables.set('LEDGER', [
+      { ID: 1, ACCOUNT: 'Operating', BALANCE: 1000 },
+    ]);
+
+    const pub = await createPublication(primary, {
+      name: 'pub_ledger',
+      nodeId: 'ledger-primary',
+      tables: [{ table: 'LEDGER', primaryKey: 'ID' }],
+    });
+
+    // Record baseline for row 1, then 4 journaled mutations (LSNs 1..4)
+    await pub.captureTableChanges({ timestamp: 1000 }); // LSN 1: INSERT ID=1 (1000)
+
+    await primary.execute?.(
+      'INSERT INTO LEDGER (ID, ACCOUNT, BALANCE) VALUES (?, ?, ?)',
+      [2, 'Payroll', 500],
+    );
+    await pub.captureTableChanges({ timestamp: 2000 }); // LSN 2: INSERT ID=2 (500)
+
+    await primary.execute?.(
+      'UPDATE LEDGER SET BALANCE = ? WHERE ID = ?',
+      [850, 1],
+    );
+    await pub.captureTableChanges({ timestamp: 3000 }); // LSN 3: UPDATE ID=1 (850)
+
+    await primary.execute?.(
+      'UPDATE LEDGER SET BALANCE = ? WHERE ID = ?',
+      [0, 2],
+    );
+    await pub.captureTableChanges({ timestamp: 4000 }); // LSN 4: UPDATE ID=2 (0)
+
+    // Export an encrypted, Gzip-compressed multi-segment PITR archive (2 entries per segment)
+    const archive = await exportJournalArchive(pub, {
+      maxEntriesPerSegment: 2,
+      compress: true,
+      key: 'pitr-archive-passphrase',
+      aad: 'ledger-prod',
+      includeBaseSnapshot: false,
+    });
+
+    expect(archive.format).toBe('firebird-repl-archive-v1');
+    expect(archive.startLsn).toBe(1);
+    expect(archive.endLsn).toBe(4);
+    expect(archive.entryCount).toBe(4);
+    expect(archive.segments).toHaveLength(2);
+    expect(archive.segments[0]!.encrypted).toBe(true);
+    expect(archive.segments[0]!.compressed).toBe(true);
+
+    // Restore into a fresh disaster-recovery database stopping at PITR LSN 3 (before Payroll was zeroed out at LSN 4)
+    const restoredDb = createMockReplDb();
+    restoredDb.tables.set('LEDGER', []);
+
+    const restoreRes = await applyJournalArchive(restoredDb, archive, {
+      key: 'pitr-archive-passphrase',
+      aad: 'ledger-prod',
+      target: { lsn: 3 },
+    });
+
+    expect(restoreRes.segmentsDecoded).toBe(2);
+    expect(restoreRes.entriesApplied).toBe(3);
+    expect(restoreRes.restoredToLsn).toBe(3);
+
+    const restoredRows = [...(restoredDb.tables.get('LEDGER') ?? [])].sort(
+      (a, b) => Number(a.ID) - Number(b.ID),
+    );
+    expect(restoredRows).toEqual([
+      { ID: 1, ACCOUNT: 'Operating', BALANCE: 850 },
+      { ID: 2, ACCOUNT: 'Payroll', BALANCE: 500 },
+    ]);
   });
 });

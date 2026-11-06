@@ -56,6 +56,9 @@ export const DEFAULT_REPL_ORIGIN_CONTEXT_VAR = 'FB_REPL_ORIGIN';
 /** Default replication slot tracking table name on the primary. */
 export const DEFAULT_REPL_SLOTS_TABLE = 'FB_REPL_SLOTS$';
 
+/** Default dead-letter queue table name on replicas (`M14 Item 2`). */
+export const DEFAULT_REPL_DLQ_TABLE = 'FB_REPL_DLQ$';
+
 /** Default replication slot TTL in milliseconds (7 days). */
 export const DEFAULT_REPL_SLOT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -254,6 +257,11 @@ export interface PublishedTableConfig {
    * ordering when replaying multi-table transactions (`txid`).
    */
   references?: readonly string[];
+  /**
+   * Optional outbound row transformation / PII masking callback applied before
+   * rows are emitted from this published table (`M14 Item 3`).
+   */
+  transformRow?: RowTransformer;
 }
 
 /** Options for {@link buildReplicationTriggerDdl}. */
@@ -462,6 +470,7 @@ export interface NormalizedPublishedTableConfig {
   readonly excludeColumns?: readonly string[];
   readonly where?: string | ((row: Record<string, unknown>) => boolean);
   readonly references?: readonly string[];
+  readonly transformRow?: RowTransformer;
 }
 
 /** Options for {@link createPublication}. */
@@ -499,6 +508,10 @@ export interface CreatePublicationOptions {
    * When omitted, an internal `createHlc(nodeId)` instance is used automatically.
    */
   hlc?: HybridLogicalClock;
+  /**
+   * Optional publication-wide outbound row transformer / PII masking function (`M14 Item 3`).
+   */
+  transformRow?: RowTransformer;
 }
 
 /** A logical replication publication on a source database. */
@@ -704,6 +717,33 @@ export interface CreateSubscriptionOptions {
    * applied on this replica.
    */
   onRowApplied?: (entry: ReplicationLogEntry) => void | Promise<void>;
+  /**
+   * Optional inbound row transformation / PII masking pipeline applied on the
+   * replica before writing incoming rows (`M14 Item 3`).
+   */
+  transformRow?: RowTransformer;
+  /**
+   * Optional entry validator invoked before applying a DML entry on the replica.
+   * Returning `false` or throwing an `Error` rejects the entry (`M14 Item 2`).
+   */
+  validateEntry?: (entry: ReplicationLogEntry) => boolean | void | Promise<boolean | void>;
+  /**
+   * Error handling policy when applying an entry fails or `validateEntry` rejects:
+   * - `'throw'` (default): abort the batch with the error.
+   * - `'dlq'`: quarantine the failed entry in `FB_REPL_DLQ$` and continue applying subsequent entries.
+   * - `'skip'`: skip the failed entry without recording in `FB_REPL_DLQ$`.
+   * - Custom callback `(entry, error) => 'dlq' | 'skip' | 'throw'`.
+   */
+  onApplyError?:
+    | 'throw'
+    | 'dlq'
+    | 'skip'
+    | ((
+        entry: ReplicationLogEntry,
+        error: Error,
+      ) => 'dlq' | 'skip' | 'throw' | Promise<'dlq' | 'skip' | 'throw'>);
+  /** Custom dead-letter queue table name. @default 'FB_REPL_DLQ$' */
+  dlqTable?: string;
 }
 
 /**
@@ -759,6 +799,8 @@ export interface SubscriptionPullResult {
   readonly appliedCount: number;
   /** Number of conflicting entries encountered and resolved. */
   readonly conflictCount: number;
+  /** Number of poison entries quarantined in `FB_REPL_DLQ$` during this cycle (`M14 Item 2`). */
+  readonly dlqCount?: number;
   /** Watermark LSN before this pull cycle. */
   readonly previousLsn: number;
   /** New watermark LSN persisted in `FB_REPL_WATERMARKS$`. */
@@ -787,6 +829,15 @@ export interface ReplicationSubscription {
   pull(): Promise<SubscriptionPullResult>;
   /** Apply an explicit batch of `ReplicationLogEntry` items and advance the watermark. */
   applyChanges(entries: readonly ReplicationLogEntry[]): Promise<SubscriptionPullResult>;
+  /** List quarantined poison entries in `FB_REPL_DLQ$` for this subscription (`M14 Item 2`). */
+  listDlq(): Promise<ReplicationDlqEntry[]>;
+  /** Retry quarantined entries from `FB_REPL_DLQ$` (`M14 Item 2`). */
+  retryDlq(options?: {
+    lsn?: number;
+    transformEntry?: (entry: ReplicationLogEntry) => ReplicationLogEntry | Promise<ReplicationLogEntry>;
+  }): Promise<{ retried: number; succeeded: number; failed: number }>;
+  /** Discard quarantined entries from `FB_REPL_DLQ$` (`M14 Item 2`). */
+  discardDlq(lsn?: number): Promise<number>;
   /** Start continuous background polling / event-driven replication. */
   start(): void;
   /** Stop background polling. */
@@ -2220,6 +2271,7 @@ export async function createPublication(
         ...(excludeColumns ? { excludeColumns } : {}),
         ...(item.where ? { where: item.where } : {}),
         ...(references ? { references } : {}),
+        ...(item.transformRow ? { transformRow: item.transformRow } : {}),
       });
     }
   };
@@ -2934,6 +2986,45 @@ export async function createPublication(
 
           after = projectReplicatedRow(after, cfg.primaryKey, cfg.columns, cfg.excludeColumns);
           before = projectReplicatedRow(before, cfg.primaryKey, cfg.columns, cfg.excludeColumns);
+
+          const rowTx = cfg.transformRow ?? options.transformRow;
+          if (rowTx && op !== 'DELETE') {
+            if (after) {
+              after = await rowTx(after, {
+                table: tableUpper,
+                operation: op,
+                key,
+                origin,
+              });
+              if (!after) continue;
+            }
+            if (before) {
+              before = await rowTx(before, {
+                table: tableUpper,
+                operation: op,
+                key,
+                origin,
+              });
+            }
+          }
+        } else if (options.transformRow && op !== 'DDL' && op !== 'DELETE') {
+          if (after) {
+            after = await options.transformRow(after, {
+              table: tableUpper,
+              operation: op,
+              key,
+              origin,
+            });
+            if (!after) continue;
+          }
+          if (before) {
+            before = await options.transformRow(before, {
+              table: tableUpper,
+              operation: op,
+              key,
+              origin,
+            });
+          }
         }
 
         const lsnNum = Number(row.LSN ?? row.lsn ?? 0);
@@ -3307,6 +3398,11 @@ export async function createSubscription(
     )`,
   );
 
+  const dlqManager = await createReplicationDlq(targetDb, {
+    subscriptionName: subName,
+    dlqTable: options.dlqTable ?? DEFAULT_REPL_DLQ_TABLE,
+  });
+
   let cachedWatermark: number | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
   let isSyncing = false;
@@ -3392,6 +3488,7 @@ export async function createSubscription(
 
     let appliedCount = 0;
     let conflictCount = 0;
+    let dlqCount = 0;
     let highestLsn = previousLsn;
 
     // Fetch any local journal entries if a bidirectional `localPublication` is attached
@@ -3472,6 +3569,53 @@ export async function createSubscription(
             ? Object.keys(entry.key).map((k) => k.toUpperCase())
             : ['ID'];
         const normKey = normalizeRowKeysUpper(entry.key);
+
+        let effectiveEntry = entry;
+        if (options.transformRow && entry.operation !== 'DELETE' && entry.after) {
+          const transformedAfter = await options.transformRow(entry.after, {
+            table: tableUpper,
+            operation: entry.operation,
+            key: normKey,
+            origin: entry.origin,
+          });
+          if (!transformedAfter) {
+            continue;
+          }
+          effectiveEntry = { ...entry, after: transformedAfter };
+        }
+
+        const handleEntryFailure = async (err: unknown): Promise<boolean> => {
+          const errorObj = err instanceof Error ? err : new Error(String(err));
+          const policy = options.onApplyError ?? 'throw';
+          const action =
+            typeof policy === 'function'
+              ? await policy(effectiveEntry, errorObj)
+              : policy;
+          if (action === 'dlq') {
+            await dlqManager.recordFailure(effectiveEntry, errorObj, subName);
+            dlqCount++;
+            return true;
+          }
+          if (action === 'skip') {
+            return true;
+          }
+          throw errorObj;
+        };
+
+        if (options.validateEntry) {
+          try {
+            const valid = await options.validateEntry(effectiveEntry);
+            if (valid === false) {
+              throw new Error(
+                `Replication entry LSN ${effectiveEntry.lsn} on ${tableUpper} rejected by validateEntry`,
+              );
+            }
+          } catch (err) {
+            const handled = await handleEntryFailure(err);
+            if (handled) continue;
+          }
+        }
+
         const whereClause = pkCols.map((c) => `${quoteIdent(c)} = ?`).join(' AND ');
         const whereParams = pkCols.map((c) => normKey[c]) as QueryParams;
 
@@ -3490,73 +3634,90 @@ export async function createSubscription(
         const localEntry = localEntriesByKey.get(lookupKey) ?? null;
 
         let isConflict = false;
-        if (entry.operation === 'INSERT' && localRow && entry.after && !rowsEqual(localRow, entry.after)) {
-          isConflict = true;
-        } else if (
-          (entry.operation === 'UPDATE' || entry.operation === 'DELETE') &&
-          entry.before &&
+        if (
+          effectiveEntry.operation === 'INSERT' &&
           localRow &&
-          !rowsEqual(localRow, entry.before)
+          effectiveEntry.after &&
+          !rowsEqual(localRow, effectiveEntry.after)
         ) {
           isConflict = true;
-        } else if (localEntry && localEntry.timestamp >= entry.timestamp) {
+        } else if (
+          (effectiveEntry.operation === 'UPDATE' || effectiveEntry.operation === 'DELETE') &&
+          effectiveEntry.before &&
+          localRow &&
+          !rowsEqual(localRow, effectiveEntry.before)
+        ) {
+          isConflict = true;
+        } else if (localEntry && localEntry.timestamp >= effectiveEntry.timestamp) {
           isConflict = true;
         }
 
-        if (isConflict) {
-          conflictCount++;
-          const ctx: ReplicationConflictContext = {
-            incoming: entry,
-            localRow,
-            localEntry,
-          };
-          const decision = await evaluateConflictResolution(conflictStrategy, ctx);
-          options.onConflictResolved?.(ctx, decision.outcome);
+        try {
+          if (isConflict) {
+            conflictCount++;
+            const ctx: ReplicationConflictContext = {
+              incoming: effectiveEntry,
+              localRow,
+              localEntry,
+            };
+            const decision = await evaluateConflictResolution(conflictStrategy, ctx);
+            options.onConflictResolved?.(ctx, decision.outcome);
 
-          if (decision.outcome === 'local-wins') {
-            continue;
+            if (decision.outcome === 'local-wins') {
+              continue;
+            }
+            if (decision.outcome === 'merge' && decision.mergedRow) {
+              await applyRowMutationToTable(
+                runner,
+                tableUpper,
+                pkCols,
+                'UPDATE',
+                normKey,
+                decision.mergedRow,
+              );
+              syncLocalMirror(tableUpper, 'UPDATE', normKey, decision.mergedRow);
+              await notifyIndexHooks(
+                tableUpper,
+                'UPDATE',
+                normKey,
+                decision.mergedRow,
+                effectiveEntry.before,
+                { ...effectiveEntry, operation: 'UPDATE', after: decision.mergedRow },
+              );
+              appliedCount++;
+              continue;
+            }
           }
-          if (decision.outcome === 'merge' && decision.mergedRow) {
-            await applyRowMutationToTable(
-              runner,
-              tableUpper,
-              pkCols,
-              'UPDATE',
-              normKey,
-              decision.mergedRow,
-            );
-            syncLocalMirror(tableUpper, 'UPDATE', normKey, decision.mergedRow);
-            await notifyIndexHooks(
-              tableUpper,
-              'UPDATE',
-              normKey,
-              decision.mergedRow,
-              entry.before,
-              { ...entry, operation: 'UPDATE', after: decision.mergedRow },
-            );
-            appliedCount++;
-            continue;
-          }
+
+          const dmlOp = effectiveEntry.operation as 'INSERT' | 'UPDATE' | 'DELETE';
+          await applyRowMutationToTable(
+            runner,
+            tableUpper,
+            pkCols,
+            dmlOp,
+            normKey,
+            effectiveEntry.after,
+          );
+          syncLocalMirror(
+            tableUpper,
+            dmlOp,
+            normKey,
+            effectiveEntry.after,
+          );
+          await notifyIndexHooks(
+            tableUpper,
+            dmlOp,
+            normKey,
+            effectiveEntry.after
+              ? normalizeRowKeysUpper({ ...effectiveEntry.after, ...normKey })
+              : null,
+            effectiveEntry.before,
+            effectiveEntry,
+          );
+          appliedCount++;
+        } catch (err) {
+          await handleEntryFailure(err);
         }
-
-        await applyRowMutationToTable(
-          runner,
-          tableUpper,
-          pkCols,
-          entry.operation,
-          normKey,
-          entry.after,
-        );
-        syncLocalMirror(tableUpper, entry.operation, normKey, entry.after);
-        await notifyIndexHooks(
-          tableUpper,
-          entry.operation,
-          normKey,
-          entry.after ? normalizeRowKeysUpper({ ...entry.after, ...normKey }) : null,
-          entry.before,
-          entry,
-        );
-        appliedCount++;
       }
     };
 
@@ -3618,6 +3779,7 @@ export async function createSubscription(
       fetchedCount: entries.length,
       appliedCount,
       conflictCount,
+      ...(dlqCount > 0 ? { dlqCount } : {}),
       previousLsn,
       currentLsn: highestLsn,
     };
@@ -3646,6 +3808,9 @@ export async function createSubscription(
       if (!fullPub) return null;
       return fullPub.heartbeatSlot(slotName, hbOpts);
     },
+    listDlq: () => dlqManager.listEntries(subName),
+    retryDlq: (retryOpts) => dlqManager.retryDlq(subscriptionObj, retryOpts),
+    discardDlq: (lsn) => dlqManager.discardDlq(lsn, subName),
     async stats(): Promise<ReplicationStats> {
       const replicaWatermark = await getWatermark();
       const primaryLsn = fullPub ? await fullPub.currentLsn() : replicaWatermark;
@@ -5805,5 +5970,1037 @@ export async function rewindToLsn(
     entriesUndone,
     journalEntriesRemoved,
     tablesAffected: [...affectedSet],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 9. Multi-Node Mesh & Hub-and-Spoke Replication Coordinator (`createReplicationMesh` / `createReplicationHub`) (M14 Item 1)
+// ---------------------------------------------------------------------------
+
+/** Node configuration within a multi-node replication mesh or hub-and-spoke cluster. */
+export interface ReplicationMeshNodeConfig {
+  /** Unique node identifier (e.g. `'hub'`, `'edge-eu'`, `'browser-tab-1'`). */
+  nodeId: string;
+  /** Database instance for this node. */
+  db: ReplicableDatabase;
+  /** Optional node role (`'hub'`, `'spoke'`, or `'peer'`). */
+  role?: 'hub' | 'spoke' | 'peer';
+  /** Optional per-node published table override. */
+  tables?: '*' | ReadonlyArray<string | PublishedTableConfig>;
+  /** Optional outbound row transformer for this node's publication. */
+  transformRow?: RowTransformer;
+}
+
+/** Options for {@link createReplicationMesh} and {@link createReplicationHub}. */
+export interface CreateReplicationMeshOptions {
+  /** Participating database nodes ($N \ge 2$). */
+  nodes: readonly ReplicationMeshNodeConfig[];
+  /**
+   * Cluster topology:
+   * - `'mesh'`: every node subscribes to every other node directly ($N(N-1)$ links).
+   * - `'hub-and-spoke'`: spoke nodes sync bidirectionally through a central hub node with transitive origin forwarding.
+   *
+   * @default 'mesh'
+   */
+  topology?: 'mesh' | 'hub-and-spoke';
+  /** Explicit hub node ID when `topology === 'hub-and-spoke'`. Defaults to the node with `role: 'hub'` or `nodes[0].nodeId`. */
+  hubNodeId?: string;
+  /** Default tables published across all nodes unless overridden per node. @default '*' */
+  tables?: '*' | ReadonlyArray<string | PublishedTableConfig>;
+  /** Conflict resolution strategy across mesh links. @default 'last-write-wins' */
+  onConflict?: ReplicationConflictStrategy;
+  /** Callback invoked when a conflict is detected and resolved on any mesh link. */
+  onConflictResolved?: (
+    ctx: ReplicationConflictContext,
+    resolution: 'remote-wins' | 'local-wins' | 'merge',
+  ) => void;
+  /**
+   * Default quorum count of peer slots that must acknowledge an LSN before
+   * `pruneQuorum()` deletes journal entries on a publishing node.
+   */
+  quorumSize?: number;
+  /** Background polling interval in milliseconds when `start()` is called. @default 1000 */
+  pollIntervalMs?: number;
+}
+
+/** Result of a full `mesh.sync()` convergence pass. */
+export interface ReplicationMeshSyncResult {
+  /** Number of sync rounds executed (1 for `'mesh'`, 2 for `'hub-and-spoke'` spoke->hub->spoke fanout). */
+  readonly rounds: number;
+  /** Total journal entries fetched across all directed links. */
+  readonly totalFetched: number;
+  /** Total journal entries applied across all directed links. */
+  readonly totalApplied: number;
+  /** Total conflicts resolved across all directed links. */
+  readonly totalConflicts: number;
+  /** Watermark matrix: `watermarks[subscriberNodeId][publisherNodeId] = lastAppliedLsn`. */
+  readonly watermarks: Readonly<Record<string, Readonly<Record<string, number>>>>;
+  /** Latest formatted HLC timestamp string on each node (`hlcState[nodeId]`). */
+  readonly hlcState: Readonly<Record<string, string>>;
+}
+
+/** Multi-node replication mesh or hub-and-spoke coordinator returned by {@link createReplicationMesh}. */
+export interface ReplicationMesh {
+  /** Active topology (`'mesh'` or `'hub-and-spoke'`). */
+  readonly topology: 'mesh' | 'hub-and-spoke';
+  /** Hub node ID when `topology === 'hub-and-spoke'`, or `null`. */
+  readonly hubNodeId: string | null;
+  /** Publications keyed by `nodeId`. */
+  readonly publications: ReadonlyMap<string, ReplicationPublication>;
+  /** Directed subscriptions keyed by `${subscriberNodeId}<-${publisherNodeId}`. */
+  readonly subscriptions: ReadonlyMap<string, ReplicationSubscription>;
+  /** Capture table changes on all nodes and converge changes across the cluster. */
+  sync(): Promise<ReplicationMeshSyncResult>;
+  /**
+   * Prune journal entries on each publishing node that have been acknowledged by
+   * at least `quorumSize` peer slots (`M14 Item 1`).
+   */
+  pruneQuorum(options?: {
+    quorumSize?: number;
+  }): Promise<Readonly<Record<string, number>>>;
+  /** Return the current watermark matrix `watermarks[subscriberNodeId][publisherNodeId]`. */
+  watermarkMatrix(): Promise<
+    Readonly<Record<string, Readonly<Record<string, number>>>>
+  >;
+  /** Start background polling on all subscriptions. */
+  start(): void;
+  /** Stop background polling on all subscriptions. */
+  stop(): Promise<void>;
+}
+
+/**
+ * Create a multi-node replication coordinator (`M14 Item 1`) supporting
+ * full `'mesh'` ($N \times (N-1)$ peer links) and `'hub-and-spoke'` (1 hub $\leftrightarrow$ $N$ spokes
+ * with transitive change forwarding, HLC watermark matrices, and quorum pruning).
+ */
+export async function createReplicationMesh(
+  options: CreateReplicationMeshOptions,
+): Promise<ReplicationMesh> {
+  if (options.nodes.length < 2) {
+    throw new Error('createReplicationMesh requires at least 2 nodes');
+  }
+  const topology = options.topology ?? 'mesh';
+  const defaultTables = options.tables ?? '*';
+  const conflictStrategy = options.onConflict ?? 'last-write-wins';
+  const pollIntervalMs = options.pollIntervalMs ?? 1000;
+
+  const hubNode =
+    topology === 'hub-and-spoke'
+      ? (options.nodes.find((n) => n.nodeId === options.hubNodeId) ??
+        options.nodes.find((n) => n.role === 'hub') ??
+        options.nodes[0]!)
+      : null;
+  const hubNodeId = hubNode ? hubNode.nodeId : null;
+
+  const publications = new Map<string, ReplicationPublication>();
+  for (const nodeCfg of options.nodes) {
+    const pub = await createPublication(nodeCfg.db, {
+      name: `pub_${nodeCfg.nodeId}`,
+      nodeId: nodeCfg.nodeId,
+      tables: nodeCfg.tables ?? defaultTables,
+      transformRow: nodeCfg.transformRow,
+    });
+    publications.set(nodeCfg.nodeId, pub);
+  }
+
+  const subscriptions = new Map<string, ReplicationSubscription>();
+  const spokeToHubSubs: ReplicationSubscription[] = [];
+  const hubToSpokeSubs: ReplicationSubscription[] = [];
+
+  for (const targetNode of options.nodes) {
+    for (const sourceNode of options.nodes) {
+      if (targetNode.nodeId === sourceNode.nodeId) continue;
+
+      if (topology === 'hub-and-spoke') {
+        const isSpokeToHub =
+          targetNode.nodeId === hubNodeId && sourceNode.nodeId !== hubNodeId;
+        const isHubToSpoke =
+          sourceNode.nodeId === hubNodeId && targetNode.nodeId !== hubNodeId;
+        if (!isSpokeToHub && !isHubToSpoke) {
+          continue;
+        }
+      }
+
+      const sourcePub = publications.get(sourceNode.nodeId)!;
+      const targetPub = publications.get(targetNode.nodeId)!;
+      const linkKey = `${targetNode.nodeId}<-${sourceNode.nodeId}`;
+
+      const sub = await createSubscription(targetNode.db, {
+        name: `sub_${targetNode.nodeId}_from_${sourceNode.nodeId}`,
+        nodeId: targetNode.nodeId,
+        slotName: `slot_${targetNode.nodeId}_on_${sourceNode.nodeId}`,
+        publication: sourcePub,
+        localPublication: targetPub,
+        hlc: targetPub.hlc,
+        onConflict: conflictStrategy,
+        onConflictResolved: options.onConflictResolved,
+        pollIntervalMs,
+        // In hub-and-spoke mode, when Hub applies a row from Spoke A, forward it
+        // into Hub's own journal (preserving Spoke A's origin) so Spoke B..N receive it!
+        onRowApplied:
+          topology === 'hub-and-spoke' && targetNode.nodeId === hubNodeId
+            ? async (appliedEntry) => {
+                if (appliedEntry.operation === 'DDL' && appliedEntry.ddlSql) {
+                  await targetPub.recordDdl(appliedEntry.ddlSql, {
+                    txid: appliedEntry.txid,
+                    origin: appliedEntry.origin,
+                    timestamp: appliedEntry.timestamp,
+                  });
+                } else if (appliedEntry.operation !== 'DDL') {
+                  await targetPub.recordDml({
+                    table: appliedEntry.table,
+                    operation: appliedEntry.operation,
+                    key: appliedEntry.key,
+                    after: appliedEntry.after,
+                    before: appliedEntry.before,
+                    txid: appliedEntry.txid,
+                    origin: appliedEntry.origin,
+                    timestamp: appliedEntry.timestamp,
+                  });
+                }
+              }
+            : undefined,
+      });
+
+      subscriptions.set(linkKey, sub);
+      if (topology === 'hub-and-spoke') {
+        if (targetNode.nodeId === hubNodeId) {
+          spokeToHubSubs.push(sub);
+        } else {
+          hubToSpokeSubs.push(sub);
+        }
+      }
+    }
+  }
+
+  const watermarkMatrix = async (): Promise<
+    Readonly<Record<string, Readonly<Record<string, number>>>>
+  > => {
+    const matrix: Record<string, Record<string, number>> = {};
+    for (const n of options.nodes) {
+      matrix[n.nodeId] = {};
+    }
+    for (const [linkKey, sub] of subscriptions.entries()) {
+      const [subId, pubId] = linkKey.split('<-');
+      if (subId && pubId) {
+        matrix[subId]![pubId] = await sub.getWatermark();
+      }
+    }
+    return matrix;
+  };
+
+  return {
+    topology,
+    hubNodeId,
+    publications,
+    subscriptions,
+
+    async sync(): Promise<ReplicationMeshSyncResult> {
+      for (const pub of publications.values()) {
+        await pub.captureTableChanges();
+      }
+
+      let totalFetched = 0;
+      let totalApplied = 0;
+      let totalConflicts = 0;
+      let rounds = 1;
+
+      if (topology === 'hub-and-spoke') {
+        rounds = 2;
+        // Round 1: Hub pulls from all Spokes (and forwards their entries into Hub's journal)
+        for (const sub of spokeToHubSubs) {
+          const r = await sub.pull();
+          totalFetched += r.fetchedCount;
+          totalApplied += r.appliedCount;
+          totalConflicts += r.conflictCount;
+        }
+        // Also capture any direct SQL writes on Hub
+        const hubPub = hubNodeId ? publications.get(hubNodeId) : undefined;
+        if (hubPub) {
+          await hubPub.captureTableChanges();
+        }
+        // Round 2: All Spokes pull from Hub
+        for (const sub of hubToSpokeSubs) {
+          const r = await sub.pull();
+          totalFetched += r.fetchedCount;
+          totalApplied += r.appliedCount;
+          totalConflicts += r.conflictCount;
+        }
+      } else {
+        for (const sub of subscriptions.values()) {
+          const r = await sub.pull();
+          totalFetched += r.fetchedCount;
+          totalApplied += r.appliedCount;
+          totalConflicts += r.conflictCount;
+        }
+      }
+
+      // Advance slot watermarks past any tail entries that originated on the subscriber itself
+      for (const [linkKey, sub] of subscriptions.entries()) {
+        const [, pubId] = linkKey.split('<-');
+        const sourcePub = pubId ? publications.get(pubId) : undefined;
+        if (!sourcePub) continue;
+        const wmk = await sub.getWatermark();
+        const headLsn = await sourcePub.currentLsn();
+        if (headLsn > wmk) {
+          const remaining = await sourcePub.fetchChangesSince(wmk, {
+            limit: 1,
+            excludeOrigin: sub.nodeId,
+          });
+          if (remaining.length === 0) {
+            await sub.setWatermark(headLsn);
+            await sourcePub.advanceSlot(sub.slotName, headLsn, {
+              nodeId: sub.nodeId,
+            });
+          }
+        }
+      }
+
+      const watermarks = await watermarkMatrix();
+      const hlcState: Record<string, string> = {};
+      for (const [nId, pub] of publications.entries()) {
+        hlcState[nId] = formatHlc(pub.hlc.last());
+      }
+
+      return {
+        rounds,
+        totalFetched,
+        totalApplied,
+        totalConflicts,
+        watermarks,
+        hlcState,
+      };
+    },
+
+    async pruneQuorum(pruneOpts = {}): Promise<Readonly<Record<string, number>>> {
+      const prunedByNode: Record<string, number> = {};
+      for (const [nId, pub] of publications.entries()) {
+        const slots = await pub.listSlots();
+        if (slots.length === 0) {
+          prunedByNode[nId] = 0;
+          continue;
+        }
+        const qSize = Math.max(
+          1,
+          Math.min(
+            slots.length,
+            pruneOpts.quorumSize ?? options.quorumSize ?? slots.length,
+          ),
+        );
+        // Sort slot confirmedFlushLsn descending; the (qSize - 1) index is the highest LSN
+        // acknowledged by at least `qSize` subscribers.
+        const sortedDesc = slots
+          .map((s) => s.confirmedFlushLsn)
+          .sort((a, b) => b - a);
+        const quorumLsn = sortedDesc[qSize - 1] ?? 0;
+        prunedByNode[nId] =
+          quorumLsn > 0 ? await pub.pruneJournal(quorumLsn) : 0;
+      }
+      return prunedByNode;
+    },
+
+    watermarkMatrix,
+
+    start() {
+      for (const sub of subscriptions.values()) {
+        sub.start();
+      }
+    },
+
+    async stop() {
+      for (const sub of subscriptions.values()) {
+        await sub.stop();
+      }
+    },
+  };
+}
+
+/**
+ * Convenience helper to create a `'hub-and-spoke'` replication coordinator (`M14 Item 1`).
+ */
+export async function createReplicationHub(
+  options: Omit<CreateReplicationMeshOptions, 'topology'>,
+): Promise<ReplicationMesh> {
+  return createReplicationMesh({ ...options, topology: 'hub-and-spoke' });
+}
+
+// ---------------------------------------------------------------------------
+// 10. Dead-Letter Queue (`FB_REPL_DLQ$`) & Quarantine / Retry Policy (M14 Item 2)
+// ---------------------------------------------------------------------------
+
+/** A quarantined replication journal entry stored in `FB_REPL_DLQ$`. */
+export interface ReplicationDlqEntry {
+  /** Journal LSN of the quarantined entry. */
+  readonly lsn: number;
+  /** Subscription name that encountered the failure. */
+  readonly subscriptionName: string;
+  /** Original `ReplicationLogEntry` payload. */
+  readonly entry: ReplicationLogEntry;
+  /** Error message explaining why the entry was quarantined. */
+  readonly errorMessage: string;
+  /** Number of retry attempts made so far (`0` on initial failure). */
+  readonly retryCount: number;
+  /** Total apply attempts made so far (`1` on initial failure, `retryCount + 1`). */
+  readonly attempts: number;
+  /** Epoch timestamp (`Date.now()`) when the entry was first quarantined. */
+  readonly quarantinedAt: number;
+  /** Epoch timestamp (`Date.now()`) of the most recent retry attempt, or `null`. */
+  readonly lastRetriedAt: number | null;
+}
+
+/** Options for {@link createReplicationDlq}. */
+export interface ReplicationDlqOptions {
+  /** Default subscription name. @default 'default_sub' */
+  subscriptionName?: string;
+  /** Custom dead-letter queue table name. @default 'FB_REPL_DLQ$' */
+  dlqTable?: string;
+}
+
+/** Dead-Letter Queue manager returned by {@link createReplicationDlq}. */
+export interface ReplicationDlq {
+  /** Record a failed `ReplicationLogEntry` into `FB_REPL_DLQ$`. */
+  recordFailure(
+    entry: ReplicationLogEntry,
+    error: unknown,
+    subscriptionName?: string,
+  ): Promise<ReplicationDlqEntry>;
+  /** Enqueue a failed `ReplicationLogEntry` into `FB_REPL_DLQ$`. */
+  enqueue(input: {
+    subscriptionName?: string;
+    entry: ReplicationLogEntry;
+    errorMessage: string;
+  }): Promise<ReplicationDlqEntry>;
+  /** List all quarantined entries (optionally filtered by `subscriptionName`). */
+  listEntries(subscriptionName?: string): Promise<ReplicationDlqEntry[]>;
+  /** Alias for {@link listEntries}. */
+  list(subscriptionName?: string): Promise<ReplicationDlqEntry[]>;
+  /**
+   * Retry applying quarantined entries through `subscription.applyChanges()`,
+   * removing entries that succeed and incrementing `RETRY_COUNT` on entries that fail.
+   */
+  retryDlq(
+    subscription: ReplicationSubscription,
+    options?: {
+      lsn?: number;
+      transformEntry?: (
+        entry: ReplicationLogEntry,
+      ) => ReplicationLogEntry | Promise<ReplicationLogEntry>;
+    },
+  ): Promise<{ retried: number; succeeded: number; failed: number }>;
+  /** Discard quarantined entry/entries from `FB_REPL_DLQ$`. */
+  discardDlq(lsn?: number, subscriptionName?: string): Promise<number>;
+}
+
+/**
+ * Provision and manage a Dead-Letter Queue (`FB_REPL_DLQ$`) for poison replication
+ * journal entries (`M14 Item 2`).
+ */
+export async function createReplicationDlq(
+  db: ReplicableDatabase,
+  options: ReplicationDlqOptions = {},
+): Promise<ReplicationDlq> {
+  const defaultSubName = (options.subscriptionName ?? 'default_sub').trim();
+  const dlqTable = quoteIdent(options.dlqTable ?? DEFAULT_REPL_DLQ_TABLE);
+
+  await ensureTableSafe(
+    db,
+    `CREATE TABLE ${dlqTable} (
+      LSN BIGINT NOT NULL PRIMARY KEY,
+      SUB_NAME VARCHAR(128) NOT NULL,
+      ENTRY_JSON VARCHAR(8191) NOT NULL,
+      ERROR_MSG VARCHAR(2000) NOT NULL,
+      RETRY_COUNT INTEGER NOT NULL,
+      QUARANTINED_AT BIGINT NOT NULL,
+      LAST_RETRIED_AT BIGINT
+    )`,
+  );
+
+  const rowToDlqEntry = (r: Row): ReplicationDlqEntry => {
+    const rawJson = String(r.ENTRY_JSON ?? r.entry_json ?? '{}');
+    const parsedEntry = JSON.parse(rawJson) as ReplicationLogEntry;
+    const lastRetriedRaw = r.LAST_RETRIED_AT ?? r.last_retried_at;
+    const retryCount = Number(r.RETRY_COUNT ?? r.retry_count ?? 0);
+    return {
+      lsn: Number(r.LSN ?? r.lsn ?? 0),
+      subscriptionName: String(r.SUB_NAME ?? r.sub_name ?? defaultSubName),
+      entry: parsedEntry,
+      errorMessage: String(r.ERROR_MSG ?? r.error_msg ?? ''),
+      retryCount,
+      attempts: retryCount + 1,
+      quarantinedAt: Number(r.QUARANTINED_AT ?? r.quarantined_at ?? 0),
+      lastRetriedAt:
+        lastRetriedRaw !== null && lastRetriedRaw !== undefined
+          ? Number(lastRetriedRaw)
+          : null,
+    };
+  };
+
+  const recordFailure = async (
+    entry: ReplicationLogEntry,
+    error: unknown,
+    subscriptionName = defaultSubName,
+  ): Promise<ReplicationDlqEntry> => {
+    const errMsg =
+      error instanceof Error ? error.message : String(error ?? 'Unknown error');
+    const now = Date.now();
+    const entryJson = JSON.stringify(entry);
+
+    const existing = await db.query<Row>(
+      `SELECT * FROM ${dlqTable} WHERE LSN = ?`,
+      [entry.lsn],
+    );
+    if (existing.rows.length > 0) {
+      const prev = rowToDlqEntry(existing.rows[0]!);
+      const nextRetry = prev.retryCount + 1;
+      await execStatement(
+        db,
+        `UPDATE ${dlqTable} SET ERROR_MSG = ?, RETRY_COUNT = ?, LAST_RETRIED_AT = ? WHERE LSN = ?`,
+        [errMsg, nextRetry, now, entry.lsn],
+      );
+      return {
+        ...prev,
+        errorMessage: errMsg,
+        retryCount: nextRetry,
+        attempts: nextRetry + 1,
+        lastRetriedAt: now,
+      };
+    }
+
+    await execStatement(
+      db,
+      `INSERT INTO ${dlqTable} (LSN, SUB_NAME, ENTRY_JSON, ERROR_MSG, RETRY_COUNT, QUARANTINED_AT, LAST_RETRIED_AT) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [entry.lsn, subscriptionName, entryJson, errMsg, 0, now, null],
+    );
+    return {
+      lsn: entry.lsn,
+      subscriptionName,
+      entry,
+      errorMessage: errMsg,
+      retryCount: 0,
+      attempts: 1,
+      quarantinedAt: now,
+      lastRetriedAt: null,
+    };
+  };
+
+  const listEntries = async (
+    subscriptionName?: string,
+  ): Promise<ReplicationDlqEntry[]> => {
+    const res = await db.query<Row>(`SELECT * FROM ${dlqTable}`);
+    const items = res.rows.map(rowToDlqEntry);
+    const filtered = subscriptionName
+      ? items.filter((i) => i.subscriptionName === subscriptionName)
+      : items;
+    return filtered.sort((a, b) => a.lsn - b.lsn);
+  };
+
+  return {
+    recordFailure,
+
+    async enqueue(input) {
+      return recordFailure(
+        input.entry,
+        input.errorMessage,
+        input.subscriptionName ?? defaultSubName,
+      );
+    },
+
+    listEntries,
+
+    async list(subscriptionName?: string): Promise<ReplicationDlqEntry[]> {
+      return listEntries(subscriptionName);
+    },
+
+    async retryDlq(
+      subscription: ReplicationSubscription,
+      retryOpts = {},
+    ): Promise<{ retried: number; succeeded: number; failed: number }> {
+      const all = await listEntries(subscription.name);
+      const candidates =
+        retryOpts.lsn !== undefined
+          ? all.filter((e) => e.lsn === retryOpts.lsn)
+          : all;
+
+      let retried = 0;
+      let succeeded = 0;
+      let failed = 0;
+
+      for (const item of candidates) {
+        retried++;
+        const candidateEntry = retryOpts.transformEntry
+          ? await retryOpts.transformEntry(item.entry)
+          : item.entry;
+        try {
+          const res = await subscription.applyChanges([candidateEntry]);
+          if (res.appliedCount > 0 && !res.dlqCount) {
+            await execStatement(db, `DELETE FROM ${dlqTable} WHERE LSN = ?`, [
+              item.lsn,
+            ]);
+            succeeded++;
+          } else {
+            failed++;
+          }
+        } catch (err) {
+          await recordFailure(candidateEntry, err, subscription.name);
+          failed++;
+        }
+      }
+
+      return { retried, succeeded, failed };
+    },
+
+    async discardDlq(lsn?: number, subscriptionName?: string): Promise<number> {
+      const current = await listEntries(subscriptionName);
+      if (lsn !== undefined) {
+        const exists = current.some((i) => i.lsn === lsn);
+        if (!exists) return 0;
+        await execStatement(db, `DELETE FROM ${dlqTable} WHERE LSN = ?`, [lsn]);
+        return 1;
+      }
+      for (const item of current) {
+        await execStatement(db, `DELETE FROM ${dlqTable} WHERE LSN = ?`, [
+          item.lsn,
+        ]);
+      }
+      return current.length;
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 11. Data Masking, PII Redaction & Row Transformation Pipelines (`transformRow`) (M14 Item 3)
+// ---------------------------------------------------------------------------
+
+/** Context passed to a {@link RowTransformer} callback. */
+export interface RowTransformContext {
+  /** Upper-case table name. */
+  readonly table: string;
+  /** DML operation (`'INSERT'`, `'UPDATE'`, or `'DELETE'`). */
+  readonly operation: 'INSERT' | 'UPDATE' | 'DELETE';
+  /** Primary key values of the row. */
+  readonly key: Record<string, unknown>;
+  /** Originating node identifier. */
+  readonly origin: string;
+}
+
+/**
+ * Pluggable outbound or inbound row transformation callback (`M14 Item 3`).
+ * Returning `null` filters/drops the row from the replication stream.
+ */
+export type RowTransformer = (
+  row: Record<string, unknown>,
+  ctx: RowTransformContext,
+) => Record<string, unknown> | null | Promise<Record<string, unknown> | null>;
+
+/** Built-in column masking strategy supported by {@link createPiiMaskingTransformer}. */
+export type PiiColumnMaskStrategy =
+  | 'redact'
+  | 'email-mask'
+  | 'card-last4'
+  | 'hash-fnv1a'
+  | 'hash-sha256'
+  | 'null'
+  | 'zero'
+  | ((value: unknown, row: Record<string, unknown>) => unknown | Promise<unknown>);
+
+async function sha256HexString(input: string): Promise<string> {
+  if (globalThis.crypto?.subtle) {
+    const bytes = new TextEncoder().encode(input);
+    const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
+    return Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+  }
+  return fnv1aHash8(input).toLowerCase().repeat(8);
+}
+
+function isPiiStrategyValue(val: unknown): val is PiiColumnMaskStrategy {
+  return (
+    typeof val === 'function' ||
+    val === 'redact' ||
+    val === 'email-mask' ||
+    val === 'card-last4' ||
+    val === 'hash-fnv1a' ||
+    val === 'hash-sha256' ||
+    val === 'null' ||
+    val === 'zero'
+  );
+}
+
+/**
+ * Create a declarative per-column or per-table/per-column PII masking and row
+ * transformation pipeline (`M14 Item 3`) usable in
+ * `CreatePublicationOptions.transformRow`, `PublishedTableConfig.transformRow`,
+ * or `CreateSubscriptionOptions.transformRow`.
+ */
+export function createPiiMaskingTransformer(
+  rules:
+    | Readonly<Record<string, PiiColumnMaskStrategy>>
+    | Readonly<Record<string, Readonly<Record<string, PiiColumnMaskStrategy>>>>,
+  options: { salt?: string; redactedText?: string } = {},
+): RowTransformer {
+  const salt = options.salt ?? '';
+  const redactedText = options.redactedText ?? '[REDACTED]';
+
+  // Normalize rule table & column names to upper-case.
+  // Supports both flat `{ EMAIL: 'email-mask' }` (applied to '*') and nested `{ USERS: { EMAIL: 'email-mask' } }`.
+  const normalizedRules = new Map<string, Map<string, PiiColumnMaskStrategy>>();
+  const wildcardRules = new Map<string, PiiColumnMaskStrategy>();
+
+  for (const [key, val] of Object.entries(rules)) {
+    if (isPiiStrategyValue(val)) {
+      wildcardRules.set(key.toUpperCase(), val);
+    } else if (val && typeof val === 'object') {
+      const colRules = new Map<string, PiiColumnMaskStrategy>();
+      for (const [col, strategy] of Object.entries(
+        val as Record<string, PiiColumnMaskStrategy>,
+      )) {
+        colRules.set(col.toUpperCase(), strategy);
+      }
+      normalizedRules.set(normalizeTableName(key), colRules);
+    }
+  }
+  if (wildcardRules.size > 0) {
+    const existingWildcard = normalizedRules.get('*');
+    if (existingWildcard) {
+      for (const [k, v] of wildcardRules.entries()) existingWildcard.set(k, v);
+    } else {
+      normalizedRules.set('*', wildcardRules);
+    }
+  }
+
+  return async (row, ctx) => {
+    const specificRules = normalizedRules.get(normalizeTableName(ctx.table));
+    const starRules = normalizedRules.get('*');
+    if (!specificRules && !starRules) {
+      return row;
+    }
+
+    const out: Record<string, unknown> = { ...row };
+    for (const [rawCol, val] of Object.entries(out)) {
+      const upperCol = rawCol.toUpperCase();
+      const strategy =
+        specificRules?.get(upperCol) ?? starRules?.get(upperCol);
+      if (!strategy) continue;
+
+      if (typeof strategy === 'function') {
+        out[rawCol] = await strategy(val, out);
+      } else if (strategy === 'null') {
+        out[rawCol] = null;
+      } else if (strategy === 'zero') {
+        out[rawCol] = 0;
+      } else if (strategy === 'redact') {
+        out[rawCol] = val === null || val === undefined ? val : redactedText;
+      } else if (strategy === 'email-mask') {
+        if (typeof val === 'string' && val.includes('@')) {
+          const [local = '', domain = ''] = val.split('@');
+          if (local.length >= 2) {
+            out[rawCol] = `${local[0]}***${local[local.length - 1]}@${domain}`;
+          } else {
+            const first = local.length > 0 ? local[0] : '*';
+            out[rawCol] = `${first}***@${domain}`;
+          }
+        } else if (val !== null && val !== undefined) {
+          out[rawCol] = redactedText;
+        }
+      } else if (strategy === 'card-last4') {
+        if (val !== null && val !== undefined) {
+          const digits = String(val).replace(/\D/g, '');
+          const last4 = digits.slice(-4).padStart(4, '*');
+          const maskLen = Math.max(8, digits.length - 4);
+          out[rawCol] = `${'*'.repeat(maskLen)}${last4}`;
+        }
+      } else if (strategy === 'hash-fnv1a') {
+        if (val !== null && val !== undefined) {
+          out[rawCol] = fnv1aHash8(`${salt}:${String(val)}`).toLowerCase();
+        }
+      } else if (strategy === 'hash-sha256') {
+        if (val !== null && val !== undefined) {
+          out[rawCol] = await sha256HexString(`${salt}:${String(val)}`);
+        }
+      }
+    }
+    return out;
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 12. Journal Archival & Point-in-Time Recovery (PITR) Bundles (`exportJournalArchive` / `applyJournalArchive`) (M14 Item 4)
+// ---------------------------------------------------------------------------
+
+/** A single encrypted/compressed segment inside a {@link ReplicationJournalArchive}. */
+export interface JournalArchiveSegment {
+  /** Monotonic 1-based segment sequence number. */
+  readonly sequence: number;
+  /** First LSN in this segment. */
+  readonly startLsn: number;
+  /** Last LSN in this segment. */
+  readonly endLsn: number;
+  /** Number of journal entries in this segment. */
+  readonly entryCount: number;
+  /** Minimum entry epoch timestamp (`Date.now()`) in this segment. */
+  readonly minTimestamp: number;
+  /** Maximum entry epoch timestamp (`Date.now()`) in this segment. */
+  readonly maxTimestamp: number;
+  /** Whether the segment payload is Gzip-compressed. */
+  readonly compressed: boolean;
+  /** Whether the segment payload is encrypted with AES-256-GCM. */
+  readonly encrypted: boolean;
+  /** Binary wire bytes produced by {@link encodeEncryptedJournalSegment}. */
+  readonly bytes: Uint8Array;
+}
+
+/** Portable Point-in-Time Recovery (PITR) archive bundle returned by {@link exportJournalArchive}. */
+export interface ReplicationJournalArchive {
+  /** Archive format identifier. */
+  readonly format: 'firebird-repl-archive-v1';
+  /** Source publication name. */
+  readonly publication: string;
+  /** Epoch timestamp (`Date.now()`) when the archive was created. */
+  readonly createdAt: number;
+  /** Optional base snapshot (`PublicationSnapshot`) taken before the journal stream. */
+  readonly baseSnapshot: PublicationSnapshot | null;
+  /** Ordered chain of binary/encrypted journal segments. */
+  readonly segments: readonly JournalArchiveSegment[];
+  /** Total journal entries across all segments. */
+  readonly entryCount: number;
+  /** Alias for {@link entryCount}. */
+  readonly totalEntries: number;
+  /** Minimum LSN across all segments (`0` if empty). */
+  readonly startLsn: number;
+  /** Alias for {@link startLsn}. */
+  readonly minLsn: number;
+  /** Maximum LSN across all segments (`0` if empty). */
+  readonly endLsn: number;
+  /** Alias for {@link endLsn}. */
+  readonly maxLsn: number;
+}
+
+/** Options for {@link exportJournalArchive}. */
+export interface ExportJournalArchiveOptions {
+  /** Source publication to export from (optional when passed as the first parameter). */
+  publication?: ReplicationPublication;
+  /**
+   * When `true` (default when `sinceLsn === 0`), includes a logical `baseSnapshot`
+   * of all published tables at LSN 0 / current state.
+   *
+   * @default false
+   */
+  includeBaseSnapshot?: boolean;
+  /** Export journal entries with `LSN > sinceLsn`. @default 0 */
+  sinceLsn?: number;
+  /** Maximum number of journal entries packed into each binary segment. @default 100 */
+  maxEntriesPerSegment?: number;
+  /** Optional AES-256-GCM encryption key for the segment chain. */
+  key?: Uint8Array | CryptoKey | string;
+  /** Whether to Gzip-compress each segment. @default true */
+  compress?: boolean;
+  /** Optional Additional Authenticated Data (AAD) for AES-256-GCM. */
+  aad?: Uint8Array | string;
+}
+
+/** Options for {@link applyJournalArchive}. */
+export interface ApplyJournalArchiveOptions {
+  /** Target database to restore into (optional when passed as the first parameter). */
+  targetDb?: ReplicableDatabase;
+  /** PITR archive bundle produced by {@link exportJournalArchive} (optional when passed as the second parameter). */
+  archive?: ReplicationJournalArchive;
+  /**
+   * Optional Point-in-Time Recovery cutoff (`lsn`, `timestamp`, or `hlc`).
+   * Only journal entries matching `<= target` are replayed onto `targetDb`.
+   */
+  target?: number | TimeTravelTarget;
+  /** Decryption key if the archive segments were encrypted. */
+  key?: Uint8Array | CryptoKey | string;
+  /** Additional Authenticated Data (AAD) if the archive segments were encrypted with AAD. */
+  aad?: Uint8Array | string;
+}
+
+/** Result returned by {@link applyJournalArchive}. */
+export interface ApplyJournalArchiveResult {
+  /** Number of rows seeded from `archive.baseSnapshot`. */
+  readonly bootstrappedRows: number;
+  /** Number of archive segments decoded and verified. */
+  readonly segmentsDecoded: number;
+  /** Number of journal entries replayed up to `target`. */
+  readonly entriesApplied: number;
+  /** Alias for {@link entriesApplied}. */
+  readonly entriesReplayed: number;
+  /** Highest LSN replayed during recovery. */
+  readonly restoredToLsn: number;
+  /** Alias for {@link restoredToLsn}. */
+  readonly restoredUpToLsn: number;
+}
+
+function isPublicationLike(val: unknown): val is ReplicationPublication {
+  return (
+    val !== null &&
+    typeof val === 'object' &&
+    typeof (val as ReplicationPublication).fetchChangesSince === 'function'
+  );
+}
+
+/**
+ * Package a publication's journal stream (and optional `baseSnapshot`) into a
+ * chunked, compressed, and optionally AES-256-GCM encrypted Point-in-Time Recovery
+ * archive (`M14 Item 4`).
+ */
+export async function exportJournalArchive(
+  publicationOrOptions: ReplicationPublication | ExportJournalArchiveOptions,
+  maybeOptions: ExportJournalArchiveOptions = {},
+): Promise<ReplicationJournalArchive> {
+  const options: ExportJournalArchiveOptions = isPublicationLike(publicationOrOptions)
+    ? { ...maybeOptions, publication: publicationOrOptions }
+    : publicationOrOptions;
+  const pub = options.publication;
+  if (!pub) {
+    throw new Error('exportJournalArchive requires a publication');
+  }
+
+  const sinceLsn = options.sinceLsn ?? 0;
+  const maxPerSeg = Math.max(1, options.maxEntriesPerSegment ?? 100);
+  const baseSnapshot = options.includeBaseSnapshot
+    ? await pub.exportSnapshot({ mode: 'logical' })
+    : null;
+
+  const entries = await pub.fetchChangesSince(sinceLsn);
+  const segments: JournalArchiveSegment[] = [];
+  const compress = options.compress ?? true;
+  const encrypted = options.key !== undefined;
+
+  for (let i = 0; i < entries.length; i += maxPerSeg) {
+    const chunk = entries.slice(i, i + maxPerSeg);
+    const seq = segments.length + 1;
+    const startLsn = chunk[0]!.lsn;
+    const endLsn = chunk[chunk.length - 1]!.lsn;
+    const minTimestamp = Math.min(...chunk.map((e) => e.timestamp));
+    const maxTimestamp = Math.max(...chunk.map((e) => e.timestamp));
+
+    const bytes = await encodeEncryptedJournalSegment(chunk, {
+      sequence: seq,
+      state: 'archivable',
+      key: options.key,
+      compress,
+      aad: options.aad,
+    });
+
+    segments.push({
+      sequence: seq,
+      startLsn,
+      endLsn,
+      entryCount: chunk.length,
+      minTimestamp,
+      maxTimestamp,
+      compressed: compress,
+      encrypted,
+      bytes,
+    });
+  }
+
+  const minLsn = entries.length > 0 ? entries[0]!.lsn : 0;
+  const maxLsn = entries.length > 0 ? entries[entries.length - 1]!.lsn : 0;
+
+  return {
+    format: 'firebird-repl-archive-v1',
+    publication: pub.name,
+    createdAt: Date.now(),
+    baseSnapshot,
+    segments,
+    entryCount: entries.length,
+    totalEntries: entries.length,
+    startLsn: minLsn,
+    minLsn,
+    endLsn: maxLsn,
+    maxLsn,
+  };
+}
+
+/**
+ * Restore a target database from a {@link ReplicationJournalArchive} up to an
+ * optional Point-in-Time Recovery (`target` LSN, timestamp, or HLC) (`M14 Item 4`).
+ */
+export async function applyJournalArchive(
+  targetDbOrOptions: ReplicableDatabase | ApplyJournalArchiveOptions,
+  maybeArchive?: ReplicationJournalArchive,
+  maybeOptions: ApplyJournalArchiveOptions = {},
+): Promise<ApplyJournalArchiveResult> {
+  const options: ApplyJournalArchiveOptions =
+    maybeArchive !== undefined
+      ? {
+          ...maybeOptions,
+          targetDb: targetDbOrOptions as ReplicableDatabase,
+          archive: maybeArchive,
+        }
+      : (targetDbOrOptions as ApplyJournalArchiveOptions);
+
+  const targetDb = options.targetDb;
+  const archive = options.archive;
+  if (!targetDb || !archive) {
+    throw new Error('applyJournalArchive requires targetDb and archive');
+  }
+
+  const tempSub = await createSubscription(targetDb, {
+    name: `pitr_restore_${archive.publication}`,
+    nodeId: 'pitr_restore_node',
+    publication: {
+      name: archive.publication,
+      fetchChangesSince: async () => [],
+    },
+  });
+
+  let bootstrappedRows = 0;
+  if (archive.baseSnapshot) {
+    const dummyPub = {
+      name: archive.publication,
+      exportSnapshot: async () => archive.baseSnapshot!,
+      registerSlot: async () => ({
+        slotName: 'pitr',
+        publication: archive.publication,
+        nodeId: 'pitr',
+        confirmedFlushLsn: 0,
+        lastSeenAt: Date.now(),
+        ttlMs: 0,
+      }),
+    } as unknown as ReplicationPublication;
+
+    const bootRes = await bootstrapReplica({
+      targetDb,
+      publication: dummyPub,
+      subscription: tempSub,
+      snapshot: archive.baseSnapshot,
+    });
+    bootstrappedRows = bootRes.rowsCopied;
+  }
+
+  const cutoffSpec =
+    options.target !== undefined
+      ? normalizeTimeTravelTarget(options.target)
+      : null;
+
+  const decodedEntries: ReplicationLogEntry[] = [];
+  let segmentsDecoded = 0;
+
+  for (const seg of archive.segments) {
+    const decoded = await decodeEncryptedJournalSegment(seg.bytes, {
+      key: options.key,
+      aad: options.aad,
+    });
+    segmentsDecoded++;
+    for (const entry of decoded.segment.entries) {
+      if (cutoffSpec && !entryMatchesTimeTravelCutoff(entry, cutoffSpec)) {
+        continue;
+      }
+      decodedEntries.push(entry);
+    }
+  }
+
+  const pullRes = await tempSub.applyChanges(decodedEntries);
+  return {
+    bootstrappedRows,
+    segmentsDecoded,
+    entriesApplied: pullRes.appliedCount,
+    entriesReplayed: pullRes.appliedCount,
+    restoredToLsn: pullRes.currentLsn,
+    restoredUpToLsn: pullRes.currentLsn,
   };
 }
