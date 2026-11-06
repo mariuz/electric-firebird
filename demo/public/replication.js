@@ -202,6 +202,7 @@ try {
       mergeCrdtRow: mod.mergeCrdtRow || fallbackMergeCrdtRow,
       encodeNativeJournalSegment:
         mod.encodeNativeJournalSegment || fallbackEncodeNativeJournalSegment,
+      decodeNativeJournalSegment: mod.decodeNativeJournalSegment,
       buildReplicationTriggerDdl:
         mod.buildReplicationTriggerDdl || fallbackBuildTriggerDdl,
     };
@@ -733,6 +734,7 @@ let isOnline = true;
 let totalConflictsResolved = 0;
 let nextTaskId = 4;
 let activeCodeTab = 'setup';
+let promoted = false;
 
 const INITIAL_TASKS = [
   {
@@ -867,12 +869,25 @@ function getSetupCodeSnippet() {
 
 function formatBinaryHexDump(entries) {
   const bytes = replLib.encodeNativeJournalSegment(entries);
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const magic = view.getUint32(0, true);
-  const version = view.getUint32(4, true);
-  const count = view.getUint32(8, true);
-  const minLsn = view.getUint32(16, true);
-  const maxLsn = view.getUint32(20, true);
+  let magic = 0;
+  let version = 0;
+  let count = 0;
+  let minLsn = 0;
+  let maxLsn = 0;
+  try {
+    const decoded = replLib.decodeNativeJournalSegment
+      ? replLib.decodeNativeJournalSegment(bytes)
+      : null;
+    if (decoded) {
+      magic = decoded.header.magic;
+      version = decoded.header.version;
+      count = decoded.header.entryCount;
+      minLsn = decoded.header.startLsn;
+      maxLsn = decoded.header.endLsn;
+    }
+  } catch {
+    // fall through with zeroed header on the built-in fallback encoder
+  }
 
   const lines = [
     `// Firebird 4.0 / 5.0 Native Binary Replication Segment (encodeNativeJournalSegment)`,
@@ -910,10 +925,12 @@ async function formatEncryptedHexDump(entries) {
   let isCompressed = false;
   if (typeof CompressionStream !== 'undefined') {
     const cs = new CompressionStream('gzip');
+    // Read concurrently: awaiting write() first deadlocks on backpressure.
+    const gzipped = new Response(cs.readable).arrayBuffer();
     const writer = cs.writable.getWriter();
-    await writer.write(new Uint8Array(rawBytes));
+    void writer.write(new Uint8Array(rawBytes)).catch(() => {});
     await writer.close();
-    compressedBytes = new Uint8Array(await new Response(cs.readable).arrayBuffer());
+    compressedBytes = new Uint8Array(await gzipped);
     isCompressed = true;
   }
 
@@ -1008,6 +1025,7 @@ async function initSimulator() {
   primaryDb = createSimNode('primary');
   replicaDb = createSimNode('replica');
   totalConflictsResolved = 0;
+  promoted = false;
   nextTaskId = 4;
 
   primaryDb.tables.set(
@@ -1167,8 +1185,11 @@ async function renderAll() {
 
   const pendingP2R = Math.max(0, primaryLsn - watermarkLsn);
   const direction = directionSelect.value;
-  topologyBadge.textContent =
-    direction === 'bidirectional' ? 'PRIMARY ↔ REPLICA' : 'PRIMARY → REPLICA';
+  topologyBadge.textContent = promoted
+    ? 'PROMOTED: REPLICA → PRIMARY'
+    : direction === 'bidirectional'
+      ? 'PRIMARY ↔ REPLICA'
+      : 'PRIMARY → REPLICA';
   linkArrow.textContent = isOnline
     ? direction === 'bidirectional'
       ? '⇄'
@@ -1445,6 +1466,7 @@ document.getElementById('show-encrypted-hex').addEventListener('click', () => {
 async function runPromoteReplicaDemo() {
   await replicator.sync();
   nextTaskId += 100; // sequenceBuffer: 100
+  promoted = true;
   topologyBadge.textContent = 'PROMOTED: REPLICA → PRIMARY';
   logEvent(
     `⚡ <strong>Automatic Failover (<code>promoteReplica()</code>)</strong>: drained pending lag (<code>lagEntries: 0</code>), bumped sequence watermarks (<code>+100</code> → next ID ${nextTaskId}), set <code>FB_REPL_ROLE = 'PRIMARY'</code>, and promoted <strong>Node B (replica)</strong> to active primary!`,

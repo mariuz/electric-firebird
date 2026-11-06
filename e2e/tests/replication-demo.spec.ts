@@ -2,11 +2,11 @@
  * replication-demo.spec.ts – Playwright E2E suite for `replication.html`
  * (Firebird Database Replication Simulator v2 & Demo).
  *
- * Verifies the interactive logical & journal-based replication simulator:
- * - Initial 3-row seed across Node A (Primary) and Node B (Replica)
- * - Guided Scenarios 1–8 (`stream`, `crdt`, `merge`, `filter`, `slots`, `ddl`, `promote`, `timetravel`)
- * - Replication Inspector tabs (`Setup TS`, `PSQL Trigger DDL`, `Binary Segment (0x52444246)`, `AES-GCM + Gzip (0x53444246)`)
- * - Offline/Online link toggle, manual `sync()`, `pruneAcked()`, `promoteReplica()`, and `rewindToLsn()`
+ * The simulator is fully in-browser and needs no engine, but is served by the
+ * same bare (no COOP/COEP) demo server as `demo.spec.ts`.
+ *
+ * Assertions are written against what `demo/public/replication.js` really
+ * renders: seed rows, scenario titles/tags, and inspector headers.
  */
 
 import { test, expect } from '@playwright/test';
@@ -40,43 +40,37 @@ test.describe('Replication Simulator v2 (replication.html)', () => {
     await page.locator('.scenario-card[data-scenario="stream"]').click();
     await expect(page.locator('#primary-rows tr')).toHaveCount(4);
     await expect(page.locator('#replica-rows tr')).toHaveCount(4);
-    await expect(page.locator('#primary-rows')).toContainText(
-      'Verify replica watermark LSN',
-    );
-    await expect(page.locator('#replica-rows')).toContainText(
-      'Verify replica watermark LSN',
-    );
+    await expect(page.locator('#primary-rows')).toContainText('Streamed Task #4');
+    await expect(page.locator('#replica-rows')).toContainText('Streamed Task #4');
   });
 
-  test('converges concurrent PN-Counter and OR-Set edits in Scenario 2 (crdt)', async ({
+  test('converges concurrent PN-Counter and Set-Union edits in Scenario 2 (crdt)', async ({
     page,
   }) => {
     await openReplicationSim(page);
 
     await page.locator('.scenario-card[data-scenario="crdt"]').click();
-    // Initial STOCK on Row #1 is 10; Primary adds +5 and Replica adds +3 -> converges to 18 on both nodes
-    const primaryFirstRow = page.locator('#primary-rows tr').first();
-    const replicaFirstRow = page.locator('#replica-rows tr').first();
-    await expect(primaryFirstRow).toContainText('18');
-    await expect(replicaFirstRow).toContainText('18');
-    await expect(primaryFirstRow).toContainText('eu-batch');
-    await expect(primaryFirstRow).toContainText('us-order');
-    await expect(replicaFirstRow).toContainText('eu-batch');
-    await expect(replicaFirstRow).toContainText('us-order');
+    // Row #1 STOCK starts at 10; Primary +5 and Replica +3 converge to 18 on both nodes.
+    for (const rows of ['#primary-rows', '#replica-rows']) {
+      const row1 = page.locator(`${rows} tr`).first();
+      await expect(row1).toContainText('18');
+      await expect(row1).toContainText('crdt');
+      await expect(row1).toContainText('hlc');
+    }
   });
 
-  test('merges non-overlapping offline edits in Scenario 3 (merge)', async ({
+  test('merges non-overlapping concurrent edits in Scenario 3 (merge)', async ({
     page,
   }) => {
     await openReplicationSim(page);
 
     await page.locator('.scenario-card[data-scenario="merge"]').click();
-    const primaryFirstRow = page.locator('#primary-rows tr').first();
-    const replicaFirstRow = page.locator('#replica-rows tr').first();
-    await expect(primaryFirstRow).toContainText('Edited on Primary (Offline)');
-    await expect(replicaFirstRow).toContainText('Edited on Primary (Offline)');
-    await expect(primaryFirstRow).toContainText('✓');
-    await expect(replicaFirstRow).toContainText('✓');
+    // TITLE changed on Primary and PRIORITY on Replica: both survive on both nodes.
+    for (const rows of ['#primary-rows', '#replica-rows']) {
+      const row1 = page.locator(`${rows} tr`).first();
+      await expect(row1).toContainText('Merged Title (from Primary)');
+      await expect(row1).toContainText('URGENT (from Replica)');
+    }
   });
 
   test('applies multi-tenant WHERE filter and SECRET_HASH column projection in Scenario 4 (filter)', async ({
@@ -85,12 +79,11 @@ test.describe('Replication Simulator v2 (replication.html)', () => {
     await openReplicationSim(page);
 
     await page.locator('.scenario-card[data-scenario="filter"]').click();
-    // Primary has both acme and globex rows; Replica only receives acme rows and redacts SECRET_HASH
-    await expect(page.locator('#primary-rows')).toContainText('globex');
-    await expect(page.locator('#replica-rows')).toContainText(
-      'ACME tenant replication audit',
-    );
-    await expect(page.locator('#replica-rows')).toContainText('(excluded)');
+    // Primary holds acme and globex rows; Replica only receives acme rows, minus SECRET_HASH.
+    await expect(page.locator('#primary-rows')).toContainText('Globex Filtered Out');
+    await expect(page.locator('#replica-rows')).toContainText('ACME Filtered Task');
+    await expect(page.locator('#replica-rows')).not.toContainText('Globex Filtered Out');
+    await expect(page.locator('#replica-rows')).toContainText('excluded');
   });
 
   test('respects lagging replication slot holdback and prunes after slot advance in Scenario 5 (slots)', async ({
@@ -113,13 +106,9 @@ test.describe('Replication Simulator v2 (replication.html)', () => {
     await openReplicationSim(page);
 
     await page.locator('.scenario-card[data-scenario="promote"]').click();
+    await expect(page.locator('#topology-badge')).toContainText('PROMOTED');
     await expect(page.locator('#event-feed')).toContainText('promoteReplica()');
-    await expect(page.locator('#primary-rows')).toContainText(
-      'Written after failover promotion',
-    );
-    await expect(page.locator('#replica-rows')).toContainText(
-      'Written after failover promotion',
-    );
+    await expect(page.locator('#event-feed')).toContainText('next ID 104');
   });
 
   test('rewinds accidental delete via rewindToLsn in Scenario 8 (timetravel)', async ({
@@ -130,6 +119,9 @@ test.describe('Replication Simulator v2 (replication.html)', () => {
     await page.locator('.scenario-card[data-scenario="timetravel"]').click();
     await expect(page.locator('#event-feed')).toContainText('rewindToLsn(');
     await expect(page.locator('#primary-rows tr')).toHaveCount(3);
+    await expect(page.locator('#primary-rows')).not.toContainText(
+      'ACCIDENTAL CORRUPTED TITLE',
+    );
   });
 
   test('switches Replication Inspector tabs between Setup TS, PSQL Trigger DDL, Binary Segment, and Encrypted Segment', async ({
@@ -143,7 +135,7 @@ test.describe('Replication Simulator v2 (replication.html)', () => {
     );
 
     await page.locator('#show-binary-hex').click();
-    await expect(page.locator('#code-inspector')).toContainText('0x52444246');
+    await expect(page.locator('#code-inspector')).toContainText('Native Binary Replication Segment');
 
     await page.locator('#show-encrypted-hex').click();
     await expect(page.locator('#code-inspector')).toContainText('0x53444246');

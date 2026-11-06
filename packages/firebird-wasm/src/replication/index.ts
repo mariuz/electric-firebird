@@ -5343,11 +5343,13 @@ async function gzipBytes(input: Uint8Array): Promise<Uint8Array> {
     throw new Error('CompressionStream is not available in this runtime');
   }
   const cs = new CompressionStream('gzip');
+  // Consume the readable side concurrently: awaiting write()/close() first
+  // deadlocks in browsers once the transform's queue applies backpressure.
+  const output = new Response(cs.readable).arrayBuffer();
   const writer = cs.writable.getWriter();
-  await writer.write(new Uint8Array(input));
+  void writer.write(new Uint8Array(input)).catch(() => undefined);
   await writer.close();
-  const buf = await new Response(cs.readable).arrayBuffer();
-  return new Uint8Array(buf);
+  return new Uint8Array(await output);
 }
 
 async function gunzipBytes(input: Uint8Array): Promise<Uint8Array> {
@@ -5355,11 +5357,11 @@ async function gunzipBytes(input: Uint8Array): Promise<Uint8Array> {
     throw new Error('DecompressionStream is not available in this runtime');
   }
   const ds = new DecompressionStream('gzip');
+  const output = new Response(ds.readable).arrayBuffer();
   const writer = ds.writable.getWriter();
-  await writer.write(new Uint8Array(input));
+  void writer.write(new Uint8Array(input)).catch(() => undefined);
   await writer.close();
-  const buf = await new Response(ds.readable).arrayBuffer();
-  return new Uint8Array(buf);
+  return new Uint8Array(await output);
 }
 
 async function resolveAesGcmCryptoKey(
