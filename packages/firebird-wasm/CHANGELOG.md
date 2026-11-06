@@ -4,6 +4,14 @@ All notable changes to `firebird-wasm`. This project follows
 [semantic versioning](https://semver.org/); while the major version is 0 the
 API may still move between minor releases.
 
+## 0.20.1 — 2026-11-06
+
+### Fixed
+
+- **Replication:** `gzipBytes` / `gunzipBytes` awaited `writer.write()` before reading the output stream, which deadlocks in browsers once `CompressionStream` applies backpressure. This hung encrypted/compressed journal segments (`encodeEncryptedJournalSegment`, `exportJournalArchive`) in the browser; the output is now consumed concurrently.
+- **Replication Simulator demo:** the "promoted" topology badge no longer resets on the next render, and the binary segment dump decodes its header via `decodeNativeJournalSegment` instead of reading wrong offsets.
+- **E2E:** corrected `replication-demo.spec.ts` assertions to match the simulator's real output.
+
 ## 0.20.0 — 2026-11-06
 
 ### Added
