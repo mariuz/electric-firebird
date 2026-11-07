@@ -53,6 +53,7 @@ import type {
   SweepResult,
 } from '../types';
 import {
+  DEFAULT_REPL_DLQ_TABLE,
   DEFAULT_REPL_JOURNAL_TABLE,
   DEFAULT_REPL_SLOTS_TABLE,
   DEFAULT_REPL_WATERMARK_TABLE,
@@ -102,6 +103,15 @@ export interface ReplReplicationJournalEntrySummary {
   readonly createdAt: string;
 }
 
+/** Quarantined Dead-Letter Queue (`FB_REPL_DLQ$`) entry summary displayed in the `<firebird-repl>` Replication Inspector. */
+export interface ReplReplicationDlqEntrySummary {
+  readonly lsn: number;
+  readonly subName: string;
+  readonly errorMessage: string;
+  readonly retryCount: number;
+  readonly quarantinedAt: string;
+}
+
 /** Structured replication state returned by `el.replication()` in `<firebird-repl>`. */
 export interface ReplReplicationInfo {
   readonly journalTableExists: boolean;
@@ -111,6 +121,9 @@ export interface ReplReplicationInfo {
   readonly slots: ReplReplicationSlotInfo[];
   readonly watermarks: ReplReplicationWatermarkInfo[];
   readonly recentEntries: ReplReplicationJournalEntrySummary[];
+  readonly dlqTableExists?: boolean;
+  readonly dlqEntryCount?: number;
+  readonly dlqEntries?: ReplReplicationDlqEntrySummary[];
   readonly liveStats?: ReplicationStats | null;
 }
 
@@ -795,11 +808,12 @@ export function defineFirebirdRepl(
       const relRes = await db.query(
         `SELECT TRIM(RDB$RELATION_NAME) AS REL_NAME
          FROM RDB$RELATIONS
-         WHERE TRIM(RDB$RELATION_NAME) IN (?, ?, ?)`,
+         WHERE TRIM(RDB$RELATION_NAME) IN (?, ?, ?, ?)`,
         [
           DEFAULT_REPL_JOURNAL_TABLE,
           DEFAULT_REPL_SLOTS_TABLE,
           DEFAULT_REPL_WATERMARK_TABLE,
+          DEFAULT_REPL_DLQ_TABLE,
         ],
         { rowMode: 'array' },
       );
@@ -885,6 +899,27 @@ export function defineFirebirdRepl(
         }
       }
 
+      const dlqEntries: ReplReplicationDlqEntrySummary[] = [];
+      if (existingTables.has(DEFAULT_REPL_DLQ_TABLE)) {
+        const dQuoted = `"${DEFAULT_REPL_DLQ_TABLE}"`;
+        const dlqRes = await db.query(
+          `SELECT LSN, SUB_NAME, ERROR_MSG, RETRY_COUNT, QUARANTINED_AT
+           FROM ${dQuoted}
+           ORDER BY LSN ASC`,
+          [],
+          { rowMode: 'array' },
+        );
+        for (const r of dlqRes.rows) {
+          dlqEntries.push({
+            lsn: Number(r[0] ?? 0),
+            subName: String(r[1] ?? '').trim(),
+            errorMessage: String(r[2] ?? '').trim(),
+            retryCount: Number(r[3] ?? 0),
+            quarantinedAt: String(r[4] ?? '').trim(),
+          });
+        }
+      }
+
       let liveStats: ReplicationStats | null = null;
       if (this.replicatorHandle && typeof this.replicatorHandle.stats === 'function') {
         try {
@@ -902,6 +937,9 @@ export function defineFirebirdRepl(
         slots,
         watermarks,
         recentEntries,
+        dlqTableExists: existingTables.has(DEFAULT_REPL_DLQ_TABLE),
+        dlqEntryCount: dlqEntries.length,
+        dlqEntries,
         liveStats,
       };
     }
@@ -1180,12 +1218,14 @@ export function defineFirebirdRepl(
           return;
         }
 
+        const dlqList = repl.dlqEntries ?? [];
         const summaryEl = el('p', 'inspector-summary');
         summaryEl.textContent =
           `Journal: ${repl.journalEntryCount} ${repl.journalEntryCount === 1 ? 'entry' : 'entries'} ` +
           `(LSN ${repl.minJournalLsn} → ${repl.maxJournalLsn}) · ` +
           `${repl.slots.length} ${repl.slots.length === 1 ? 'slot' : 'slots'} · ` +
-          `${repl.watermarks.length} ${repl.watermarks.length === 1 ? 'watermark' : 'watermarks'}`;
+          `${repl.watermarks.length} ${repl.watermarks.length === 1 ? 'watermark' : 'watermarks'} · ` +
+          `${dlqList.length} DLQ`;
         panel.append(summaryEl);
 
         if (repl.liveStats) {
@@ -1297,6 +1337,29 @@ export function defineFirebirdRepl(
             jList.append(li);
           }
           panel.append(jList);
+        }
+
+        const dlqTitle = el('div', 'schema-group-title');
+        dlqTitle.textContent = `Dead-Letter Queue (${dlqList.length})`;
+        panel.append(dlqTitle);
+        if (dlqList.length === 0) {
+          const empty = el('p', 'inspector-empty');
+          empty.textContent = 'No quarantined entries in FB_REPL_DLQ$.';
+          panel.append(empty);
+        } else {
+          const dList = el('ul', 'schema-list replication-dlq');
+          for (const d of dlqList) {
+            const li = el('li', 'migration-item replication-dlq-item');
+            const lsnSpan = el('span', 'migration-version');
+            lsnSpan.textContent = `#${d.lsn}`;
+            const errSpan = el('span', 'migration-name');
+            errSpan.textContent = `${d.subName}: ${d.errorMessage}`;
+            const badge = el('span', 'schema-badge');
+            badge.textContent = `retries ${d.retryCount}`;
+            li.append(lsnSpan, errSpan, badge);
+            dList.append(li);
+          }
+          panel.append(dList);
         }
 
         this.inspectorBody.append(panel);
@@ -2125,6 +2188,14 @@ export function defineFirebirdRepl(
                     .map((w) => `${w.peerId} @ LSN ${w.lastLsn}`)
                     .join(', ')
                 : 'none',
+            ],
+            [
+              'Dead-letter queue (FB_REPL_DLQ$)',
+              (r.dlqEntries?.length ?? 0) > 0
+                ? r.dlqEntries!
+                    .map((d) => `#${d.lsn} (${d.errorMessage}, retries ${d.retryCount})`)
+                    .join(', ')
+                : '0 quarantined',
             ],
           ];
           if (r.liveStats) {

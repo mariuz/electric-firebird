@@ -576,6 +576,11 @@ export interface ReplicationPublication {
    */
   pruneAcked(options?: { now?: number; pruneWhenNoSlots?: boolean }): Promise<PruneAckedResult>;
   /**
+   * Collapse superseded per-row mutations in `FB_REPL_JOURNAL$` (`INSERT` + `UPDATE` -> `INSERT`,
+   * `UPDATE` + `UPDATE` -> `UPDATE`, `INSERT` + `DELETE` -> elided) while preserving the final LSN watermark (`M15 Item 3`).
+   */
+  compactJournal(options?: CompactJournalOptions): Promise<JournalCompactionResult>;
+  /**
    * Export a consistent logical table dump or binary page-diff (`FBDF\x01`) snapshot
    * tagged with the publication's current LSN watermark for replica bootstrapping.
    */
@@ -744,6 +749,13 @@ export interface CreateSubscriptionOptions {
       ) => 'dlq' | 'skip' | 'throw' | Promise<'dlq' | 'skip' | 'throw'>);
   /** Custom dead-letter queue table name. @default 'FB_REPL_DLQ$' */
   dlqTable?: string;
+  /**
+   * Schema/DDL replay policy on the subscriber (`M15 Item 5`):
+   * - `'apply'` (default): execute every incoming `DDL` journal entry as-is.
+   * - `'idempotent'`: skip `CREATE TABLE` / `ALTER TABLE ADD` statements whose table or column already exists on the replica.
+   * - `'additive-only'`: allow additive DDL (`CREATE TABLE`, `ALTER TABLE ADD`, `CREATE INDEX`), skip already-applied additive DDL idempotently, and reject destructive DDL (`DROP TABLE`, `ALTER TABLE DROP`, `ALTER TABLE ALTER`).
+   */
+  ddlPolicy?: 'apply' | 'idempotent' | 'additive-only';
 }
 
 /**
@@ -2748,6 +2760,14 @@ export async function createPublication(
       };
     },
 
+    async compactJournal(compactOpts = {}): Promise<JournalCompactionResult> {
+      return compactJournal(db, {
+        ...compactOpts,
+        publication: compactOpts.publication ?? pubName,
+        journalTable: compactOpts.journalTable ?? options.journalTable,
+      });
+    },
+
     async exportSnapshot(snapOpts = {}): Promise<PublicationSnapshot> {
       await publication.captureTableChanges();
       const watermarkLsn = await publication.currentLsn();
@@ -3682,8 +3702,91 @@ export async function createSubscription(
 
         if (entry.operation === 'DDL') {
           if (entry.ddlSql) {
-            await execStatement(runner, entry.ddlSql);
-            appliedCount++;
+            const ddlPolicy = options.ddlPolicy ?? 'apply';
+            const handleDdlFailure = async (err: unknown): Promise<boolean> => {
+              const errorObj = err instanceof Error ? err : new Error(String(err));
+              const policy = options.onApplyError ?? 'throw';
+              const action =
+                typeof policy === 'function' ? await policy(entry, errorObj) : policy;
+              if (action === 'dlq') {
+                await dlqManager.recordFailure(entry, errorObj, subName);
+                dlqCount++;
+                return true;
+              }
+              if (action === 'skip') {
+                return true;
+              }
+              throw errorObj;
+            };
+
+            if (ddlPolicy !== 'apply') {
+              const classified = classifyDdlStatement(entry.ddlSql);
+              let existingCols: string[] = [];
+              let tableExists = false;
+              if (classified.table) {
+                try {
+                  const colRes = await runner.query<Row>(
+                    `SELECT TRIM(RDB$FIELD_NAME) AS COL_NAME FROM RDB$RELATION_FIELDS WHERE TRIM(RDB$RELATION_NAME) = ?`,
+                    [classified.table],
+                  );
+                  existingCols = colRes.rows
+                    .map((r) => String(r.COL_NAME ?? r.col_name ?? '').trim().toUpperCase())
+                    .filter(Boolean);
+                  tableExists = existingCols.length > 0;
+                } catch {
+                  // Fallback: probe via SELECT
+                }
+                if (!tableExists) {
+                  try {
+                    const probe = await runner.query<Row>(
+                      `SELECT * FROM ${quoteIdent(classified.table)}`,
+                    );
+                    if (probe.fields && probe.fields.length > 0) {
+                      tableExists = true;
+                      existingCols = probe.fields.map((f) => f.name.toUpperCase());
+                    } else if (probe.rows.length > 0 && probe.rows[0]) {
+                      tableExists = true;
+                      existingCols = Object.keys(probe.rows[0]).map((c) => c.toUpperCase());
+                    }
+                  } catch {
+                    tableExists = false;
+                  }
+                }
+              }
+
+              const resolution = resolveDdlConflict(entry.ddlSql, existingCols, {
+                policy: ddlPolicy,
+                tableExists,
+              });
+              if (resolution.action === 'skip') {
+                continue;
+              }
+              if (resolution.action === 'reject') {
+                const handled = await handleDdlFailure(new Error(resolution.reason));
+                if (handled) continue;
+              }
+              try {
+                await execStatement(runner, resolution.sql ?? entry.ddlSql);
+                appliedCount++;
+              } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                if (
+                  /already exists|duplicate|unsuccessful metadata update/i.test(msg)
+                ) {
+                  continue;
+                }
+                const handled = await handleDdlFailure(err);
+                if (handled) continue;
+              }
+            } else {
+              try {
+                await execStatement(runner, entry.ddlSql);
+                appliedCount++;
+              } catch (err) {
+                const handled = await handleDdlFailure(err);
+                if (handled) continue;
+              }
+            }
           }
           continue;
         }
@@ -6116,6 +6219,12 @@ export interface ReplicationMeshNodeConfig {
   tables?: '*' | ReadonlyArray<string | PublishedTableConfig>;
   /** Optional outbound row transformer for this node's publication. */
   transformRow?: RowTransformer;
+  /** Optional inbound entry validator for subscriptions targeting this node (`M15 Item 1`). */
+  validateEntry?: CreateSubscriptionOptions['validateEntry'];
+  /** Optional error handling policy (`'throw' | 'dlq' | 'skip'`) for subscriptions targeting this node (`M15 Item 1`). */
+  onApplyError?: CreateSubscriptionOptions['onApplyError'];
+  /** Optional DDL replay policy (`'apply' | 'idempotent' | 'additive-only'`) for subscriptions targeting this node (`M15 Item 5`). */
+  ddlPolicy?: CreateSubscriptionOptions['ddlPolicy'];
 }
 
 /** Options for {@link createReplicationMesh} and {@link createReplicationHub}. */
@@ -6124,12 +6233,12 @@ export interface CreateReplicationMeshOptions {
   nodes: readonly ReplicationMeshNodeConfig[];
   /**
    * Cluster topology:
-   * - `'mesh'`: every node subscribes to every other node directly ($N(N-1)$ links).
+   * - `'mesh'` / `'full-mesh'`: every node subscribes to every other node directly ($N(N-1)$ links).
    * - `'hub-and-spoke'`: spoke nodes sync bidirectionally through a central hub node with transitive origin forwarding.
    *
    * @default 'mesh'
    */
-  topology?: 'mesh' | 'hub-and-spoke';
+  topology?: 'mesh' | 'full-mesh' | 'hub-and-spoke';
   /** Explicit hub node ID when `topology === 'hub-and-spoke'`. Defaults to the node with `role: 'hub'` or `nodes[0].nodeId`. */
   hubNodeId?: string;
   /** Default tables published across all nodes unless overridden per node. @default '*' */
@@ -6206,7 +6315,8 @@ export async function createReplicationMesh(
   if (options.nodes.length < 2) {
     throw new Error('createReplicationMesh requires at least 2 nodes');
   }
-  const topology = options.topology ?? 'mesh';
+  const topology: 'mesh' | 'hub-and-spoke' =
+    options.topology === 'hub-and-spoke' ? 'hub-and-spoke' : 'mesh';
   const defaultTables = options.tables ?? '*';
   const conflictStrategy = options.onConflict ?? 'last-write-wins';
   const pollIntervalMs = options.pollIntervalMs ?? 1000;
@@ -6262,6 +6372,9 @@ export async function createReplicationMesh(
         onConflict: conflictStrategy,
         onConflictResolved: options.onConflictResolved,
         pollIntervalMs,
+        validateEntry: targetNode.validateEntry,
+        onApplyError: targetNode.onApplyError,
+        ddlPolicy: targetNode.ddlPolicy,
         // In hub-and-spoke mode, when Hub applies a row from Spoke A, forward it
         // into Hub's own journal (preserving Spoke A's origin) so Spoke B..N receive it!
         onRowApplied:
@@ -6916,8 +7029,14 @@ export interface ExportJournalArchiveOptions {
   includeBaseSnapshot?: boolean;
   /** Export journal entries with `LSN > sinceLsn`. @default 0 */
   sinceLsn?: number;
+  /** Optional minimum LSN (inclusive) to export (`LSN >= fromLsn`). */
+  fromLsn?: number;
+  /** Optional maximum LSN (inclusive) to export (`LSN <= toLsn`). */
+  toLsn?: number;
   /** Maximum number of journal entries packed into each binary segment. @default 100 */
   maxEntriesPerSegment?: number;
+  /** Alias for `maxEntriesPerSegment`. */
+  segmentMaxEntries?: number;
   /** Optional AES-256-GCM encryption key for the segment chain. */
   key?: Uint8Array | CryptoKey | string;
   /** Whether to Gzip-compress each segment. @default true */
@@ -6984,13 +7103,22 @@ export async function exportJournalArchive(
     throw new Error('exportJournalArchive requires a publication');
   }
 
-  const sinceLsn = options.sinceLsn ?? 0;
-  const maxPerSeg = Math.max(1, options.maxEntriesPerSegment ?? 100);
+  const sinceLsn =
+    options.fromLsn !== undefined ? Math.max(0, options.fromLsn - 1) : (options.sinceLsn ?? 0);
+  const maxPerSeg = Math.max(
+    1,
+    options.maxEntriesPerSegment ?? options.segmentMaxEntries ?? 100,
+  );
   const baseSnapshot = options.includeBaseSnapshot
     ? await pub.exportSnapshot({ mode: 'logical' })
     : null;
 
-  const entries = await pub.fetchChangesSince(sinceLsn);
+  const rawEntries = await pub.fetchChangesSince(sinceLsn);
+  const entries = rawEntries.filter((e) => {
+    if (options.fromLsn !== undefined && e.lsn < options.fromLsn) return false;
+    if (options.toLsn !== undefined && e.lsn > options.toLsn) return false;
+    return true;
+  });
   const segments: JournalArchiveSegment[] = [];
   const compress = options.compress ?? true;
   const encrypted = options.key !== undefined;
@@ -7131,3 +7259,1246 @@ export async function applyJournalArchive(
     restoredUpToLsn: pullRes.currentLsn,
   };
 }
+
+// ---------------------------------------------------------------------------
+// 13. Journal Retention, Compaction & Automated PITR Archival Policy (M15 Item 3)
+// ---------------------------------------------------------------------------
+
+/** Options for {@link compactJournal}. */
+export interface CompactJournalOptions {
+  /** Filter by publication name (optional; when omitted, compacts each publication independently). */
+  publication?: string;
+  /** Minimum LSN (inclusive) of the compaction window. */
+  fromLsn?: number;
+  /** Maximum LSN (inclusive) of the compaction window. */
+  upToLsn?: number;
+  /**
+   * When `true` (default), an `INSERT` followed by a `DELETE` for the same
+   * `(publication, table, key)` within the compaction window cancels out completely
+   * unless it holds the highest LSN in the journal (in which case a tombstone is kept
+   * if needed to preserve `currentLsn()`).
+   *
+   * @default true
+   */
+  elideTransientInserts?: boolean;
+  /** Custom journal table name. @default 'FB_REPL_JOURNAL$' */
+  journalTable?: string;
+}
+
+/** Result returned by {@link compactJournal}. */
+export interface JournalCompactionResult {
+  /** Number of journal entries scanned in the compaction window. */
+  readonly entriesBefore: number;
+  /** Number of journal entries remaining in the compaction window after coalescing. */
+  readonly entriesAfter: number;
+  /** Number of superseded journal entries removed (`entriesBefore - entriesAfter`). */
+  readonly entriesRemoved: number;
+  /** Number of distinct `(table, key)` row chains that were coalesced. */
+  readonly keysCompacted: number;
+  /** Highest LSN in the journal after compaction. */
+  readonly highestLsn: number;
+}
+
+/** Options for {@link applyRetentionPolicy}. */
+export interface JournalRetentionPolicyOptions {
+  /**
+   * Maximum number of entries to retain in `FB_REPL_JOURNAL$` for this publication.
+   * Entries older than the newest `maxEntries` are eligible for pruning (subject to active slot watermarks unless `ignoreSlotWatermarks` is `true`).
+   */
+  maxEntries?: number;
+  /**
+   * Maximum age in milliseconds for retained journal entries (`now - entry.timestamp > maxAgeMs`).
+   */
+  maxAgeMs?: number;
+  /**
+   * When `true`, runs {@link compactJournal} on the remaining unpruned journal entries.
+   * @default true
+   */
+  compact?: boolean;
+  /**
+   * When `true`, exports pruned entries into a `ReplicationJournalArchive` bundle before deleting them from `FB_REPL_JOURNAL$`.
+   * @default false
+   */
+  archiveBeforePrune?: boolean;
+  /** Optional AES-256-GCM key used when `archiveBeforePrune` is `true`. */
+  archiveKey?: CryptoKey | Uint8Array | string;
+  /** Optional segment size when `archiveBeforePrune` is `true`. @default 200 */
+  archiveSegmentMaxEntries?: number;
+  /**
+   * When `true`, allows `maxEntries` / `maxAgeMs` pruning even when no active slots exist
+   * or beyond unacknowledged slot watermarks.
+   * @default false
+   */
+  ignoreSlotWatermarks?: boolean;
+  /** Override current timestamp (`Date.now()`) for deterministic testing. */
+  now?: number;
+  /** Custom journal table name. @default 'FB_REPL_JOURNAL$' */
+  journalTable?: string;
+}
+
+/** Result returned by {@link applyRetentionPolicy}. */
+export interface JournalRetentionPolicyResult {
+  /** Safe LSN watermark up to which entries were pruned (`null` if no entries were pruned). */
+  readonly prunedUpToLsn: number | null;
+  /** Number of journal entries deleted by the retention policy. */
+  readonly prunedEntries: number;
+  /** Expired replication slot names dropped during slot TTL cleanup. */
+  readonly expiredSlots: readonly string[];
+  /** Result of journal compaction if `compact !== false`, or `null`. */
+  readonly compaction: JournalCompactionResult | null;
+  /** Exported PITR archive of the pruned entries if `archiveBeforePrune` was `true` and entries were pruned, or `null`. */
+  readonly archive: ReplicationJournalArchive | null;
+}
+
+/**
+ * Collapse superseded per-row mutations in `FB_REPL_JOURNAL$` within the specified LSN window (`M15 Item 3`):
+ * - `INSERT` + $N \times$ `UPDATE` $\rightarrow$ single `INSERT` at the latest LSN with the final `after` state.
+ * - `UPDATE` + $N \times$ `UPDATE` $\rightarrow$ single `UPDATE` at the latest LSN with the earliest `before` and latest `after` state.
+ * - `UPDATE` + `DELETE` $\rightarrow$ single `DELETE` at the latest LSN with the earliest `before` state.
+ * - `INSERT` + ($\dots$) + `DELETE` $\rightarrow$ completely elided when `elideTransientInserts !== false` (since the row never existed before the window and is deleted by the end of the window).
+ * - `DDL` entries act as per-table barriers (mutations before a DDL on the same table are not merged across the DDL boundary).
+ */
+export async function compactJournal(
+  db: ReplicableDatabase,
+  options: CompactJournalOptions = {},
+): Promise<JournalCompactionResult> {
+  const journalTable = quoteIdent(options.journalTable ?? DEFAULT_REPL_JOURNAL_TABLE);
+  const elideTransientInserts = options.elideTransientInserts ?? true;
+
+  let res: QueryResult<Row>;
+  try {
+    res = await db.query<Row>(
+      `SELECT * FROM ${journalTable} ORDER BY LSN ASC`,
+    );
+  } catch {
+    return {
+      entriesBefore: 0,
+      entriesAfter: 0,
+      entriesRemoved: 0,
+      keysCompacted: 0,
+      highestLsn: 0,
+    };
+  }
+
+  const pubFilter = options.publication ? options.publication.trim() : null;
+  const entries: ReplicationLogEntry[] = res.rows
+    .map((r) => ({
+      lsn: Number(r.LSN ?? r.lsn ?? 0),
+      txid: String(r.TXID ?? r.txid ?? ''),
+      origin: String(r.ORIGIN ?? r.origin ?? ''),
+      publication: String(r.PUBLICATION ?? r.publication ?? 'default'),
+      table: String(r.TABLE_NAME ?? r.table_name ?? ''),
+      operation: String(r.OP ?? r.op ?? 'INSERT').toUpperCase() as ReplicationOperation,
+      key: decodeJson(r.KEY_JSON ?? r.key_json ?? r.ROW_KEY ?? r.row_key) ?? {},
+      after: decodeJson(r.AFTER_JSON ?? r.after_json ?? r.AFTER_ROW ?? r.after_row),
+      before: decodeJson(r.BEFORE_JSON ?? r.before_json ?? r.BEFORE_ROW ?? r.before_row),
+      ddlSql:
+        r.DDL_SQL !== null && r.DDL_SQL !== undefined
+          ? String(r.DDL_SQL)
+          : r.ddl_sql !== null && r.ddl_sql !== undefined
+            ? String(r.ddl_sql)
+            : null,
+      timestamp: Number(r.TS ?? r.ts ?? 0),
+      hlc:
+        r.HLC !== null && r.HLC !== undefined && String(r.HLC).length > 0
+          ? String(r.HLC)
+          : r.hlc !== null && r.hlc !== undefined && String(r.hlc).length > 0
+            ? String(r.hlc)
+            : undefined,
+    }))
+    .filter((e) => {
+      if (pubFilter && e.publication !== pubFilter) return false;
+      if (options.fromLsn !== undefined && e.lsn < options.fromLsn) return false;
+      if (options.upToLsn !== undefined && e.lsn > options.upToLsn) return false;
+      return true;
+    });
+
+  if (entries.length === 0) {
+    return {
+      entriesBefore: 0,
+      entriesAfter: 0,
+      entriesRemoved: 0,
+      keysCompacted: 0,
+      highestLsn: 0,
+    };
+  }
+
+  interface ChainState {
+    entries: ReplicationLogEntry[];
+    netOp: 'INSERT' | 'UPDATE' | 'DELETE' | 'ELIDED';
+    firstBefore: Record<string, unknown> | null;
+    latestAfter: Record<string, unknown> | null;
+    latestEntry: ReplicationLogEntry;
+  }
+
+  let ddlEpoch = 0;
+  const chains = new Map<string, ChainState>();
+  const keptDdlEntries: ReplicationLogEntry[] = [];
+
+  for (const entry of entries) {
+    if (entry.operation === 'DDL' || entry.table === '$DDL') {
+      ddlEpoch++;
+      keptDdlEntries.push(entry);
+      continue;
+    }
+
+    const tableUpper = normalizeTableName(entry.table);
+    const normKey = normalizeRowKeysUpper(entry.key);
+    const pkCols = Object.keys(normKey).sort();
+    const chainId = `${entry.publication}|${ddlEpoch}|${tableUpper}|${serializeKeyRecord(normKey, pkCols)}`;
+
+    const existing = chains.get(chainId);
+    if (!existing) {
+      chains.set(chainId, {
+        entries: [entry],
+        netOp: entry.operation,
+        firstBefore: entry.before,
+        latestAfter: entry.after,
+        latestEntry: entry,
+      });
+      continue;
+    }
+
+    existing.entries.push(entry);
+    existing.latestEntry = entry;
+
+    if (existing.netOp === 'ELIDED') {
+      // Re-inserted after an elided INSERT+DELETE cycle
+      existing.netOp = entry.operation;
+      existing.firstBefore = entry.before;
+      existing.latestAfter = entry.after;
+    } else if (existing.netOp === 'INSERT') {
+      if (entry.operation === 'UPDATE') {
+        existing.netOp = 'INSERT';
+        existing.latestAfter = { ...(existing.latestAfter ?? {}), ...(entry.after ?? {}) };
+      } else if (entry.operation === 'DELETE') {
+        if (elideTransientInserts) {
+          existing.netOp = 'ELIDED';
+          existing.latestAfter = null;
+        } else {
+          existing.netOp = 'DELETE';
+          existing.latestAfter = null;
+        }
+      } else if (entry.operation === 'INSERT') {
+        existing.netOp = 'INSERT';
+        existing.latestAfter = entry.after;
+      }
+    } else if (existing.netOp === 'UPDATE') {
+      if (entry.operation === 'UPDATE') {
+        existing.netOp = 'UPDATE';
+        existing.latestAfter = { ...(existing.latestAfter ?? {}), ...(entry.after ?? {}) };
+      } else if (entry.operation === 'DELETE') {
+        existing.netOp = 'DELETE';
+        existing.latestAfter = null;
+      } else if (entry.operation === 'INSERT') {
+        existing.netOp = 'UPDATE';
+        existing.latestAfter = entry.after;
+      }
+    } else if (existing.netOp === 'DELETE') {
+      if (entry.operation === 'INSERT') {
+        existing.netOp = 'UPDATE';
+        existing.latestAfter = entry.after;
+      }
+    }
+  }
+
+  const lsnsToDelete: number[] = [];
+  const entriesToUpdate: ReplicationLogEntry[] = [];
+  let keysCompacted = 0;
+
+  for (const chain of chains.values()) {
+    if (chain.entries.length <= 1) {
+      continue;
+    }
+    keysCompacted++;
+    if (chain.netOp === 'ELIDED') {
+      for (const e of chain.entries) {
+        lsnsToDelete.push(e.lsn);
+      }
+    } else {
+      // Delete all earlier entries in the chain and update the latest entry in-place
+      for (let i = 0; i < chain.entries.length - 1; i++) {
+        lsnsToDelete.push(chain.entries[i]!.lsn);
+      }
+      const finalEntry: ReplicationLogEntry = {
+        ...chain.latestEntry,
+        operation: chain.netOp,
+        before: chain.netOp === 'INSERT' ? null : chain.firstBefore,
+        after: chain.netOp === 'DELETE' ? null : chain.latestAfter,
+      };
+      entriesToUpdate.push(finalEntry);
+    }
+  }
+
+  for (const lsn of lsnsToDelete) {
+    await execStatement(db, `DELETE FROM ${journalTable} WHERE LSN = ?`, [lsn]);
+  }
+
+  for (const upd of entriesToUpdate) {
+    await execStatement(
+      db,
+      `UPDATE ${journalTable} SET OP = ?, AFTER_JSON = ?, BEFORE_JSON = ? WHERE LSN = ?`,
+      [
+        upd.operation,
+        upd.after ? JSON.stringify(upd.after) : null,
+        upd.before ? JSON.stringify(upd.before) : null,
+        upd.lsn,
+      ],
+    );
+  }
+
+  const entriesBefore = entries.length;
+  const entriesRemoved = lsnsToDelete.length;
+  const entriesAfter = entriesBefore - entriesRemoved;
+
+  let highestLsn = 0;
+  for (const e of entries) {
+    if (!lsnsToDelete.includes(e.lsn) && e.lsn > highestLsn) {
+      highestLsn = e.lsn;
+    }
+  }
+  for (const d of keptDdlEntries) {
+    if (d.lsn > highestLsn) {
+      highestLsn = d.lsn;
+    }
+  }
+
+  return {
+    entriesBefore,
+    entriesAfter,
+    entriesRemoved,
+    keysCompacted,
+    highestLsn,
+  };
+}
+
+/**
+ * Enforce an automated journal retention, PITR archival rotation, and row-compaction policy
+ * on `FB_REPL_JOURNAL$` (`M15 Item 3`).
+ */
+export async function applyRetentionPolicy(
+  db: ReplicableDatabase,
+  publication: ReplicationPublication,
+  options: JournalRetentionPolicyOptions = {},
+): Promise<JournalRetentionPolicyResult> {
+  const now = options.now ?? Date.now();
+  const journalTable = quoteIdent(options.journalTable ?? DEFAULT_REPL_JOURNAL_TABLE);
+
+  // 1. Expire stale slots and find active slot watermark ceiling
+  const allSlots = await publication.listSlots();
+  const expiredSlots: string[] = [];
+  const activeSlots: ReplicationSlot[] = [];
+
+  for (const slot of allSlots) {
+    if (slot.ttlMs > 0 && now - slot.lastSeenAt > slot.ttlMs) {
+      await publication.dropSlot(slot.slotName);
+      expiredSlots.push(slot.slotName);
+    } else {
+      activeSlots.push(slot);
+    }
+  }
+
+  const slotCeilingLsn =
+    !options.ignoreSlotWatermarks && activeSlots.length > 0
+      ? Math.min(...activeSlots.map((s) => s.confirmedFlushLsn))
+      : Infinity;
+
+  // 2. Determine candidate LSN cutoff from active slots, `maxEntries`, and `maxAgeMs`
+  const allEntries = await publication.fetchChangesSince(0);
+  let targetPruneLsn =
+    activeSlots.length > 0 && !options.ignoreSlotWatermarks ? slotCeilingLsn : 0;
+
+  if (options.maxEntries !== undefined && options.maxEntries >= 0) {
+    if (allEntries.length > options.maxEntries) {
+      const overflowCount = allEntries.length - options.maxEntries;
+      const cutoffEntry = allEntries[overflowCount - 1];
+      if (cutoffEntry && cutoffEntry.lsn > targetPruneLsn) {
+        targetPruneLsn = Math.min(cutoffEntry.lsn, slotCeilingLsn);
+      }
+    }
+  }
+
+  if (options.maxAgeMs !== undefined && options.maxAgeMs >= 0) {
+    const minTimestamp = now - options.maxAgeMs;
+    for (const entry of allEntries) {
+      if (entry.timestamp < minTimestamp && entry.lsn <= slotCeilingLsn) {
+        if (entry.lsn > targetPruneLsn) {
+          targetPruneLsn = entry.lsn;
+        }
+      }
+    }
+  }
+
+  let archive: ReplicationJournalArchive | null = null;
+  let prunedEntries = 0;
+  let prunedUpToLsn: number | null = null;
+
+  if (targetPruneLsn > 0 && Number.isFinite(targetPruneLsn)) {
+    const prunable = allEntries.filter((e) => e.lsn <= targetPruneLsn);
+    if (prunable.length > 0) {
+      if (options.archiveBeforePrune) {
+        archive = await exportJournalArchive(publication, {
+          fromLsn: prunable[0]!.lsn,
+          toLsn: targetPruneLsn,
+          segmentMaxEntries: options.archiveSegmentMaxEntries ?? 200,
+          key: options.archiveKey,
+          includeBaseSnapshot: false,
+        });
+      }
+      prunedEntries = await publication.pruneJournal(targetPruneLsn);
+      prunedUpToLsn = targetPruneLsn;
+    }
+  }
+
+  // 3. Optionally compact remaining unpruned journal entries
+  let compaction: JournalCompactionResult | null = null;
+  if (options.compact !== false) {
+    compaction = await compactJournal(db, {
+      publication: publication.name,
+      fromLsn: prunedUpToLsn !== null ? prunedUpToLsn + 1 : undefined,
+      journalTable: options.journalTable ?? DEFAULT_REPL_JOURNAL_TABLE,
+    });
+  }
+
+  void journalTable;
+  return {
+    prunedUpToLsn,
+    prunedEntries,
+    expiredSlots,
+    compaction,
+    archive,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 14. Structured Replication Telemetry & Prometheus / OTel Export (M15 Item 4)
+// ---------------------------------------------------------------------------
+
+/** Structured telemetry snapshot emitted by {@link ReplicationMetricsCollector}. */
+export interface ReplicationTelemetrySnapshot {
+  /** Epoch timestamp (`Date.now()`) when the snapshot was sampled. */
+  readonly timestamp: number;
+  /** Publication name (`'unknown'` if not attached). */
+  readonly publicationName: string;
+  /** Subscription name (`'unknown'` if not attached). */
+  readonly subscriptionName: string;
+  /** Node identifier. */
+  readonly nodeId: string;
+  /** Current replication state (`'idle'`, `'running'`, `'syncing'`). */
+  readonly status: 'idle' | 'running' | 'syncing';
+  /** Highest LSN on the source publication. */
+  readonly primaryLsn: number;
+  /** Applied LSN watermark on the replica. */
+  readonly replicaWatermark: number;
+  /** Unapplied journal entries (`Math.max(0, primaryLsn - replicaWatermark)`). */
+  readonly lagEntries: number;
+  /** Age in milliseconds of the oldest unapplied journal entry (`0` when caught up). */
+  readonly lagMs: number;
+  /** Number of entries currently retained in `FB_REPL_JOURNAL$` (`0` if publication not attached). */
+  readonly journalDepth: number;
+  /** Number of active replication slots registered on the publication (`0` if publication not attached). */
+  readonly activeSlots: number;
+  /** Number of quarantined poison entries currently in `FB_REPL_DLQ$`. */
+  readonly dlqDepth: number;
+  /** Cumulative entries fetched by the subscriber. */
+  readonly totalFetched: number;
+  /** Cumulative entries applied by the subscriber. */
+  readonly totalApplied: number;
+  /** Cumulative conflicts resolved by the subscriber. */
+  readonly totalConflicts: number;
+  /** Cumulative payload bytes transferred. */
+  readonly bytesTransferred: number;
+  /** Instantaneous apply throughput (`entries / sec`) since the previous sample. */
+  readonly throughputEntriesPerSec: number;
+  /** Ratio of conflicts to applied entries (`totalConflicts / Math.max(1, totalApplied)`). */
+  readonly conflictRate: number;
+}
+
+/** OpenTelemetry-compatible metric data point returned by `collector.toOpenTelemetry()`. */
+export interface ReplicationOtelMetric {
+  /** Metric name (e.g. `'firebird.replication.lag.entries'`). */
+  readonly name: string;
+  /** Human-readable metric description. */
+  readonly description: string;
+  /** Metric unit (`'1'`, `'ms'`, `'By'`, `'1/s'`). */
+  readonly unit: string;
+  /** Instrument kind (`'gauge'` or `'counter'`). */
+  readonly type: 'gauge' | 'counter';
+  /** Numeric value. */
+  readonly value: number;
+  /** Metric attributes (`publication`, `subscription`, `node_id`). */
+  readonly attributes: Readonly<Record<string, string>>;
+  /** Sample timestamp in milliseconds. */
+  readonly timestamp: number;
+}
+
+/** Options for {@link createReplicationMetricsCollector}. */
+export interface CreateReplicationMetricsCollectorOptions {
+  /** Optional source publication to inspect `currentLsn()`, `fetchChangesSince(0)` depth, and `listSlots()`. */
+  publication?: ReplicationPublication;
+  /** Optional target subscription to inspect `stats()` and `listDlq()` depth. */
+  subscription?: ReplicationSubscription;
+  /** Optional explicit DLQ manager if `subscription` is not provided. */
+  dlq?: ReplicationDlq;
+  /** Node identifier label override. */
+  nodeId?: string;
+  /** Optional callback invoked whenever `collect()` produces a new `ReplicationTelemetrySnapshot`. */
+  onSnapshot?: (snapshot: ReplicationTelemetrySnapshot) => void;
+}
+
+/** Telemetry collector returned by {@link createReplicationMetricsCollector}. */
+export interface ReplicationMetricsCollector {
+  /** Sample current replication telemetry and notify any registered listeners. */
+  collect(now?: number): Promise<ReplicationTelemetrySnapshot>;
+  /** Subscribe to telemetry snapshots emitted on each `collect()` call. Returns an unsubscribe function. */
+  subscribe(listener: (snapshot: ReplicationTelemetrySnapshot) => void): () => void;
+  /** Return the most recently collected `ReplicationTelemetrySnapshot`, or `null`. */
+  lastSnapshot(): ReplicationTelemetrySnapshot | null;
+  /** Collect and format telemetry in Prometheus text exposition format (`0.0.4`). */
+  toPrometheus(prefix?: string): Promise<string>;
+  /** Collect and format telemetry as OpenTelemetry-compatible metric records. */
+  toOpenTelemetry(): Promise<ReplicationOtelMetric[]>;
+}
+
+/**
+ * Format a {@link ReplicationTelemetrySnapshot} in Prometheus text exposition format (`M15 Item 4`).
+ */
+export function formatPrometheusReplicationMetrics(
+  snapshot: ReplicationTelemetrySnapshot,
+  prefix = 'firebird_replication',
+): string {
+  const esc = (v: string) => v.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
+  const labels = `publication="${esc(snapshot.publicationName)}",subscription="${esc(snapshot.subscriptionName)}",node_id="${esc(snapshot.nodeId)}"`;
+
+  const lines: string[] = [
+    `# HELP ${prefix}_primary_lsn Highest LSN recorded on the source publication.`,
+    `# TYPE ${prefix}_primary_lsn gauge`,
+    `${prefix}_primary_lsn{${labels}} ${snapshot.primaryLsn}`,
+    `# HELP ${prefix}_replica_watermark_lsn Last applied LSN watermark on the replica.`,
+    `# TYPE ${prefix}_replica_watermark_lsn gauge`,
+    `${prefix}_replica_watermark_lsn{${labels}} ${snapshot.replicaWatermark}`,
+    `# HELP ${prefix}_lag_entries Unapplied journal entries between primary and replica.`,
+    `# TYPE ${prefix}_lag_entries gauge`,
+    `${prefix}_lag_entries{${labels}} ${snapshot.lagEntries}`,
+    `# HELP ${prefix}_lag_ms Replication lag in milliseconds.`,
+    `# TYPE ${prefix}_lag_ms gauge`,
+    `${prefix}_lag_ms{${labels}} ${snapshot.lagMs}`,
+    `# HELP ${prefix}_journal_depth Retained entries in FB_REPL_JOURNAL$.`,
+    `# TYPE ${prefix}_journal_depth gauge`,
+    `${prefix}_journal_depth{${labels}} ${snapshot.journalDepth}`,
+    `# HELP ${prefix}_active_slots Active replication slots in FB_REPL_SLOTS$.`,
+    `# TYPE ${prefix}_active_slots gauge`,
+    `${prefix}_active_slots{${labels}} ${snapshot.activeSlots}`,
+    `# HELP ${prefix}_dlq_depth Quarantined poison entries in FB_REPL_DLQ$.`,
+    `# TYPE ${prefix}_dlq_depth gauge`,
+    `${prefix}_dlq_depth{${labels}} ${snapshot.dlqDepth}`,
+    `# HELP ${prefix}_fetched_total Cumulative journal entries fetched.`,
+    `# TYPE ${prefix}_fetched_total counter`,
+    `${prefix}_fetched_total{${labels}} ${snapshot.totalFetched}`,
+    `# HELP ${prefix}_applied_total Cumulative journal entries applied.`,
+    `# TYPE ${prefix}_applied_total counter`,
+    `${prefix}_applied_total{${labels}} ${snapshot.totalApplied}`,
+    `# HELP ${prefix}_conflicts_total Cumulative replication conflicts resolved.`,
+    `# TYPE ${prefix}_conflicts_total counter`,
+    `${prefix}_conflicts_total{${labels}} ${snapshot.totalConflicts}`,
+    `# HELP ${prefix}_bytes_transferred_total Cumulative replication payload bytes transferred.`,
+    `# TYPE ${prefix}_bytes_transferred_total counter`,
+    `${prefix}_bytes_transferred_total{${labels}} ${snapshot.bytesTransferred}`,
+    `# HELP ${prefix}_throughput_entries_per_sec Instantaneous replication apply throughput.`,
+    `# TYPE ${prefix}_throughput_entries_per_sec gauge`,
+    `${prefix}_throughput_entries_per_sec{${labels}} ${Number(snapshot.throughputEntriesPerSec.toFixed(4))}`,
+    `# HELP ${prefix}_conflict_rate Ratio of conflicts to applied entries.`,
+    `# TYPE ${prefix}_conflict_rate gauge`,
+    `${prefix}_conflict_rate{${labels}} ${Number(snapshot.conflictRate.toFixed(6))}`,
+  ];
+
+  return lines.join('\n') + '\n';
+}
+
+/**
+ * Create a structured replication telemetry collector with Prometheus & OpenTelemetry
+ * export helpers (`M15 Item 4`).
+ */
+export function createReplicationMetricsCollector(
+  options: CreateReplicationMetricsCollectorOptions,
+): ReplicationMetricsCollector {
+  const listeners = new Set<(snapshot: ReplicationTelemetrySnapshot) => void>();
+  if (options.onSnapshot) {
+    listeners.add(options.onSnapshot);
+  }
+
+  let prevSnapshot: ReplicationTelemetrySnapshot | null = null;
+
+  const collect = async (now = Date.now()): Promise<ReplicationTelemetrySnapshot> => {
+    const pub = options.publication;
+    const sub = options.subscription;
+
+    const subStats = sub ? await sub.stats() : null;
+    const primaryLsn = subStats
+      ? subStats.primaryLsn
+      : pub
+        ? await pub.currentLsn()
+        : 0;
+    const replicaWatermark = subStats ? subStats.replicaWatermark : 0;
+    const lagEntries = subStats
+      ? subStats.lagEntries
+      : Math.max(0, primaryLsn - replicaWatermark);
+    const lagMs = subStats ? subStats.lagMs : 0;
+
+    let journalDepth = 0;
+    let activeSlots = 0;
+    if (pub) {
+      const [entries, slots] = await Promise.all([
+        pub.fetchChangesSince(0),
+        pub.listSlots(),
+      ]);
+      journalDepth = entries.length;
+      activeSlots = slots.length;
+    }
+
+    let dlqDepth = 0;
+    if (options.dlq) {
+      const dlqItems = await options.dlq.listEntries();
+      dlqDepth = dlqItems.length;
+    } else if (sub) {
+      const dlqItems = await sub.listDlq();
+      dlqDepth = dlqItems.length;
+    }
+
+    const totalFetched = subStats?.totalFetched ?? 0;
+    const totalApplied = subStats?.totalApplied ?? 0;
+    const totalConflicts = subStats?.totalConflicts ?? 0;
+    const bytesTransferred = subStats?.bytesTransferred ?? 0;
+
+    let throughputEntriesPerSec = 0;
+    if (prevSnapshot && now > prevSnapshot.timestamp) {
+      const deltaApplied = Math.max(0, totalApplied - prevSnapshot.totalApplied);
+      const elapsedSec = (now - prevSnapshot.timestamp) / 1000;
+      throughputEntriesPerSec = elapsedSec > 0 ? deltaApplied / elapsedSec : 0;
+    }
+
+    const conflictRate = totalApplied > 0 ? totalConflicts / totalApplied : 0;
+
+    const snapshot: ReplicationTelemetrySnapshot = {
+      timestamp: now,
+      publicationName: pub?.name ?? 'default',
+      subscriptionName: sub?.name ?? 'default_sub',
+      nodeId: options.nodeId ?? sub?.nodeId ?? pub?.nodeId ?? 'node',
+      status: subStats?.status ?? 'idle',
+      primaryLsn,
+      replicaWatermark,
+      lagEntries,
+      lagMs,
+      journalDepth,
+      activeSlots,
+      dlqDepth,
+      totalFetched,
+      totalApplied,
+      totalConflicts,
+      bytesTransferred,
+      throughputEntriesPerSec,
+      conflictRate,
+    };
+
+    prevSnapshot = snapshot;
+    for (const listener of listeners) {
+      listener(snapshot);
+    }
+    return snapshot;
+  };
+
+  return {
+    collect,
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+    lastSnapshot() {
+      return prevSnapshot;
+    },
+    async toPrometheus(prefix = 'firebird_replication'): Promise<string> {
+      const snap = await collect();
+      return formatPrometheusReplicationMetrics(snap, prefix);
+    },
+    async toOpenTelemetry(): Promise<ReplicationOtelMetric[]> {
+      const snap = await collect();
+      const attributes = {
+        publication: snap.publicationName,
+        subscription: snap.subscriptionName,
+        node_id: snap.nodeId,
+      };
+      const ts = snap.timestamp;
+      return [
+        {
+          name: 'firebird.replication.primary_lsn',
+          description: 'Highest LSN recorded on the source publication.',
+          unit: '1',
+          type: 'gauge',
+          value: snap.primaryLsn,
+          attributes,
+          timestamp: ts,
+        },
+        {
+          name: 'firebird.replication.replica_watermark_lsn',
+          description: 'Last applied LSN watermark on the replica.',
+          unit: '1',
+          type: 'gauge',
+          value: snap.replicaWatermark,
+          attributes,
+          timestamp: ts,
+        },
+        {
+          name: 'firebird.replication.lag.entries',
+          description: 'Unapplied journal entries between primary and replica.',
+          unit: '1',
+          type: 'gauge',
+          value: snap.lagEntries,
+          attributes,
+          timestamp: ts,
+        },
+        {
+          name: 'firebird.replication.lag.ms',
+          description: 'Replication lag in milliseconds.',
+          unit: 'ms',
+          type: 'gauge',
+          value: snap.lagMs,
+          attributes,
+          timestamp: ts,
+        },
+        {
+          name: 'firebird.replication.journal.depth',
+          description: 'Retained entries in FB_REPL_JOURNAL$.',
+          unit: '1',
+          type: 'gauge',
+          value: snap.journalDepth,
+          attributes,
+          timestamp: ts,
+        },
+        {
+          name: 'firebird.replication.dlq.depth',
+          description: 'Quarantined poison entries in FB_REPL_DLQ$.',
+          unit: '1',
+          type: 'gauge',
+          value: snap.dlqDepth,
+          attributes,
+          timestamp: ts,
+        },
+        {
+          name: 'firebird.replication.applied.total',
+          description: 'Cumulative journal entries applied.',
+          unit: '1',
+          type: 'counter',
+          value: snap.totalApplied,
+          attributes,
+          timestamp: ts,
+        },
+        {
+          name: 'firebird.replication.conflicts.total',
+          description: 'Cumulative replication conflicts resolved.',
+          unit: '1',
+          type: 'counter',
+          value: snap.totalConflicts,
+          attributes,
+          timestamp: ts,
+        },
+        {
+          name: 'firebird.replication.bytes_transferred.total',
+          description: 'Cumulative replication payload bytes transferred.',
+          unit: 'By',
+          type: 'counter',
+          value: snap.bytesTransferred,
+          attributes,
+          timestamp: ts,
+        },
+        {
+          name: 'firebird.replication.throughput.entries_per_sec',
+          description: 'Instantaneous replication apply throughput.',
+          unit: '1/s',
+          type: 'gauge',
+          value: snap.throughputEntriesPerSec,
+          attributes,
+          timestamp: ts,
+        },
+      ];
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 15. Schema-Aware Replication & DDL Compatibility / Conflict Guard (M15 Item 5)
+// ---------------------------------------------------------------------------
+
+/** High-level DDL operation category returned by {@link classifyDdlStatement}. */
+export type DdlChangeCategory =
+  | 'create-table'
+  | 'drop-table'
+  | 'add-column'
+  | 'drop-column'
+  | 'alter-column'
+  | 'create-index'
+  | 'drop-index'
+  | 'other';
+
+/** Structured classification of a SQL DDL statement returned by {@link classifyDdlStatement}. */
+export interface ClassifiedDdlStatement {
+  /** High-level DDL change category. */
+  readonly category: DdlChangeCategory;
+  /** Target upper-case table name (or `''` if not applicable). */
+  readonly table: string;
+  /** Target upper-case column name for `add-column` / `drop-column` / `alter-column` (or `null`). */
+  readonly column: string | null;
+  /** Column SQL type definition for `add-column` / `alter-column` (or `null`). */
+  readonly columnType: string | null;
+  /** `true` if the DDL statement is purely additive (`CREATE TABLE`, `ALTER TABLE ADD`, `CREATE INDEX`). */
+  readonly isAdditive: boolean;
+  /** `true` if the DDL statement drops or narrows existing schema objects (`DROP TABLE`, `DROP COLUMN`, `ALTER COLUMN`). */
+  readonly isDestructive: boolean;
+  /** Original SQL statement trimmed. */
+  readonly sql: string;
+}
+
+/** Decision returned by {@link resolveDdlConflict}. */
+export interface DdlConflictResolution {
+  /** Whether to execute (`'apply'`), ignore idempotently (`'skip'`), or block (`'reject'`) the DDL statement. */
+  readonly action: 'apply' | 'skip' | 'reject';
+  /** Human-readable explanation for the decision. */
+  readonly reason: string;
+  /** SQL statement to execute when `action === 'apply'`. */
+  readonly sql?: string;
+  /** Parsed classification of the DDL statement. */
+  readonly classified: ClassifiedDdlStatement;
+}
+
+/** A single schema drift / compatibility issue detected between source and replica catalogs. */
+export interface SchemaColumnCompatibilityIssue {
+  /** Upper-case table name. */
+  readonly table: string;
+  /** Upper-case column name (`null` for table-level issues). */
+  readonly column: string | null;
+  /** Severity (`'compatible-additive'` when safe to replicate or `'breaking'` when replica will fail to apply). */
+  readonly severity: 'compatible-additive' | 'breaking';
+  /** Machine-readable issue code. */
+  readonly code:
+    | 'missing-replica-table'
+    | 'missing-replica-column'
+    | 'extra-replica-nullable-column'
+    | 'extra-replica-not-null-column'
+    | 'column-type-mismatch';
+  /** Human-readable explanation. */
+  readonly message: string;
+  /** Optional suggested remediation DDL statement on the replica. */
+  readonly suggestedDdl?: string;
+}
+
+/** Report returned by {@link checkReplicationSchemaCompatibility}. */
+export interface ReplicationSchemaCompatibilityReport {
+  /** `true` when no `'breaking'` issues exist across the inspected tables. */
+  readonly compatible: boolean;
+  /** List of all compatibility issues (`'compatible-additive'` and `'breaking'`). */
+  readonly issues: readonly SchemaColumnCompatibilityIssue[];
+  /** Suggested additive DDL statements that can bring the replica schema into compatibility. */
+  readonly remediationDdl: readonly string[];
+}
+
+/**
+ * Classify a Firebird SQL DDL statement into additive vs. destructive schema categories (`M15 Item 5`).
+ */
+export function classifyDdlStatement(ddlSql: string): ClassifiedDdlStatement {
+  const sql = ddlSql.trim();
+
+  // CREATE TABLE <name>
+  const createTableMatch = /^\s*CREATE\s+(?:GLOBAL\s+TEMPORARY\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:"([^"]+)"|([A-Za-z0-9_$]+))/i.exec(
+    sql,
+  );
+  if (createTableMatch) {
+    const table = (createTableMatch[1] ?? createTableMatch[2] ?? '').toUpperCase();
+    return {
+      category: 'create-table',
+      table,
+      column: null,
+      columnType: null,
+      isAdditive: true,
+      isDestructive: false,
+      sql,
+    };
+  }
+
+  // DROP TABLE <name>
+  const dropTableMatch = /^\s*DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:"([^"]+)"|([A-Za-z0-9_$]+))/i.exec(
+    sql,
+  );
+  if (dropTableMatch) {
+    const table = (dropTableMatch[1] ?? dropTableMatch[2] ?? '').toUpperCase();
+    return {
+      category: 'drop-table',
+      table,
+      column: null,
+      columnType: null,
+      isAdditive: false,
+      isDestructive: true,
+      sql,
+    };
+  }
+
+  // ALTER TABLE <table> ADD [COLUMN] <col> <type>
+  const alterAddMatch =
+    /^\s*ALTER\s+TABLE\s+(?:"([^"]+)"|([A-Za-z0-9_$]+))\s+ADD\s+(?:COLUMN\s+)?(?:"([^"]+)"|([A-Za-z0-9_$]+))\s+(.+?)\s*;?\s*$/is.exec(
+      sql,
+    );
+  if (alterAddMatch) {
+    const table = (alterAddMatch[1] ?? alterAddMatch[2] ?? '').toUpperCase();
+    const column = (alterAddMatch[3] ?? alterAddMatch[4] ?? '').toUpperCase();
+    const columnType = (alterAddMatch[5] ?? '').trim();
+    return {
+      category: 'add-column',
+      table,
+      column,
+      columnType,
+      isAdditive: true,
+      isDestructive: false,
+      sql,
+    };
+  }
+
+  // ALTER TABLE <table> DROP [COLUMN] <col>
+  const alterDropMatch =
+    /^\s*ALTER\s+TABLE\s+(?:"([^"]+)"|([A-Za-z0-9_$]+))\s+DROP\s+(?:COLUMN\s+)?(?:"([^"]+)"|([A-Za-z0-9_$]+))/i.exec(
+      sql,
+    );
+  if (alterDropMatch) {
+    const table = (alterDropMatch[1] ?? alterDropMatch[2] ?? '').toUpperCase();
+    const column = (alterDropMatch[3] ?? alterDropMatch[4] ?? '').toUpperCase();
+    return {
+      category: 'drop-column',
+      table,
+      column,
+      columnType: null,
+      isAdditive: false,
+      isDestructive: true,
+      sql,
+    };
+  }
+
+  // ALTER TABLE <table> ALTER [COLUMN] <col> ...
+  const alterColMatch =
+    /^\s*ALTER\s+TABLE\s+(?:"([^"]+)"|([A-Za-z0-9_$]+))\s+ALTER\s+(?:COLUMN\s+)?(?:"([^"]+)"|([A-Za-z0-9_$]+))\s*(.*)$/is.exec(
+      sql,
+    );
+  if (alterColMatch) {
+    const table = (alterColMatch[1] ?? alterColMatch[2] ?? '').toUpperCase();
+    const column = (alterColMatch[3] ?? alterColMatch[4] ?? '').toUpperCase();
+    const rest = (alterColMatch[5] ?? '').trim();
+    return {
+      category: 'alter-column',
+      table,
+      column,
+      columnType: rest || null,
+      isAdditive: false,
+      isDestructive: true,
+      sql,
+    };
+  }
+
+  // CREATE [UNIQUE] [ASC|DESC] INDEX <idx> ON <table>
+  const createIdxMatch =
+    /^\s*CREATE\s+(?:UNIQUE\s+)?(?:ASC(?:ENDING)?\s+|DESC(?:ENDING)?\s+)?INDEX\s+(?:"[^"]+"|[A-Za-z0-9_$]+)\s+ON\s+(?:"([^"]+)"|([A-Za-z0-9_$]+))/i.exec(
+      sql,
+    );
+  if (createIdxMatch) {
+    const table = (createIdxMatch[1] ?? createIdxMatch[2] ?? '').toUpperCase();
+    return {
+      category: 'create-index',
+      table,
+      column: null,
+      columnType: null,
+      isAdditive: true,
+      isDestructive: false,
+      sql,
+    };
+  }
+
+  // DROP INDEX <idx>
+  if (/^\s*DROP\s+INDEX\s+/i.test(sql)) {
+    return {
+      category: 'drop-index',
+      table: '',
+      column: null,
+      columnType: null,
+      isAdditive: false,
+      isDestructive: true,
+      sql,
+    };
+  }
+
+  return {
+    category: 'other',
+    table: '',
+    column: null,
+    columnType: null,
+    isAdditive: false,
+    isDestructive: false,
+    sql,
+  };
+}
+
+/**
+ * Resolve how an incoming DDL statement should be handled on a replica given its current
+ * table columns and DDL replay policy (`M15 Item 5`).
+ */
+export function resolveDdlConflict(
+  ddlSql: string,
+  replicaTableColumns: readonly string[],
+  options: {
+    policy?: 'apply' | 'idempotent' | 'additive-only';
+    tableExists?: boolean;
+  } = {},
+): DdlConflictResolution {
+  const policy = options.policy ?? 'idempotent';
+  const classified = classifyDdlStatement(ddlSql);
+  const existingColsUpper = new Set(replicaTableColumns.map((c) => c.trim().toUpperCase()));
+  const tableExists = options.tableExists ?? existingColsUpper.size > 0;
+
+  if (policy === 'apply') {
+    return {
+      action: 'apply',
+      reason: 'Policy is apply; executing DDL statement directly.',
+      sql: classified.sql,
+      classified,
+    };
+  }
+
+  if (policy === 'additive-only' && classified.isDestructive) {
+    return {
+      action: 'reject',
+      reason: `Destructive DDL (${classified.category} on ${classified.table || 'schema'}) rejected by additive-only policy.`,
+      classified,
+    };
+  }
+
+  if (classified.category === 'create-table' && tableExists) {
+    return {
+      action: 'skip',
+      reason: `Table ${classified.table} already exists on replica; skipping duplicate CREATE TABLE idempotently.`,
+      classified,
+    };
+  }
+
+  if (
+    classified.category === 'add-column' &&
+    classified.column &&
+    existingColsUpper.has(classified.column)
+  ) {
+    return {
+      action: 'skip',
+      reason: `Column ${classified.table}.${classified.column} already exists on replica; skipping duplicate ALTER TABLE ADD idempotently.`,
+      classified,
+    };
+  }
+
+  if (
+    classified.category === 'drop-column' &&
+    classified.column &&
+    tableExists &&
+    !existingColsUpper.has(classified.column)
+  ) {
+    return {
+      action: 'skip',
+      reason: `Column ${classified.table}.${classified.column} is already absent on replica; skipping duplicate ALTER TABLE DROP idempotently.`,
+      classified,
+    };
+  }
+
+  if (classified.category === 'drop-table' && !tableExists) {
+    return {
+      action: 'skip',
+      reason: `Table ${classified.table} is already absent on replica; skipping duplicate DROP TABLE idempotently.`,
+      classified,
+    };
+  }
+
+  return {
+    action: 'apply',
+    reason: 'DDL statement is compatible and not yet applied on replica.',
+    sql: classified.sql,
+    classified,
+  };
+}
+
+/**
+ * Inspect `sourceDb` and `targetDb` catalogs (`introspect`) and verify whether
+ * published tables on `sourceDb` can replicate cleanly into `targetDb`, reporting both
+ * breaking missing columns/tables and compatible additive columns (`M15 Item 5`).
+ */
+export async function checkReplicationSchemaCompatibility(options: {
+  sourceDb: ReplicableDatabase;
+  targetDb: ReplicableDatabase;
+  tables?: readonly string[];
+}): Promise<ReplicationSchemaCompatibilityReport> {
+  interface NormColInfo {
+    name: string;
+    type: string;
+    nullable: boolean;
+    hasDefault: boolean;
+  }
+  interface NormTableInfo {
+    table: string;
+    primaryKey: readonly string[];
+    columns: Map<string, NormColInfo>;
+  }
+
+  const loadNormalizedCatalog = async (
+    db: ReplicableDatabase,
+  ): Promise<Map<string, NormTableInfo>> => {
+    const out = new Map<string, NormTableInfo>();
+    try {
+      const schema = await introspect(toMigrationExecutor(db));
+      if (schema.tables.length > 0) {
+        for (const tbl of schema.tables) {
+          const upper = normalizeTableName(tbl.name);
+          if (isInternalReplicationTable(upper)) continue;
+          const cols = new Map<string, NormColInfo>();
+          for (const c of tbl.columns) {
+            cols.set(c.name.trim().toUpperCase(), {
+              name: c.name.trim().toUpperCase(),
+              type: c.typeName.trim().toUpperCase(),
+              nullable: c.nullable,
+              hasDefault: c.defaultSource !== null && c.defaultSource !== undefined,
+            });
+          }
+          out.set(upper, {
+            table: upper,
+            primaryKey: tbl.primaryKey.map((k) => k.toUpperCase()),
+            columns: cols,
+          });
+        }
+        if (out.size > 0) return out;
+      }
+    } catch {
+      // Fallback to discoverUserTables
+    }
+
+    const discovered = await discoverUserTables(db);
+    for (const d of discovered) {
+      const upper = normalizeTableName(d.table);
+      if (isInternalReplicationTable(upper)) continue;
+      const cols = new Map<string, NormColInfo>();
+      for (const colName of d.columns ?? ['ID']) {
+        const cUpper = colName.trim().toUpperCase();
+        cols.set(cUpper, {
+          name: cUpper,
+          type: 'VARCHAR(255)',
+          nullable: cUpper !== 'ID',
+          hasDefault: false,
+        });
+      }
+      out.set(upper, {
+        table: upper,
+        primaryKey: (d.primaryKey ? (Array.isArray(d.primaryKey) ? d.primaryKey : [d.primaryKey]) : ['ID']).map((k) =>
+          String(k).toUpperCase(),
+        ),
+        columns: cols,
+      });
+    }
+    return out;
+  };
+
+  const [sourceCatalog, targetCatalog] = await Promise.all([
+    loadNormalizedCatalog(options.sourceDb),
+    loadNormalizedCatalog(options.targetDb),
+  ]);
+
+  const filterTables = options.tables
+    ? new Set(options.tables.map((t) => normalizeTableName(t)))
+    : null;
+
+  const issues: SchemaColumnCompatibilityIssue[] = [];
+  const remediationDdl: string[] = [];
+
+  for (const [tableUpper, srcTable] of sourceCatalog.entries()) {
+    if (filterTables && !filterTables.has(tableUpper)) continue;
+
+    const tgtTable = targetCatalog.get(tableUpper);
+    if (!tgtTable) {
+      const colDefs = Array.from(srcTable.columns.values()).map((c) => {
+        const notNull = !c.nullable ? ' NOT NULL' : '';
+        return `${quoteIdent(c.name)} ${c.type}${notNull}`;
+      });
+      const pkClause =
+        srcTable.primaryKey.length > 0
+          ? `, PRIMARY KEY (${srcTable.primaryKey.map((k) => quoteIdent(k)).join(', ')})`
+          : '';
+      const createDdl = `CREATE TABLE ${quoteIdent(tableUpper)} (${colDefs.join(', ')}${pkClause})`;
+      issues.push({
+        table: tableUpper,
+        column: null,
+        severity: 'breaking',
+        code: 'missing-replica-table',
+        message: `Published table ${tableUpper} exists on source but is missing on replica.`,
+        suggestedDdl: createDdl,
+      });
+      remediationDdl.push(createDdl);
+      continue;
+    }
+
+    // 1. Check every source column exists on replica with compatible type
+    for (const [colName, srcCol] of srcTable.columns.entries()) {
+      const tgtCol = tgtTable.columns.get(colName);
+      if (!tgtCol) {
+        const addDdl = `ALTER TABLE ${quoteIdent(tableUpper)} ADD ${quoteIdent(colName)} ${srcCol.type}`;
+        issues.push({
+          table: tableUpper,
+          column: colName,
+          severity: 'breaking',
+          code: 'missing-replica-column',
+          message: `Column ${tableUpper}.${colName} (${srcCol.type}) is published by source but missing on replica.`,
+          suggestedDdl: addDdl,
+        });
+        remediationDdl.push(addDdl);
+        continue;
+      }
+
+      const normType = (t: string) => t.trim().toUpperCase().replace(/\s+/g, ' ');
+      if (normType(srcCol.type) !== normType(tgtCol.type)) {
+        issues.push({
+          table: tableUpper,
+          column: colName,
+          severity: 'breaking',
+          code: 'column-type-mismatch',
+          message: `Column ${tableUpper}.${colName} has type ${srcCol.type} on source vs ${tgtCol.type} on replica.`,
+        });
+      }
+    }
+
+    // 2. Check extra columns present on replica but absent on source
+    for (const [colName, tgtCol] of tgtTable.columns.entries()) {
+      if (srcTable.columns.has(colName)) continue;
+      if (tgtCol.nullable || tgtCol.hasDefault) {
+        issues.push({
+          table: tableUpper,
+          column: colName,
+          severity: 'compatible-additive',
+          code: 'extra-replica-nullable-column',
+          message: `Replica table ${tableUpper} has extra nullable/defaulted column ${colName} (${tgtCol.type}); source rows will replicate cleanly.`,
+        });
+      } else {
+        issues.push({
+          table: tableUpper,
+          column: colName,
+          severity: 'breaking',
+          code: 'extra-replica-not-null-column',
+          message: `Replica table ${tableUpper} has extra NOT NULL column ${colName} without a default value; source INSERTs will fail.`,
+        });
+      }
+    }
+  }
+
+  const compatible = !issues.some((i) => i.severity === 'breaking');
+  return {
+    compatible,
+    issues,
+    remediationDdl,
+  };
+}
+

@@ -417,6 +417,9 @@
           <button type="button" id="prune-journal" class="btn-sm">
             Prune Acked (<code>pruneAcked()</code>)
           </button>
+          <button type="button" id="compact-journal" class="btn-sm">
+            Compact Journal (<code>compactJournal()</code>)
+          </button>
           <button type="button" id="reset-sim" class="btn-sm">
             Reset State
           </button>
@@ -456,6 +459,14 @@
         <button type="button" class="scenario-card" data-scenario="timetravel">
           <strong>8. Time-Travel &amp; Rollback (<code>rewindToLsn</code>)</strong>
           <span>Perform accidental updates/deletes, inspect historical state via asOfLsn(), and rewind back in time!</span>
+        </button>
+        <button type="button" class="scenario-card" data-scenario="mesh">
+          <strong>9. 3-Node Hub &amp; Spoke Mesh (<code>createReplicationHub</code>)</strong>
+          <span>Converge 3 nodes (hub, edge_eu, edge_us) with transitive routing and inspect the live Watermark Matrix!</span>
+        </button>
+        <button type="button" class="scenario-card" data-scenario="dlq">
+          <strong>10. Dead-Letter Queue (<code>FB_REPL_DLQ$</code>) &amp; Compaction</strong>
+          <span>Quarantine a poison row into FB_REPL_DLQ$, retry with sanitization, and compact superseded journal updates!</span>
         </button>
       </section>
 
@@ -598,6 +609,7 @@
               <button type="button" class="btn-sm" id="show-trigger-ddl">PSQL Trigger DDL</button>
               <button type="button" class="btn-sm" id="show-binary-hex">Binary Segment (0x52444246)</button>
               <button type="button" class="btn-sm" id="show-encrypted-hex">AES-GCM + Gzip (0x53444246)</button>
+              <button type="button" class="btn-sm" id="show-mesh-dlq">Mesh Matrix &amp; DLQ</button>
             </div>
           </div>
           <pre class="code-pre" id="code-inspector"></pre>

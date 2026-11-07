@@ -409,13 +409,14 @@ describe('firebird-wasm/repl', () => {
           ],
         })),
         query: vi.fn(async (sqlText: string) => {
-          if (sqlText.includes('RDB$RELATIONS') && sqlText.includes('IN (?, ?, ?)')) {
+          if (sqlText.includes('RDB$RELATIONS') && sqlText.includes('IN (?, ?, ?, ?)')) {
             return {
               fields: [{ name: 'REL_NAME' }],
               rows: [
                 ['FB_REPL_JOURNAL$'],
                 ['FB_REPL_SLOTS$'],
                 ['FB_REPL_WATERMARKS$'],
+                ['FB_REPL_DLQ$'],
               ],
             };
           }
@@ -489,6 +490,18 @@ describe('firebird-wasm/repl', () => {
                 { name: 'UPDATED_AT' },
               ],
               rows: [['edge-1', 5, '2026-11-05T11:59:30.000Z']],
+            };
+          }
+          if (sqlText.includes('FROM "FB_REPL_DLQ$"')) {
+            return {
+              fields: [
+                { name: 'LSN' },
+                { name: 'SUB_NAME' },
+                { name: 'ERROR_MSG' },
+                { name: 'RETRY_COUNT' },
+                { name: 'QUARANTINED_AT' },
+              ],
+              rows: [[7, 'sub_edge_1', 'CHECK constraint failed', 2, '1730800001000']],
             };
           }
           return { fields: [], rows: [] };
@@ -627,17 +640,24 @@ describe('firebird-wasm/repl', () => {
       expect(replEntry?.replication?.slots).toHaveLength(1);
       expect(replEntry?.replication?.slots[0]?.slotName).toBe('slot_edge_1');
       expect(replEntry?.replication?.watermarks).toHaveLength(1);
+      expect(replEntry?.replication?.dlqTableExists).toBe(true);
+      expect(replEntry?.replication?.dlqEntryCount).toBe(1);
+      expect(replEntry?.replication?.dlqEntries?.[0]?.errorMessage).toBe(
+        'CHECK constraint failed',
+      );
       expect(replEntry?.replication?.liveStats?.lagEntries).toBe(1);
       expect(replicationEventDetail?.replication?.journalEntryCount).toBe(5);
       expect(el.inspectorOpen).toBe(true);
       expect(el.inspectorTab).toBe('replication');
       expect(inspectorNode.allText()).toContain(
-        'Journal: 5 entries (LSN 2 → 6) · 1 slot · 1 watermark',
+        'Journal: 5 entries (LSN 2 → 6) · 1 slot · 1 watermark · 1 DLQ',
       );
       expect(inspectorNode.allText()).toContain('1 entries / 45 ms');
       expect(inspectorNode.allText()).toContain('slot_edge_1');
       expect(inspectorNode.allText()).toContain('ack LSN 4 · lag 2');
       expect(inspectorNode.allText()).toContain('#6');
+      expect(inspectorNode.allText()).toContain('Dead-Letter Queue (1)');
+      expect(inspectorNode.allText()).toContain('CHECK constraint failed');
 
       // 6. Toggle inspector closed
       await el.toggleInspector('replication');

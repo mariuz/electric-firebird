@@ -1534,6 +1534,38 @@ Next-horizon milestones (`v0.20.0`):
 
 ---
 
+### M15 — Simulator E2E CI Gate & Stress Suite, Multi-Node Mesh/DLQ Simulator Panel, Journal Compaction & Retention Policies, Replication Telemetry Hooks & Schema-Aware DDL Compatibility
+
+- [x] **1. Simulator E2E CI Gate & Multi-Node Mesh / DLQ Stress Suite (`ci.yml` + `replication.test.ts`).**
+      Run the Playwright `replication.html` E2E suite (`e2e/tests/replication-demo.spec.ts`)
+      on every push and pull request in `.github/workflows/ci.yml`, and add
+      high-concurrency multi-node mesh (`createReplicationMesh` / `createReplicationHub`)
+      and Dead-Letter Queue (`FB_REPL_DLQ$`) stress tests.
+- [x] **2. Replication Simulator v3: Multi-Node Mesh/Hub Panel, Watermark Matrix & DLQ Inspector (`demo/public/replication.html`).**
+      Extend `demo/public/replication.html` and `demo/public/replication.js` with
+      interactive 3-node Hub-and-Spoke / Mesh cluster simulation, live
+      `watermarks[subscriber][publisher]` matrix, journal compaction controls,
+      and `FB_REPL_DLQ$` quarantine/retry inspection.
+- [x] **3. Journal Retention, Compaction & Automated PITR Archival Policy (`compactJournal` / `applyRetentionPolicy`).**
+      Collapse superseded per-row journal mutations (`INSERT` + $N \times$ `UPDATE`
+      $\rightarrow$ net `INSERT`, `UPDATE` + `UPDATE` $\rightarrow$ net `UPDATE`,
+      or `INSERT` + `DELETE` within the compaction window) to bound
+      `FB_REPL_JOURNAL$` growth, and automatically rotate pruned entries into
+      `ReplicationJournalArchive` bundles via `applyRetentionPolicy()`.
+- [x] **4. Replication Metrics Hooks & `<firebird-repl>` DLQ / Telemetry Inspector (`createReplicationMetricsCollector` / `formatPrometheusReplicationMetrics`).**
+      Provide structured replication telemetry (`lagEntries`, `lagMs`,
+      `journalDepth`, `activeSlots`, `dlqDepth`, `throughputEntriesPerSec`,
+      `conflictRate`, `bytesTransferred`) with Prometheus text exposition and
+      OpenTelemetry export helpers, and surface `FB_REPL_DLQ$` quarantined
+      entries in `<firebird-repl>`'s Replication Inspector.
+- [x] **5. Schema-Aware Replication & DDL Compatibility / Conflict Guard (`classifyDdlStatement` / `resolveDdlConflict` / `checkReplicationSchemaCompatibility`).**
+      Classify incoming DDL statements into additive vs. destructive schema
+      operations, guard subscriber DDL replay with `ddlPolicy: 'apply' | 'idempotent' | 'additive-only'`,
+      and inspect source vs. replica catalogs to detect missing or incompatible
+      columns and generate remediation DDL.
+
+---
+
 ## 5. Test coverage added alongside this review
 
 `src/browser/` was excluded from Jest and had no browser tests.  It now has 73

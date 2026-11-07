@@ -44,6 +44,13 @@ import {
   createPiiMaskingTransformer,
   exportJournalArchive,
   applyJournalArchive,
+  compactJournal,
+  applyRetentionPolicy,
+  createReplicationMetricsCollector,
+  formatPrometheusReplicationMetrics,
+  classifyDdlStatement,
+  resolveDdlConflict,
+  checkReplicationSchemaCompatibility,
   type ReplicableDatabase,
   type WebSocketLike,
 } from '../replication';
@@ -1959,5 +1966,412 @@ describe('firebird-wasm/replication - real-engine regressions', () => {
       table: 'ITEMS', operation: 'INSERT', after: { ID: 3, NAME: 'c' }, applyLocally: false,
     });
     expect(next.lsn).toBe(42);
+  });
+
+  // -------------------------------------------------------------------------
+  // M15 Item 1: High-Concurrency Multi-Node Mesh & DLQ Stress Suite
+  // -------------------------------------------------------------------------
+  it('converges a 4-node full-mesh cluster under concurrent multi-writer CRDT updates and DLQ quarantine/recovery (M15 Item 1)', async () => {
+    const dbA = createMockReplDb();
+    const dbB = createMockReplDb();
+    const dbC = createMockReplDb();
+    const dbD = createMockReplDb();
+
+    for (const db of [dbA, dbB, dbC, dbD]) {
+      db.tables.set('COUNTERS', []);
+    }
+
+    const crdtResolver = createCrdtConflictResolver({
+      columns: { HITS: 'pn-counter', TAG: 'lww' },
+    });
+
+    let rejectPoisonOnD = true;
+    const mesh = await createReplicationMesh({
+      topology: 'full-mesh',
+      tables: [{ table: 'COUNTERS', primaryKey: 'ID' }],
+      onConflict: crdtResolver,
+      nodes: [
+        { nodeId: 'node_a', db: dbA },
+        { nodeId: 'node_b', db: dbB },
+        { nodeId: 'node_c', db: dbC },
+        {
+          nodeId: 'node_d',
+          db: dbD,
+          onApplyError: 'dlq',
+          validateEntry: (entry) => {
+            if (rejectPoisonOnD && entry.after?.TAG === 'POISON_ROW') {
+              throw new Error('Poison row blocked on node_d');
+            }
+            return true;
+          },
+        },
+      ],
+    });
+
+    const pubA = mesh.publications.get('node_a')!;
+    const pubB = mesh.publications.get('node_b')!;
+    const pubC = mesh.publications.get('node_c')!;
+
+    // Seed initial counter row (ID=1, HITS=10) across all 4 nodes
+    await pubA.recordDml({
+      table: 'COUNTERS',
+      operation: 'INSERT',
+      key: { ID: 1 },
+      after: { ID: 1, HITS: 10, TAG: 'init' },
+      timestamp: 900,
+    });
+    await mesh.sync();
+
+    // Concurrent counter increments on A (+5), B (+12), C (+8) from base 10 => net 10 + 5 + 12 + 8 = 35
+    await pubA.recordDml({
+      table: 'COUNTERS',
+      operation: 'UPDATE',
+      key: { ID: 1 },
+      before: { ID: 1, HITS: 10, TAG: 'init' },
+      after: { ID: 1, HITS: 15, TAG: 'from_a' },
+      timestamp: 1000,
+    });
+    await pubB.recordDml({
+      table: 'COUNTERS',
+      operation: 'UPDATE',
+      key: { ID: 1 },
+      before: { ID: 1, HITS: 10, TAG: 'init' },
+      after: { ID: 1, HITS: 22, TAG: 'from_b' },
+      timestamp: 1010,
+    });
+    await pubC.recordDml({
+      table: 'COUNTERS',
+      operation: 'UPDATE',
+      key: { ID: 1 },
+      before: { ID: 1, HITS: 10, TAG: 'init' },
+      after: { ID: 1, HITS: 18, TAG: 'from_c' },
+      timestamp: 1020,
+    });
+
+    // Also insert a poison row on node A that node D quarantines in FB_REPL_DLQ$
+    await pubA.recordDml({
+      table: 'COUNTERS',
+      operation: 'INSERT',
+      key: { ID: 99 },
+      after: { ID: 99, HITS: 1, TAG: 'POISON_ROW' },
+      timestamp: 1030,
+    });
+
+    const syncRes = await mesh.sync();
+    expect(syncRes.rounds).toBeGreaterThanOrEqual(1);
+    expect(syncRes.totalApplied).toBeGreaterThan(0);
+
+    // Nodes A, B, C have both ID=1 (converged HITS=35, TAG='from_c') and ID=99
+    for (const db of [dbA, dbB, dbC]) {
+      const row1 = db.tables.get('COUNTERS')!.find((r) => r.ID === 1);
+      expect(row1?.HITS).toBe(35);
+      expect(row1?.TAG).toBe('from_c');
+      const row99 = db.tables.get('COUNTERS')!.find((r) => r.ID === 99);
+      expect(row99?.TAG).toBe('POISON_ROW');
+    }
+
+    // Node D applied ID=1 (HITS=35) and quarantined ID=99 in FB_REPL_DLQ$
+    const row1OnD = dbD.tables.get('COUNTERS')!.find((r) => r.ID === 1);
+    expect(row1OnD?.HITS).toBe(35);
+    expect(dbD.tables.get('COUNTERS')!.find((r) => r.ID === 99)).toBeUndefined();
+
+    const dlqOnD = await createReplicationDlq(dbD);
+    const quarantined = await dlqOnD.listEntries();
+    expect(quarantined.length).toBeGreaterThanOrEqual(1);
+    expect(quarantined[0]?.errorMessage).toContain('Poison row blocked on node_d');
+
+    // Clear the validation block and retry DLQ on node_d -> node_d converges on ID=99 too
+    rejectPoisonOnD = false;
+    const subDFromA = mesh.subscriptions.get('node_d<-node_a')!;
+    const retryRes = await subDFromA.retryDlq({
+      transformEntry: (e) => ({
+        ...e,
+        after: { ...(e.after ?? {}), TAG: 'SANITIZED_ROW' },
+      }),
+    });
+    expect(retryRes.succeeded).toBe(1);
+    const row99OnD = dbD.tables.get('COUNTERS')!.find((r) => r.ID === 99);
+    expect(row99OnD?.TAG).toBe('SANITIZED_ROW');
+  });
+
+  // -------------------------------------------------------------------------
+  // M15 Item 3: Journal Compaction & Automated PITR Retention Policy
+  // -------------------------------------------------------------------------
+  it('compacts superseded per-row mutations and rotates pruned entries into PITR archives (M15 Item 3)', async () => {
+    const db = createMockReplDb();
+    db.tables.set('ITEMS', []);
+
+    const pub = await createPublication(db, {
+      name: 'pub_compact',
+      nodeId: 'node_1',
+      tables: [{ table: 'ITEMS', primaryKey: 'ID' }],
+    });
+
+    // Row 1: INSERT + 3 UPDATEs -> compacts to a single INSERT at the latest LSN with final state
+    await pub.recordDml({
+      table: 'ITEMS',
+      operation: 'INSERT',
+      key: { ID: 1 },
+      after: { ID: 1, NAME: 'v1', QTY: 1 },
+      timestamp: 1000,
+    });
+    await pub.recordDml({
+      table: 'ITEMS',
+      operation: 'UPDATE',
+      key: { ID: 1 },
+      after: { ID: 1, NAME: 'v2', QTY: 2 },
+      timestamp: 1010,
+    });
+    await pub.recordDml({
+      table: 'ITEMS',
+      operation: 'UPDATE',
+      key: { ID: 1 },
+      after: { ID: 1, NAME: 'v3', QTY: 3 },
+      timestamp: 1020,
+    });
+    await pub.recordDml({
+      table: 'ITEMS',
+      operation: 'UPDATE',
+      key: { ID: 1 },
+      after: { ID: 1, NAME: 'v4', QTY: 4 },
+      timestamp: 1030,
+    });
+
+    // Row 2: INSERT + UPDATE + DELETE within the window -> elided completely
+    await pub.recordDml({
+      table: 'ITEMS',
+      operation: 'INSERT',
+      key: { ID: 2 },
+      after: { ID: 2, NAME: 'temp', QTY: 1 },
+      timestamp: 1040,
+    });
+    await pub.recordDml({
+      table: 'ITEMS',
+      operation: 'UPDATE',
+      key: { ID: 2 },
+      after: { ID: 2, NAME: 'temp2', QTY: 2 },
+      timestamp: 1050,
+    });
+    await pub.recordDml({
+      table: 'ITEMS',
+      operation: 'DELETE',
+      key: { ID: 2 },
+      timestamp: 1060,
+    });
+
+    // Row 3: untouched single INSERT
+    await pub.recordDml({
+      table: 'ITEMS',
+      operation: 'INSERT',
+      key: { ID: 3 },
+      after: { ID: 3, NAME: 'stable', QTY: 10 },
+      timestamp: 1070,
+    });
+
+    const compactRes = await compactJournal(db, { publication: 'pub_compact' });
+    expect(compactRes.entriesBefore).toBe(8);
+    expect(compactRes.entriesAfter).toBe(2); // Row 1 net INSERT (LSN 4) + Row 3 INSERT (LSN 8)
+    expect(compactRes.entriesRemoved).toBe(6);
+    expect(compactRes.keysCompacted).toBe(2);
+
+    const remaining = await pub.fetchChangesSince(0);
+    expect(remaining).toHaveLength(2);
+    expect(remaining[0]?.lsn).toBe(4);
+    expect(remaining[0]?.operation).toBe('INSERT');
+    expect(remaining[0]?.after).toEqual({ ID: 1, NAME: 'v4', QTY: 4 });
+    expect(remaining[1]?.lsn).toBe(8);
+    expect(remaining[1]?.after).toEqual({ ID: 3, NAME: 'stable', QTY: 10 });
+
+    // A fresh replica pulling from the compacted journal converges to the exact table state
+    const replicaDb = createMockReplDb();
+    replicaDb.tables.set('ITEMS', []);
+    const sub = await createSubscription(replicaDb, {
+      publication: pub,
+      name: 'sub_after_compact',
+      nodeId: 'node_2',
+    });
+    await sub.pull();
+    expect(replicaDb.tables.get('ITEMS')).toEqual([
+      { ID: 1, NAME: 'v4', QTY: 4 },
+      { ID: 3, NAME: 'stable', QTY: 10 },
+    ]);
+
+    // Now test applyRetentionPolicy with archiveBeforePrune: true
+    await pub.recordDml({
+      table: 'ITEMS',
+      operation: 'UPDATE',
+      key: { ID: 1 },
+      after: { ID: 1, NAME: 'v5', QTY: 50 },
+      timestamp: 2000,
+    });
+    const retentionRes = await applyRetentionPolicy(db, pub, {
+      maxEntries: 1,
+      archiveBeforePrune: true,
+      ignoreSlotWatermarks: true,
+    });
+    expect(retentionRes.prunedEntries).toBe(2);
+    expect(retentionRes.prunedUpToLsn).toBe(8);
+    expect(retentionRes.archive).not.toBeNull();
+    expect(retentionRes.archive?.totalEntries).toBe(2);
+  });
+
+  // -------------------------------------------------------------------------
+  // M15 Item 4: Structured Replication Telemetry & Prometheus / OTel Export
+  // -------------------------------------------------------------------------
+  it('collects structured replication telemetry and exports Prometheus & OpenTelemetry metrics (M15 Item 4)', async () => {
+    const primaryDb = createMockReplDb();
+    const replicaDb = createMockReplDb();
+    primaryDb.tables.set('ORDERS', []);
+    replicaDb.tables.set('ORDERS', []);
+
+    const pub = await createPublication(primaryDb, {
+      name: 'orders_pub',
+      nodeId: 'primary_1',
+      tables: [{ table: 'ORDERS', primaryKey: 'ID' }],
+    });
+    await pub.registerSlot({ slotName: 'slot_rep_1', nodeId: 'replica_1' });
+
+    const sub = await createSubscription(replicaDb, {
+      publication: pub,
+      name: 'orders_sub',
+      nodeId: 'replica_1',
+      slotName: 'slot_rep_1',
+      onApplyError: 'dlq',
+      validateEntry: (e) => {
+        if (Number(e.after?.TOTAL ?? 0) < 0) {
+          throw new Error('Negative order total');
+        }
+      },
+    });
+
+    await pub.recordDml({
+      table: 'ORDERS',
+      operation: 'INSERT',
+      key: { ID: 1 },
+      after: { ID: 1, TOTAL: 100 },
+      timestamp: 1000,
+    });
+    await pub.recordDml({
+      table: 'ORDERS',
+      operation: 'INSERT',
+      key: { ID: 2 },
+      after: { ID: 2, TOTAL: -50 },
+      timestamp: 1010,
+    });
+
+    const snapshots: unknown[] = [];
+    const collector = createReplicationMetricsCollector({
+      publication: pub,
+      subscription: sub,
+      onSnapshot: (s) => snapshots.push(s),
+    });
+
+    // Before pull: lagEntries = 2, dlqDepth = 0
+    const beforeSnap = await collector.collect(1050);
+    expect(beforeSnap.lagEntries).toBe(2);
+    expect(beforeSnap.dlqDepth).toBe(0);
+    expect(beforeSnap.journalDepth).toBe(2);
+    expect(beforeSnap.activeSlots).toBe(1);
+
+    // Pull: 1 applied, 1 quarantined in FB_REPL_DLQ$
+    await sub.pull();
+
+    const afterSnap = await collector.collect(2050);
+    expect(afterSnap.lagEntries).toBe(0);
+    expect(afterSnap.totalApplied).toBe(1);
+    expect(afterSnap.dlqDepth).toBe(1);
+    expect(afterSnap.throughputEntriesPerSec).toBeCloseTo(1.0, 2);
+    expect(snapshots).toHaveLength(2);
+
+    const promText = await collector.toPrometheus('fb_repl');
+    expect(promText).toContain('fb_repl_primary_lsn{publication="orders_pub",subscription="orders_sub",node_id="replica_1"} 2');
+    expect(promText).toContain('fb_repl_dlq_depth{publication="orders_pub",subscription="orders_sub",node_id="replica_1"} 1');
+    expect(promText).toContain('fb_repl_applied_total{publication="orders_pub",subscription="orders_sub",node_id="replica_1"} 1');
+    expect(formatPrometheusReplicationMetrics(collector.lastSnapshot()!, 'fb_repl')).toBe(promText);
+
+    const otelMetrics = await collector.toOpenTelemetry();
+    const dlqMetric = otelMetrics.find((m) => m.name === 'firebird.replication.dlq.depth');
+    expect(dlqMetric?.value).toBe(1);
+    expect(dlqMetric?.attributes.publication).toBe('orders_pub');
+  });
+
+  // -------------------------------------------------------------------------
+  // M15 Item 5: Schema-Aware Replication & DDL Compatibility / Conflict Guard
+  // -------------------------------------------------------------------------
+  it('classifies DDL statements, guards additive-only / idempotent DDL replay, and checks catalog compatibility (M15 Item 5)', async () => {
+    const createCls = classifyDdlStatement('CREATE TABLE "AUDIT_LOG" (ID INT NOT NULL PRIMARY KEY)');
+    expect(createCls.category).toBe('create-table');
+    expect(createCls.table).toBe('AUDIT_LOG');
+    expect(createCls.isAdditive).toBe(true);
+    expect(createCls.isDestructive).toBe(false);
+
+    const addColCls = classifyDdlStatement('ALTER TABLE USERS ADD PHONE VARCHAR(32)');
+    expect(addColCls.category).toBe('add-column');
+    expect(addColCls.table).toBe('USERS');
+    expect(addColCls.column).toBe('PHONE');
+    expect(addColCls.isAdditive).toBe(true);
+
+    const dropColCls = classifyDdlStatement('ALTER TABLE USERS DROP COLUMN LEGACY_FLAG');
+    expect(dropColCls.category).toBe('drop-column');
+    expect(dropColCls.isDestructive).toBe(true);
+
+    // Duplicate column on replica is skipped idempotently
+    const skipRes = resolveDdlConflict(
+      'ALTER TABLE USERS ADD EMAIL VARCHAR(120)',
+      ['ID', 'NAME', 'EMAIL'],
+      { policy: 'idempotent' },
+    );
+    expect(skipRes.action).toBe('skip');
+
+    // Destructive DDL under 'additive-only' is rejected
+    const rejectRes = resolveDdlConflict(
+      'ALTER TABLE USERS DROP COLUMN EMAIL',
+      ['ID', 'NAME', 'EMAIL'],
+      { policy: 'additive-only' },
+    );
+    expect(rejectRes.action).toBe('reject');
+
+    // End-to-end subscription with ddlPolicy: 'additive-only' + onApplyError: 'dlq'
+    const primaryDb = createMockReplDb();
+    const replicaDb = createMockReplDb();
+    primaryDb.tables.set('USERS', [{ ID: 1, NAME: 'Ada' }]);
+    replicaDb.tables.set('USERS', [{ ID: 1, NAME: 'Ada', PHONE: null }]);
+
+    const pub = await createPublication(primaryDb, {
+      name: 'ddl_pub',
+      nodeId: 'node_p',
+      tables: [{ table: 'USERS', primaryKey: 'ID' }],
+    });
+    const sub = await createSubscription(replicaDb, {
+      publication: pub,
+      name: 'ddl_sub',
+      nodeId: 'node_r',
+      ddlPolicy: 'additive-only',
+      onApplyError: 'dlq',
+    });
+
+    // 1. Additive DDL for column that already exists on replica -> skipped idempotently
+    await pub.recordDdl('ALTER TABLE USERS ADD PHONE VARCHAR(32)');
+    // 2. Additive DDL for new column -> applied on replica
+    await pub.recordDdl('ALTER TABLE USERS ADD TIER VARCHAR(16)');
+    // 3. Destructive DDL -> rejected by 'additive-only' and quarantined in FB_REPL_DLQ$
+    await pub.recordDdl('DROP TABLE USERS');
+
+    const pullRes = await sub.pull();
+    expect(pullRes.appliedCount).toBe(1); // Only TIER was executed
+    expect(pullRes.dlqCount).toBe(1); // DROP TABLE was quarantined
+    expect(replicaDb.ddlLog).toContain('ALTER TABLE USERS ADD TIER VARCHAR(16)');
+    expect(replicaDb.ddlLog).not.toContain('DROP TABLE USERS');
+
+    // Catalog compatibility check between primaryDb and replicaDb
+    primaryDb.tables.set('USERS', [{ ID: 1, NAME: 'Ada', NEW_SOURCE_COL: 'val' }]);
+    const compatReport = await checkReplicationSchemaCompatibility({
+      sourceDb: primaryDb,
+      targetDb: replicaDb,
+      tables: ['USERS'],
+    });
+    expect(compatReport.compatible).toBe(false);
+    expect(compatReport.issues.some((i) => i.code === 'missing-replica-column' && i.column === 'NEW_SOURCE_COL')).toBe(true);
+    expect(compatReport.remediationDdl[0]).toContain('ALTER TABLE USERS ADD NEW_SOURCE_COL');
   });
 });

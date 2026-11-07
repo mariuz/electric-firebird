@@ -286,6 +286,13 @@ export {
   createPiiMaskingTransformer,
   exportJournalArchive,
   applyJournalArchive,
+  compactJournal,
+  applyRetentionPolicy,
+  createReplicationMetricsCollector,
+  formatPrometheusReplicationMetrics,
+  classifyDdlStatement,
+  resolveDdlConflict,
+  checkReplicationSchemaCompatibility,
 } from './replication';
 export type {
   ReplicableDatabase,
@@ -359,6 +366,19 @@ export type {
   ExportJournalArchiveOptions,
   ApplyJournalArchiveOptions,
   ApplyJournalArchiveResult,
+  CompactJournalOptions,
+  JournalCompactionResult,
+  JournalRetentionPolicyOptions,
+  JournalRetentionPolicyResult,
+  ReplicationTelemetrySnapshot,
+  ReplicationOtelMetric,
+  CreateReplicationMetricsCollectorOptions,
+  ReplicationMetricsCollector,
+  DdlChangeCategory,
+  ClassifiedDdlStatement,
+  DdlConflictResolution,
+  SchemaColumnCompatibilityIssue,
+  ReplicationSchemaCompatibilityReport,
 } from './replication';
 export {
   ENCRYPTED_PAGE_MAGIC,

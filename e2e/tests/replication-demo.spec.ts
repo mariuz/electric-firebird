@@ -141,4 +141,26 @@ test.describe('Replication Simulator v2 (replication.html)', () => {
     await expect(page.locator('#code-inspector')).toContainText('0x53444246');
     await expect(page.locator('#code-inspector')).toContainText('AES-256-GCM');
   });
+
+  test('Scenario 9 & 10: 3-Node Hub & Spoke Mesh Watermark Matrix, Dead-Letter Queue (FB_REPL_DLQ$) and Journal Compaction', async ({
+    page,
+  }) => {
+    await openReplicationSim(page);
+    await page.locator('.scenario-card[data-scenario="mesh"]').click();
+
+    await expect(page.locator('#primary-rows')).toContainText('Edge-EU Mesh Task');
+    await expect(page.locator('#replica-rows')).toContainText('Edge-US Spoke Task');
+    await expect(page.locator('#slots-list')).toContainText('slot_edge_eu');
+    await expect(page.locator('#slots-list')).toContainText('slot_edge_us');
+    await expect(page.locator('#code-inspector')).toContainText('Watermark Matrix');
+    await expect(page.locator('#code-inspector')).toContainText('firebird_replication_primary_lsn');
+
+    await page.locator('.scenario-card[data-scenario="dlq"]').click();
+
+    await expect(page.locator('#primary-rows')).toContainText('Compacted Final v3');
+    await expect(page.locator('#replica-rows')).toContainText('Compacted Final v3');
+    await expect(page.locator('#code-inspector')).toContainText('Dead-Letter Queue (FB_REPL_DLQ$)');
+    await expect(page.locator('#code-inspector')).toContainText('validateEntry rejected row');
+    await expect(page.locator('#event-feed')).toContainText('Scenario 10');
+  });
 });

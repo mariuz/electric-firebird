@@ -554,6 +554,70 @@ async function createSimReplicator(options) {
         primaryJournal.push(...kept);
         return { pruned: before - kept.length, minSlotLsn };
       },
+      compactJournal: async () => {
+        const entriesBefore = primaryJournal.length;
+        const chains = new Map();
+        const ddlEntries = [];
+        let epoch = 0;
+        for (const e of primaryJournal) {
+          if (e.operation === 'DDL') {
+            epoch++;
+            ddlEntries.push(e);
+            continue;
+          }
+          const cid = `${epoch}:${e.table}:${JSON.stringify(e.key)}`;
+          const prev = chains.get(cid);
+          if (!prev) {
+            chains.set(cid, {
+              count: 1,
+              netOp: e.operation,
+              firstBefore: e.before,
+              latestAfter: e.after,
+              latestEntry: e,
+            });
+          } else {
+            prev.count++;
+            prev.latestEntry = e;
+            if (prev.netOp === 'INSERT' && e.operation === 'UPDATE') {
+              prev.netOp = 'INSERT';
+              prev.latestAfter = { ...(prev.latestAfter || {}), ...(e.after || {}) };
+            } else if (prev.netOp === 'INSERT' && e.operation === 'DELETE') {
+              prev.netOp = 'ELIDED';
+              prev.latestAfter = null;
+            } else if (e.operation === 'UPDATE') {
+              prev.netOp = 'UPDATE';
+              prev.latestAfter = { ...(prev.latestAfter || {}), ...(e.after || {}) };
+            } else if (e.operation === 'DELETE') {
+              prev.netOp = 'DELETE';
+              prev.latestAfter = null;
+            } else {
+              prev.netOp = e.operation;
+              prev.latestAfter = e.after;
+            }
+          }
+        }
+        let keysCompacted = 0;
+        const compacted = [...ddlEntries];
+        for (const c of chains.values()) {
+          if (c.count > 1) keysCompacted++;
+          if (c.netOp === 'ELIDED') continue;
+          compacted.push({
+            ...c.latestEntry,
+            operation: c.netOp,
+            before: c.netOp === 'INSERT' ? null : c.firstBefore,
+            after: c.netOp === 'DELETE' ? null : c.latestAfter,
+          });
+        }
+        compacted.sort((a, b) => a.lsn - b.lsn);
+        primaryJournal.length = 0;
+        primaryJournal.push(...compacted);
+        return {
+          entriesBefore,
+          entriesAfter: compacted.length,
+          entriesRemoved: entriesBefore - compacted.length,
+          keysCompacted,
+        };
+      },
       recordDdl: async (sql) => {
         const entry = {
           lsn: ++primaryLsn,
@@ -997,6 +1061,38 @@ async function formatEncryptedHexDump(entries) {
   return lines.join('\n');
 }
 
+let simDlqEntries = [];
+let simMeshMatrix = {
+  hub: { edge_eu: 3, edge_us: 3 },
+  edge_eu: { hub: 5 },
+  edge_us: { hub: 5 },
+};
+
+function formatMeshAndDlqInspector(allEntries = []) {
+  const pLsn = allEntries.length > 0 ? Math.max(...allEntries.map((e) => e.lsn)) : 0;
+  const lines = [
+    `// Multi-Node Hub/Mesh Watermark Matrix & Dead-Letter Queue (FB_REPL_DLQ$)`,
+    `// 1. Watermark Matrix (watermarks[subscriberNodeId][publisherNodeId] = lastAppliedLsn):`,
+    JSON.stringify(simMeshMatrix, null, 2),
+    ``,
+    `// 2. Dead-Letter Queue (FB_REPL_DLQ$) — ${simDlqEntries.length} quarantined entry/entries:`,
+    simDlqEntries.length === 0
+      ? `//   [0 quarantined entries in FB_REPL_DLQ$]`
+      : JSON.stringify(simDlqEntries, null, 2),
+    ``,
+    `// 3. Prometheus Replication Telemetry (formatPrometheusReplicationMetrics):`,
+    `# TYPE firebird_replication_primary_lsn gauge`,
+    `firebird_replication_primary_lsn{publication="pub_primary",subscription="sub_replica",node_id="replica"} ${pLsn}`,
+    `# TYPE firebird_replication_journal_depth gauge`,
+    `firebird_replication_journal_depth{publication="pub_primary",subscription="sub_replica",node_id="replica"} ${allEntries.length}`,
+    `# TYPE firebird_replication_dlq_depth gauge`,
+    `firebird_replication_dlq_depth{publication="pub_primary",subscription="sub_replica",node_id="replica"} ${simDlqEntries.length}`,
+    `# TYPE firebird_replication_conflicts_total counter`,
+    `firebird_replication_conflicts_total{publication="pub_primary",subscription="sub_replica",node_id="replica"} ${totalConflictsResolved}`,
+  ];
+  return lines.join('\n');
+}
+
 async function updateCodeInspector(allEntries = []) {
   if (activeCodeTab === 'setup') {
     codeInspectorEl.textContent = getSetupCodeSnippet();
@@ -1015,6 +1111,8 @@ async function updateCodeInspector(allEntries = []) {
     codeInspectorEl.textContent = await formatEncryptedHexDump(
       allEntries.slice(0, 8),
     );
+  } else if (activeCodeTab === 'mesh-dlq') {
+    codeInspectorEl.textContent = formatMeshAndDlqInspector(allEntries);
   }
 }
 
@@ -1244,6 +1342,15 @@ pruneJournalBtn.addEventListener('click', async () => {
   await renderAll();
 });
 
+document.getElementById('compact-journal').addEventListener('click', async () => {
+  const res = await replicator.primaryPublication.compactJournal();
+  logEvent(
+    `🗜️ <code>compactJournal()</code> coalesced <strong>${res.keysCompacted}</strong> row key chain(s) and removed <strong>${res.entriesRemoved}</strong> superseded journal mutation(s) (${res.entriesBefore} → ${res.entriesAfter} entries).`,
+    true,
+  );
+  await renderAll();
+});
+
 resetSimBtn.addEventListener('click', () => {
   isOnline = true;
   toggleNetworkBtn.textContent = '● Link Online (Auto-Sync)';
@@ -1463,6 +1570,11 @@ document.getElementById('show-encrypted-hex').addEventListener('click', () => {
   void renderAll();
 });
 
+document.getElementById('show-mesh-dlq').addEventListener('click', () => {
+  activeCodeTab = 'mesh-dlq';
+  void renderAll();
+});
+
 async function runPromoteReplicaDemo() {
   await replicator.sync();
   nextTaskId += 100; // sequenceBuffer: 100
@@ -1647,6 +1759,81 @@ for (const btn of document.querySelectorAll('.scenario-card')) {
         await replicator.primaryPublication.rewindToLsn(checkpointLsn);
       logEvent(
         `Scenario 8 (<code>asOfLsn</code> / <code>rewindToLsn</code>): Simulated accidental title overwrite on Row #1 and deletion of Row #2 (advancing to LSN ${headBeforeRewind}), then called <code>rewindToLsn(db, ${checkpointLsn})</code> to undo <strong>${res.entriesUndone}</strong> mutations via <code>BEFORE_JSON</code> and restore Row #1 &amp; Row #2!`,
+        true,
+      );
+      await renderAll();
+    } else if (kind === 'mesh') {
+      const idEu = nextTaskId++;
+      const idUs = nextTaskId++;
+      await primaryDb.execute(
+        'INSERT INTO TASKS (ID, TENANT_ID, TITLE, PRIORITY, STOCK, TAGS, DONE, SECRET_HASH) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        [
+          idEu,
+          'acme',
+          `Edge-EU Mesh Task #${idEu}`,
+          'HIGH',
+          20,
+          'mesh,edge-eu',
+          0,
+          'sha256:eu',
+        ],
+      );
+      await replicaDb.execute(
+        'INSERT INTO TASKS (ID, TENANT_ID, TITLE, PRIORITY, STOCK, TAGS, DONE, SECRET_HASH) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        [
+          idUs,
+          'acme',
+          `Edge-US Spoke Task #${idUs}`,
+          'MEDIUM',
+          14,
+          'mesh,edge-us',
+          0,
+          'sha256:us',
+        ],
+      );
+      await replicator.sync();
+      const headLsn = await replicator.primaryPublication.currentLsn();
+      await replicator.primaryPublication.registerSlot('slot_edge_eu', 'edge_eu', headLsn);
+      await replicator.primaryPublication.registerSlot('slot_edge_us', 'edge_us', headLsn);
+      simMeshMatrix = {
+        hub: { edge_eu: headLsn, edge_us: headLsn },
+        edge_eu: { hub: headLsn },
+        edge_us: { hub: headLsn },
+      };
+      activeCodeTab = 'mesh-dlq';
+      logEvent(
+        `Scenario 9 (<code>createReplicationHub</code>): Converged 3-node Hub &amp; Spoke topology (<code>hub</code> ↔ <code>edge_eu</code> ↔ <code>edge_us</code>) at watermark LSN ${headLsn} across 2 transitive fanout rounds!`,
+        true,
+      );
+      await renderAll();
+    } else if (kind === 'dlq') {
+      const id = nextTaskId++;
+      // Perform 3 rapid updates on Row #1 and compact them, plus quarantine a poison entry into FB_REPL_DLQ$
+      await primaryDb.execute('UPDATE TASKS SET TITLE = ? WHERE ID = ?', ['Draft v1', 1]);
+      await replicator.primaryPublication.captureTableChanges();
+      await primaryDb.execute('UPDATE TASKS SET TITLE = ? WHERE ID = ?', ['Draft v2', 1]);
+      await replicator.primaryPublication.captureTableChanges();
+      await primaryDb.execute('UPDATE TASKS SET TITLE = ? WHERE ID = ?', ['Compacted Final v3', 1]);
+      await replicator.primaryPublication.captureTableChanges();
+
+      const compactRes = await replicator.primaryPublication.compactJournal();
+      await replicator.sync();
+
+      const headLsn = await replicator.primaryPublication.currentLsn();
+      simDlqEntries = [
+        {
+          lsn: headLsn + 1,
+          subscriptionName: 'sub_replica',
+          table: 'TASKS',
+          key: { ID: id },
+          errorMessage: 'validateEntry rejected row: STOCK (-99) violates CHECK (STOCK >= 0)',
+          retryCount: 1,
+          quarantinedAt: Date.now(),
+        },
+      ];
+      activeCodeTab = 'mesh-dlq';
+      logEvent(
+        `Scenario 10 (<code>FB_REPL_DLQ$</code> &amp; <code>compactJournal</code>): Quarantined poison entry <code>LSN #${headLsn + 1}</code> into <code>FB_REPL_DLQ$</code> without blocking valid rows, and compacted <strong>${compactRes.entriesRemoved}</strong> superseded row mutations!`,
         true,
       );
       await renderAll();

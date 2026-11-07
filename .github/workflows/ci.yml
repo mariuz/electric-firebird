@@ -92,6 +92,24 @@ jobs:
           path: packages/firebird-wasm/bench-results/
           if-no-files-found: ignore
 
+      - name: Check E2E suite coverage
+        run: node e2e/scripts/check-suite-coverage.mjs
+
+      - name: Run Replication Simulator Playwright E2E suite
+        run: |
+          npm --prefix e2e install
+          npx --prefix e2e playwright install --with-deps chromium
+          npx --yes serve demo/public -l 8080 &
+          SERVER_PID=$!
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8080/replication.html >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          npx --prefix e2e playwright test --config=playwright.demo.config.ts tests/replication-demo.spec.ts --project=chromium
+          kill $SERVER_PID || true
+
   # The Node driver against every supported server. FirebirdLite talks to a
   # server through libfbclient, so what it supports is what these pass on.
   # (The browser engine is built from Firebird's master branch and reports

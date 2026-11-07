@@ -647,3 +647,64 @@ const result = await applyJournalArchive(recoveryDb, archive, {
   target: { lsn: 42 },
 });
 ```
+
+---
+
+## 20. Journal Compaction & Automated Retention Policies (`compactJournal` / `applyRetentionPolicy`)
+
+Collapse superseded per-row mutations (`INSERT` + $N \times$ `UPDATE` $\rightarrow$ single `INSERT`, `UPDATE` + `UPDATE` $\rightarrow$ single `UPDATE`, `INSERT` + `DELETE` $\rightarrow$ elided) to bound `FB_REPL_JOURNAL$` size while preserving the final LSN watermark, and automatically rotate pruned entries into encrypted PITR archives:
+
+```ts
+import { compactJournal, applyRetentionPolicy } from 'firebird-wasm/replication';
+
+// Coalesce superseded row updates in-place
+const compaction = await primaryPub.compactJournal();
+
+// Enforce maxEntries / maxAgeMs retention with automatic PITR archive export before pruning
+const retention = await applyRetentionPolicy(primaryDb, primaryPub, {
+  maxEntries: 1000,
+  maxAgeMs: 24 * 60 * 60 * 1000,
+  archiveBeforePrune: true,
+  archiveKey: 'pitr-backup-passphrase',
+  compact: true,
+});
+```
+
+---
+
+## 21. Structured Replication Telemetry & Prometheus / OpenTelemetry Export (`createReplicationMetricsCollector`)
+
+Collect live replication telemetry (`lagEntries`, `lagMs`, `journalDepth`, `activeSlots`, `dlqDepth`, `throughputEntriesPerSec`, `conflictRate`) and export in Prometheus text exposition format or OpenTelemetry metric records:
+
+```ts
+import { createReplicationMetricsCollector } from 'firebird-wasm/replication';
+
+const metrics = createReplicationMetricsCollector({
+  publication: primaryPub,
+  subscription: replicaSub,
+});
+
+const prometheusText = await metrics.toPrometheus('firebird_replication');
+const otelPoints = await metrics.toOpenTelemetry();
+```
+
+---
+
+## 22. Schema-Aware Replication & DDL Compatibility Guard (`classifyDdlStatement` / `resolveDdlConflict` / `checkReplicationSchemaCompatibility`)
+
+Classify DDL statements into additive vs. destructive schema changes, enforce idempotent or additive-only DDL replay on subscribers (`ddlPolicy: 'idempotent' | 'additive-only'`), and check schema compatibility across primary and replica catalogs:
+
+```ts
+import {
+  classifyDdlStatement,
+  resolveDdlConflict,
+  checkReplicationSchemaCompatibility,
+} from 'firebird-wasm/replication';
+
+const report = await checkReplicationSchemaCompatibility({
+  sourceDb: primaryDb,
+  targetDb: replicaDb,
+});
+// report.compatible, report.issues, report.remediationDdl
+```
+
