@@ -4,6 +4,14 @@ All notable changes to `firebird-wasm`. This project follows
 [semantic versioning](https://semver.org/); while the major version is 0 the
 API may still move between minor releases.
 
+## 0.20.2 — 2026-11-07
+
+### Fixed
+
+- **Replication on real Firebird WASM:** quoted the `"PUBLICATION"` column in `FB_REPL_JOURNAL$`, `FB_REPL_SLOTS$` and `FB_REPL_MIRROR$` DDL/DML/queries (`PUBLICATION` is a reserved keyword in Firebird 4.0+).
+- **Replication triggers via `FirebirdBrowser`:** `installReplicationTriggers` now executes `CREATE OR ALTER TRIGGER` inside a single transaction statement (`execPsqlDdl`) rather than top-level `exec()`, avoiding `splitStatements()` semicolon truncation on PSQL variable declarations and blocks.
+- **Unified LSN sequence & trigger/mirror deduplication:** `recordDml()` and `captureTableChanges()` now draw LSNs from `FB_REPL_LSN_GEN$` (when installed) and normalize primary-key JSON values (`looseKey`) so tables with active PSQL capture triggers are not double-journalled or collided on `FB_REPL_JOURNAL$.LSN` during `sync()`.
+
 ## 0.20.1 — 2026-11-06
 
 ### Fixed

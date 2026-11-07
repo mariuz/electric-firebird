@@ -1562,6 +1562,25 @@ async function execStatement(
   }
 }
 
+/**
+ * Execute a single PSQL DDL statement (`CREATE OR ALTER TRIGGER ...`) whose body
+ * contains `;` terminators.
+ *
+ * `FirebirdBrowser.exec()` treats its input as an isql-style script and splits
+ * it on `;` (honouring `SET TERM`), which would truncate a trigger body at its
+ * first `DECLARE VARIABLE`. A transaction's `exec()` runs exactly one statement
+ * verbatim, so PSQL DDL is routed through `db.transaction()` when available.
+ */
+async function execPsqlDdl(db: ReplicableDatabase, ddl: string): Promise<void> {
+  if (typeof db.transaction === 'function') {
+    await db.transaction(async (tx) => {
+      await execStatement(tx, ddl);
+    });
+    return;
+  }
+  await execStatement(db, ddl);
+}
+
 async function ensureTableSafe(
   db: ReplicableDatabase,
   createSql: string,
@@ -1773,7 +1792,7 @@ export function buildReplicationTriggerDdl(
     `      v_after = NULL;`,
     `      v_before = ${beforeExpr};`,
     `    END`,
-    `    INSERT INTO ${journalTable} (LSN, TXID, ORIGIN, PUBLICATION, TABLE_NAME, OP, KEY_JSON, AFTER_JSON, BEFORE_JSON, DDL_SQL, TS)`,
+    `    INSERT INTO ${journalTable} (LSN, TXID, ORIGIN, "PUBLICATION", TABLE_NAME, OP, KEY_JSON, AFTER_JSON, BEFORE_JSON, DDL_SQL, TS)`,
     `    VALUES (`,
     `      NEXT VALUE FOR ${seqName},`,
     `      CAST(CURRENT_TRANSACTION AS VARCHAR(128)),`,
@@ -1856,7 +1875,7 @@ export async function installReplicationTriggers(
       LSN BIGINT NOT NULL PRIMARY KEY,
       TXID VARCHAR(128) NOT NULL,
       ORIGIN VARCHAR(128) NOT NULL,
-      PUBLICATION VARCHAR(128) NOT NULL,
+      "PUBLICATION" VARCHAR(128) NOT NULL,
       TABLE_NAME VARCHAR(128) NOT NULL,
       OP VARCHAR(16) NOT NULL,
       KEY_JSON VARCHAR(2000) NOT NULL,
@@ -1899,7 +1918,7 @@ export async function installReplicationTriggers(
       sequenceName: options.sequenceName ?? DEFAULT_REPL_LSN_SEQUENCE,
     });
 
-    await execStatement(db, ddl);
+    await execPsqlDdl(db, ddl);
 
     installed.push({
       table: tableUpper,
@@ -2296,7 +2315,7 @@ export async function createPublication(
       LSN BIGINT NOT NULL PRIMARY KEY,
       TXID VARCHAR(128) NOT NULL,
       ORIGIN VARCHAR(128) NOT NULL,
-      PUBLICATION VARCHAR(128) NOT NULL,
+      "PUBLICATION" VARCHAR(128) NOT NULL,
       TABLE_NAME VARCHAR(128) NOT NULL,
       OP VARCHAR(16) NOT NULL,
       KEY_JSON VARCHAR(2000) NOT NULL,
@@ -2312,7 +2331,7 @@ export async function createPublication(
     db,
     `CREATE TABLE ${slotsTable} (
       SLOT_NAME VARCHAR(128) NOT NULL PRIMARY KEY,
-      PUBLICATION VARCHAR(128) NOT NULL,
+      "PUBLICATION" VARCHAR(128) NOT NULL,
       NODE_ID VARCHAR(128) NOT NULL,
       CONFIRMED_LSN BIGINT NOT NULL,
       LAST_SEEN_AT BIGINT NOT NULL,
@@ -2336,6 +2355,78 @@ export async function createPublication(
   } catch {
     // Ignore if journal table is empty or mock DB does not aggregate MAX(LSN)
   }
+
+  // Once PSQL capture triggers are installed, the triggers take LSNs from
+  // `FB_REPL_LSN_GEN$`. Every journal write made from JavaScript must then draw
+  // from the same sequence, or the in-memory counter and the generator hand
+  // out the same LSN twice and collide on the journal's primary key.
+  const lsnSequence = quoteIdent(options.sequenceName ?? DEFAULT_REPL_LSN_SEQUENCE);
+  let triggerCapture = false;
+  // Journal head as of the last `captureTableChanges()` (trigger mode only):
+  // rows the triggers journalled after this point are not re-captured by the diff.
+  let captureWatermark = 0;
+
+  const allocateLsn = async (): Promise<number> => {
+    if (triggerCapture) {
+      try {
+        const res = await db.query<Row>(
+          `SELECT NEXT VALUE FOR ${lsnSequence} AS NEXT_LSN FROM RDB$DATABASE`,
+        );
+        const v = Number(res.rows[0]?.NEXT_LSN ?? res.rows[0]?.next_lsn);
+        if (Number.isFinite(v) && v > 0) {
+          if (v > lsnCounter) lsnCounter = v;
+          return v;
+        }
+      } catch {
+        // Database without sequence support (test doubles): fall back below
+      }
+    }
+    return ++lsnCounter;
+  };
+
+  /** Advance `FB_REPL_LSN_GEN$` past any LSN already present in the journal. */
+  const alignLsnSequence = async (): Promise<void> => {
+    try {
+      const head = await publication.currentLsn();
+      const cur = await db.query<Row>(
+        `SELECT GEN_ID(${lsnSequence}, 0) AS CUR_LSN FROM RDB$DATABASE`,
+      );
+      const value = Number(cur.rows[0]?.CUR_LSN ?? cur.rows[0]?.cur_lsn ?? 0);
+      if (Number.isFinite(value) && head > value) {
+        await db.query<Row>(
+          `SELECT GEN_ID(${lsnSequence}, ${Math.trunc(head - value)}) AS NEW_LSN FROM RDB$DATABASE`,
+        );
+      }
+    } catch {
+      // Test doubles without generators
+    }
+  };
+
+  /**
+   * Type-insensitive key for matching trigger-journalled rows against table
+   * rows: PSQL triggers serialise key values into KEY_JSON as text (`"1"`)
+   * while the table returns them as numbers (`1`).
+   */
+  const looseKey = (tableUpper: string, rec: Record<string, unknown>, pkCols: readonly string[]): string =>
+    `${tableUpper}|${pkCols.map((c) => String(rec[c.toUpperCase()] ?? '')).join('\u0001')}`;
+
+  /** Table + key pairs the capture triggers journalled with `LSN > sinceLsn`. */
+  const triggerCapturedKeys = async (sinceLsn: number): Promise<Set<string>> => {
+    const seen = new Set<string>();
+    if (!triggerCapture) return seen;
+    try {
+      const entries = await publication.fetchChangesSince(sinceLsn);
+      for (const e of entries) {
+        const tableUpper = normalizeTableName(e.table);
+        const cfg = tablesMap.get(tableUpper);
+        if (!cfg) continue;
+        seen.add(looseKey(tableUpper, normalizeRowKeysUpper(e.key), cfg.primaryKey));
+      }
+    } catch {
+      // Ignore: fall back to journalling the full diff
+    }
+    return seen;
+  };
 
   let txCounter = 0;
   const nextTxId = (): string => `${nodeId}-tx-${++txCounter}`;
@@ -2366,7 +2457,7 @@ export async function createPublication(
     }
     await execStatement(
       db,
-      `INSERT INTO ${journalTable} (LSN, TXID, ORIGIN, PUBLICATION, TABLE_NAME, OP, KEY_JSON, AFTER_JSON, BEFORE_JSON, DDL_SQL, TS) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO ${journalTable} (LSN, TXID, ORIGIN, "PUBLICATION", TABLE_NAME, OP, KEY_JSON, AFTER_JSON, BEFORE_JSON, DDL_SQL, TS) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         entry.lsn,
         entry.txid,
@@ -2431,7 +2522,7 @@ export async function createPublication(
     async minRetainedLsn(): Promise<number | null> {
       try {
         const res = await db.query<Row>(
-          `SELECT LSN, PUBLICATION FROM ${journalTable} WHERE LSN > ? ORDER BY LSN ASC`,
+          `SELECT LSN, "PUBLICATION" FROM ${journalTable} WHERE LSN > ? ORDER BY LSN ASC`,
           [0],
         );
         for (const r of res.rows) {
@@ -2447,13 +2538,17 @@ export async function createPublication(
     },
 
     async installTriggers(): Promise<InstalledReplicationTrigger[]> {
-      return installReplicationTriggers(db, {
+      const installed = await installReplicationTriggers(db, {
         tables: Array.from(tablesMap.values()),
         publication: pubName,
         nodeId,
         journalTable: options.journalTable ?? DEFAULT_REPL_JOURNAL_TABLE,
         sequenceName: options.sequenceName ?? DEFAULT_REPL_LSN_SEQUENCE,
       });
+      triggerCapture = true;
+      await alignLsnSequence();
+      captureWatermark = await publication.currentLsn();
+      return installed;
     },
 
     async dropTriggers(): Promise<string[]> {
@@ -2482,7 +2577,7 @@ export async function createPublication(
         const nextLsn = Math.max(prevLsn, initialLsn);
         await execStatement(
           db,
-          `UPDATE ${slotsTable} SET PUBLICATION = ?, NODE_ID = ?, CONFIRMED_LSN = ?, LAST_SEEN_AT = ?, TTL_MS = ? WHERE SLOT_NAME = ?`,
+          `UPDATE ${slotsTable} SET "PUBLICATION" = ?, NODE_ID = ?, CONFIRMED_LSN = ?, LAST_SEEN_AT = ?, TTL_MS = ? WHERE SLOT_NAME = ?`,
           [pubName, slotNodeId, nextLsn, now, ttlMs, slotName],
         );
         return {
@@ -2497,7 +2592,7 @@ export async function createPublication(
 
       await execStatement(
         db,
-        `INSERT INTO ${slotsTable} (SLOT_NAME, PUBLICATION, NODE_ID, CONFIRMED_LSN, LAST_SEEN_AT, TTL_MS) VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO ${slotsTable} (SLOT_NAME, "PUBLICATION", NODE_ID, CONFIRMED_LSN, LAST_SEEN_AT, TTL_MS) VALUES (?, ?, ?, ?, ?, ?)`,
         [slotName, pubName, slotNodeId, initialLsn, now, ttlMs],
       );
       return {
@@ -2755,6 +2850,7 @@ export async function createPublication(
           : normalizeRowKeysUpper({ ...(beforeNorm ?? {}), ...(afterNorm ?? {}), ...keyRec });
 
       if (applyLocally) {
+        const lsnBeforeApply = triggerCapture ? await publication.currentLsn() : 0;
         await applyRowMutationToTable(
           db,
           tableUpper,
@@ -2763,6 +2859,21 @@ export async function createPublication(
           keyRec,
           fullAfter,
         );
+        if (triggerCapture) {
+          // The capture trigger already journalled this write; return its
+          // entry instead of journalling the same change a second time.
+          const wantKey = looseKey(tableUpper, keyRec, pkCols);
+          const captured = (await publication.fetchChangesSince(lsnBeforeApply)).filter(
+            (e) =>
+              normalizeTableName(e.table) === tableUpper &&
+              looseKey(tableUpper, normalizeRowKeysUpper(e.key), pkCols) === wantKey,
+          );
+          const last = captured[captured.length - 1];
+          if (last) {
+            updateMirrorRow(tableUpper, pkCols, params.operation, keyRec, fullAfter);
+            return last;
+          }
+        }
       }
 
       updateMirrorRow(tableUpper, pkCols, params.operation, keyRec, fullAfter);
@@ -2782,7 +2893,7 @@ export async function createPublication(
 
       const ts = params.timestamp ?? Date.now();
       const entry: ReplicationLogEntry = {
-        lsn: ++lsnCounter,
+        lsn: await allocateLsn(),
         txid: params.txid ?? nextTxId(),
         origin: params.origin ?? nodeId,
         publication: pubName,
@@ -2817,7 +2928,7 @@ export async function createPublication(
 
       const ts = ddlOpts.timestamp ?? Date.now();
       const entry: ReplicationLogEntry = {
-        lsn: ++lsnCounter,
+        lsn: await allocateLsn(),
         txid: ddlOpts.txid ?? nextTxId(),
         origin: ddlOpts.origin ?? nodeId,
         publication: pubName,
@@ -2842,6 +2953,14 @@ export async function createPublication(
       const captured: ReplicationLogEntry[] = [];
       const txid = captureOpts.txid ?? nextTxId();
       const ts = captureOpts.timestamp ?? Date.now();
+      // With capture triggers installed, writes made since the last capture are
+      // already in the journal; the diff only refreshes the mirror for them.
+      const alreadyJournalled = await triggerCapturedKeys(captureWatermark);
+      const isTriggerCaptured = (
+        tableUpper: string,
+        rec: Record<string, unknown>,
+        pkCols: readonly string[],
+      ): boolean => alreadyJournalled.has(looseKey(tableUpper, rec, pkCols));
 
       for (const [tableUpper, cfg] of tablesMap.entries()) {
         const pkCols = cfg.primaryKey;
@@ -2867,9 +2986,12 @@ export async function createPublication(
           nextMirror.set(k, projectedRow);
 
           const prevRow = prevMirror.get(k);
+          if (isTriggerCaptured(tableUpper, keyRec, pkCols)) {
+            continue;
+          }
           if (!prevRow) {
             const entry: ReplicationLogEntry = {
-              lsn: ++lsnCounter,
+              lsn: await allocateLsn(),
               txid,
               origin: nodeId,
               publication: pubName,
@@ -2886,7 +3008,7 @@ export async function createPublication(
             captured.push(entry);
           } else if (!rowsEqual(prevRow, projectedRow)) {
             const entry: ReplicationLogEntry = {
-              lsn: ++lsnCounter,
+              lsn: await allocateLsn(),
               txid,
               origin: nodeId,
               publication: pubName,
@@ -2905,10 +3027,10 @@ export async function createPublication(
         }
 
         for (const [k, prevRow] of prevMirror.entries()) {
-          if (!nextMirror.has(k)) {
+          if (!nextMirror.has(k) && !isTriggerCaptured(tableUpper, extractKeyRecord(prevRow, pkCols), pkCols)) {
             const keyRec = extractKeyRecord(prevRow, pkCols);
             const entry: ReplicationLogEntry = {
-              lsn: ++lsnCounter,
+              lsn: await allocateLsn(),
               txid,
               origin: nodeId,
               publication: pubName,
@@ -2929,6 +3051,9 @@ export async function createPublication(
         tableMirrors.set(tableUpper, nextMirror);
       }
 
+      if (triggerCapture) {
+        captureWatermark = await publication.currentLsn();
+      }
       return captured;
     },
 
@@ -2937,7 +3062,7 @@ export async function createPublication(
       fetchOpts = {},
     ): Promise<ReplicationLogEntry[]> {
       const res = await db.query<Row>(
-        `SELECT LSN, TXID, ORIGIN, PUBLICATION, TABLE_NAME, OP, KEY_JSON, AFTER_JSON, BEFORE_JSON, DDL_SQL, TS FROM ${journalTable} WHERE LSN > ? ORDER BY LSN ASC`,
+        `SELECT LSN, TXID, ORIGIN, "PUBLICATION", TABLE_NAME, OP, KEY_JSON, AFTER_JSON, BEFORE_JSON, DDL_SQL, TS FROM ${journalTable} WHERE LSN > ? ORDER BY LSN ASC`,
         [sinceLsn],
       );
 
@@ -5685,7 +5810,7 @@ async function loadAllJournalEntries(
 ): Promise<ReplicationLogEntry[]> {
   const jTable = quoteIdent(journalTableName);
   const res = await db.query(
-    `SELECT LSN, TXID, ORIGIN, PUBLICATION, TABLE_NAME, OP, KEY_JSON, AFTER_JSON, BEFORE_JSON, DDL_SQL, TS FROM ${jTable} WHERE LSN > ? ORDER BY LSN ASC`,
+    `SELECT LSN, TXID, ORIGIN, "PUBLICATION", TABLE_NAME, OP, KEY_JSON, AFTER_JSON, BEFORE_JSON, DDL_SQL, TS FROM ${jTable} WHERE LSN > ? ORDER BY LSN ASC`,
     [0],
   );
   return res.rows.map((r) => {
@@ -5947,7 +6072,7 @@ export async function rewindToLsn(
       try {
         await execStatement(
           db,
-          `DELETE FROM ${mTable} WHERE PUBLICATION = ? AND TABLE_NAME = ?`,
+          `DELETE FROM ${mTable} WHERE "PUBLICATION" = ? AND TABLE_NAME = ?`,
           ['default', tbl],
         );
         const rows = snapshot.tables[tbl] ?? [];
@@ -5956,7 +6081,7 @@ export async function rewindToLsn(
           const rowKey = JSON.stringify([idVal]);
           await execStatement(
             db,
-            `INSERT INTO ${mTable} (PUBLICATION, TABLE_NAME, ROW_KEY, ROW_JSON) VALUES (?, ?, ?, ?)`,
+            `INSERT INTO ${mTable} ("PUBLICATION", TABLE_NAME, ROW_KEY, ROW_JSON) VALUES (?, ?, ?, ?)`,
             ['default', tbl, rowKey, encodeJson(r)],
           );
         }

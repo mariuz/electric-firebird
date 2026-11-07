@@ -1858,3 +1858,106 @@ describe('firebird-wasm/replication – Logical & Journal-Based Database Replica
     ]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Regressions found running replication against the real Firebird engine
+// (FBSimCity machine room, Firebird 6.0 WASM). The in-memory mock above
+// accepts SQL the engine rejects, so these pin the engine-facing behaviour.
+// ---------------------------------------------------------------------------
+
+describe('firebird-wasm/replication - real-engine regressions', () => {
+  it('quotes the PUBLICATION column, a reserved word since Firebird 4.0', async () => {
+    const db = createMockReplDb();
+    const seen: string[] = [];
+    const origExec = db.exec!.bind(db);
+    const origQuery = db.query.bind(db);
+    db.exec = async (sql: string, params?: QueryParams) => {
+      seen.push(sql);
+      return origExec(sql, params);
+    };
+    db.query = (async (sql: string, params?: QueryParams) => {
+      seen.push(sql);
+      return origQuery(sql, params);
+    }) as typeof db.query;
+
+    const pub = await createPublication(db, {
+      name: 'pub_q',
+      nodeId: 'n1',
+      tables: [{ table: 'ITEMS', primaryKey: 'ID' }],
+    });
+    await pub.recordDml({ table: 'ITEMS', operation: 'INSERT', after: { ID: 1 }, applyLocally: false });
+    await pub.registerSlot('slot_q');
+    await pub.minRetainedLsn();
+
+    const touchingPublication = seen.filter((s) => /PUBLICATION/i.test(s) && /FB_REPL_/i.test(s));
+    expect(touchingPublication.length).toBeGreaterThan(0);
+    for (const sql of touchingPublication) {
+      // every SQL occurrence of the column is double-quoted
+      expect(sql).not.toMatch(/(^|[^"\w$])PUBLICATION(?![\w$"])/);
+    }
+    const { ddl } = buildReplicationTriggerDdl({
+      table: 'ITEMS', primaryKey: ['ID'], columns: ['ID'], publication: 'pub_q', nodeId: 'n1',
+    });
+    expect(ddl).toContain('"PUBLICATION"');
+  });
+
+  it('installs PSQL trigger DDL through a transaction, not the script-splitting exec()', async () => {
+    const db = createMockReplDb();
+    db.tables.set('ITEMS', [{ ID: 1, NAME: 'a' }]);
+    const topLevelTriggerExecs: string[] = [];
+    const origExec = db.exec!.bind(db);
+    db.exec = async (sql: string, params?: QueryParams) => {
+      if (/CREATE\s+OR\s+ALTER\s+TRIGGER/i.test(sql)) topLevelTriggerExecs.push(sql);
+      return origExec(sql, params);
+    };
+    let txCalls = 0;
+    db.transaction = (async (fn: Parameters<NonNullable<typeof db.transaction>>[0]) => {
+      txCalls++;
+      // a transaction handle whose exec runs the statement verbatim
+      return fn({
+        query: origExec as never,
+        exec: origExec,
+      } as never);
+    }) as typeof db.transaction;
+
+    await installReplicationTriggers(db, { tables: [{ table: 'ITEMS', primaryKey: 'ID', columns: ['ID', 'NAME'] }] });
+    expect(topLevelTriggerExecs).toEqual([]);
+    expect(txCalls).toBe(1);
+    expect(db.triggerDdlLog.length).toBe(1);
+  });
+
+  it('draws journal LSNs from FB_REPL_LSN_GEN$ once capture triggers are installed', async () => {
+    const db = createMockReplDb();
+    db.tables.set('ITEMS', [{ ID: 1, NAME: 'a' }]);
+    let gen = 0;
+    const origQuery = db.query.bind(db);
+    db.query = (async (sql: string, params?: QueryParams) => {
+      const next = /NEXT\s+VALUE\s+FOR/i.test(sql) && /RDB\$DATABASE/i.test(sql);
+      if (next) return { rows: [{ NEXT_LSN: ++gen }] };
+      const peek = /GEN_ID\(\s*"?FB_REPL_LSN_GEN\$"?\s*,\s*(-?\d+)\s*\)/i.exec(sql);
+      if (peek) {
+        gen += Number(peek[1]);
+        return { rows: [{ CUR_LSN: gen, NEW_LSN: gen }] };
+      }
+      return origQuery(sql, params);
+    }) as typeof db.query;
+
+    // the sequence has already been advanced by triggers firing elsewhere
+    gen = 40;
+    const pub = await createPublication(db, {
+      name: 'default',
+      nodeId: 'n1',
+      tables: [{ table: 'ITEMS', primaryKey: 'ID', columns: ['ID', 'NAME'] }],
+      installTriggers: true,
+    });
+    const entry = await pub.recordDml({
+      table: 'ITEMS', operation: 'INSERT', after: { ID: 2, NAME: 'b' }, applyLocally: false,
+    });
+    // in-memory counter would have said 1; the shared sequence says 41
+    expect(entry.lsn).toBe(41);
+    const next = await pub.recordDml({
+      table: 'ITEMS', operation: 'INSERT', after: { ID: 3, NAME: 'c' }, applyLocally: false,
+    });
+    expect(next.lsn).toBe(42);
+  });
+});
