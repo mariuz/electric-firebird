@@ -95,7 +95,13 @@ jobs:
       - name: Check E2E suite coverage
         run: node e2e/scripts/check-suite-coverage.mjs
 
+      # The simulator needs no engine, and this job builds none, so the suite runs against demo/public served
+      # bare on 8080: DEMO_BASE_URL makes playwright.demo.config.ts use it instead of its own webServer, whose
+      # demo build stops without dist/wasm. Playwright runs from e2e/, where its config lives (from the
+      # repository root, --config named a file that does not exist).
       - name: Run Replication Simulator Playwright E2E suite
+        env:
+          DEMO_BASE_URL: http://localhost:8080/
         run: |
           npm --prefix e2e install
           npx --prefix e2e playwright install --with-deps chromium
@@ -107,7 +113,7 @@ jobs:
             fi
             sleep 1
           done
-          npx --prefix e2e playwright test --config=playwright.demo.config.ts tests/replication-demo.spec.ts --project=chromium
+          (cd e2e && npx playwright test --config=playwright.demo.config.ts tests/replication-demo.spec.ts --project=chromium)
           kill $SERVER_PID || true
 
   # The Node driver against every supported server. FirebirdLite talks to a
