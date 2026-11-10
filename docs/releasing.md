@@ -8,6 +8,13 @@ unregistered, so the first publish claims it.
 > from a separate hour-long Emscripten build, and a package published without
 > it installs perfectly and then 404s the engine in every consumer's browser.
 > `prepublishOnly` runs `scripts/check-publish.mjs` to make that impossible.
+> It also runs each engine build in `dist/wasm` (`scripts/check-engine.mjs`,
+> `npm run check:engine -w packages/firebird-wasm` on its own): it creates a database,
+> answers `SELECT 1 FROM rdb$database` and keeps a row, or the publish is refused. 0.20.1
+> shipped a pair of `.wasm` files of the right names and sizes that trapped on every attach
+> (`null function or function signature mismatch`); the files check alone let it through.
+> The safest engine to publish is CI's: the `v*` release carries `firebird-embedded*.{js,wasm}`
+> and their `SHA256SUMS.txt`.
 
 ---
 
@@ -117,7 +124,10 @@ npm version patch      # or minor / major — writes the tag commit
 npm publish --otp=123456
 ```
 
-`prepublishOnly` runs the publish check first and aborts on anything missing.
+`prepublishOnly` runs the publish check first and aborts on anything missing, or on an
+engine build that cannot create a database and run a statement (each build in a child
+process, `CHECK_ENGINE_TIMEOUT_MS`, 60 s by default: a trap in the threaded build's worker
+can leave the engine silent rather than throwing).
 
 Then push the tag and cut a GitHub release:
 
