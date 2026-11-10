@@ -275,8 +275,9 @@ const { rows: note } = useQuery('SELECT title FROM notes WHERE id = ?', () => [p
 ```
 
 Svelte 5 (`setFirebirdContext`, `createQuery`, `createLiveQuery` from
-`firebird-wasm/svelte`) and SolidJS (`FirebirdContext`, `createQuery`,
-`createLiveQuery` from `firebird-wasm/solid`) follow the same pattern.
+`firebird-wasm/svelte`) and SolidJS (`setFirebirdContext`, `useFirebird`,
+`createQuery`, `createLiveQuery` from `firebird-wasm/solid`) follow the same
+pattern.
 
 All four return `rows` (`undefined` until the first result), `error`, `loading`
 and `refresh()`. Other SQL or parameters run the query again; equal
@@ -286,27 +287,36 @@ component moved on, or unmounted, is dropped, and an unmounted component's
 live query is unsubscribed. Pass `{ db }` to a hook to use a database other
 than the provided one.
 
-A live query re-runs on events, not on table changes: Firebird has no way to
-say which tables a statement read, so the events are named, as for
-`db.live()`. A trigger per table that posts its name is the usual pattern:
+`events` is optional on `db.live()` and `useLiveQuery()` / `createLiveQuery()`:
+when omitted, `extractReferencedTables()` detects user tables read by the SQL
+statement and installs an idempotent `FB_LIVE$<hash>` trigger once per table.
+You can also pass explicit `{ events: ['notes'] }` for custom `POST_EVENT`
+triggers or `db.notify('notes')`:
 
 ```sql
 CREATE TRIGGER notes_changed FOR notes AFTER INSERT OR UPDATE OR DELETE
 AS BEGIN POST_EVENT 'notes'; END
 ```
 
-### Kysely, Drizzle, and Vector Search
+### ORMs, State Adapters, Vector HNSW, Full-Text Search & Replication
 
-- **`firebird-wasm/kysely`**: Provides `FirebirdBrowserDialect` (translating
-  `LIMIT`/`OFFSET` to `ROWS ... TO ...`) and `generateKyselyTypes(db)` to
-  emit a TypeScript `Database` interface from live `db.introspect()` metadata.
-- **`firebird-wasm/drizzle`**: Provides a lightweight `drizzle(db)` query
-  builder plus `generateDrizzleSchema(db)` for code-generating table definitions.
-- **`firebird-wasm/vector`**: Provides `encodeVector` / `decodeVector`
-  (`Float32` & `Int8`), `registerVectorFunctions(db)` (`COSINE_DISTANCE`,
-  `L2_DISTANCE`, `DOT_PRODUCT`, `VECTOR_DIMS`, `VECTOR_NORM` in SQL via
-  `ENGINE JS`), and `vectorSearch(db, options)` for top-$k$ RAG similarity
-  queries.
+- **`firebird-wasm/kysely`**: Provides `FirebirdDialect` (`createKysely(db)`),
+  translating `LIMIT`/`OFFSET` to `OFFSET ? ROWS FETCH NEXT ? ROWS ONLY`, plus
+  `generateKyselyTypes(db)` to emit a TypeScript `Database` interface from live
+  `db.introspect()` metadata.
+- **`firebird-wasm/drizzle`**: Provides `drizzle(db)` and `firebirdTable(...)`
+  plus `generateDrizzleSchema(db)` for code-generating table definitions.
+- **`firebird-wasm/tanstack` & `firebird-wasm/rxdb`**: Official adapters for
+  TanStack Query (`createFirebirdQueryOptions`, `connectFirebirdQueryClient`),
+  TanStack DB (`createFirebirdCollection`), and RxDB (`getRxStorageFirebird`).
+- **`firebird-wasm/vector` & `firebird-wasm/fts`**: Float32/Int8 vector codec,
+  persistent HNSW ANN index (`HnswIndex`, `createVectorIndex`), SQL UDRs
+  (`registerVectorFunctions`, `registerFtsFunctions`), Okapi BM25 inverted index
+  (`Bm25Index`, `createFtsIndex`), and RRF `hybridSearch` combining BM25 +
+  `vectorSearch`.
+- **`firebird-wasm/replication`**: Logical/journal & native Firebird engine
+  replication (`replicateDatabases`, CRDTs, multi-node mesh/hub, DLQ, PITR
+  archives, time-travel) — see [replication.md](./replication.md).
 
 ### A SQL console & Inspector (`<firebird-repl>`)
 
@@ -332,9 +342,10 @@ code and resolves with what each statement did, the same list the
 `firebird-repl-run` event carries.
 
 Click **Inspector** in the toolbar (or call `repl.toggleInspector()`,
-`await repl.schema()`, `await repl.migrations()`, `await repl.profiler()`) to
-browse tables, columns, indexes, triggers, applied migrations, and query
-latency/plan metrics.
+`await repl.schema()`, `await repl.migrations()`, `await repl.profiler()`,
+`await repl.replication()`) to browse tables, columns, indexes, triggers,
+applied migrations, query latency/I/O metrics, visual query execution plan
+trees, and replication journal/slot/DLQ status.
 
 Values are written as text, never as HTML: a row cannot put markup in the
 page. Colours follow the page's `color-scheme` and can be set through

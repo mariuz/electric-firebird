@@ -1,8 +1,8 @@
 # Database Replication Guide (`firebird-wasm/replication`)
 
-`firebird-wasm/replication` provides logical and journal-based database replication between `FirebirdLite` (Node.js / server / desktop) and `FirebirdBrowser` (WebAssembly / OPFS / IndexedDB), as well as peer-to-peer across browser tabs or edge workers.
+`firebird-wasm/replication` provides logical, journal-based, and native Firebird C++ engine (`"FBCHANGELOG\0"` / `IReplicator`) database replication between `FirebirdLite` (Node.js / server / desktop) and `FirebirdBrowser` (WebAssembly / OPFS / IndexedDB / Memory), as well as peer-to-peer across browser tabs, WebSockets, or multi-node clusters.
 
-> **Interactive Simulator & Live Demo**: Try the [Firebird WASM Replication Simulator & Live Demo](https://mariuz.github.io/electric-firebird/replication.html) (`demo/public/replication.html`) to inspect live `FB_REPL_JOURNAL$` LSN streams, trigger capture, network partitions, and 3-way conflict resolution in real time.
+> **Interactive Simulator & Live Demo**: Try the [Firebird WASM Replication Simulator & Live Demo](https://mariuz.github.io/electric-firebird/replication.html) (`demo/public/replication.html`) to inspect live `FB_REPL_JOURNAL$` LSN streams, trigger capture, CRDT merges, multi-node mesh/hub watermarks, `FB_REPL_DLQ$` quarantine/retry, AES-256-GCM encrypted segments, and time-travel rewind in real time.
 
 ---
 
@@ -10,37 +10,55 @@
 
 1. [Architecture Overview](#1-architecture-overview)
 2. [Quick Start — Replication Setup](#2-quick-start--replication-setup)
-   - [High-Level `replicateDatabases()` Setup](#21-high-level-replicatedatabases-setup)
-   - [Explicit Publication & Subscription Setup](#22-explicit-publication--subscription-setup)
-3. [Native Firebird SQL Trigger-Based Change Capture](#3-native-firebird-sql-trigger-based-change-capture)
-   - [Automatic Trigger Installation (`installReplicationTriggers`)](#31-automatic-trigger-installation-installreplicationtriggers)
-   - [Loop Prevention via `RDB$GET_CONTEXT` / `RDB$SET_CONTEXT`](#32-loop-prevention-via-rdbget_context--rdbset_context)
-4. [Conflict Resolution Strategies](#4-conflict-resolution-strategies)
-5. [Full Database Replication: Snapshot Bootstrap & Schema Evolution](#5-full-database-replication-snapshot-bootstrap--schema-evolution)
-   - [Phase 1 — Initial Snapshot or Binary Page-Diff (`exportDiff` / `applyDiff`) Bootstrap](#51-phase-1--initial-snapshot-or-binary-page-diff-exportdiff--applydiff-bootstrap)
-   - [Phase 2 — Automatic Schema Evolution (`diffSchema` + `generateMigration`)](#52-phase-2--automatic-schema-evolution-diffschema--generatemigration)
-   - [Phase 3 — Journal Pruning & Watermark Management](#53-phase-3--journal-pruning--watermark-management)
-6. [Replication Use Cases](#6-replication-use-cases)
-7. [API Reference](#7-api-reference)
+   - [2.1 High-Level `replicateDatabases()` Setup](#21-high-level-replicatedatabases-setup)
+   - [2.2 Explicit Publication & Subscription Setup](#22-explicit-publication--subscription-setup)
+3. [SQL Trigger-Based Change Capture](#3-sql-trigger-based-change-capture)
+   - [3.1 Automatic Trigger Installation (`installReplicationTriggers`)](#31-automatic-trigger-installation-installreplicationtriggers)
+   - [3.2 Echo-Loop Prevention via `RDB$GET_CONTEXT` / `RDB$SET_CONTEXT`](#32-echo-loop-prevention-via-rdbget_context--rdbset_context)
+4. [Conflict Resolution & CRDTs](#4-conflict-resolution--crdts)
+   - [4.1 Built-In & Custom Conflict Strategies](#41-built-in--custom-conflict-strategies)
+   - [4.2 Hybrid Logical Clocks (`createHlc`) & Per-Column CRDTs (`createCrdtConflictResolver`)](#42-hybrid-logical-clocks-createhlc--per-column-crdts-createcrdtconflictresolver)
+5. [Full Database Replication Lifecycle](#5-full-database-replication-lifecycle)
+   - [5.1 Snapshot & Binary Page-Diff Bootstrap (`bootstrapReplica` & `needsBootstrap`)](#51-snapshot--binary-page-diff-bootstrap-bootstrapreplica--needsbootstrap)
+   - [5.2 Whole-Database Publication (`publishAllTables`) & Catalog Sync (`syncCatalog`)](#52-whole-database-publication-publishalltables--catalog-sync-synccatalog)
+   - [5.3 Multi-Tenant Row/Column Filtering & Topological Foreign-Key Replay](#53-multi-tenant-rowcolumn-filtering--topological-foreign-key-replay)
+   - [5.4 Replication Slots (`FB_REPL_SLOTS$`) & Safe Auto-Pruning (`pruneAcked`)](#54-replication-slots-fb_repl_slots--safe-auto-pruning-pruneacked)
+   - [5.5 Network Transports (HTTP/SSE, WebSocket & `BroadcastChannel`)](#55-network-transports-httpsse-websocket--broadcastchannel)
+   - [5.6 Binary (`0x52444246`) & AES-256-GCM Encrypted (`0x53444246`) Journal Segments](#56-binary-0x52444246--aes-256-gcm-encrypted-0x53444246-journal-segments)
+   - [5.7 Automatic Failover & Replica-to-Primary Promotion (`promoteReplica`)](#57-automatic-failover--replica-to-primary-promotion-promotereplica)
+   - [5.8 Time-Travel Querying (`asOfLsn`) & Point-in-Time Rollback (`rewindToLsn`)](#58-time-travel-querying-asoflsn--point-in-time-rollback-rewindtolsn)
+6. [Multi-Node Topologies, Resilience & Operations](#6-multi-node-topologies-resilience--operations)
+   - [6.1 Multi-Node Mesh & Hub-and-Spoke Coordinator (`createReplicationMesh` / `createReplicationHub`)](#61-multi-node-mesh--hub-and-spoke-coordinator-createreplicationmesh--createreplicationhub)
+   - [6.2 Dead-Letter Queue (`FB_REPL_DLQ$`) & Quarantine / Retry Policy](#62-dead-letter-queue-fb_repl_dlq--quarantine--retry-policy)
+   - [6.3 Data Masking, PII Redaction & Row Transformation (`transformRow`)](#63-data-masking-pii-redaction--row-transformation-transformrow)
+   - [6.4 PITR Journal Archives (`exportJournalArchive` / `applyJournalArchive`)](#64-pitr-journal-archives-exportjournalarchive--applyjournalarchive)
+   - [6.5 Journal Compaction & Automated Retention Policies (`compactJournal` / `applyRetentionPolicy`)](#65-journal-compaction--automated-retention-policies-compactjournal--applyretentionpolicy)
+   - [6.6 Structured Telemetry & Prometheus / OpenTelemetry Export (`createReplicationMetricsCollector`)](#66-structured-telemetry--prometheus--opentelemetry-export-createreplicationmetricscollector)
+   - [6.7 Schema-Aware Replication & DDL Compatibility Guard](#67-schema-aware-replication--ddl-compatibility-guard)
+7. [Native Firebird Engine Replication (`RDB$PUBLICATIONS`, `replication.conf`, `"FBCHANGELOG\0"` & `IReplicator`)](#7-native-firebird-engine-replication-rdbpublications-replicationconf-fbchangelog0--ireplicator)
+   - [7.1 `RDB$PUBLICATIONS`, `replication.conf` & `IReplicator`](#71-rdbpublications-replicationconf--ireplicator)
+   - [7.2 `"FBCHANGELOG\0"` Binary Opcode Decoder, JRD Record/Sequence Extractor & Continuous Changelog Poller](#72-fbchangelog0-binary-opcode-decoder-jrd-recordsequence-extractor--continuous-changelog-poller)
+8. [Replication Use Cases](#8-replication-use-cases)
+9. [API Reference](#9-api-reference)
 
 ---
 
 ## 1. Architecture Overview
 
-Replication in `firebird-wasm` is built around three core primitives stored inside standard Firebird SQL tables and sequences:
+Logical journal replication in `firebird-wasm` is built around standard Firebird SQL tables, sequences, and session context variables (alongside optional native C++ JRD engine changelog integration in [§7](#7-native-firebird-engine-replication-rdbpublications-replicationconf-fbchangelog0--ireplicator)):
 
 1. **Change Journal (`FB_REPL_JOURNAL$`) & Sequence (`FB_REPL_LSN_GEN$`)**:
-   Every published DDL or DML mutation (`INSERT`, `UPDATE`, `DELETE`, `DDL`) is recorded with a monotonically increasing **Log Sequence Number (`LSN`)**, transaction ID (`TXID`), originating node ID (`ORIGIN`), publication name (`PUBLICATION`), primary key (`KEY_JSON`), `BEFORE_JSON` / `AFTER_JSON` row snapshots, and epoch timestamp (`TS`).
-2. **Replica Watermarks (`FB_REPL_WATERMARKS$`)**:
-   Each subscriber persists its last applied `LAST_LSN` watermark inside `FB_REPL_WATERMARKS$` within the same atomic replica transaction that applies the incoming changes—guaranteeing **at-least-once delivery with idempotent replay**.
+   Every published DDL or DML mutation (`INSERT`, `UPDATE`, `DELETE`, `DDL`) is recorded with a monotonically increasing **Log Sequence Number (`LSN`)**, transaction ID (`TXID`), originating node ID (`ORIGIN`), publication name (`PUBLICATION`), primary key (`KEY_JSON`), `BEFORE_JSON` / `AFTER_JSON` row snapshots, and epoch/HLC timestamp (`TS`, `HLC`).
+2. **Replica Watermarks (`FB_REPL_WATERMARKS$`) & Slots (`FB_REPL_SLOTS$`)**:
+   Each subscriber persists its last applied `LAST_LSN` watermark inside `FB_REPL_WATERMARKS$` within the same atomic replica transaction that applies incoming changes—guaranteeing **at-least-once delivery with idempotent replay**—while `FB_REPL_SLOTS$` tracks acknowledged flush positions on the primary for safe auto-pruning.
 3. **Echo-Loop Prevention (`ORIGIN` & `FB_REPL_ROLE`)**:
-   In bidirectional (`primary <-> replica`) topologies, changes are tagged with `origin: nodeId` and applied under `RDB$SET_CONTEXT('USER_SESSION', 'FB_REPL_ROLE', 'REPLICA')` so replica replay never re-triggers local change capture.
+   In bidirectional (`primary <-> replica`) and mesh topologies, changes carry `origin: nodeId` and are applied under `RDB$SET_CONTEXT('USER_SESSION', 'FB_REPL_ROLE', 'REPLICA')` so replica replay never re-triggers local change capture.
 
 ```mermaid
 flowchart LR
   subgraph Primary["Primary Node (FirebirdLite / FirebirdBrowser)"]
     AppA["SQL Writes (INSERT / UPDATE / DELETE / DDL)"]
-    TrgA["Triggers (FB_REPL_TRG$*) / captureTableChanges()"]
+    TrgA["Triggers (FB_REPL_TRG$*) / Native RDB$PUBLICATIONS"]
     JrnA[("FB_REPL_JOURNAL$\n(LSN 1..N)")]
     AppA --> TrgA --> JrnA
   end
@@ -65,10 +83,11 @@ flowchart LR
 Use `replicateDatabases()` to pair two `FirebirdBrowser` or `FirebirdLite` instances in either `'one-way'` (`primary -> replica`) or `'bidirectional'` (`primary <-> replica`) mode:
 
 ```ts
-import { FirebirdBrowser, replicateDatabases } from 'firebird-wasm/browser';
+import { FirebirdBrowser } from 'firebird-wasm/browser';
+import { replicateDatabases } from 'firebird-wasm/replication';
 
-const primary = await FirebirdBrowser.create({ database: 'primary.fdb' });
-const replica = await FirebirdBrowser.create({ database: 'replica.fdb' });
+const primary = new FirebirdBrowser('memory://primary');
+const replica = new FirebirdBrowser('memory://replica');
 
 // Provision schema on both nodes
 const schemaSql = `
@@ -90,13 +109,13 @@ const replicator = await replicateDatabases({
   onConflict: 'merge',       // 'primary-wins' | 'replica-wins' | 'last-write-wins' | 'merge' | fn
   installTriggers: true,     // Install AFTER INSERT/UPDATE/DELETE PSQL triggers
   onConflictResolved(ctx, resolution) {
-    console.log(`Conflict on ${ctx.incoming.table} resolved via ${resolution}`);
+    console.log(`Conflict on ${ctx.incoming.table} resolved via`, resolution);
   },
 });
 
 // Mutate primary and replica independently
-await primary.execute('INSERT INTO TODOS (ID, TITLE, DONE) VALUES (?, ?, ?)', [1, 'Ship WASM engine', 0]);
-await replica.execute('INSERT INTO TODOS (ID, TITLE, DONE) VALUES (?, ?, ?)', [2, 'Write replication docs', 1]);
+await primary.exec('INSERT INTO TODOS (ID, TITLE, DONE) VALUES (?, ?, ?)', [1, 'Ship WASM engine', 0]);
+await replica.exec('INSERT INTO TODOS (ID, TITLE, DONE) VALUES (?, ?, ?)', [2, 'Write replication docs', 1]);
 
 // Run a single replication cycle (or call `replicator.start()` for continuous background sync)
 const stats = await replicator.sync();
@@ -122,7 +141,7 @@ const publication = await createPublication(serverDb, {
   installTriggers: true,
 });
 
-// Expose an HTTP endpoint that returns `publication.fetchChangesSince(sinceLsn, { limit, excludeOrigin })`
+// Expose an HTTP endpoint (see §5.5 `createHttpReplicationHandler` for a ready-made handler)
 
 // 2. On the Replica (Browser Client):
 const subscription = await createSubscription(browserDb, {
@@ -148,7 +167,7 @@ subscription.start();
 
 ---
 
-## 3. Native Firebird SQL Trigger-Based Change Capture
+## 3. SQL Trigger-Based Change Capture
 
 ### 3.1 Automatic Trigger Installation (`installReplicationTriggers`)
 
@@ -159,7 +178,7 @@ When `installTriggers: true` is passed to `createPublication()` (or `installRepl
 3. An idempotent `AFTER INSERT OR UPDATE OR DELETE POSITION 32000` PSQL trigger (`FB_REPL_TRG$<TABLE>`) on every published table, plus `POST_EVENT 'fb_repl_<publication>'` for instant event-driven wakeups.
 
 ```ts
-import { installReplicationTriggers, buildReplicationTriggerDdl } from 'firebird-wasm/replication';
+import { installReplicationTriggers } from 'firebird-wasm/replication';
 
 const triggers = await installReplicationTriggers(db, {
   publication: 'default',
@@ -173,7 +192,7 @@ console.log(triggers[0].triggerName); // "FB_REPL_TRG$ORDERS"
 console.log(triggers[0].eventName);   // "fb_repl_default"
 ```
 
-### 3.2 Loop Prevention via `RDB$GET_CONTEXT` / `RDB$SET_CONTEXT`
+### 3.2 Echo-Loop Prevention via `RDB$GET_CONTEXT` / `RDB$SET_CONTEXT`
 
 Every generated trigger guards execution with Firebird's session context variable `FB_REPL_ROLE`:
 
@@ -192,11 +211,13 @@ SELECT RDB$SET_CONTEXT('USER_SESSION', 'FB_REPL_ROLE', 'REPLICA') FROM RDB$DATAB
 SELECT RDB$SET_CONTEXT('USER_SESSION', 'FB_REPL_ROLE', 'PRIMARY') FROM RDB$DATABASE;
 ```
 
-This guarantees that applying remote changes on a node that also has triggers installed never re-logs those mutations back into the local journal.
+This guarantees that applying remote changes on a node with triggers installed never re-logs those mutations back into the local journal.
 
 ---
 
-## 4. Conflict Resolution Strategies
+## 4. Conflict Resolution & CRDTs
+
+### 4.1 Built-In & Custom Conflict Strategies
 
 When two nodes modify the same primary key concurrently before syncing, `createSubscription` / `replicateDatabases` detects the conflict by comparing `entry.before` against `localRow` (and `localEntry.timestamp`) and invokes the configured `onConflict` strategy:
 
@@ -204,26 +225,19 @@ When two nodes modify the same primary key concurrently before syncing, `createS
 |---|---|---|
 | `'primary-wins'` / `'remote-wins'` | Incoming change overwrites the local row. | Read replicas, server-authoritative caches. |
 | `'replica-wins'` / `'local-wins'` | Local row is preserved; conflicting remote mutation is skipped. | Local user overrides, sticky drafts. |
-| `'last-write-wins'` | Compares `incoming.timestamp` vs `localEntry.timestamp` (deterministic tie-breaker on `origin` node ID). | General active-active peer sync. |
+| `'last-write-wins'` | Compares `incoming.timestamp` / `hlc` vs `localEntry` (deterministic tie-breaker on `origin` node ID). | General active-active peer sync. |
 | `'merge'` | **3-way field-level merge** (`mergeReplicatedRow(before, localRow, remoteAfter)`): merges non-overlapping column edits onto the same row. | Collaborative forms, multi-column task/document editors. |
-| Custom `(ctx) => ...` | Receives `{ incoming, localRow, localEntry }` and returns `'remote-wins'`, `'local-wins'`, `'merge'`, or `{ action: 'merge', row }`. | Domain-specific business rules (e.g., inventory counters, financial ledgers). |
-
-#### Example: Custom Conflict Resolver
+| Custom `(ctx) => ...` | Receives `{ incoming, localRow, localEntry }` and returns `'remote-wins'`, `'local-wins'`, `'merge'`, or `{ action: 'merge', row }`. | Domain-specific business rules (inventory counters, ledgers). |
 
 ```ts
 const sub = await createSubscription(replicaDb, {
   publication,
   onConflict: ({ incoming, localRow }) => {
     if (incoming.table === 'INVENTORY' && localRow && incoming.after && incoming.before) {
-      // Additive delta merge on QTY column
       const delta = Number(incoming.after.QTY) - Number(incoming.before.QTY);
       return {
         action: 'merge',
-        row: {
-          ...localRow,
-          ...incoming.after,
-          QTY: Number(localRow.QTY) + delta,
-        },
+        row: { ...localRow, ...incoming.after, QTY: Number(localRow.QTY) + delta },
       };
     }
     return 'merge';
@@ -231,11 +245,34 @@ const sub = await createSubscription(replicaDb, {
 });
 ```
 
+### 4.2 Hybrid Logical Clocks (`createHlc`) & Per-Column CRDTs (`createCrdtConflictResolver`)
+
+Use `createHlc()` for skew-tolerant causal ordering (`<wallMs>:<counter>:<nodeId>`) and `createCrdtConflictResolver()` to combine per-column CRDT strategies (`'pn-counter'`, `'set-union'`, `'g-set'`, `'max'`, `'min'`, `'lww'`):
+
+```ts
+import { replicateDatabases, createCrdtConflictResolver } from 'firebird-wasm/replication';
+
+const replicator = await replicateDatabases({
+  primary: nodeA,
+  replica: nodeB,
+  tables: [{ table: 'PRODUCTS', primaryKey: 'ID' }],
+  direction: 'bidirectional',
+  onConflict: createCrdtConflictResolver({
+    columns: {
+      STOCK: 'pn-counter', // additive delta merge: base + localDelta + remoteDelta
+      TAGS: 'set-union',   // 2P/OR-Set union with removal tracking
+      HIGH_BID: 'max',     // join-semilattice max
+      TITLE: 'lww',        // HLC-ordered Last-Write-Wins
+    },
+  }),
+});
+```
+
 ---
 
-## 5. Full Database Replication: Snapshot Bootstrap & Schema Evolution
+## 5. Full Database Replication Lifecycle
 
-For large databases or newly provisioned replicas, replaying the entire historical `FB_REPL_JOURNAL$` from `LSN = 0` is unnecessary. Combine **Incremental Binary Page Diffs (`exportDiff` / `applyDiff`)** with **Logical Journal Replay** for fast full-database replication:
+For large databases or newly provisioned replicas, combine **Initial Snapshot / Binary Page-Diff Bootstrap** with **Incremental Journal Replay**:
 
 ```mermaid
 sequenceDiagram
@@ -254,14 +291,13 @@ sequenceDiagram
   R->>R: sub.applyChanges(entries) & advance watermark
 ```
 
-### 5.1 Phase 1 — Initial Snapshot or Binary Page-Diff (`bootstrapReplica` & `exportSnapshot`)
+### 5.1 Snapshot & Binary Page-Diff Bootstrap (`bootstrapReplica` & `needsBootstrap`)
 
-Use `bootstrapReplica()` (or enable `autoBootstrap: true` on `createSubscription()` / `replicateDatabases()`) to automatically seed a brand-new replica or catch up a replica whose watermark has fallen behind a pruned journal (`watermark < minRetainedLsn`):
+Use `bootstrapReplica()` (or enable `autoBootstrap: true` on `createSubscription()` / `replicateDatabases()`) to seed a new replica or catch up a replica whose watermark has fallen behind a pruned journal (`watermark < minRetainedLsn`):
 
 ```ts
 import { bootstrapReplica, needsBootstrap } from 'firebird-wasm/replication';
 
-// Check if the replica needs bootstrapping (e.g. watermark === 0 or behind minRetainedLsn)
 const check = await needsBootstrap(primaryPublication, replicaSubscription);
 if (check.needed) {
   const boot = await bootstrapReplica({
@@ -274,21 +310,19 @@ if (check.needed) {
 }
 ```
 
-### 5.2 Phase 2 — Whole-Database Publication (`publishAllTables`) & Catalog Sync (`syncCatalog`)
+### 5.2 Whole-Database Publication (`publishAllTables`) & Catalog Sync (`syncCatalog`)
 
 Publish every user table (`tables: '*'`) and keep replica schemas + Firebird sequence/generator watermarks (`RDB$GENERATORS`) synchronized via `syncCatalog()`:
 
 ```ts
 import { publishAllTables, syncCatalog } from 'firebird-wasm/replication';
 
-// Publish all user tables (excluding scratch/audit tables)
 const pub = await publishAllTables(primary, {
   name: 'full_pub',
   excludeTables: ['AUDIT_SCRATCH'],
   installTriggers: true,
 });
 
-// Synchronize schema DDL (via diffSchema + generateMigration) and sequence watermarks:
 const catResult = await syncCatalog({
   sourceDb: primary,
   targetDb: replica,
@@ -297,7 +331,7 @@ const catResult = await syncCatalog({
 console.log(catResult.discoveredTables, catResult.sequencesSynced);
 ```
 
-### 5.3 Phase 3 — Multi-Tenant Row/Column Filtering & Topological Foreign-Key Replay
+### 5.3 Multi-Tenant Row/Column Filtering & Topological Foreign-Key Replay
 
 Slice publications per tenant with `where` predicates and `columns` / `excludeColumns` projections, and declare foreign-key `references` so multi-table transactions (`txid`) replay parents before children on `INSERT`/`UPDATE` and children before parents on `DELETE`:
 
@@ -321,41 +355,16 @@ const tenantPub = await createPublication(primary, {
 });
 ```
 
-### 5.4 Phase 4 — Hybrid Logical Clocks (`createHlc`) & Per-Column CRDTs (`createCrdtConflictResolver`)
-
-Use `createHlc()` for skew-tolerant causal ordering (`<wallMs>:<counter>:<nodeId>`) and `createCrdtConflictResolver()` to combine per-column CRDT strategies (`'pn-counter'`, `'set-union'`, `'g-set'`, `'max'`, `'min'`, `'lww'`):
-
-```ts
-import { replicateDatabases, createCrdtConflictResolver } from 'firebird-wasm/replication';
-
-const replicator = await replicateDatabases({
-  primary: nodeA,
-  replica: nodeB,
-  tables: [{ table: 'PRODUCTS', primaryKey: 'ID' }],
-  direction: 'bidirectional',
-  onConflict: createCrdtConflictResolver({
-    columns: {
-      STOCK: 'pn-counter', // additive delta merge: base + localDelta + remoteDelta
-      TAGS: 'set-union',   // 2P/OR-Set union with removal tracking
-      HIGH_BID: 'max',     // join-semilattice max
-      TITLE: 'lww',        // HLC-ordered Last-Write-Wins
-    },
-  }),
-});
-```
-
-### 5.5 Phase 5 — Replication Slots (`FB_REPL_SLOTS$`) & Safe Auto-Pruning (`pruneAcked`)
+### 5.4 Replication Slots (`FB_REPL_SLOTS$`) & Safe Auto-Pruning (`pruneAcked`)
 
 Each subscriber registers a slot in `FB_REPL_SLOTS$` (`slotName`, `nodeId`, `confirmedFlushLsn`, `lastSeenAt`, `ttlMs`). Calling `publication.pruneAcked()` expires stale slots past their TTL and safely deletes only journal entries `<= MIN(confirmedFlushLsn)` across all active subscribers:
 
 ```ts
-// Automatically expire stale slots and prune journal entries acknowledged by all active replicas:
 const pruneResult = await primaryPublication.pruneAcked();
-console.log(pruneResult);
 // { expiredSlots: [], activeSlotCount: 2, safeLsn: 42, prunedEntries: 42 }
 ```
 
-### 5.6 Phase 6 — Network Transports (HTTP/SSE, WebSocket & `BroadcastChannel`)
+### 5.5 Network Transports (HTTP/SSE, WebSocket & `BroadcastChannel`)
 
 Connect `FirebirdLite` (server) and `FirebirdBrowser` (WASM) across HTTP/SSE, duplex WebSockets, or browser tabs:
 
@@ -393,21 +402,19 @@ const tabTransport = createBroadcastChannelTransport({
 });
 ```
 
-### 5.7 Phase 7 — Firebird 4.0/5.0 Native Binary Journal Segments, Index Hooks & `replicator.stats()`
+### 5.6 Binary (`0x52444246`) & AES-256-GCM Encrypted (`0x53444246`) Journal Segments
 
-Encode/decode binary journal segments (`0x52444246` `'FBDR'` header + FNV-1a checksum), keep local `HnswIndex` / `Bm25Index` search indexes updated incrementally via `indexHooks`, and monitor live replication lag via `replicator.stats()`:
+Encode/decode binary journal segments (`0x52444246` `'FBDR'` header + FNV-1a checksum), optionally Gzip-compressed (`CompressionStream('gzip')`) and end-to-end encrypted with WebCrypto AES-256-GCM (`0x53444246` `'FBDS'` envelope):
 
 ```ts
 import {
   encodeNativeJournalSegment,
   decodeNativeJournalSegment,
+  encodeEncryptedJournalSegment,
+  decodeEncryptedJournalSegment,
 } from 'firebird-wasm/replication';
 
-// Live lag & throughput telemetry:
-const telemetry = await replicator.stats();
-console.log(telemetry.lagEntries, telemetry.lagMs, telemetry.bytesTransferred);
-
-// Binary journal segment round-trip:
+// Unencrypted binary segment:
 const entries = await primaryPublication.fetchChangesSince(0);
 const segmentBytes = encodeNativeJournalSegment(entries, {
   guid: 'a1b2c3d4-e5f6-4789-8012-3456789abcde',
@@ -415,11 +422,22 @@ const segmentBytes = encodeNativeJournalSegment(entries, {
   state: 'archivable',
 });
 const decoded = decodeNativeJournalSegment(segmentBytes);
+
+// Gzip-compressed + AES-256-GCM encrypted wire segment:
+const encryptedWireBytes = await encodeEncryptedJournalSegment(entries, {
+  key: 'cluster-replication-passphrase',
+  compress: true,
+  aad: 'prod-eu-west',
+});
+const { segment, compressed, encrypted } = await decodeEncryptedJournalSegment(
+  encryptedWireBytes,
+  { key: 'cluster-replication-passphrase', aad: 'prod-eu-west' },
+);
 ```
 
-### 5.8 Phase 8 — Automatic Failover & Replica-to-Primary Promotion (`promoteReplica`)
+### 5.7 Automatic Failover & Replica-to-Primary Promotion (`promoteReplica`)
 
-Promote a standby replica to the new primary in a single call — draining pending changes, validating replication lag against `maxAllowedLagEntries`, bumping sequence watermarks (`sequenceBuffer`), resetting `FB_REPL_ROLE` to `'PRIMARY'`, installing triggers, and re-seeding peer subscriptions:
+Promote a standby replica to the new primary in a single call — draining pending changes, validating lag against `maxAllowedLagEntries`, bumping sequence watermarks (`sequenceBuffer`), resetting `FB_REPL_ROLE` to `'PRIMARY'`, installing triggers, and re-seeding peer subscriptions:
 
 ```ts
 import { promoteReplica } from 'firebird-wasm/replication';
@@ -437,111 +455,29 @@ const promoted = await promoteReplica({
 console.log(promoted.promotedNodeId, promoted.publishedTables);
 ```
 
-### 5.9 Phase 9 — Encrypted & Gzip-Compressed Journal Segments (AES-256-GCM)
-
-Compress journal segments with Gzip (`CompressionStream('gzip')`) and encrypt them end-to-end with WebCrypto AES-256-GCM (`0x53444246` `'FBDS'` envelope) using a 32-byte key, `CryptoKey`, or PBKDF2 passphrase:
-
-```ts
-import {
-  encodeEncryptedJournalSegment,
-  decodeEncryptedJournalSegment,
-} from 'firebird-wasm/replication';
-
-const encryptedWireBytes = await encodeEncryptedJournalSegment(entries, {
-  key: 'cluster-replication-passphrase',
-  compress: true,
-  aad: 'prod-eu-west',
-});
-
-const { segment, compressed, encrypted } = await decodeEncryptedJournalSegment(
-  encryptedWireBytes,
-  { key: 'cluster-replication-passphrase', aad: 'prod-eu-west' },
-);
-```
-
-### 5.10 Phase 10 — Time-Travel Querying (`asOfLsn`) & Point-in-Time Rollback (`rewindToLsn`)
+### 5.8 Time-Travel Querying (`asOfLsn`) & Point-in-Time Rollback (`rewindToLsn`)
 
 Reconstruct historical table state at any past LSN, timestamp, or HLC without mutating the live database via `asOfLsn()`, or roll back the live database in reverse chronological order via `rewindToLsn()`:
 
 ```ts
 import { asOfLsn, rewindToLsn } from 'firebird-wasm/replication';
 
-// 1. Non-destructive point-in-time snapshot at LSN 42 (or { timestamp } / { hlc }):
+// Non-destructive point-in-time snapshot at LSN 42 (or { timestamp } / { hlc }):
 const historical = await asOfLsn(db, 42);
 console.log(historical.tables.ACCOUNTS);
 
-// 2. Roll back the live database to LSN 42 using BEFORE_JSON / AFTER_JSON inverse DML:
+// Roll back the live database to LSN 42 using BEFORE_JSON / AFTER_JSON inverse DML:
 const rewindResult = await rewindToLsn(db, 42);
 console.log(`Undid ${rewindResult.entriesUndone} operations back to LSN ${rewindResult.rewoundToLsn}`);
 ```
 
 ---
 
-## 6. Replication Use Cases
+## 6. Multi-Node Topologies, Resilience & Operations
 
-| # | Use Case | Topology | Recommended Conflict Strategy |
-|---|---|---|---|
-| **1** | **Offline-First Field & Mobile Apps** | Bidirectional (`FirebirdBrowser` ↔ `FirebirdLite`) | `'merge'` (3-way field merge) |
-| **2** | **Multi-Tab / Multi-Window Instant Sync** | Bidirectional across tabs (`BroadcastChannel` + OPFS) | `'last-write-wins'` |
-| **3** | **Cloud-to-Browser Read Replicas** | One-Way (`FirebirdLite` → `FirebirdBrowser`) | `'primary-wins'` |
-| **4** | **Edge / CDN Read Scaling** | One-Way Fan-Out (1 Primary → N Edge Workers) | `'primary-wins'` |
-| **5** | **Collaborative Multi-User Workspaces** | Bidirectional Hub-and-Spoke | `'merge'` + custom resolvers |
-| **6** | **Zero-Downtime Schema & Version Upgrades** | Shadow Replica (`diffSchema` + `replicateDatabases`) | `'primary-wins'` |
-| **7** | **Continuous Backup, PITR & Audit Time-Travel** | Append-Only Journal Subscriber (`FB_REPL_JOURNAL$`) | `'primary-wins'` |
-| **8** | **Hybrid RAG / Local Vector + BM25 Search Sync** | One-Way (`primary` → local `HnswIndex` / `Bm25Index`) | `'primary-wins'` |
-| **9** | **Multi-Tenant Data Slicing (Partial Publications)** | Filtered Per-Tenant Publication → Client Replica | `'primary-wins'` / `'merge'` |
-| **10** | **CI / Ephemeral PR Preview Databases** | Snapshot `exportDiff` + Journal Tail | `'primary-wins'` |
-| **11** | **Desktop Electron / Tauri Local-to-Cloud Sync** | Bidirectional (`FirebirdLite` Desktop ↔ Cloud) | `'merge'` / `'last-write-wins'` |
-| **12** | **Telemetry & IoT Edge-to-Central Consolidation** | Many-to-One (`Edge Replicas` → `Central Aggregator`) | `'replica-wins'` / append-only |
+### 6.1 Multi-Node Mesh & Hub-and-Spoke Coordinator (`createReplicationMesh` / `createReplicationHub`)
 
----
-
-## 7. API Reference
-
-| Export | Description |
-|---|---|
-| `replicateDatabases(options)` | High-level helper pairing `primary` and `replica` in `'one-way'` or `'bidirectional'` mode. |
-| `createPublication(db, options)` | Provisions `FB_REPL_JOURNAL$` and returns a `ReplicationPublication` handle. |
-| `createSubscription(db, options)` | Provisions `FB_REPL_WATERMARKS$` and returns a `ReplicationSubscription` handle. |
-| `installReplicationTriggers(db, options)` | Creates `FB_REPL_LSN_GEN$` and installs `AFTER INSERT OR UPDATE OR DELETE` PSQL triggers on published tables. |
-| `dropReplicationTriggers(db, options)` | Drops replication triggers for the given tables and publication. |
-| `buildReplicationTriggerDdl(options)` | Pure helper returning `{ triggerName, eventName, ddl }` for a table's PSQL replication trigger. |
-| `replicationTriggerName(table, pub?)` | Deterministic ≤31-char Firebird trigger name (`FB_REPL_TRG$<TABLE>`). |
-| `replicationEventName(pub?)` | Deterministic ≤31-char Firebird `POST_EVENT` name (`fb_repl_<pub>`). |
-| `mergeReplicatedRow(before, local, remote)` | 3-way field-level merge helper used by the `'merge'` conflict strategy. |
-| `bootstrapReplica(options)` | Seeds or re-seeds a replica from a logical or binary page-diff `PublicationSnapshot`. |
-| `needsBootstrap(pub, sub)` | Checks whether a replica is uninitialized or behind `pub.minRetainedLsn()`. |
-| `publishAllTables(db, options?)` | Whole-database publication (`tables: '*'`) discovering all user tables via `discoverUserTables()`. |
-| `syncCatalog(options)` | Synchronizes schema DDL (`generateMigration`) and generator/sequence watermarks (`exportSequences` + `applySequences`). |
-| `projectReplicatedRow(row, pk, cols?, excl?)` | Projects a row according to `columns` whitelist and `excludeColumns` blacklist. |
-| `matchesRowFilter(row, where?)` | Evaluates a SQL `WHERE` predicate string or filter function against a row. |
-| `orderEntriesByTopology(entries, deps?)` | Groups journal entries by `txid` and orders parent/child tables topologically. |
-| `createHlc(nodeId, options?)` | Creates a monotonic Hybrid Logical Clock (`<wallMs>:<counter>:<nodeId>`). |
-| `mergeCrdtRow(ctx, config?)` | Per-column CRDT conflict merger (`'lww'`, `'pn-counter'`, `'set-union'`, `'g-set'`, `'max'`, `'min'`). |
-| `createCrdtConflictResolver(config?)` | Returns a pluggable `onConflict` resolver callback backed by `mergeCrdtRow()`. |
-| `createHttpReplicationHandler(options)` | Web Fetch API `(Request) => Promise<Response>` handler serving `/changes`, `/ack`, `/heartbeat`, `/snapshot`, `/push`, and `/events` (SSE). |
-| `createHttpReplicationClient(options)` | Remote HTTP replication client compatible with `createSubscription()`. |
-| `createBroadcastChannelTransport(options?)` | Cross-tab / cross-worker replication transport backed by `BroadcastChannel`. |
-| `createWebSocketReplicationPeer(options)` | Duplex WebSocket replication peer streaming entries, pull requests, and slot acks. |
-| `encodeNativeJournalSegment(entries, opts?)` | Encodes journal entries into a Firebird 4.0/5.0 binary journal segment (`0x52444246`). |
-| `decodeNativeJournalSegment(bytes)` | Validates FNV-1a checksum and decodes a Firebird 4.0/5.0 binary journal segment. |
-| `promoteReplica(options)` | Drains lag, syncs sequence watermarks, resets `FB_REPL_ROLE='PRIMARY'`, installs triggers, and promotes a replica to primary. |
-| `encodeEncryptedJournalSegment(entries, opts?)` | Gzip-compresses and encrypts a journal segment with WebCrypto AES-256-GCM (`0x53444246`). |
-| `decodeEncryptedJournalSegment(bytes, opts?)` | Decrypts and decompresses an encrypted journal segment (or transparently decodes raw `0x52444246` segments). |
-| `asOfLsn(db, target)` | Non-destructively reconstructs historical table rows at any past LSN, timestamp, or HLC. |
-| `rewindToLsn(db, targetOrOptions)` | Rolls back a live database to a historical LSN, timestamp, or HLC using inverse DML from `BEFORE_JSON`. |
-| `createReplicationMesh(options)` | Coordinates $N \ge 2$ database nodes in `'mesh'` or `'hub-and-spoke'` topologies with transitive routing, `watermarkMatrix()`, and `pruneQuorum()`. |
-| `createReplicationHub(options)` | Convenience wrapper creating a `'hub-and-spoke'` replication coordinator (`1` hub ↔ $N$ spokes). |
-| `createReplicationDlq(db, options?)` | Provisions `FB_REPL_DLQ$` for quarantining, inspecting, retrying, and discarding poison journal entries. |
-| `createPiiMaskingTransformer(rules, options?)` | Creates a declarative PII redaction / row transformation callback (`'email-mask'`, `'card-last4'`, `'hash-sha256'`, `'redact'`, etc.) for `transformRow`. |
-| `exportJournalArchive(pub, options?)` | Packages a base snapshot + chunked encrypted/compressed `0x53444246` journal segments into a portable PITR bundle. |
-| `applyJournalArchive(db, archive, options?)` | Restores a database from a `ReplicationJournalArchive` up to an optional target LSN, timestamp, or HLC. |
-
----
-
-## 16. Multi-Node Mesh & Hub-and-Spoke Replication (`createReplicationMesh` / `createReplicationHub`)
-
-Coordinate $N \ge 2$ database nodes in either `'hub-and-spoke'` (1 central hub ↔ $N$ edge/browser spokes with automatic transitive origin forwarding) or full `'mesh'` ($N \times (N-1)$ peer links) topologies:
+Coordinate $N \ge 2$ database nodes in `'hub-and-spoke'` (1 central hub ↔ $N$ edge/browser spokes with automatic transitive origin forwarding) or full `'mesh'` ($N \times (N - 1)$ peer links) topologies:
 
 ```ts
 import { createReplicationHub, createCrdtConflictResolver } from 'firebird-wasm/replication';
@@ -557,17 +493,13 @@ const hub = await createReplicationHub({
   onConflict: createCrdtConflictResolver({ columns: { STOCK: 'pn-counter' } }),
 });
 
-// Converges spoke-eu -> cloud-hub -> spoke-us and spoke-us -> cloud-hub -> spoke-eu
 await hub.sync();
 
-// Inspect watermarks[subscriberNodeId][publisherNodeId] and prune quorum-acknowledged entries
-const matrix = await hub.watermarkMatrix();
+const matrix = await hub.watermarkMatrix(); // watermarks[subscriberNodeId][publisherNodeId]
 const prunedByNode = await hub.pruneQuorum();
 ```
 
----
-
-## 17. Dead-Letter Queue (`FB_REPL_DLQ$`) & Quarantine / Retry Policy
+### 6.2 Dead-Letter Queue (`FB_REPL_DLQ$`) & Quarantine / Retry Policy
 
 Configure `onApplyError: 'dlq'` (or a custom policy callback) and optional `validateEntry` on `createSubscription()` so a single poison row never stalls the replication stream:
 
@@ -589,7 +521,6 @@ const sub = await createSubscription(replicaDb, {
 await sub.pull();
 const quarantined = await sub.listDlq!();
 
-// Sanitize and re-apply quarantined entries from FB_REPL_DLQ$
 await sub.retryDlq!({
   transformEntry: (e) => ({
     ...e,
@@ -598,9 +529,7 @@ await sub.retryDlq!({
 });
 ```
 
----
-
-## 18. Data Masking, PII Redaction & Row Transformation Pipelines (`transformRow`)
+### 6.3 Data Masking, PII Redaction & Row Transformation (`transformRow`)
 
 Attach `transformRow` (or `createPiiMaskingTransformer`) to a publication or subscription to redact sensitive columns before changes leave a primary or land on an analytics/browser replica:
 
@@ -624,9 +553,7 @@ const pub = await createPublication(primaryDb, {
 });
 ```
 
----
-
-## 19. Journal Archival & Point-in-Time Recovery (PITR) Bundles (`exportJournalArchive` / `applyJournalArchive`)
+### 6.4 PITR Journal Archives (`exportJournalArchive` / `applyJournalArchive`)
 
 Export a publication's journal stream (and optional `baseSnapshot`) into a multi-segment Gzip + AES-256-GCM encrypted PITR archive, and restore any database up to a target LSN, timestamp, or HLC:
 
@@ -640,7 +567,6 @@ const archive = await exportJournalArchive(primaryPub, {
   aad: 'cluster-prod',
 });
 
-// Restore a fresh database stopping at historical LSN 42
 const result = await applyJournalArchive(recoveryDb, archive, {
   key: 'pitr-backup-passphrase',
   aad: 'cluster-prod',
@@ -648,19 +574,15 @@ const result = await applyJournalArchive(recoveryDb, archive, {
 });
 ```
 
----
+### 6.5 Journal Compaction & Automated Retention Policies (`compactJournal` / `applyRetentionPolicy`)
 
-## 20. Journal Compaction & Automated Retention Policies (`compactJournal` / `applyRetentionPolicy`)
-
-Collapse superseded per-row mutations (`INSERT` + $N \times$ `UPDATE` $\rightarrow$ single `INSERT`, `UPDATE` + `UPDATE` $\rightarrow$ single `UPDATE`, `INSERT` + `DELETE` $\rightarrow$ elided) to bound `FB_REPL_JOURNAL$` size while preserving the final LSN watermark, and automatically rotate pruned entries into encrypted PITR archives:
+Collapse superseded per-row mutations (`INSERT` + $N \times$ `UPDATE` $\rightarrow$ single `INSERT`, `UPDATE` + `UPDATE` $\rightarrow$ single `UPDATE`, `INSERT` + `DELETE` $\rightarrow$ elided) while preserving the final LSN watermark, and automatically rotate pruned entries into encrypted PITR archives:
 
 ```ts
-import { compactJournal, applyRetentionPolicy } from 'firebird-wasm/replication';
+import { applyRetentionPolicy } from 'firebird-wasm/replication';
 
-// Coalesce superseded row updates in-place
 const compaction = await primaryPub.compactJournal();
 
-// Enforce maxEntries / maxAgeMs retention with automatic PITR archive export before pruning
 const retention = await applyRetentionPolicy(primaryDb, primaryPub, {
   maxEntries: 1000,
   maxAgeMs: 24 * 60 * 60 * 1000,
@@ -670,11 +592,9 @@ const retention = await applyRetentionPolicy(primaryDb, primaryPub, {
 });
 ```
 
----
+### 6.6 Structured Telemetry & Prometheus / OpenTelemetry Export (`createReplicationMetricsCollector`)
 
-## 21. Structured Replication Telemetry & Prometheus / OpenTelemetry Export (`createReplicationMetricsCollector`)
-
-Collect live replication telemetry (`lagEntries`, `lagMs`, `journalDepth`, `activeSlots`, `dlqDepth`, `throughputEntriesPerSec`, `conflictRate`) and export in Prometheus text exposition format or OpenTelemetry metric records:
+Collect live replication telemetry (`lagEntries`, `lagMs`, `journalDepth`, `activeSlots`, `dlqDepth`, `throughputEntriesPerSec`, `conflictRate`) via `replicator.stats()` or `createReplicationMetricsCollector()`, and export in Prometheus text exposition format or OpenTelemetry metric records:
 
 ```ts
 import { createReplicationMetricsCollector } from 'firebird-wasm/replication';
@@ -688,11 +608,9 @@ const prometheusText = await metrics.toPrometheus('firebird_replication');
 const otelPoints = await metrics.toOpenTelemetry();
 ```
 
----
+### 6.7 Schema-Aware Replication & DDL Compatibility Guard
 
-## 22. Schema-Aware Replication & DDL Compatibility Guard (`classifyDdlStatement` / `resolveDdlConflict` / `checkReplicationSchemaCompatibility`)
-
-Classify DDL statements into additive vs. destructive schema changes, enforce idempotent or additive-only DDL replay on subscribers (`ddlPolicy: 'idempotent' | 'additive-only'`), and check schema compatibility across primary and replica catalogs:
+Classify DDL statements into additive vs. destructive schema changes, enforce idempotent or additive-only DDL replay on subscribers (`ddlPolicy: 'apply' | 'idempotent' | 'additive-only'`), and inspect schema compatibility across primary and replica catalogs:
 
 ```ts
 import {
@@ -710,9 +628,11 @@ const report = await checkReplicationSchemaCompatibility({
 
 ---
 
-## 23. Native Firebird Engine Replication (`RDB$PUBLICATIONS`, `replication.conf`, `"FBCHANGELOG\0"` & `IReplicator`)
+## 7. Native Firebird Engine Replication (`RDB$PUBLICATIONS`, `replication.conf`, `"FBCHANGELOG\0"` & `IReplicator`)
 
-Drive Firebird's compiled-in C++ JRD replication subsystem (`RDB$PUBLICATIONS`, `RDB$PUBLICATION_TABLES`, `/usr/local/firebird/replication.conf`, `"FBCHANGELOG\0"` binary segment files, and `IAttachment::createReplicator`):
+### 7.1 `RDB$PUBLICATIONS`, `replication.conf` & `IReplicator`
+
+Firebird's own C++ JRD replication subsystem (`src/jrd/replication/`) is compiled into `firebird-embedded.wasm`. You can drive `RDB$PUBLICATIONS`, `RDB$PUBLICATION_TABLES`, `/usr/local/firebird/replication.conf`, `"FBCHANGELOG\0"` binary segment files, and `IAttachment::createReplicator` (`_fb_replicate_changelog` / `_fb_set_replica_mode`) directly—or pass `engineMode: 'native' | 'trigger' | 'auto'` on `createPublication()`:
 
 ```ts
 import {
@@ -746,9 +666,7 @@ for (const seg of segments) {
 }
 ```
 
----
-
-## 24. `"FBCHANGELOG\0"` Binary Opcode Decoder, JRD Record/Sequence Extractor & Continuous Changelog Poller (`decodeFbChangelogOperations` / `fbChangelogToLogicalEntries` / `createWasmChangelogPoller`)
+### 7.2 `"FBCHANGELOG\0"` Binary Opcode Decoder, JRD Record/Sequence Extractor & Continuous Changelog Poller
 
 Decode all 16 Firebird `Replication::Block` opcodes (`opStartTransaction`..`opDefineAtom`), convert uncompressed JRD record buffers, BLOB chunks (`opStoreBlob`), and sequence watermarks (`opSetSequence`) into logical `ReplicationLogEntry` items (honoring transaction & savepoint rollbacks), configure `hdr_replica_mode` on replica `.fdb` files, and stream archived `.journal-NNNNNNNNN` segments continuously:
 
@@ -789,5 +707,115 @@ const poller = createWasmChangelogPoller({
 await poller.pollOnce(); // or poller.start(100)
 ```
 
+---
 
+## 8. Replication Use Cases
 
+| # | Use Case | Topology | Recommended Conflict Strategy |
+|---|---|---|---|
+| **1** | **Offline-First Field & Mobile Apps** | Bidirectional (`FirebirdBrowser` ↔ `FirebirdLite`) | `'merge'` (3-way field merge) |
+| **2** | **Multi-Tab / Multi-Window Instant Sync** | Bidirectional across tabs (`BroadcastChannel` + OPFS) | `'last-write-wins'` |
+| **3** | **Cloud-to-Browser Read Replicas** | One-Way (`FirebirdLite` → `FirebirdBrowser`) | `'primary-wins'` |
+| **4** | **Edge / CDN Read Scaling** | One-Way Fan-Out (1 Primary → $N$ Edge Workers) | `'primary-wins'` |
+| **5** | **Collaborative Multi-User Workspaces** | Bidirectional Hub-and-Spoke (`createReplicationHub`) | `'merge'` + per-column CRDTs |
+| **6** | **Zero-Downtime Schema & Version Upgrades** | Shadow Replica (`checkReplicationSchemaCompatibility` + `syncCatalog`) | `'primary-wins'` |
+| **7** | **Continuous Backup, PITR & Audit Time-Travel** | Append-Only Journal + `exportJournalArchive` / `asOfLsn` | `'primary-wins'` |
+| **8** | **Hybrid RAG / Local Vector + BM25 Search Sync** | One-Way (`primary` → local `HnswIndex` / `Bm25Index` via `indexHooks`) | `'primary-wins'` |
+| **9** | **Multi-Tenant Data Slicing (Partial Publications)** | Filtered Per-Tenant Publication (`where` + `excludeColumns`) | `'primary-wins'` / `'merge'` |
+| **10** | **Privacy-Preserving Analytics Replicas** | One-Way with `createPiiMaskingTransformer` | `'primary-wins'` |
+| **11** | **Desktop Electron / Tauri Local-to-Cloud Sync** | Bidirectional (`FirebirdLite` Desktop ↔ Cloud) | `'merge'` / `'last-write-wins'` |
+| **12** | **Telemetry & IoT Edge-to-Central Consolidation** | Many-to-One (`createReplicationHub`) | `'replica-wins'` / append-only |
+
+---
+
+## 9. API Reference
+
+### Core Setup, Triggers & Topologies
+
+| Export | Description |
+|---|---|
+| `replicateDatabases(options)` | High-level helper pairing `primary` and `replica` in `'one-way'` or `'bidirectional'` mode. |
+| `createPublication(db, options)` | Provisions `FB_REPL_JOURNAL$` (and optionally native `RDB$PUBLICATIONS` via `engineMode`) and returns a `ReplicationPublication`. |
+| `createSubscription(db, options)` | Provisions `FB_REPL_WATERMARKS$` and returns a `ReplicationSubscription`. |
+| `createReplicationMesh(options)` | Coordinates $N \ge 2$ database nodes in `'mesh'` or `'hub-and-spoke'` topologies with transitive routing, `watermarkMatrix()`, and `pruneQuorum()`. |
+| `createReplicationHub(options)` | Convenience wrapper creating a `'hub-and-spoke'` coordinator (`1` hub ↔ $N$ spokes). |
+| `installReplicationTriggers(db, options)` | Creates `FB_REPL_LSN_GEN$` and installs `AFTER INSERT OR UPDATE OR DELETE` PSQL triggers on published tables. |
+| `dropReplicationTriggers(db, options)` | Drops replication triggers for the given tables and publication. |
+| `buildReplicationTriggerDdl(options)` | Pure helper returning `{ triggerName, eventName, ddl }` for a table's PSQL trigger. |
+| `replicationTriggerName(table, pub?)` | Deterministic ≤31-char Firebird trigger name (`FB_REPL_TRG$<TABLE>`). |
+| `replicationEventName(pub?)` | Deterministic ≤31-char Firebird `POST_EVENT` name (`fb_repl_<pub>`). |
+
+### Bootstrap, Catalog, Filtering & Failover
+
+| Export | Description |
+|---|---|
+| `bootstrapReplica(options)` | Seeds or re-seeds a replica from a logical or binary page-diff `PublicationSnapshot`. |
+| `needsBootstrap(pub, sub)` | Checks whether a replica is uninitialized (`watermark === 0`) or behind `pub.minRetainedLsn()`. |
+| `discoverUserTables(db, exclude?)` | Lists all non-system user tables in the database via `introspect()`. |
+| `publishAllTables(db, options?)` | Whole-database publication (`tables: '*'`) discovering all user tables automatically. |
+| `exportSequences(db, exclude?)` / `applySequences(db, seqs)` | Exports and restores Firebird sequence/generator watermarks (`RDB$GENERATORS`). |
+| `syncCatalog(options)` | Synchronizes schema DDL (`generateMigration`) and generator/sequence watermarks. |
+| `projectReplicatedRow(row, pk, cols?, excl?)` | Projects a row according to `columns` whitelist and `excludeColumns` blacklist. |
+| `matchesRowFilter(row, where?)` | Evaluates a SQL `WHERE` predicate string or filter function against a row. |
+| `orderEntriesByTopology(entries, deps?)` | Groups journal entries by `txid` and orders parent/child tables topologically. |
+| `promoteReplica(options)` | Drains lag, syncs sequence watermarks, resets `FB_REPL_ROLE='PRIMARY'`, installs triggers, and promotes a replica to primary. |
+
+### Conflict Resolution, HLC, CRDTs & PII Masking
+
+| Export | Description |
+|---|---|
+| `mergeReplicatedRow(before, local, remote)` | 3-way field-level merge helper used by the `'merge'` conflict strategy. |
+| `createHlc(nodeId, options?)` | Creates a monotonic Hybrid Logical Clock (`<wallMs>:<counter>:<nodeId>`). |
+| `formatHlc` / `parseHlc` / `compareHlc` | Formats, parses, and causally compares HLC timestamp strings. |
+| `mergeCrdtRow(ctx, config?)` | Per-column CRDT conflict merger (`'lww'`, `'pn-counter'`, `'set-union'`, `'g-set'`, `'max'`, `'min'`). |
+| `createCrdtConflictResolver(config?)` | Returns a pluggable `onConflict` resolver callback backed by `mergeCrdtRow()`. |
+| `createPiiMaskingTransformer(rules, options?)` | Declarative PII redaction / row transformation callback (`'email-mask'`, `'card-last4'`, `'hash-sha256'`, `'redact'`, `'null'`). |
+
+### Network Transports, Binary Segments, PITR, Compaction, DLQ & Telemetry
+
+| Export | Description |
+|---|---|
+| `createHttpReplicationHandler(options)` | Web Fetch API `(Request) => Promise<Response>` handler serving `/changes`, `/ack`, `/heartbeat`, `/snapshot`, `/push`, and `/events` (SSE). |
+| `createHttpReplicationClient(options)` | Remote HTTP replication client compatible with `createSubscription()`. |
+| `createBroadcastChannelTransport(options?)` | Cross-tab / cross-worker replication transport backed by `BroadcastChannel`. |
+| `createWebSocketReplicationPeer(options)` | Duplex WebSocket replication peer streaming entries, pull requests, and slot acks. |
+| `encodeNativeJournalSegment(entries, opts?)` | Encodes journal entries into a binary journal segment (`0x52444246` `'FBDR'`). |
+| `decodeNativeJournalSegment(bytes)` | Validates FNV-1a checksum and decodes a `0x52444246` binary journal segment. |
+| `encodeEncryptedJournalSegment(entries, opts?)` | Gzip-compresses and encrypts a journal segment with WebCrypto AES-256-GCM (`0x53444246` `'FBDS'`). |
+| `decodeEncryptedJournalSegment(bytes, opts?)` | Decrypts and decompresses an encrypted journal segment (or transparently decodes raw `0x52444246` segments). |
+| `asOfLsn(db, target)` | Non-destructively reconstructs historical table rows at any past LSN, timestamp, or HLC. |
+| `rewindToLsn(db, targetOrOptions)` | Rolls back a live database to a historical LSN, timestamp, or HLC using inverse DML from `BEFORE_JSON`. |
+| `exportJournalArchive(pub, options?)` | Packages a base snapshot + chunked encrypted/compressed `0x53444246` segments into a portable PITR bundle. |
+| `applyJournalArchive(db, archive, options?)` | Restores a database from a `ReplicationJournalArchive` up to an optional target LSN, timestamp, or HLC. |
+| `compactJournal(db, options?)` | Collapses superseded per-row mutations in `FB_REPL_JOURNAL$` while preserving the latest LSN watermark. |
+| `applyRetentionPolicy(db, pub, options?)` | Enforces `maxEntries` / `maxAgeMs` retention, optional compaction, and automatic PITR archival before pruning. |
+| `createReplicationDlq(db, options?)` | Provisions `FB_REPL_DLQ$` for quarantining, inspecting, retrying, and discarding poison journal entries. |
+| `createReplicationMetricsCollector(options)` | Collects structured replication telemetry with `.toPrometheus()` and `.toOpenTelemetry()` exporters. |
+| `formatPrometheusReplicationMetrics(snap, prefix?)` | Formats a `ReplicationTelemetrySnapshot` in Prometheus text exposition format. |
+| `classifyDdlStatement(sql)` | Classifies DDL into `'additive'`, `'destructive'`, or `'other'` schema operations. |
+| `resolveDdlConflict(sql, policy, schema?)` | Evaluates incoming DDL against `'apply' \| 'idempotent' \| 'additive-only'` subscriber policy. |
+| `checkReplicationSchemaCompatibility(options)` | Compares source and target database catalogs and emits remediation DDL for missing/incompatible columns. |
+
+### Native Firebird C++ Engine Replication (`RDB$PUBLICATIONS` & `"FBCHANGELOG\0"`)
+
+| Export | Description |
+|---|---|
+| `enableEnginePublication(db, options?)` | Enables Firebird's native `RDB$PUBLICATIONS` catalog and includes specified (or all) tables. |
+| `disableEnginePublication(db)` | Runs `ALTER DATABASE DISABLE PUBLICATION`. |
+| `includeTablesInPublication(db, tables)` | Runs `ALTER DATABASE INCLUDE TABLE ... TO PUBLICATION` (or `INCLUDE ALL`). |
+| `excludeTablesFromPublication(db, tables)` | Runs `ALTER DATABASE EXCLUDE TABLE ... FROM PUBLICATION`. |
+| `getEnginePublicationStatus(db)` | Queries `RDB$PUBLICATIONS`, `RDB$PUBLICATION_TABLES`, `REPLICA_MODE`, and `REPLICATION_SEQUENCE`. |
+| `buildReplicationConf(entry)` | Generates a Firebird `replication.conf` configuration block. |
+| `configureWasmReplicationConf(fs, entry)` | Writes `/usr/local/firebird/replication.conf` and creates journal/archive directories in Emscripten `MEMFS`. |
+| `isFbChangelogSegment(bytes)` | Tests whether `bytes` begins with the 12-byte `"FBCHANGELOG\0"` magic header. |
+| `parseFbChangelogSegment(bytes)` | Parses a `"FBCHANGELOG\0"` binary segment's 48-byte header, transaction blocks, atoms, and SQL statements. |
+| `readWasmChangelogSegments(fs, dir, opts?)` | Reads and parses all `"FBCHANGELOG\0"` segment files in a WASM virtual directory in sequence order. |
+| `applyFbChangelogSegmentToDatabase(db, seg, opts?)` | Replays a `"FBCHANGELOG\0"` segment via C++ `IAttachment::createReplicator` (`_fb_replicate_changelog`) or parsed SQL/JRD fallback. |
+| `encodeFbChangelogSegment(options)` | Packs a 48-byte `"FBCHANGELOG\0"` header and `Replication::Block` payloads into a binary changelog segment. |
+| `decodeFbChangelogBlockOperations(block)` | Decodes all binary `Replication::Block` opcodes inside a single `FbChangelogBlock`. |
+| `decodeFbChangelogOperations(segmentOrBytes)` | Decodes all 16 binary `Replication::Block` opcodes across an entire `"FBCHANGELOG\0"` segment. |
+| `decodeJrdRecordBuffer(recordData, cols, blobs?)` | Decodes an uncompressed Firebird JRD record buffer into a typed JavaScript row object. |
+| `encodeJrdRecordBuffer(row, columns)` | Encodes a JavaScript row object into Firebird's uncompressed JRD record buffer format. |
+| `fbChangelogToLogicalEntries(segOrBytes, opts?)` | Converts a `"FBCHANGELOG\0"` segment into committed `ReplicationLogEntry[]`, `sequences`, and `ddlStatements` (honoring tx & savepoint rollbacks). |
+| `setWasmDatabaseReplicaMode(fs, dbPath, mode?)` | Configures `Ods::header_page::hdr_replica_mode` (`'none' \| 'read_only' \| 'read_write'`) on an unattached `.fdb` file in `MEMFS`. |
+| `createWasmChangelogPoller(options)` | Continuous poller & archiver applying `"FBCHANGELOG\0"` segments in sequence order (`pollOnce()`, `start()`, `stop()`, `stats()`). |

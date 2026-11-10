@@ -20,18 +20,51 @@ A PGlite-style wrapper around the Firebird embedded engine for Node.js.
 class FirebirdLite {
   constructor(dbPath: string, options?: FirebirdLiteOptions)
 
-  exec(sql: string | SqlFragment, params?: QueryParams): Promise<void>
+  exec(sql: string | SqlFragment, params?: QueryParams, options?: StatementExecutionOptions): Promise<void>
   execBatch(sql: string, rows: QueryParams[]): Promise<void>
-  query<T extends Row = Row>(sql: SqlFragment, options?: TransactionOptions): Promise<QueryResult<T>>
+  query<T extends Row = Row>(sql: SqlFragment, options?: QueryOptions): Promise<QueryResult<T>>
   query<T extends Row = Row>(
     sql: string,
     params?: QueryParams,
-    options?: TransactionOptions,
+    options?: QueryOptions,
   ): Promise<QueryResult<T>>
+  queryStream<T extends Row = Row>(
+    sql: string | SqlFragment,
+    params?: QueryParams | QueryStreamOptions,
+    options?: QueryStreamOptions,
+  ): AsyncIterableIterator<QueryResult<T>>
+  prepare(sql: string | SqlFragment): Promise<PreparedStatement>
   transaction<T>(
     fn: (tx: FirebirdTransaction) => Promise<T>,
     options?: TransactionOptions,
   ): Promise<T>
+  describeQuery(sql: string | SqlFragment): Promise<QueryDescription>
+  explain(sql: string | SqlFragment, options?: ExplainOptions): Promise<string>
+  databaseInfo(): Promise<DatabaseInfo>
+  sweep(): Promise<SweepResult>
+  introspect(options?: IntrospectOptions): Promise<SchemaIntrospection>
+  migrate(migrations: readonly Migration[], options?: MigrateOptions): Promise<MigrateResult>
+  registerFunction(name: string, options: RegisterFunctionOptions, fn: JsFunctionHandler): Promise<RegisteredRoutine>
+  unregisterFunction(name: string): Promise<void>
+  registerProcedure(name: string, options: RegisterProcedureOptions, fn: JsProcedureHandler): Promise<RegisteredRoutine>
+  unregisterProcedure(name: string): Promise<void>
+  createBlobStream(options?: BlobStreamOptions): Promise<BlobWritableStream>
+  openBlobStream(sqlOrHandle: string | SqlFragment | BlobHandle, params?: QueryParams | BlobStreamOptions, options?: BlobStreamOptions): Promise<ReadableStream<Uint8Array>>
+  copyFromStream(tableName: string, stream: ReadableStream<Uint8Array | string> | AsyncIterable<Uint8Array | string>, options?: CopyFromOptions): Promise<CopyResult>
+  copyToStream(tableOrQuery: string | SqlFragment, params?: QueryParams | CopyToOptions, options?: CopyToOptions): ReadableStream<Uint8Array>
+  snapshot(options?: SnapshotOptions | string): Promise<DatabaseSnapshot>
+  restoreSnapshot(snapshotOrId: DatabaseSnapshot | string): Promise<void>
+  listSnapshots(): DatabaseSnapshotInfo[]
+  deleteSnapshot(snapshotOrId: DatabaseSnapshot | string): boolean
+  exportDiff(baseSnapshotOrId: SnapshotOrImageInput, targetSnapshotOrId?: SnapshotOrImageInput, options?: PageDiffOptions): Promise<Uint8Array>
+  applyDiff(diffBytes: Uint8Array | ArrayBufferLike, options?: ApplyPageDiffOptions): Promise<void>
+  dumpDataDir(): Promise<Uint8Array>
+  dumpDataStream(options?: DataStreamOptions): ReadableStream<Uint8Array>
+  loadDataStream(stream: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array>, options?: DataStreamOptions): Promise<void>
+  onQuery(listener: QueryProfileListener): () => void
+  monitorStats(): Promise<MonitorStats>
+  resetMonitorStats(): void
+  cancelOperation(): Promise<void>
   close(): Promise<void>
 }
 ```
@@ -220,8 +253,8 @@ const shape = await db.describeQuery('SELECT id, name FROM items WHERE id = ?');
 
 ```ts
 interface QueryDescription {
-  params?: FieldInfo[]      // one per `?`, in order
-  fields: FieldInfo[]       // one per result column
+  params: FieldInfo[]       // one per `?`, in positional order
+  fields: FieldInfo[]       // one per result column, in positional order
   statementType: StatementKind   // 'SELECT' | 'INSERT' | 'DDL' | …
   hasResultSet: boolean
 }
@@ -237,17 +270,12 @@ A `` sql`…` `` fragment is accepted; only its text decides the shape, so its
 values are ignored.
 
 Parameters are positional in Firebird and have no names, so `ParamInfo.name` is
-the empty string.  They are described by type and position.
+the empty string.  They are described by type and position on **both**
+`FirebirdBrowser` and `FirebirdLite`.
 
 `statementType` is `'UNKNOWN'` for a code this library has no name for — a
 future Firebird may add one, and that is no reason to fail a description that
 is otherwise complete.
-
-> **`params` is `undefined` on the Node backend.**  The native driver exposes
-> no input metadata at all, and `[]` would claim the statement takes no
-> parameters — a different and wrong thing to say about `WHERE id = ?`.
-> `fields` there carries names only, as `FieldInfo` does everywhere on that
-> backend.  The WASM backend reports both in full.
 
 ---
 
@@ -408,18 +436,58 @@ IndexedDB-based virtual filesystem.
 class FirebirdBrowser {
   constructor(dbName: string, options?: FirebirdBrowserOptions)
 
-  exec(sql: string | SqlFragment, params?: QueryParams): Promise<ExecResult[]>
+  readonly isLeader: boolean
+  exec(sql: string | SqlFragment, params?: QueryParams, options?: StatementExecutionOptions): Promise<ExecResult[]>
   execBatch(sql: string, rows: QueryParams[]): Promise<ExecResult>
-  query<T extends Row = Row>(sql: SqlFragment, options?: TransactionOptions): Promise<QueryResult<T>>
+  query<T extends Row = Row>(sql: SqlFragment, options?: QueryOptions): Promise<QueryResult<T>>
   query<T extends Row = Row>(
     sql: string,
     params?: QueryParams,
-    options?: TransactionOptions,
+    options?: QueryOptions,
   ): Promise<QueryResult<T>>
+  queryStream<T extends Row = Row>(
+    sql: string | SqlFragment,
+    params?: QueryParams | QueryStreamOptions,
+    options?: QueryStreamOptions,
+  ): AsyncIterableIterator<QueryResult<T>>
+  prepare(sql: string | SqlFragment): Promise<PreparedStatement>
   transaction<T>(
     fn: (tx: FirebirdBrowserTransaction) => Promise<T>,
     options?: TransactionOptions,
   ): Promise<T>
+  listen(names: string | string[], onEvent: (counts: Record<string, number>) => void, options?: ListenOptions): Promise<EventSubscription>
+  notify(name: string): Promise<void>
+  live<T extends Row = Row>(sql: string | SqlFragment, onChange: (rows: T[]) => void): Promise<LiveQuery<T>>
+  live<T extends Row = Row>(sql: string | SqlFragment, options: LiveQueryOptions, onChange: (rows: T[]) => void): Promise<LiveQuery<T>>
+  describeQuery(sql: string | SqlFragment): Promise<QueryDescription>
+  explain(sql: string | SqlFragment, options?: ExplainOptions): Promise<string>
+  databaseInfo(): Promise<DatabaseInfo>
+  sweep(): Promise<SweepResult>
+  introspect(options?: IntrospectOptions): Promise<SchemaIntrospection>
+  migrate(migrations: readonly Migration[], options?: MigrateOptions): Promise<MigrateResult>
+  registerFunction(name: string, options: RegisterFunctionOptions, fn: JsFunctionHandler): Promise<RegisteredRoutine>
+  unregisterFunction(name: string): Promise<void>
+  registerProcedure(name: string, options: RegisterProcedureOptions, fn: JsProcedureHandler): Promise<RegisteredRoutine>
+  unregisterProcedure(name: string): Promise<void>
+  createBlobStream(options?: BlobStreamOptions): Promise<BlobWritableStream>
+  openBlobStream(sqlOrHandle: string | SqlFragment | BlobHandle, params?: QueryParams | BlobStreamOptions, options?: BlobStreamOptions): Promise<ReadableStream<Uint8Array>>
+  copyFromStream(tableName: string, stream: ReadableStream<Uint8Array | string> | AsyncIterable<Uint8Array | string>, options?: CopyFromOptions): Promise<CopyResult>
+  copyToStream(tableOrQuery: string | SqlFragment, params?: QueryParams | CopyToOptions, options?: CopyToOptions): ReadableStream<Uint8Array>
+  snapshot(options?: SnapshotOptions | string): Promise<DatabaseSnapshot>
+  restoreSnapshot(snapshotOrId: DatabaseSnapshot | string): Promise<void>
+  listSnapshots(): DatabaseSnapshotInfo[]
+  deleteSnapshot(snapshotOrId: DatabaseSnapshot | string): boolean
+  exportDiff(baseSnapshotOrId: SnapshotOrImageInput, targetSnapshotOrId?: SnapshotOrImageInput, options?: PageDiffOptions): Promise<Uint8Array>
+  applyDiff(diffBytes: Uint8Array | ArrayBufferLike, options?: ApplyPageDiffOptions): Promise<void>
+  branch(branchDbName: string, options?: BranchOptions): Promise<FirebirdBrowser>
+  dumpDataDir(): Promise<Uint8Array>
+  dumpDataStream(options?: DataStreamOptions): ReadableStream<Uint8Array>
+  loadDataStream(stream: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array>, options?: DataStreamOptions): Promise<void>
+  loadIcuLocaleData(data: Uint8Array | ArrayBufferLike): Promise<void>
+  onQuery(listener: QueryProfileListener): () => void
+  monitorStats(): Promise<MonitorStats>
+  resetMonitorStats(): void
+  cancelOperation(): Promise<void>
   persist(): Promise<void>
   close(): Promise<void>
 }
@@ -516,16 +584,20 @@ queue.
 
 Closing the database unsubscribes every listener on it.
 
-#### `db.live(sql, options, onChange)`
+#### `db.live(sql, onChange)` / `db.live(sql, options, onChange)`
 
-Re-run a query whenever named events fire.
+Re-run a query whenever referenced tables change or named events fire.
 
 ```ts
-// A trigger does the posting:
-//   CREATE TRIGGER items_ai FOR items AFTER INSERT
-//   AS BEGIN POST_EVENT 'items_changed'; END
-
+// Zero-config: referenced user tables are extracted from `sql` and idempotent
+// `FB_LIVE$<hash>` triggers are installed automatically once per table:
 const live = await db.live(
+  'SELECT id, name FROM items ORDER BY id',
+  (rows) => render(rows),
+);
+
+// Or supply explicit `POST_EVENT` names (e.g. from custom triggers or `db.notify()`):
+const customLive = await db.live(
   'SELECT id, name FROM items ORDER BY id',
   { events: ['items_changed'] },
   (rows) => render(rows),
@@ -545,22 +617,14 @@ refresh only ever sees data that survived.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `events` | `string[]` | — | Event names to watch.  Required. |
+| `events` | `string[]` | auto-inferred | Event names to watch. When omitted, `extractReferencedTables()` detects user tables read by `sql` and installs `FB_LIVE$<hash>` triggers automatically. |
 | `params` | `QueryParams` | `[]` | Parameters for the statement. |
 | `pollIntervalMs` | `number` | `250` | How often to ask whether anything fired. |
 | `onError` | `(e: Error) => void` | `console.error` | A refresh failed.  Polling continues. |
 
-**The event names are yours to supply.**  Nothing in Firebird connects a posted
-event to the tables a statement reads, so inferring them would be guesswork
-dressed as convenience.
-
 `live()` is built on [`listen()`](#dblistennames-onevent-options--dbnotifyname):
-the subscription, the polling and the teardown are the same machinery, with a
-query re-run on top.
-
-This polls rather than pushes: the engine's callback runs on an engine thread
-and re-arming the subscription has to happen off it.  A tick that finds nothing
-costs one round trip to the Worker.
+the subscription, the polling, cross-tab `BroadcastChannel` fan-out, and the
+teardown are the same machinery, with a query re-run on top.
 
 Closing the database unsubscribes every live query on it.
 
@@ -877,11 +941,33 @@ interface TransactionOptions {
 ```ts
 interface FirebirdBrowserOptions {
   vfs?: IndexedDBVFSOptions;
+  encryptionKey?: PageEncryptionKey;
+  crossTabLive?: boolean;
   wasmBinary?: ArrayBuffer | string;
   locateFile?: (filename: string) => string;
+  threads?: boolean | 'auto';
+  worker?: Worker | (() => Worker);
+  transport?: EngineTransport;
+  autoPersist?: boolean;
+  autoPersistDebounceMs?: number;
+  onPersistError?: (error: Error) => void;
+  multiTab?: 'exclusive' | 'shared' | 'allow-unsafe';
+  sharedReads?: boolean;
+  lockTimeoutMs?: number;
   types?: TypeOptions;
-  // …plus worker, transport, autoPersist, multiTab and lockTimeoutMs —
-  // see the class documentation in src/browser/firebird-browser.ts.
+  loadDataDir?: Uint8Array;
+  loadDataStream?:
+    | ReadableStream<Uint8Array>
+    | AsyncIterable<Uint8Array>
+    | (() =>
+        | ReadableStream<Uint8Array>
+        | AsyncIterable<Uint8Array>
+        | Promise<ReadableStream<Uint8Array> | AsyncIterable<Uint8Array>>);
+  icuLocaleData?:
+    | Uint8Array
+    | ArrayBuffer
+    | ArrayBufferLike
+    | (() => Uint8Array | ArrayBufferLike | Promise<Uint8Array | ArrayBufferLike>);
 }
 ```
 
@@ -997,8 +1083,10 @@ encoder, because with a Worker transport the encoder is on the far side of
 
 ```ts
 interface IndexedDBVFSOptions {
-  pageSize?: number;  // default: 8192
-  prefix?: string;    // default: 'firebird_'
+  pageSize?: number;                 // default: 8192
+  prefix?: string;                   // default: 'firebird_'
+  encryptionKey?: PageEncryptionKey; // AES-128/256-GCM CryptoKey or raw 16/32-byte key
+  indexedDB?: IDBFactory;
 }
 ```
 
@@ -1008,6 +1096,7 @@ interface IndexedDBVFSOptions {
 interface VFSMetadata {
   pageSize: number;
   pageCount: number;
+  encrypted?: boolean;
 }
 ```
 
@@ -1077,21 +1166,24 @@ try {
 |--------|------|-------------|
 | `stmt.sql` | `string` | SQL text of the prepared statement |
 | `stmt.fields` | `FieldInfo[]` | Output column metadata |
-| `stmt.params` | `FieldInfo[] \| undefined` | Input parameter metadata |
+| `stmt.params` | `FieldInfo[]` | Input `?` parameter metadata, in positional order |
 | `stmt.statementType` | `StatementKind` | `'SELECT'`, `'INSERT'`, `'UPDATE'`, etc. |
 | `stmt.hasResultSet` | `boolean` | Whether executing returns rows |
-| `stmt.exec(params?, options?)` | `Promise<ExecResult \| void>` | Execute without materialising rows |
+| `stmt.closed` | `boolean` | Whether `close()` has been called |
+| `stmt.exec(params?, options?)` | `Promise<{ affectedRows: number }>` | Execute without materialising rows |
+| `stmt.execBatch(rows)` | `Promise<{ affectedRows: number }>` | Execute once per row in an atomic batch |
 | `stmt.query<T>(params?, options?)` | `Promise<QueryResult<T>>` | Execute and return all rows |
-| `stmt.stream<T>(params?, options?)` | `AsyncIterableIterator<QueryStreamBatch<T>>` | Stream rows in batches |
-| `stmt.setTimeout(timeoutMs)` | `Promise<void>` | Set per-statement execution timeout (ms, `0` to clear) |
-| `stmt.close()` | `Promise<void>` | Free the prepared statement handle |
+| `stmt.queryStream<T>(params?, options?)` | `AsyncIterableIterator<QueryResult<T>>` | Stream rows in cursor batches (default `batchSize: 500`) |
+| `stmt.setTimeout?(timeoutMs)` | `Promise<void>` | Set per-statement execution timeout (ms, `0` to clear) |
+| `stmt.close()` | `Promise<void>` | Free the prepared statement handle (also supports `[Symbol.asyncDispose]`) |
 
 ---
 
 ### `db.queryStream<T>(sql, params?, options?)` — Cursor Streaming
 
-Stream large result sets in configurable batches (`batchSize`, default `250`)
-without loading the entire table into memory:
+Stream large result sets in configurable batches (`batchSize`, default `500`)
+without loading the entire table into memory. Breaking out of `for await`
+early closes the cursor and finishes the transaction immediately:
 
 ```ts
 for await (const batch of db.queryStream('SELECT * FROM events', [], { batchSize: 500 })) {
@@ -1103,42 +1195,45 @@ for await (const batch of db.queryStream('SELECT * FROM events', [], { batchSize
 
 ---
 
-### `db.createBlobStream(options?)` & `db.openBlobStream(blobId, options?)`
+### `db.createBlobStream(options?)` & `db.openBlobStream(sqlOrHandle, params?, options?)`
 
-Stream large binary or text BLOBs in chunks without holding the full buffer in
-memory:
+Stream large binary or text BLOBs in segments (`segmentSize`, default `32768`,
+max `65535` on write) without holding the full buffer in memory:
 
 ```ts
-// Write a BLOB from a stream:
-const writer = await db.createBlobStream({ chunkSize: 16384 });
-await writer.write(new Uint8Array([1, 2, 3, 4]));
-const blobId = await writer.close();
+// Write a BLOB from chunks (or via `await readable.pipeTo(blobStream)`):
+const blobStream = await db.createBlobStream({ segmentSize: 32768 });
+await blobStream.writeChunk(new Uint8Array([1, 2, 3, 4]));
+const handle = await blobStream.finish();
+await db.exec('INSERT INTO files (id, payload) VALUES (?, ?)', [1, handle]);
 
-// Read a BLOB as a Web ReadableStream<Uint8Array>:
-const stream = await db.openBlobStream(blobId);
+// Read a BLOB as a Web ReadableStream<Uint8Array> (by BlobHandle or SELECT query):
+const stream = await db.openBlobStream('SELECT payload FROM files WHERE id = ?', [1]);
 ```
 
 ---
 
-### `db.copyFromStream(table, stream, options?)` & `db.copyToStream(tableOrQuery, writable, options?)`
+### `db.copyFromStream(tableName, stream, options?)` & `db.copyToStream(tableOrQuery, params?, options?)`
 
-Bulk-ingest or export CSV / JSONL streams (`ReadableStream` / `WritableStream`
-or `AsyncIterable<Uint8Array | string>`) with automatic transaction batching:
+Bulk-ingest or export CSV / JSONL (`'csv' | 'jsonl' | 'ndjson'`) streams with
+bounded-memory batching (`batchSize`, default `500`) and optional `'gzip'`
+compression:
 
 ```ts
 // Bulk import CSV:
-const { rowsImported, batchesCommitted } = await db.copyFromStream('items', csvStream, {
+const { rowsCopied, batches, columns } = await db.copyFromStream('items', csvStream, {
   format: 'csv',
   header: true,
   batchSize: 500,
 });
 
-// Bulk export JSONL:
-const { rowsExported } = await db.copyToStream(
-  'SELECT id, name FROM items ORDER BY id',
-  writableStream,
+// Bulk export JSONL as a ReadableStream<Uint8Array>:
+const jsonlStream = db.copyToStream(
+  'SELECT id, name FROM items WHERE id > ? ORDER BY id',
+  [0],
   { format: 'jsonl' },
 );
+await jsonlStream.pipeTo(writableStream);
 ```
 
 ---
@@ -1165,8 +1260,9 @@ await db.transaction(async (tx) => {
 
 ### Statement Cancellation & Timeouts (`AbortSignal`, `timeoutMs`, `db.cancelOperation()`)
 
-Pass `signal` (`AbortSignal`) or `timeoutMs` (`number`) in `QueryExecutionOptions`
-to `exec()`, `query()`, or `queryStream()`, or call `db.cancelOperation('raise')`:
+Pass `signal` (`AbortSignal`) or `timeoutMs` (`number`, requires threaded WASM
+build or Node server) in `StatementExecutionOptions` to `exec()`, `query()`,
+`queryStream()`, or `PreparedStatement`, or call `db.cancelOperation()`:
 
 ```ts
 const controller = new AbortController();
@@ -1180,30 +1276,42 @@ await db.query('SELECT * FROM heavy_view', [], {
 
 ---
 
-### `db.explain(sql, params?)`, `db.introspect()`, `db.migrate(migrations, options?)`, `db.sweep()`
+### Schema, Plans, Diagnostics & Maintenance (`explain`, `databaseInfo`, `sweep`, `introspect`, `migrate`, `diffSchema`)
 
-- **`db.explain(sql, params?)`**: Returns `{ planText, nodes, fields, statementType }`
-  without executing the query.
-- **`db.introspect()`**: Queries `RDB$*` system catalogs and returns a
-  `DatabaseSchema` (`tables`, `views`, `sequences`, `columns`, `indexes`,
-  `primaryKey`, `foreignKeys`, `triggers`).
-- **`db.migrate(migrations, options?)`**: Applies pending versioned SQL
-  migrations in order inside transactions and records them in
-  `SCHEMA_MIGRATIONS`.
-- **`db.sweep()`**: Runs cooperative garbage collection and compacts unused
-  pages in the VFS.
+- **`db.explain(sql, { detailed?: boolean })`**: Returns `Promise<string>` —
+  either the compact `PLAN (...)` string (default) or Firebird 5/6's multi-line
+  explained plan tree (`detailed: true`), without executing the query.
+- **`db.databaseInfo()`**: Returns `Promise<DatabaseInfo>` (`pageSize`,
+  `allocatedPages`, `databaseSizeBytes`, `odsVersion`, `oldestTransaction`,
+  `oldestActive`, `oldestSnapshot`, `nextTransaction`, `transactionGap`,
+  `currentMemory`, `maxMemory`, `pageBuffers`, `reads`, `writes`, `fetches`,
+  `marks`).
+- **`db.sweep()`**: Runs garbage collection and returns `Promise<SweepResult>`
+  (`before`, `after`, `tablesScanned`, `oitAdvanced`, `gapReduced`,
+  `durationMs`).
+- **`db.introspect(options?)`**: Queries `RDB$*` catalogs and returns a
+  `SchemaIntrospection` (`tables`, `views`, `columns`, `primaryKeys`,
+  `foreignKeys`, `indexes`, `sequences`, `triggers`).
+- **`db.migrate(migrations, options?)`**: Applies (or reverts with
+  `direction: 'down'`) versioned SQL migrations transactionally and records
+  applied versions in `FB_MIGRATIONS$`.
+- **`diffSchema(sourceA, sourceB)` & `generateMigration(sourceA, sourceB, options?)`**
+  (exported from `firebird-wasm` and `firebird-wasm/browser`): Compares two live
+  databases, `SchemaIntrospection` objects, or SQL DDL scripts and emits forward
+  (`upSql`) and rollback (`downSql`) Firebird migration DDL.
 
 ---
 
 ### `db.registerFunction(name, options, fn)` & `db.registerProcedure(name, options, fn)`
 
-Register a JavaScript function or selectable stored procedure (`ENGINE JS`) on
-the database connection:
+Register a JavaScript scalar function or selectable stored procedure (`ENGINE JS`)
+on the database connection. Returns a `RegisteredRoutine` handle (`unregister()` /
+`await using`):
 
 ```ts
 // Scalar UDR function:
 await db.registerFunction(
-  ' REVERSE_STR',
+  'REVERSE_STR',
   { args: [{ name: 'VAL', type: 'VARCHAR(200)' }], returns: 'VARCHAR(200)' },
   (val) => (val == null ? null : String(val).split('').reverse().join('')),
 );
@@ -1228,14 +1336,22 @@ await db.registerProcedure(
 
 ---
 
-### Copy-on-Write Snapshots & Branching (`FirebirdBrowser`)
+### Copy-on-Write Snapshots, Branching & Binary Page Diffs
 
 ```ts
-const snap = await db.snapshot('checkpoint-1'); // DatabaseSnapshotInfo
-const list = db.listSnapshots();                // DatabaseSnapshotInfo[]
-await db.restoreSnapshot(snap.id);              // restore in-place
-const forkedDb = await db.branch('experiment'); // new independent FirebirdBrowser
-db.deleteSnapshot(snap.id);
+const snap1 = await db.snapshot('checkpoint-1'); // DatabaseSnapshot
+await db.exec("INSERT INTO items VALUES (99, 'delta')");
+const snap2 = await db.snapshot('checkpoint-2');
+
+// Export & apply compact binary page deltas (`FBDF\x01` + CRC32):
+const diffBytes = await db.exportDiff(snap1, snap2);
+await otherDb.applyDiff(diffBytes);
+
+// List, restore in-place, or fork an isolated FirebirdBrowser branch:
+const list = db.listSnapshots();                 // DatabaseSnapshotInfo[]
+await db.restoreSnapshot(snap1.id);              // restore in-place
+const forkedDb = await db.branch('experiment');  // independent FirebirdBrowser
+db.deleteSnapshot(snap1.id);
 ```
 
 ---
@@ -1244,27 +1360,40 @@ db.deleteSnapshot(snap.id);
 
 ```ts
 const unsub = db.onQuery((event) => {
-  console.log(event.kind, event.sql, `${event.durationMs.toFixed(2)}ms`, event.rowCount);
+  console.log(event.kind, event.sql, `${event.durationMs.toFixed(2)}ms`, event.cacheHit, event.rowCount);
 });
 
 const stats = await db.monitorStats();
-// { totalQueries, totalExecs, totalErrors, totalDurationMs, maxDurationMs, recentQueries, engineTables }
+// {
+//   totalQueries, totalExecs, totalErrors,
+//   totalDurationMs, avgDurationMs, maxDurationMs, slowestSql,
+//   prepareCacheHits, prepareCacheMisses, prepareCacheHitRate,
+//   io, transactions, activeStatements, recentQueries
+// }
 ```
 
 ---
 
 ### `OPFSVFS` & WebCrypto Page Encryption (`firebird-wasm/browser`)
 
+Encrypt 8 KiB database pages at rest (`"FBE1"` envelope with 96-bit IV, 128-bit
+GCM tag, and `(pageNumber, pageSize)` AAD) across `FirebirdBrowser`,
+`IndexedDBVFS`, and `OPFSVFS`:
+
 ```ts
 import {
+  FirebirdBrowser,
   OPFSVFS,
-  deriveEncryptionKey,
+  deriveEncryptionKeyFromPassphrase,
   generateEncryptionKey,
 } from 'firebird-wasm/browser';
 
-const { key, salt } = await deriveEncryptionKey('my-passphrase');
+const salt = crypto.getRandomValues(new Uint8Array(16));
+const key = await deriveEncryptionKeyFromPassphrase('my-passphrase', salt);
+// or: const key = await generateEncryptionKey();
+
+const db = new FirebirdBrowser('mydb', { worker, encryptionKey: key });
 const vfs = new OPFSVFS({ encryptionKey: key });
-await vfs.open('mydb');
 ```
 
 ---
@@ -1273,14 +1402,16 @@ await vfs.open('mydb');
 
 ### `firebird-wasm/vector`
 
-Float32 / Int8 vector encoding, SQL UDR registration (`COSINE_DISTANCE`,
-`L2_DISTANCE`, `DOT_PRODUCT`, `VECTOR_DIMS`, `VECTOR_NORM`), and similarity
-search:
+Float32 / Int8 vector encoding, persistent multi-layer HNSW ANN graph index
+(`HnswIndex`, `createVectorIndex` backed by `FB_VECTOR_INDEX$`), SQL UDR
+registration (`COSINE_DISTANCE`, `L2_DISTANCE`, `DOT_PRODUCT`, `VECTOR_DIMS`,
+`VECTOR_NORM`), and top-$k$ `vectorSearch`:
 
 ```ts
 import {
   encodeVector,
   registerVectorFunctions,
+  createVectorIndex,
   vectorSearch,
 } from 'firebird-wasm/vector';
 
@@ -1288,20 +1419,59 @@ await registerVectorFunctions(db);
 await db.exec('CREATE TABLE docs (id INTEGER PRIMARY KEY, title VARCHAR(100), embedding VARBINARY(12))');
 await db.exec('INSERT INTO docs VALUES (?, ?, ?)', [1, 'Firebird WASM', encodeVector([1, 0, 0])]);
 
+const index = await createVectorIndex(db, {
+  table: 'docs',
+  keyColumn: 'id',
+  vectorColumn: 'embedding',
+  dimensions: 3,
+  metric: 'cosine',
+});
+
 const matches = await vectorSearch(db, {
   table: 'docs',
   column: 'embedding',
   query: [1, 0, 0],
   metric: 'cosine',
+  index,
   limit: 5,
+});
+```
+
+### `firebird-wasm/fts`
+
+Unicode tokenization, diacritic folding, Porter stemming (`tokenizeText`,
+`stemWord`), snippet highlighting (`highlightSnippet`), persistent Okapi BM25
+inverted index (`Bm25Index`, `createFtsIndex`), SQL UDRs
+(`registerFtsFunctions`: `FTS_TOKENIZE`, `FTS_STEM`, `FTS_BM25`,
+`FTS_HIGHLIGHT`), and Reciprocal Rank Fusion (`reciprocalRankFusion`,
+`hybridSearch`) combining BM25 keyword search with `vectorSearch`:
+
+```ts
+import { createFtsIndex, registerFtsFunctions, hybridSearch } from 'firebird-wasm/fts';
+
+await registerFtsFunctions(db);
+const fts = await createFtsIndex(db, {
+  table: 'docs',
+  keyColumn: 'id',
+  textColumns: ['title'],
+});
+
+const results = await hybridSearch(db, {
+  ftsIndex: fts,
+  queryText: 'firebird wasm',
+  vectorOptions: { table: 'docs', column: 'embedding', query: [1, 0, 0] },
+  limit: 10,
 });
 ```
 
 ### `firebird-wasm/kysely` & `firebird-wasm/drizzle`
 
 ```ts
-import { FirebirdBrowserDialect, generateKyselyTypes } from 'firebird-wasm/kysely';
-import { drizzle, generateDrizzleSchema } from 'firebird-wasm/drizzle';
+import { FirebirdDialect, createKysely, generateKyselyTypes } from 'firebird-wasm/kysely';
+import { drizzle, firebirdTable, generateDrizzleSchema } from 'firebird-wasm/drizzle';
+
+const kyselyDb = createKysely<Database>(db);
+const drizzleDb = drizzle(db);
 
 const kyselyDts = await generateKyselyTypes(db);
 const drizzleTs = await generateDrizzleSchema(db);
@@ -1313,10 +1483,24 @@ Reactive query and live-query hooks/stores across all four UI frameworks:
 
 - `firebird-wasm/react`: `FirebirdProvider`, `useFirebird`, `useQuery`, `useLiveQuery`
 - `firebird-wasm/vue`: `FIREBIRD`, `provideFirebird`, `useFirebird`, `useQuery`, `useLiveQuery`
-- `firebird-wasm/svelte`: `FIREBIRD_CONTEXT_KEY`, `setFirebirdContext`, `getFirebirdContext`, `createQuery`, `createLiveQuery`
-- `firebird-wasm/solid`: `FirebirdContext`, `useFirebird`, `createQuery`, `createLiveQuery`
+- `firebird-wasm/svelte`: `FIREBIRD_CONTEXT_KEY`, `configureSveltePrimitives`, `setFirebirdContext`, `getFirebirdContext`, `useFirebird`, `createQuery`, `createLiveQuery`
+- `firebird-wasm/solid`: `FIREBIRD_SOLID_KEY`, `configureSolidPrimitives`, `setFirebirdContext`, `useFirebird`, `createQuery`, `createLiveQuery`
+
+### `firebird-wasm/tanstack` & `firebird-wasm/rxdb`
+
+- `firebird-wasm/tanstack`: `createFirebirdQueryOptions`, `connectFirebirdQueryClient` (bridges `POST_EVENT` / `db.live()` into TanStack `QueryClient`), `createWriteQueueMutationOptions`, and `createFirebirdCollection` (TanStack DB local-first collection).
+- `firebird-wasm/rxdb`: `getRxStorageFirebird` (RxDB `RxStorage` engine backed by `FB_RXDB_<COLLECTION>$` tables, Mango selector queries via `matchesMangoSelector`, checkpoints, reactive `changeStream()`, and optional `WriteQueue` sync bridge).
+
+### `firebird-wasm/repl`
+
+- `defineFirebirdRepl`: Registers the `<firebird-repl>` custom element with interactive SQL execution (`SET TERM` PSQL support) and a 5-tab Inspector sidebar (`Schema`, `Migrations`, `Profiler`, `Plan` flamegraph/tree explorer, and `Replication` topology/DLQ inspector).
+- `parseQueryPlan` & `computeTableIoBreakdown`: Parse Firebird `PLAN (...)` / detailed explain output into typed operator trees (`ParsedQueryPlan`) and per-table page I/O breakdowns.
 
 ### `firebird-wasm/electric` & `firebird-wasm/electric-server`
 
-- `firebird-wasm/electric`: `syncShapeToTable`, `syncShapesToTables`, `syncShapes` (relational FK-ordered multi-shape sync), `createWriteQueue` (with `onConflict` resolution), `tableFromSchema`.
+- `firebird-wasm/electric`: `syncShapeToTable`, `syncShapesToTables`, `syncShapes` (relational FK-ordered multi-shape sync), `createWriteQueue` (durable `FB_WRITE_QUEUE$` offline write queue with `onConflict` resolution), `tableFromSchema`.
 - `firebird-wasm/electric-server`: `createShapeServer` (with `where` join pushdown, `replica=full` old-row tracking, and `applyWrite` optimistic mutation endpoint).
+
+### `firebird-wasm/replication`
+
+Logical, journal-based (`FB_REPL_JOURNAL$`), and native Firebird C++ engine (`RDB$PUBLICATIONS`, `replication.conf`, `"FBCHANGELOG\0"`, `IReplicator`) replication: `replicateDatabases`, `createPublication`, `createSubscription`, `createReplicationMesh`, `createReplicationHub`, `installReplicationTriggers`, `bootstrapReplica`, `publishAllTables`, `syncCatalog`, `createHlc`, `createCrdtConflictResolver`, `promoteReplica`, `encodeEncryptedJournalSegment`, `asOfLsn`, `rewindToLsn`, `createReplicationDlq`, `createPiiMaskingTransformer`, `exportJournalArchive`, `applyJournalArchive`, `compactJournal`, `applyRetentionPolicy`, `createReplicationMetricsCollector`, `checkReplicationSchemaCompatibility`, `enableEnginePublication`, `readWasmChangelogSegments`, `decodeFbChangelogOperations`, `fbChangelogToLogicalEntries`, `createWasmChangelogPoller`, and `applyFbChangelogSegmentToDatabase`. See the full [Database Replication Guide](./replication.md).

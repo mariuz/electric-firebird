@@ -1,7 +1,6 @@
 # Publishing to npm
 
-The package is `firebird-wasm`, at `packages/firebird-wasm`. The name is
-unregistered, so the first publish claims it.
+The package is [`firebird-wasm`](https://www.npmjs.com/package/firebird-wasm), at `packages/firebird-wasm`.
 
 > **The one thing that makes this different from an ordinary npm package:**
 > `npm run build` does *not* produce the engine. `firebird-embedded.wasm` comes
@@ -154,7 +153,7 @@ the last stable version and only `npm i firebird-wasm@next` gets the candidate.
 
 | Field | Value | Why |
 |-------|-------|-----|
-| `files` | `dist`, `README.md`, `LICENSE` | Everything else is source, submodules and build trees |
+| `files` | `dist`, `README.md`, `CHANGELOG.md`, `LICENSE` | Everything else is source, submodules and build trees |
 | `dependencies` | `node-firebird-driver` | Imported directly by `src/firebird.ts` |
 | `optionalDependencies` | `node-firebird-driver-native` | Needs Firebird's client library; a browser consumer must not be blocked by it |
 | `exports["."]` | Node backend | Native driver, talks to a Firebird server |

@@ -103,6 +103,7 @@ API exported from `wasm/fb_wasm_api.cpp`:
 | `fb_prepare` / `fb_stmt_cursor_open` / `fb_cursor_fetch_bin` | Reusable prepared statements & streaming binary cursors |
 | `fb_blob_create` / `fb_blob_open` / `fb_blob_read` / `fb_blob_write` | Chunked BLOB streaming |
 | `fb_js_udr_set_dispatcher` | Register JavaScript callback for `ENGINE JS` UDR functions & procedures |
+| `fb_replicate_changelog` / `fb_set_replica_mode` | Replay `"FBCHANGELOG\0"` segments via `IAttachment::createReplicator` (`IReplicator`) & toggle replica mode |
 | `fb_start_transaction_ex(handle, isolation, readOnly)` | Begin a transaction |
 | `fb_commit(txHandle)` / `fb_rollback(txHandle)` | Commit / Rollback |
 | `fb_cancel_operation(handle, kind)` | Abort an in-flight statement |
@@ -145,12 +146,17 @@ electric-firebird/
 │       │   ├── drizzle/         ← Drizzle-style query builder & schema codegen
 │       │   ├── electric/        ← ElectricSQL client shape sync & write queue
 │       │   ├── electric-server/ ← Firebird-backed Electric shape server
+│       │   ├── frameworks/      ← Shared reactive query-store core
+│       │   ├── fts/             ← Okapi BM25 full-text search, stemming UDRs & RRF hybrid search
 │       │   ├── kysely/          ← Kysely dialect & TypeScript schema codegen
 │       │   ├── react/           ← React hooks & provider
-│       │   ├── repl/            ← <firebird-repl> Web Component + Inspector
+│       │   ├── repl/            ← <firebird-repl> Web Component + 5-tab Inspector
+│       │   ├── replication/     ← Logical/journal & native FBCHANGELOG replication
+│       │   ├── rxdb/            ← RxDB storage adapter
 │       │   ├── solid/           ← SolidJS hooks & context
 │       │   ├── svelte/          ← Svelte 5 context & reactive stores
-│       │   ├── vector/          ← Vector embeddings codec, UDRs & similarity search
+│       │   ├── tanstack/        ← TanStack Query & TanStack DB adapters
+│       │   ├── vector/          ← Vector embeddings codec, HNSW ANN index, UDRs & search
 │       │   ├── vue/             ← Vue 3 composables & provider
 │       │   ├── firebird.ts      ← FirebirdLite (Node.js backend)
 │       │   ├── index.ts         ← Node.js entry point

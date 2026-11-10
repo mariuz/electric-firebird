@@ -5,7 +5,7 @@ electric-firebird's stated goal is "Firebird embedded in WASM, similar to
 that goal actually is, compares the API surface against PGlite feature by
 feature, and proposes a staged roadmap.
 
-Last reviewed: 2026-10-26.
+Last reviewed: 2026-11-10.
 
 ---
 
@@ -604,10 +604,10 @@ Legend: ✅ shipped · 🟡 partial · ❌ missing · n/a not applicable
 | Prebuilt WASM on npm | ✅ | ✅ | `npm install firebird-wasm` ships the engine |
 | CDN distribution | ✅ | ✅ | `cdnArtifacts()` gives the jsDelivr/unpkg URLs and their `locateFile`; both builds tested from another origin |
 | Bundler guides (Vite/webpack) | ✅ | ✅ | Vite, webpack, esbuild and Next.js in [integration.md](./integration.md); `examples/vite` and `examples/webpack` are built and run in CI |
-| Framework hooks (React/Vue) | ✅ | ✅ | `firebird-wasm/react` and `firebird-wasm/vue`: a provider, `useQuery` and `useLiveQuery` |
+| Framework & state adapters | ✅ | ✅ | `firebird-wasm/react`, `/vue`, `/svelte`, `/solid`, `/tanstack` (TanStack Query & TanStack DB), and `/rxdb` (`getRxStorageFirebird`) |
 | ORM / query-builder support | ✅ | ✅ | `firebird-wasm/kysely` (`FirebirdDialect`, `createKysely`) and `firebird-wasm/drizzle` (`drizzle`, `firebirdTable`) run against both `FirebirdBrowser` and `FirebirdLite`, with `?` parameter binding, `OFFSET ? ROWS FETCH NEXT ? ROWS ONLY`, multi-row `INSERT … SELECT … FROM RDB$DATABASE UNION ALL …`, `UPDATE OR INSERT … MATCHING`, `RETURNING`, transactions + savepoints, cursor streaming, and system-table introspection |
-| Extensions / plugin API | ✅ | n/a | Firebird UDRs are a different model; not a near-term goal |
-| REPL component | ✅ | ✅ | `<firebird-repl>` in `firebird-wasm/repl`, a custom element that works in plain pages, React and Vue |
+| Extensions / UDRs, Vector, FTS & Replication | ✅ | ✅ | Native C++ `ENGINE JS` UDR bridge (`db.registerFunction` / `db.registerProcedure`), `firebird-wasm/vector` (HNSW ANN + SQL UDRs), `firebird-wasm/fts` (Okapi BM25 + RRF hybrid search), and `firebird-wasm/replication` (logical journal + native `"FBCHANGELOG\0"` / `IReplicator`) |
+| REPL component | ✅ | ✅ | `<firebird-repl>` in `firebird-wasm/repl`, a custom element with Schema, Migrations, Profiler, Query Plan, and Replication inspector tabs |
 
 ### Where Firebird can beat the comparison
 

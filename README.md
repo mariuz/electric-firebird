@@ -85,10 +85,10 @@ to a file with no persist step at all, and `memory://` keeps nothing — and a
 statement can re-run itself when the data changes:
 
 ```ts
-// Given a trigger that does: POST_EVENT 'items_changed';
+// Automatically watches referenced tables via generated FB_LIVE$ triggers,
+// or pass explicit { events: ['items_changed'] } for custom POST_EVENT names:
 const live = await db.live(
   'SELECT id, name FROM items ORDER BY id',
-  { events: ['items_changed'] },
   (rows) => render(rows),
 );
 
@@ -101,7 +101,7 @@ In React, Vue, Svelte 5, or SolidJS, the same as a reactive hook or store:
 import { FirebirdProvider, useLiveQuery } from 'firebird-wasm/react'; // or /vue, /svelte, /solid
 
 function Items() {
-  const { rows } = useLiveQuery('SELECT id, name FROM items ORDER BY id', { events: ['items_changed'] });
+  const { rows } = useLiveQuery('SELECT id, name FROM items ORDER BY id');
   return <ul>{rows?.map((r) => <li key={r.ID}>{r.NAME}</li>)}</ul>;
 }
 ```
@@ -110,22 +110,23 @@ function Items() {
 
 | Import | Description |
 |--------|-------------|
-| `firebird-wasm` | `FirebirdLite` — Node.js native/embedded driver |
-| `firebird-wasm/browser` | `FirebirdBrowser`, `IndexedDBVFS`, `OPFSVFS`, encryption helpers |
+| `firebird-wasm` | `FirebirdLite` — Node.js native/embedded driver + shared schema, vector, and replication helpers |
+| `firebird-wasm/browser` | `FirebirdBrowser`, `IndexedDBVFS`, `OPFSVFS`, snapshots/page diffs, and AES-256-GCM encryption helpers |
 | `firebird-wasm/browser/worker-entry` | Dedicated Web Worker entry point for the WASM engine |
 | `firebird-wasm/react` | React `<FirebirdProvider>`, `useFirebird`, `useQuery`, `useLiveQuery` |
 | `firebird-wasm/vue` | Vue 3 `provideFirebird`, `useFirebird`, `useQuery`, `useLiveQuery` |
-| `firebird-wasm/svelte` | Svelte 5 `setFirebirdContext`, `getFirebirdContext`, `createQuery`, `createLiveQuery` |
-| `firebird-wasm/solid` | SolidJS `FirebirdContext`, `useFirebird`, `createQuery`, `createLiveQuery` |
-| `firebird-wasm/repl` | `<firebird-repl>` custom element with Schema, Migrations, and Profiler tabs |
-| `firebird-wasm/electric` | ElectricSQL Postgres shape sync (`syncShapeToTable`, `syncShapes`, `createWriteQueue`) |
-| `firebird-wasm/electric-server` | Firebird-backed shape server & HTTP handler (`createShapeServer`, `applyWrite`) |
-| `firebird-wasm/kysely` | Kysely dialect (`FirebirdBrowserDialect`) & TypeScript codegen (`generateKyselyTypes`) |
-| `firebird-wasm/drizzle` | Drizzle-style query builder (`drizzle`) & schema codegen (`generateDrizzleSchema`) |
-| `firebird-wasm/vector` | Float32/Int8 vector codec, SQL UDR registration (`COSINE_DISTANCE`, `L2_DISTANCE`, `DOT_PRODUCT`), and `vectorSearch` |
-| `firebird-wasm/replication` | Logical & journal replication (`createPublication`, `createSubscription`, `replicateDatabases`, `installReplicationTriggers`) |
-| `firebird-wasm/tanstack` | TanStack Query (`createFirebirdQueryOptions`) & TanStack DB (`firebirdCollectionOptions`) adapters |
+| `firebird-wasm/svelte` | Svelte 5 `setFirebirdContext`, `getFirebirdContext`, `useFirebird`, `createQuery`, `createLiveQuery` |
+| `firebird-wasm/solid` | SolidJS `setFirebirdContext`, `useFirebird`, `createQuery`, `createLiveQuery` |
+| `firebird-wasm/tanstack` | TanStack Query (`createFirebirdQueryOptions`, `connectFirebirdQueryClient`) & TanStack DB (`createFirebirdCollection`) adapters |
 | `firebird-wasm/rxdb` | RxDB storage adapter (`getRxStorageFirebird`) backed by Firebird SQL |
+| `firebird-wasm/repl` | `<firebird-repl>` custom element with Schema, Migrations, Profiler, Query Plan, and Replication inspector tabs |
+| `firebird-wasm/electric` | ElectricSQL Postgres shape sync (`syncShapeToTable`, `syncShapesToTables`, `syncShapes`, `createWriteQueue`) |
+| `firebird-wasm/electric-server` | Firebird-backed shape server & HTTP handler (`createShapeServer`, `applyWrite`) |
+| `firebird-wasm/kysely` | Kysely dialect (`FirebirdDialect`, `createKysely`) & TypeScript schema codegen (`generateKyselyTypes`) |
+| `firebird-wasm/drizzle` | Drizzle-style query builder (`drizzle`, `firebirdTable`) & schema codegen (`generateDrizzleSchema`) |
+| `firebird-wasm/vector` | Float32/Int8 vector codec, persistent HNSW ANN index (`HnswIndex`, `createVectorIndex`), SQL UDRs, and `vectorSearch` |
+| `firebird-wasm/fts` | Okapi BM25 full-text search (`Bm25Index`, `createFtsIndex`), stemming/highlighting SQL UDRs, and RRF `hybridSearch` |
+| `firebird-wasm/replication` | Logical, journal & native Firebird engine replication (`replicateDatabases`, CRDTs, mesh/hub, DLQ, PITR archives, `"FBCHANGELOG\0"` parser & `IReplicator`) |
 
 See [docs/integration.md](./docs/integration.md), [docs/replication.md](./docs/replication.md), and [docs/api.md](./docs/api.md) for full details and usage examples.
 
@@ -285,15 +286,16 @@ The library provides two execution backends:
 - [x] Pre-built WASM binary published to npm — `npm install firebird-wasm`
 - [x] Live queries / `POST_EVENT`-based notifications (`live()`, `listen()`, `notify()`), including cross-tab `BroadcastChannel` fan-out
 - [x] React, Vue, Svelte 5, and SolidJS hooks (`firebird-wasm/react`, `/vue`, `/svelte`, `/solid`)
-- [x] A REPL component: `<firebird-repl>` (`firebird-wasm/repl`) with Schema, Migrations, and Query Profiler inspector tabs
+- [x] A REPL component: `<firebird-repl>` (`firebird-wasm/repl`) with Schema, Migrations, Query Profiler, Plan Explorer, and Replication inspector tabs
 - [x] Sync a Postgres table through ElectricSQL (`firebird-wasm/electric`) with relational `syncShapes` and conflict-aware `createWriteQueue`
 - [x] Sync a Firebird server's table the same way (`firebird-wasm/electric-server`), with `where`, join pushdown, `replica=full`, and `applyWrite`
 - [x] Reusable prepared statements (`db.prepare()`), streaming cursors (`queryStream()`), BLOB streams (`createBlobStream()` / `openBlobStream()`), and `COPY`-style bulk CSV/JSONL streams (`copyFromStream()` / `copyToStream()`)
-- [x] Database dump/restore (`dumpDataDir()` / `loadDataDir()`, `dumpDataStream()` / `loadDataStream()`), schema introspection (`introspect()`), and declarative migrations (`migrate()`)
+- [x] Database dump/restore (`dumpDataDir()` / `loadDataDir`, `dumpDataStream()` / `loadDataStream()`), schema introspection (`introspect()`), schema diffing (`diffSchema()` / `generateMigration()`), and declarative migrations (`migrate()`)
 - [x] Nested savepoints (`tx.savepoint()`), `AbortSignal` / `timeoutMs` statement cancellation, and query observability (`db.onQuery()` / `db.monitorStats()`)
-- [x] WebCrypto AES-256-GCM page encryption at rest, and Copy-on-Write snapshots & branching (`db.snapshot()`, `db.restoreSnapshot()`, `db.branch()`)
+- [x] WebCrypto AES-256-GCM page encryption at rest, Copy-on-Write snapshots & branching (`db.snapshot()`, `db.restoreSnapshot()`, `db.branch()`), and incremental binary page diffs (`db.exportDiff()` / `db.applyDiff()`)
 - [x] JavaScript User-Defined Functions & Procedures (`db.registerFunction()` / `db.registerProcedure()`) via a native C++ `IExternalEngine` (`ENGINE JS`) bridge
-- [x] Vector embeddings & similarity search (`firebird-wasm/vector`) and Kysely / Drizzle adapters + schema codegen (`firebird-wasm/kysely`, `firebird-wasm/drizzle`)
+- [x] Vector embeddings, HNSW ANN index (`firebird-wasm/vector`), BM25 full-text & RRF hybrid search (`firebird-wasm/fts`), Kysely / Drizzle adapters + schema codegen (`firebird-wasm/kysely`, `firebird-wasm/drizzle`), and TanStack Query/DB & RxDB adapters (`firebird-wasm/tanstack`, `firebird-wasm/rxdb`)
+- [x] Full database replication (`firebird-wasm/replication`) — PSQL trigger capture, replication slots, HLC/CRDT conflict resolution, multi-node mesh/hub coordinator, DLQ (`FB_REPL_DLQ$`), AES-256-GCM PITR journal archives, time-travel (`asOfLsn`/`rewindToLsn`), and native Firebird `"FBCHANGELOG\0"` / `IReplicator` engine replication
 - [x] Typed binary result wire format (`FBR\x01`), on-demand ICU locale collation packs (`loadIcuLocaleData`), and Firebird 5.0 LTS + 6.0 WASM build targets
 
 See [docs/roadmap.md](./docs/roadmap.md) for the full status audit, a

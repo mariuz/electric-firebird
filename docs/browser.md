@@ -110,7 +110,7 @@ Each logical database gets its own IndexedDB database named `firebird_<dbName>`
 | Key | Value |
 |-----|-------|
 | `0`, `1`, `2`, … | `{ data: ArrayBuffer }` (one Firebird page per record) |
-| `__meta__` | `{ pageSize: number, pageCount: number, encrypted?: boolean, kdfSalt?: string, kdfIterations?: number }` |
+| `__meta__` | `{ pageSize: number, pageCount: number, encrypted?: boolean }` |
 
 ### 2. Origin Private File System (`opfs://` and `OPFSVFS`)
 
@@ -130,34 +130,45 @@ database that touches neither IndexedDB nor OPFS and is discarded on `close()`.
 
 ### 4. WebCrypto AES-256-GCM Encryption at Rest
 
-Both `IndexedDBVFS` and `OPFSVFS` (and `FirebirdBrowser` via `options.vfs`)
-support transparent per-page **AES-256-GCM** encryption at rest using the
-WebCrypto API (`crypto.subtle`):
+Both `IndexedDBVFS` and `OPFSVFS` (and `FirebirdBrowser` via `options.encryptionKey`
+or `options.vfs.encryptionKey`) support transparent per-page **AES-256-GCM**
+encryption at rest using the WebCrypto API (`crypto.subtle`):
 
 ```ts
+import {
+  FirebirdBrowser,
+  deriveEncryptionKeyFromPassphrase,
+} from 'firebird-wasm/browser';
+
+const salt = crypto.getRandomValues(new Uint8Array(16));
+const key = await deriveEncryptionKeyFromPassphrase('correct horse battery staple', salt);
+
 const db = new FirebirdBrowser('mydb', {
-  vfs: {
-    encryptionPassword: 'correct horse battery staple',
-    // or pass a 256-bit CryptoKey / 32-byte Uint8Array via encryptionKey
-  },
+  worker,
+  encryptionKey: key, // CryptoKey or 16/32-byte Uint8Array
 });
 ```
 
-Each page is encrypted with a fresh 96-bit IV and authenticated with the page
-number (`page:<n>`) as Additional Authenticated Data (AAD), preventing page
-swapping or tampering in browser storage.
+Each encrypted page is stored in a `"FBE1"` envelope with a fresh 96-bit IV and
+authenticated with `(pageNumber, pageSize)` as Additional Authenticated Data
+(AAD), preventing page swapping, truncation, or tampering in browser storage.
 
-### 5. Copy-on-Write Snapshots & Instant Database Branching
+### 5. Copy-on-Write Snapshots, Instant Branching & Binary Page Diffs
 
-Take zero-copy in-memory page snapshots and restore or fork isolated database
-branches in milliseconds:
+Take zero-copy in-memory page snapshots, export compact binary page deltas
+(`FBDF\x01`), restore in-place, or fork isolated database branches in
+milliseconds:
 
 ```ts
-const snap = await db.snapshot('before-migration');
+const snap1 = await db.snapshot('before-migration');
 await db.exec('DELETE FROM items');
+const snap2 = await db.snapshot('after-migration');
+
+// Export or apply compact binary page diffs:
+const delta = await db.exportDiff(snap1, snap2);
 
 // Restore in-place:
-await db.restoreSnapshot(snap.id);
+await db.restoreSnapshot(snap1.id);
 
 // Or fork an independent database branch:
 const previewDb = await db.branch('preview-branch');
@@ -229,10 +240,11 @@ const { rows } = await db.query("SELECT SLUGIFY('Hello Firebird WASM!') AS SLUG 
 | Binary result wire format (`FBR\x01`) | Shipped — zero-`JSON.parse` binary row decoding from `HEAPU8` |
 | Concurrent tabs | **Safe by default** (`multiTab: 'exclusive'`) and **shared leader election** (`multiTab: 'shared'`) with cross-tab `BroadcastChannel` live queries |
 | Storage engines | `IndexedDBVFS`, `OPFSVFS` (`opfs://`), and `memory://`, plus AES-256-GCM encryption at rest |
-| Copy-on-Write snapshots & branching | `db.snapshot()`, `db.restoreSnapshot()`, `db.branch()` |
+| Copy-on-Write snapshots, branching & binary diffs | `db.snapshot()`, `db.restoreSnapshot()`, `db.branch()`, `db.exportDiff()`, `db.applyDiff()` |
 | Prepared statements & streaming cursors | `db.prepare()`, `db.queryStream()`, `createBlobStream()`, `openBlobStream()`, `copyFromStream()`, `copyToStream()` |
-| JavaScript UDRs & Vector search | `db.registerFunction()`, `db.registerProcedure()`, and `firebird-wasm/vector` |
-| Observability & Cancellation | `db.onQuery()`, `db.monitorStats()`, `AbortSignal` / `timeoutMs`, `db.cancelOperation()` |
+| JavaScript UDRs, Vector HNSW & BM25 FTS | `db.registerFunction()`, `db.registerProcedure()`, `firebird-wasm/vector`, and `firebird-wasm/fts` |
+| Database replication | `firebird-wasm/replication` — logical journal, CRDTs, mesh/hub, PITR archives, and native `"FBCHANGELOG\0"` / `IReplicator` |
+| Observability & Cancellation | `db.onQuery()`, `db.monitorStats()`, `db.databaseInfo()`, `db.sweep()`, `AbortSignal` / `timeoutMs`, `db.cancelOperation()` |
 
 ### Concurrent tabs
 

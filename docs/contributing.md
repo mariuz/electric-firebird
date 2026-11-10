@@ -9,7 +9,7 @@ Thank you for your interest in contributing to electric-firebird!
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/mariuz/electric-firebird.git
+git clone --recurse-submodules https://github.com/mariuz/electric-firebird.git
 cd electric-firebird
 npm install
 ```
@@ -81,12 +81,17 @@ electric-firebird/
 │       │   ├── drizzle/         ← Drizzle-style query builder & schema codegen
 │       │   ├── electric/        ← ElectricSQL client shape sync & write queue
 │       │   ├── electric-server/ ← Firebird-backed Electric shape server
+│       │   ├── frameworks/      ← Shared reactive query-store core
+│       │   ├── fts/             ← Okapi BM25 full-text search, stemming UDRs & RRF hybrid search
 │       │   ├── kysely/          ← Kysely dialect & TypeScript schema codegen
 │       │   ├── react/           ← React hooks & provider
-│       │   ├── repl/            ← <firebird-repl> Web Component + Inspector
+│       │   ├── repl/            ← <firebird-repl> Web Component + 5-tab Inspector
+│       │   ├── replication/     ← Logical/journal & native FBCHANGELOG replication
+│       │   ├── rxdb/            ← RxDB storage adapter
 │       │   ├── solid/           ← SolidJS hooks & context
 │       │   ├── svelte/          ← Svelte 5 context & reactive stores
-│       │   ├── vector/          ← Vector embeddings codec, UDRs & similarity search
+│       │   ├── tanstack/        ← TanStack Query & TanStack DB adapters
+│       │   ├── vector/          ← Vector embeddings codec, HNSW ANN index, UDRs & search
 │       │   ├── vue/             ← Vue 3 composables & provider
 │       │   ├── firebird.ts      ← Node.js backend (FirebirdLite)
 │       │   ├── index.ts         ← Node.js entry point
