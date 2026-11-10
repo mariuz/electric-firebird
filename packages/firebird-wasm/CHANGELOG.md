@@ -4,7 +4,14 @@ All notable changes to `firebird-wasm`. This project follows
 [semantic versioning](https://semver.org/); while the major version is 0 the
 API may still move between minor releases.
 
-## Unreleased
+## 0.20.3 — 2026-11-10
+
+### Added
+
+- **Journal compaction & automated retention policies (`compactJournal` / `applyRetentionPolicy`):** coalesce superseded per-row mutations (`INSERT` + `UPDATE` → `INSERT`, `UPDATE` + `UPDATE` → `UPDATE`, `INSERT` + `DELETE` → elided) in `FB_REPL_JOURNAL$` while preserving the high-water LSN, and enforce `maxEntries` / `maxAgeMs` retention limits with optional pre-prune encrypted PITR archive rotation.
+- **Replication telemetry & Prometheus / OpenTelemetry export (`createReplicationMetricsCollector` / `formatPrometheusReplicationMetrics`):** collect live replication metrics (`lagEntries`, `lagMs`, `journalDepth`, `activeSlots`, `dlqDepth`, `throughputEntriesPerSec`, `conflictRate`, `bytesTransferred`) and export in Prometheus text exposition or OpenTelemetry format; surface `FB_REPL_DLQ$` quarantined entries in `<firebird-repl>`.
+- **Schema-aware replication & DDL compatibility guard (`classifyDdlStatement` / `resolveDdlConflict` / `checkReplicationSchemaCompatibility`):** classify DDL operations into additive vs. destructive changes, support `ddlPolicy: 'apply' | 'idempotent' | 'additive-only'` on subscribers, and inspect source vs. replica catalogs to detect schema drift and generate remediation DDL.
+- **Replication Simulator v3 (`demo/public/replication.html`):** interactive 3-node Hub-and-Spoke / Mesh cluster panel, live `watermarks[subscriber][publisher]` matrix, journal compaction controls, `FB_REPL_DLQ$` quarantine/retry inspector, and CI Playwright E2E gate.
 
 ### Fixed
 
