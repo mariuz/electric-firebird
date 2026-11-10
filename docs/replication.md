@@ -708,3 +708,42 @@ const report = await checkReplicationSchemaCompatibility({
 // report.compatible, report.issues, report.remediationDdl
 ```
 
+---
+
+## 23. Native Firebird Engine Replication (`RDB$PUBLICATIONS`, `replication.conf`, `"FBCHANGELOG\0"` & `IReplicator`)
+
+Drive Firebird's compiled-in C++ JRD replication subsystem (`RDB$PUBLICATIONS`, `RDB$PUBLICATION_TABLES`, `/usr/local/firebird/replication.conf`, `"FBCHANGELOG\0"` binary segment files, and `IAttachment::createReplicator`):
+
+```ts
+import {
+  enableEnginePublication,
+  getEnginePublicationStatus,
+  configureWasmReplicationConf,
+  readWasmChangelogSegments,
+  applyFbChangelogSegmentToDatabase,
+} from 'firebird-wasm/replication';
+
+// 1. Provision /usr/local/firebird/replication.conf inside Emscripten MEMFS (threaded WASM build)
+configureWasmReplicationConf(wasmModule.FS, {
+  journalDirectory: '/repl_log',
+  journalArchiveDirectory: '/repl_arch',
+  journalArchiveTimeout: 1,
+  verboseLogging: true,
+});
+
+// 2. Enable native engine publication in RDB$PUBLICATIONS / RDB$PUBLICATION_TABLES
+const status = await enableEnginePublication(primaryDb, { tables: ['ORDERS', 'CUSTOMERS'] });
+console.log(status.name, status.active, status.publishedTables);
+
+// 3. Read and parse real "FBCHANGELOG\0" binary segments emitted by the engine on commit
+const segments = readWasmChangelogSegments(wasmModule.FS, '/repl_arch');
+for (const seg of segments) {
+  console.log(seg.header.guid, seg.header.sequence, seg.blocks.length, seg.atoms, seg.executedSql);
+  await applyFbChangelogSegmentToDatabase(replicaDb, seg, {
+    wasmModule,
+    dbHandle: replicaHandle,
+  });
+}
+```
+
+

@@ -259,6 +259,19 @@ export interface FirebirdWasmModule {
    */
   _fb_database_info?(dbHandle: FbHandle): number;
   _fb_sweep?(dbHandle: FbHandle): number;
+  /**
+   * Configure a database's native replica mode (`isc_dpb_set_db_replica` = 90)
+   * on the database header page (`0` = none, `1` = read-only, `2` = read-write).
+   * Returns 0 on success, non-zero on failure.
+   */
+  _fb_set_replica_mode?(dbHandle: FbHandle, mode: number): number;
+  /**
+   * Apply a native Firebird binary changelog segment (`"FBCHANGELOG\0"` 48-byte
+   * header followed by 16-byte `Replication::Block` records) to `dbHandle` via
+   * `IAttachment::createReplicator` (`IReplicator::process` / `IReplicator::close`).
+   * Returns the number of changelog blocks processed (`>= 0`) on success, or `< 0` on error.
+   */
+  _fb_replicate_changelog?(dbHandle: FbHandle, dataPtr: number, byteLength: number): number;
   _fb_prepare?(
     dbHandle: FbHandle,
     txHandle: FbHandle,

@@ -1566,6 +1566,48 @@ Next-horizon milestones (`v0.20.0`):
 
 ---
 
+### M16 — Native Firebird Engine Replication (`RDB$PUBLICATIONS`, `replication.conf`, `IAttachment::createReplicator` & Binary Changelog Applier)
+
+Firebird's own JRD replication subsystem (`src/jrd/replication/`: `Config.cpp`,
+`ChangeLog.cpp`, `Manager.cpp`, `Replicator.cpp`, `Applier.cpp`) is already
+compiled into `firebird-embedded.wasm`. M16 wires the real C++ engine
+replication pipeline end-to-end across WASM (`FirebirdWasm` / `FirebirdBrowser`)
+and Node (`FirebirdLite`):
+
+- [x] **1. Native Engine Publication DDL & Catalog Helpers (`enableEnginePublication` / `disableEnginePublication` / `includeTablesInPublication` / `excludeTablesFromPublication` / `getEnginePublicationStatus`).**
+      Drive Firebird's built-in publication catalog (`RDB$PUBLICATIONS` and
+      `RDB$PUBLICATION_TABLES`) via native SQL (`ALTER DATABASE INCLUDE ALL TO PUBLICATION`,
+      `ALTER DATABASE INCLUDE TABLE ... TO PUBLICATION`, `ALTER DATABASE EXCLUDE TABLE ... FROM PUBLICATION`,
+      `ALTER DATABASE ENABLE PUBLICATION`, `ALTER DATABASE DISABLE PUBLICATION`),
+      and query `RDB$GET_CONTEXT('SYSTEM', 'REPLICA_MODE')`, `RDB$GET_CONTEXT('SYSTEM', 'REPLICATION_SEQUENCE')`,
+      and `RDB$PUBLICATIONS`.
+- [x] **2. WASM `replication.conf` Provisioning & Native `"FBCHANGELOG\0"` Changelog Segment Parser (`buildReplicationConf` / `configureWasmReplicationConf` / `parseFbChangelogSegment` / `readWasmChangelogSegments`).**
+      Configure Firebird's `/usr/local/firebird/replication.conf` inside the WASM
+      virtual filesystem (`journal_directory`, `journal_archive_directory`,
+      `journal_archive_timeout`, `verbose_logging`) so JRD's `Replication::Manager`
+      / `ChangeLog` writes real Firebird `"FBCHANGELOG\0"` binary changelog
+      segment files (`48`-byte `ChangeLog::Header` + `16`-byte `Replication::Block`
+      packets) directly to `MEMFS` on transaction commit, and parse blocks,
+      atoms (`opDefineAtom`), and DDL statements (`opExecuteSqlIntl`).
+- [x] **3. C++ `IAttachment::createReplicator` (`IReplicator`) Bridge in `fb_wasm_api.cpp` (`fb_replicate_changelog` / `fb_set_replica_mode` / `applyFbChangelogSegmentToDatabase`).**
+      Expose Firebird's public OO replication applier (`IAttachment::createReplicator`,
+      `IReplicator::process`, `IReplicator::close`) and `isc_dpb_set_db_replica`
+      through `fb_wasm_api.cpp` (`_fb_replicate_changelog` and `_fb_set_replica_mode`)
+      plus a TypeScript applier helper (`applyFbChangelogSegmentToDatabase`).
+- [x] **4. Unified `engineMode: 'native' | 'trigger' | 'auto'` in `createPublication`.**
+      Add `engineMode: 'native' | 'trigger' | 'auto'` support to `firebird-wasm/replication`
+      that automatically synchronizes Firebird's native `RDB$PUBLICATIONS` /
+      `RDB$PUBLICATION_TABLES` catalog when creating publications against a real
+      Firebird engine while seamlessly falling back on lightweight mock databases.
+- [x] **5. Real-Engine WASM & Unit Native Replication Integration Tests (`wasm-integration.test.ts` + `replication.test.ts`).**
+      Verify end-to-end native engine replication (`ALTER DATABASE ENABLE PUBLICATION`
+      $\rightarrow$ commit `INSERT` / `UPDATE` / `DELETE` / `ALTER TABLE` transactions
+      on the real threaded Firebird WASM engine $\rightarrow$ harvest and parse
+      the generated `.journal-000000001` `"FBCHANGELOG\0"` binary segment from
+      `MEMFS` $\rightarrow$ replay onto a replica database).
+
+---
+
 ## 5. Test coverage added alongside this review
 
 `src/browser/` was excluded from Jest and had no browser tests.  It now has 73

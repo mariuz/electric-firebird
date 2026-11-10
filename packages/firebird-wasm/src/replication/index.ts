@@ -512,6 +512,18 @@ export interface CreatePublicationOptions {
    * Optional publication-wide outbound row transformer / PII masking function (`M14 Item 3`).
    */
   transformRow?: RowTransformer;
+  /**
+   * Native Firebird engine publication mode (`M16 Item 4`):
+   * - `'native'`: also registers the published tables in Firebird's built-in
+   *   `RDB$PUBLICATIONS` / `RDB$PUBLICATION_TABLES` catalog (`ALTER DATABASE INCLUDE ... TO PUBLICATION`
+   *   + `ALTER DATABASE ENABLE PUBLICATION`).
+   * - `'auto'`: attempts to synchronize `RDB$PUBLICATIONS` when the database supports it,
+   *   ignoring gracefully on lightweight mock databases.
+   * - `'trigger'`: uses only logical journal / PSQL trigger capture without altering `RDB$PUBLICATIONS`.
+   *
+   * @default 'trigger'
+   */
+  engineMode?: 'native' | 'trigger' | 'auto';
 }
 
 /** A logical replication publication on a source database. */
@@ -3232,6 +3244,18 @@ export async function createPublication(
 
   if (options.installTriggers) {
     await publication.installTriggers();
+  }
+
+  if (options.engineMode === 'native' || options.engineMode === 'auto') {
+    try {
+      await enableEnginePublication(db, {
+        tables: isWildcard ? '*' : Array.from(tablesMap.keys()),
+      });
+    } catch (err) {
+      if (options.engineMode === 'native') {
+        throw err;
+      }
+    }
   }
 
   return publication;
@@ -8501,4 +8525,672 @@ export async function checkReplicationSchemaCompatibility(options: {
     remediationDdl,
   };
 }
+
+// ---------------------------------------------------------------------------
+// 16. Native Firebird Engine Replication (M16 Items 1–4)
+//     (`RDB$PUBLICATIONS`, `replication.conf`, `"FBCHANGELOG\0"` Parser & `IReplicator` Bridge)
+// ---------------------------------------------------------------------------
+
+/**
+ * Magic 12-byte signature at the start of every native Firebird binary
+ * changelog segment file (`ChangeLog::Header::magic = "FBCHANGELOG\0"`).
+ */
+export const FB_CHANGELOG_MAGIC = 'FBCHANGELOG\0';
+
+/** Byte size of Firebird's `Replication::ChangeLog::Header` (`48` bytes). */
+export const FB_CHANGELOG_HEADER_BYTES = 48;
+
+/** Byte size of Firebird's `Replication::Block` header (`16` bytes). */
+export const FB_CHANGELOG_BLOCK_HEADER_BYTES = 16;
+
+/** `Replication::Block` flag indicating the start of a replicated transaction (`1`). */
+export const FB_CHANGELOG_BLOCK_BEGIN_TRANS = 1;
+
+/** `Replication::Block` flag indicating the end (commit/rollback) of a replicated transaction (`2`). */
+export const FB_CHANGELOG_BLOCK_END_TRANS = 2;
+
+/**
+ * Native Firebird replication protocol opcodes (`src/jrd/replication/Protocol.h`).
+ */
+export const FbChangelogOpcode = {
+  opStartTransaction: 1,
+  opPrepareTransaction: 2,
+  opCommitTransaction: 3,
+  opRollbackTransaction: 4,
+  opCleanupTransaction: 7,
+  opStartSavepoint: 5,
+  opDefineAtom: 6,
+  opInsertRecord: 9,
+  opUpdateRecord: 10,
+  opDeleteRecord: 11,
+  opStoreBlob: 12,
+  opExecuteSql: 13,
+  opSetSequence: 14,
+  opExecuteSqlIntl: 15,
+} as const;
+
+/** Status of Firebird's built-in `RDB$PUBLICATIONS` / `RDB$PUBLICATION_TABLES` catalog (`M16 Item 1`). */
+export interface EnginePublicationStatus {
+  /** Publication name in `RDB$PUBLICATIONS` (normally `'RDB$DEFAULT'`). */
+  readonly name: string;
+  /** Whether the native engine publication is currently enabled (`RDB$ACTIVE_FLAG = 1`). */
+  readonly active: boolean;
+  /** Whether newly created tables are automatically added (`RDB$AUTO_ENABLE = 1`, i.e. `INCLUDE ALL`). */
+  readonly autoEnable: boolean;
+  /** Upper-case table names currently listed in `RDB$PUBLICATION_TABLES`. */
+  readonly publishedTables: readonly string[];
+  /** Database replica mode reported by `MON$DATABASE` / `RDB$GET_CONTEXT('SYSTEM', 'REPLICA_MODE')`. */
+  readonly replicaMode: string | null;
+  /** Current native replication sequence number reported by `RDB$GET_CONTEXT('SYSTEM', 'REPLICATION_SEQUENCE')`. */
+  readonly replicationSequence: number | null;
+}
+
+/** Options for {@link enableEnginePublication} (`M16 Item 1`). */
+export interface EnableEnginePublicationOptions {
+  /**
+   * Tables to include in Firebird's native `RDB$DEFAULT` publication before enabling it:
+   * - `'*'`: executes `ALTER DATABASE INCLUDE ALL TO PUBLICATION` (`RDB$AUTO_ENABLE = 1`).
+   * - `string[]`: executes `ALTER DATABASE INCLUDE TABLE <t> TO PUBLICATION` for each table.
+   * - `undefined`: enables the publication without altering its current table membership.
+   */
+  tables?: '*' | readonly string[];
+}
+
+/**
+ * Include all user tables (`'*'`) or specific tables in Firebird's built-in
+ * `RDB$PUBLICATIONS` / `RDB$PUBLICATION_TABLES` catalog (`M16 Item 1`).
+ */
+export async function includeTablesInPublication(
+  db: ReplicableDatabase,
+  tables: '*' | readonly string[],
+): Promise<string[]> {
+  const executedDdl: string[] = [];
+  if (tables === '*') {
+    const sql = 'ALTER DATABASE INCLUDE ALL TO PUBLICATION';
+    await execStatement(db, sql);
+    executedDdl.push(sql);
+    return executedDdl;
+  }
+
+  for (const rawTable of tables) {
+    const clean = normalizeTableName(rawTable);
+    if (!clean || isInternalReplicationTable(clean)) continue;
+    const sql = `ALTER DATABASE INCLUDE TABLE ${quoteIdent(clean)} TO PUBLICATION`;
+    await execStatement(db, sql);
+    executedDdl.push(sql);
+  }
+  return executedDdl;
+}
+
+/**
+ * Exclude all tables (`'*'`) or specific tables from Firebird's built-in
+ * `RDB$PUBLICATIONS` / `RDB$PUBLICATION_TABLES` catalog (`M16 Item 1`).
+ */
+export async function excludeTablesFromPublication(
+  db: ReplicableDatabase,
+  tables: '*' | readonly string[],
+): Promise<string[]> {
+  const executedDdl: string[] = [];
+  if (tables === '*') {
+    const sql = 'ALTER DATABASE EXCLUDE ALL FROM PUBLICATION';
+    await execStatement(db, sql);
+    executedDdl.push(sql);
+    return executedDdl;
+  }
+
+  for (const rawTable of tables) {
+    const clean = normalizeTableName(rawTable);
+    if (!clean) continue;
+    const sql = `ALTER DATABASE EXCLUDE TABLE ${quoteIdent(clean)} FROM PUBLICATION`;
+    await execStatement(db, sql);
+    executedDdl.push(sql);
+  }
+  return executedDdl;
+}
+
+/**
+ * Enable Firebird's native engine publication (`ALTER DATABASE ENABLE PUBLICATION`),
+ * optionally including `tables` (`'*'` or specific table names) first (`M16 Item 1`).
+ */
+export async function enableEnginePublication(
+  db: ReplicableDatabase,
+  options: EnableEnginePublicationOptions = {},
+): Promise<EnginePublicationStatus> {
+  if (options.tables !== undefined) {
+    await includeTablesInPublication(db, options.tables);
+  }
+  await execStatement(db, 'ALTER DATABASE ENABLE PUBLICATION');
+  return getEnginePublicationStatus(db);
+}
+
+/**
+ * Disable Firebird's native engine publication (`ALTER DATABASE DISABLE PUBLICATION`) (`M16 Item 1`).
+ */
+export async function disableEnginePublication(
+  db: ReplicableDatabase,
+): Promise<EnginePublicationStatus> {
+  await execStatement(db, 'ALTER DATABASE DISABLE PUBLICATION');
+  return getEnginePublicationStatus(db);
+}
+
+/**
+ * Inspect Firebird's built-in `RDB$PUBLICATIONS`, `RDB$PUBLICATION_TABLES`,
+ * `MON$DATABASE`, and `SYSTEM` replication context variables (`M16 Item 1`).
+ */
+export async function getEnginePublicationStatus(
+  db: ReplicableDatabase,
+): Promise<EnginePublicationStatus> {
+  let name = 'RDB$DEFAULT';
+  let active = false;
+  let autoEnable = false;
+
+  try {
+    const pubRes = await db.query<Row>(
+      `SELECT TRIM(RDB$PUBLICATION_NAME) AS PUB_NAME, RDB$ACTIVE_FLAG AS ACTIVE_FLAG, RDB$AUTO_ENABLE AS AUTO_ENABLE FROM RDB$PUBLICATIONS`,
+    );
+    const row = pubRes.rows[0];
+    if (row) {
+      name = String(row.PUB_NAME ?? row.pub_name ?? 'RDB$DEFAULT').trim();
+      active = Number(row.ACTIVE_FLAG ?? row.active_flag ?? 0) === 1;
+      autoEnable = Number(row.AUTO_ENABLE ?? row.auto_enable ?? 0) === 1;
+    }
+  } catch {
+    // Fallback for mock databases without RDB$PUBLICATIONS
+  }
+
+  const publishedTables: string[] = [];
+  try {
+    const tblRes = await db.query<Row>(
+      `SELECT TRIM(RDB$TABLE_NAME) AS TABLE_NAME FROM RDB$PUBLICATION_TABLES ORDER BY RDB$TABLE_NAME`,
+    );
+    for (const r of tblRes.rows) {
+      const tbl = String(r.TABLE_NAME ?? r.table_name ?? '').trim().toUpperCase();
+      if (tbl) publishedTables.push(tbl);
+    }
+  } catch {
+    // Ignore if RDB$PUBLICATION_TABLES is unavailable
+  }
+
+  let replicaMode: string | null = null;
+  let replicationSequence: number | null = null;
+  try {
+    const ctxRes = await db.query<Row>(
+      `SELECT RDB$GET_CONTEXT('SYSTEM', 'REPLICA_MODE') AS REPL_MODE, RDB$GET_CONTEXT('SYSTEM', 'REPLICATION_SEQUENCE') AS REPL_SEQ FROM RDB$DATABASE`,
+    );
+    const ctxRow = ctxRes.rows[0];
+    if (ctxRow) {
+      const rawMode = ctxRow.REPL_MODE ?? ctxRow.repl_mode;
+      if (rawMode !== null && rawMode !== undefined) {
+        replicaMode = String(rawMode).trim();
+      }
+      const rawSeq = ctxRow.REPL_SEQ ?? ctxRow.repl_seq;
+      if (rawSeq !== null && rawSeq !== undefined) {
+        const parsed = Number(rawSeq);
+        if (Number.isFinite(parsed)) {
+          replicationSequence = parsed;
+        }
+      }
+    }
+  } catch {
+    // Ignore if SYSTEM context variables are unsupported on mock DB
+  }
+
+  return {
+    name,
+    active,
+    autoEnable,
+    publishedTables,
+    replicaMode,
+    replicationSequence,
+  };
+}
+
+/** Per-database block entry for Firebird's `/usr/local/firebird/replication.conf` (`M16 Item 2`). */
+export interface ReplicationConfEntry {
+  /** Database path pattern in `MEMFS` (e.g. `'/data/primary.fdb'`). Omit for the global default section. */
+  database?: string;
+  /** Directory where active `"FBCHANGELOG\0"` segments are written (`journal_directory`). */
+  journalDirectory?: string;
+  /** Directory where completed `"FBCHANGELOG\0"` segments are archived (`journal_archive_directory`). */
+  journalArchiveDirectory?: string;
+  /** Archive timeout in seconds (`journal_archive_timeout`). @default 1 */
+  journalArchiveTimeout?: number;
+  /** Source directory polled by a replica (`journal_source_directory`). */
+  journalSourceDirectory?: string;
+  /** Maximum segment size in bytes (`journal_segment_size`). */
+  journalSegmentSize?: number;
+  /** Enable verbose logging to `/usr/local/firebird/replication.log` (`verbose_logging`). @default true */
+  verboseLogging?: boolean;
+}
+
+/**
+ * Format a valid Firebird `replication.conf` configuration file text (`M16 Item 2`).
+ *
+ * Uses the real Firebird `Replication::Config` keys (`journal_directory`,
+ * `journal_archive_directory`, `journal_archive_timeout`, `journal_source_directory`,
+ * `verbose_logging`).
+ */
+export function buildReplicationConf(
+  entries: ReplicationConfEntry | ReadonlyArray<ReplicationConfEntry>,
+): string {
+  const list = Array.isArray(entries) ? entries : [entries];
+  const blocks: string[] = [];
+
+  for (const entry of list) {
+    const header = entry.database ? `database = ${entry.database}` : 'database';
+    const lines: string[] = [header, '{'];
+    if (entry.journalDirectory) {
+      lines.push(`  journal_directory = ${entry.journalDirectory}`);
+    }
+    if (entry.journalArchiveDirectory) {
+      lines.push(`  journal_archive_directory = ${entry.journalArchiveDirectory}`);
+    }
+    if (entry.journalArchiveTimeout !== undefined) {
+      lines.push(`  journal_archive_timeout = ${Math.max(1, Math.trunc(entry.journalArchiveTimeout))}`);
+    }
+    if (entry.journalSourceDirectory) {
+      lines.push(`  journal_source_directory = ${entry.journalSourceDirectory}`);
+    }
+    if (entry.journalSegmentSize !== undefined) {
+      lines.push(`  journal_segment_size = ${Math.max(4096, Math.trunc(entry.journalSegmentSize))}`);
+    }
+    if (entry.verboseLogging ?? true) {
+      lines.push('  verbose_logging = true');
+    }
+    lines.push('}');
+    blocks.push(lines.join('\n'));
+  }
+
+  return blocks.join('\n\n') + '\n';
+}
+
+/** Minimal Emscripten FS subset needed by {@link configureWasmReplicationConf} and {@link readWasmChangelogSegments}. */
+export interface ReplicationEmscriptenFS {
+  mkdir(path: string): void;
+  writeFile(path: string, data: Uint8Array | string, opts?: { encoding?: string }): void;
+  readFile(path: string, opts?: { encoding?: string }): Uint8Array | string;
+  readdir?(path: string): string[];
+  analyzePath?(path: string): { exists: boolean };
+}
+
+function mkdirRecursiveSafe(fs: ReplicationEmscriptenFS, fullPath: string): void {
+  const parts = fullPath.split('/').filter(Boolean);
+  let cur = '';
+  for (const part of parts) {
+    cur += '/' + part;
+    try {
+      if (fs.analyzePath && fs.analyzePath(cur).exists) continue;
+      fs.mkdir(cur);
+    } catch {
+      // Directory already exists
+    }
+  }
+}
+
+/**
+ * Provision `/usr/local/firebird/replication.conf` (and create all referenced
+ * `journal_directory` / `journal_archive_directory` / `journal_source_directory`
+ * folders) in the Emscripten `MEMFS` so Firebird's compiled-in `Replication::Manager`
+ * writes native `"FBCHANGELOG\0"` binary segments (`M16 Item 2`).
+ */
+export function configureWasmReplicationConf(
+  fs: ReplicationEmscriptenFS,
+  config: string | ReplicationConfEntry | ReadonlyArray<ReplicationConfEntry>,
+  confPath = '/usr/local/firebird/replication.conf',
+): string {
+  const parentDir = confPath.slice(0, Math.max(0, confPath.lastIndexOf('/'))) || '/usr/local/firebird';
+  mkdirRecursiveSafe(fs, parentDir);
+
+  if (typeof config !== 'string') {
+    const list = Array.isArray(config) ? config : [config];
+    for (const item of list) {
+      if (item.journalDirectory) mkdirRecursiveSafe(fs, item.journalDirectory);
+      if (item.journalArchiveDirectory) mkdirRecursiveSafe(fs, item.journalArchiveDirectory);
+      if (item.journalSourceDirectory) mkdirRecursiveSafe(fs, item.journalSourceDirectory);
+    }
+  }
+
+  const confText = typeof config === 'string' ? config : buildReplicationConf(config);
+  fs.writeFile(confPath, confText);
+  return confText;
+}
+
+/** Parsed 48-byte `ChangeLog::Header` from a native `"FBCHANGELOG\0"` segment file (`M16 Item 2`). */
+export interface FbChangelogHeader {
+  /** 12-byte magic signature (`"FBCHANGELOG\0"`). */
+  readonly magic: string;
+  /** Changelog format version (`1`). */
+  readonly version: number;
+  /** Segment state (`1` = `USED`, `2` = `FULL`, `3` = `ARCHIVABLE`, `0` = `FREE`). */
+  readonly state: number;
+  /** Database UUID formatted as `XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX`. */
+  readonly guid: string;
+  /** Raw 16-byte binary database GUID. */
+  readonly guidBytes: Uint8Array;
+  /** Monotonic changelog segment sequence number (`1`, `2`, ...). */
+  readonly sequence: number;
+  /** Total byte length recorded in the segment header (`>= 48`). */
+  readonly length: number;
+}
+
+/** Parsed 16-byte `Replication::Block` record inside a `"FBCHANGELOG\0"` segment (`M16 Item 2`). */
+export interface FbChangelogBlock {
+  /** Byte offset of this block inside the segment file (`>= 48`). */
+  readonly offset: number;
+  /** Firebird transaction number (`traNumber`). */
+  readonly traNumber: number;
+  /** Replication protocol version (`1` in Firebird 4/5, `2` in Firebird 6). */
+  readonly protocol: number;
+  /** Raw block flags bitmask (`BLOCK_BEGIN_TRANS = 1`, `BLOCK_END_TRANS = 2`). */
+  readonly flags: number;
+  /** `true` when `BLOCK_BEGIN_TRANS` (`1`) is set. */
+  readonly beginTrans: boolean;
+  /** `true` when `BLOCK_END_TRANS` (`2`) is set. */
+  readonly endTrans: boolean;
+  /** Payload byte length following the 16-byte block header. */
+  readonly length: number;
+  /** Raw payload bytes (`length` bytes). */
+  readonly payload: Uint8Array;
+  /** Leading opcode byte of the payload (or `null` if payload is empty). */
+  readonly leadingOpcode: number | null;
+  /** Atom names defined via `opDefineAtom` (`6`) inside this block. */
+  readonly atoms: readonly string[];
+  /** SQL DDL/DML statements executed via `opExecuteSql` (`13`) or `opExecuteSqlIntl` (`15`) inside this block. */
+  readonly executedSql: readonly string[];
+}
+
+/** Parsed native Firebird `"FBCHANGELOG\0"` binary segment file (`M16 Item 2`). */
+export interface ParsedFbChangelogSegment {
+  /** Optional filename in `journal_directory` / `journal_archive_directory`. */
+  readonly filename?: string;
+  /** Parsed 48-byte `ChangeLog::Header`. */
+  readonly header: FbChangelogHeader;
+  /** Ordered list of transaction blocks inside the segment. */
+  readonly blocks: readonly FbChangelogBlock[];
+  /** Union of all atom names (`opDefineAtom`) defined across all blocks in this segment. */
+  readonly atoms: readonly string[];
+  /** Union of all SQL strings (`opExecuteSql` / `opExecuteSqlIntl`) recorded in this segment. */
+  readonly executedSql: readonly string[];
+  /** Raw segment bytes. */
+  readonly rawBytes: Uint8Array;
+}
+
+function formatGuidBytes(bytes: Uint8Array): string {
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0').toUpperCase());
+  return [
+    hex.slice(0, 4).join(''),
+    hex.slice(4, 6).join(''),
+    hex.slice(6, 8).join(''),
+    hex.slice(8, 10).join(''),
+    hex.slice(10, 16).join(''),
+  ].join('-');
+}
+
+function extractAtomsAndSqlFromPayload(
+  payload: Uint8Array,
+  _protocol: number,
+): { atoms: string[]; executedSql: string[] } {
+  const atoms: string[] = [];
+  const executedSql: string[] = [];
+  const decoder = new TextDecoder('utf-8', { fatal: false });
+
+  // Scan for opDefineAtom (opcode 6: 0x06 [uint8 len] [ASCII bytes] or 0x06 0x10 [uint8 len] [ASCII bytes])
+  // or length-prefixed identifier atoms (`[uint8 len] [ASCII identifier]`),
+  // and opExecuteSqlIntl (opcode 15) / opExecuteSql (opcode 13).
+  let i = 0;
+  while (i < payload.length) {
+    const op = payload[i]!;
+    if (op === FbChangelogOpcode.opDefineAtom || op === 0x10) {
+      for (const offsetDelta of [1, 2]) {
+        const lenPos = i + offsetDelta;
+        if (lenPos < payload.length) {
+          const len = payload[lenPos]!;
+          if (len >= 2 && len <= 63 && lenPos + 1 + len <= payload.length) {
+            const text = decoder.decode(payload.subarray(lenPos + 1, lenPos + 1 + len));
+            if (/^[A-Za-z_][A-Za-z0-9_$]*$/.test(text)) {
+              atoms.push(text);
+            }
+          }
+        }
+      }
+    }
+    if (
+      (op === FbChangelogOpcode.opExecuteSqlIntl || op === FbChangelogOpcode.opExecuteSql) &&
+      i + 8 <= payload.length
+    ) {
+      // Look for a 32-bit LE length followed by printable SQL text near the tail of the block
+      const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+      for (let lenPos = i + 1; lenPos + 4 <= payload.length; lenPos++) {
+        const sqlLen = view.getUint32(lenPos, true);
+        if (
+          sqlLen > 0 &&
+          lenPos + 4 + sqlLen <= payload.length &&
+          payload.length - (lenPos + 4 + sqlLen) <= 2
+        ) {
+          const sqlText = decoder.decode(payload.subarray(lenPos + 4, lenPos + 4 + sqlLen)).trim();
+          if (sqlText.length >= 4 && /^[\x20-\x7E\r\n\t]+$/.test(sqlText)) {
+            executedSql.push(sqlText);
+            break;
+          }
+        }
+      }
+    }
+    i++;
+  }
+
+  return { atoms, executedSql };
+}
+
+/**
+ * Return `true` when `bytes` begins with Firebird's 12-byte `"FBCHANGELOG\0"`
+ * binary changelog header (`M16 Item 2`).
+ */
+export function isFbChangelogSegment(bytes: Uint8Array): boolean {
+  if (bytes.byteLength < FB_CHANGELOG_HEADER_BYTES) return false;
+  for (let i = 0; i < FB_CHANGELOG_MAGIC.length; i++) {
+    if (bytes[i] !== FB_CHANGELOG_MAGIC.charCodeAt(i)) return false;
+  }
+  return true;
+}
+
+/**
+ * Parse a real Firebird `"FBCHANGELOG\0"` binary changelog segment file
+ * (`ChangeLog::Header` + `Replication::Block` stream) (`M16 Item 2`).
+ */
+export function parseFbChangelogSegment(
+  bytes: Uint8Array,
+  filename?: string,
+): ParsedFbChangelogSegment {
+  if (!isFbChangelogSegment(bytes)) {
+    throw new Error(
+      'Invalid Firebird changelog segment: expected 48-byte header starting with "FBCHANGELOG\\0".',
+    );
+  }
+
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const version = view.getUint16(12, true);
+  const state = view.getUint16(14, true);
+  const guidBytes = bytes.slice(16, 32);
+  const guid = formatGuidBytes(guidBytes);
+  const sequence = Number(view.getBigUint64(32, true));
+  const length = Number(view.getBigUint64(40, true));
+
+  const header: FbChangelogHeader = {
+    magic: FB_CHANGELOG_MAGIC,
+    version,
+    state,
+    guid,
+    guidBytes,
+    sequence,
+    length,
+  };
+
+  const blocks: FbChangelogBlock[] = [];
+  const allAtoms = new Set<string>();
+  const allExecutedSql: string[] = [];
+
+  const maxOffset = Math.min(bytes.byteLength, length > 0 ? length : bytes.byteLength);
+  let offset = FB_CHANGELOG_HEADER_BYTES;
+
+  while (offset + FB_CHANGELOG_BLOCK_HEADER_BYTES <= maxOffset) {
+    const traNumber = Number(view.getBigUint64(offset, true));
+    const protocol = view.getUint16(offset + 8, true);
+    const flags = view.getUint16(offset + 10, true);
+    const blockLen = view.getUint32(offset + 12, true);
+    const payloadStart = offset + FB_CHANGELOG_BLOCK_HEADER_BYTES;
+    const payloadEnd = payloadStart + blockLen;
+    if (payloadEnd > bytes.byteLength) {
+      break;
+    }
+
+    const payload = bytes.slice(payloadStart, payloadEnd);
+    const leadingOpcode = payload.length > 0 ? payload[0]! : null;
+    const { atoms, executedSql } = extractAtomsAndSqlFromPayload(payload, protocol);
+    for (const a of atoms) allAtoms.add(a);
+    for (const s of executedSql) allExecutedSql.push(s);
+
+    blocks.push({
+      offset,
+      traNumber,
+      protocol,
+      flags,
+      beginTrans: (flags & FB_CHANGELOG_BLOCK_BEGIN_TRANS) !== 0,
+      endTrans: (flags & FB_CHANGELOG_BLOCK_END_TRANS) !== 0,
+      length: blockLen,
+      payload,
+      leadingOpcode,
+      atoms,
+      executedSql,
+    });
+
+    offset = payloadEnd;
+  }
+
+  return {
+    ...(filename !== undefined ? { filename } : {}),
+    header,
+    blocks,
+    atoms: Array.from(allAtoms),
+    executedSql: allExecutedSql,
+    rawBytes: bytes,
+  };
+}
+
+/**
+ * Scan a directory in Emscripten `MEMFS` (e.g. `journal_archive_directory` or
+ * `journal_directory`) and parse all native `"FBCHANGELOG\0"` segment files
+ * (`*.journal-*`), sorted in ascending `sequence` order (`M16 Item 2`).
+ */
+export function readWasmChangelogSegments(
+  fs: ReplicationEmscriptenFS,
+  directory: string,
+  options: { sinceSequence?: number } = {},
+): ParsedFbChangelogSegment[] {
+  if (typeof fs.readdir !== 'function') {
+    return [];
+  }
+  let entries: string[];
+  try {
+    entries = fs.readdir(directory);
+  } catch {
+    return [];
+  }
+
+  const sinceSeq = options.sinceSequence ?? 0;
+  const cleanDir = directory.endsWith('/') ? directory.slice(0, -1) : directory;
+  const segments: ParsedFbChangelogSegment[] = [];
+
+  for (const name of entries) {
+    if (name === '.' || name === '..' || name.endsWith('.lock')) continue;
+    const fullPath = `${cleanDir}/${name}`;
+    try {
+      const raw = fs.readFile(fullPath);
+      if (raw instanceof Uint8Array && isFbChangelogSegment(raw)) {
+        const parsed = parseFbChangelogSegment(raw, name);
+        if (parsed.header.sequence > sinceSeq) {
+          segments.push(parsed);
+        }
+      }
+    } catch {
+      // Skip unreadable or non-file entries
+    }
+  }
+
+  segments.sort((a, b) => a.header.sequence - b.header.sequence);
+  return segments;
+}
+
+/** Result returned by {@link applyFbChangelogSegmentToDatabase} (`M16 Item 3`). */
+export interface ApplyFbChangelogResult {
+  /** Segment sequence number from the `"FBCHANGELOG\0"` header. */
+  readonly sequence: number;
+  /** Number of `Replication::Block` records processed. */
+  readonly blocksProcessed: number;
+  /** Number of SQL DDL statements replayed. */
+  readonly ddlExecuted: readonly string[];
+  /** Whether the native C++ `_fb_replicate_changelog` (`IReplicator`) fast-path was used. */
+  readonly usedNativeReplicator: boolean;
+}
+
+/**
+ * Apply a parsed or raw `"FBCHANGELOG\0"` segment to a target database (`M16 Item 3`).
+ *
+ * - When `wasmModule` and `dbHandle` are provided and `wasmModule._fb_replicate_changelog`
+ *   is compiled into the WASM binary, invokes Firebird's native `IAttachment::createReplicator`
+ *   (`IReplicator::process` / `IReplicator::close`) directly in C++.
+ * - Otherwise, replays any `opExecuteSql` / `opExecuteSqlIntl` DDL statements extracted
+ *   from the `"FBCHANGELOG\0"` blocks onto `targetDb` via SQL execution.
+ */
+export async function applyFbChangelogSegmentToDatabase(
+  targetDb: ReplicableDatabase,
+  segmentOrBytes: Uint8Array | ParsedFbChangelogSegment,
+  options: {
+    wasmModule?: {
+      _fb_replicate_changelog?(dbHandle: number, dataPtr: number, byteLength: number): number;
+      _malloc(size: number): number;
+      _free(ptr: number): void;
+      HEAPU8: Uint8Array;
+    };
+    dbHandle?: number;
+  } = {},
+): Promise<ApplyFbChangelogResult> {
+  const segment =
+    segmentOrBytes instanceof Uint8Array
+      ? parseFbChangelogSegment(segmentOrBytes)
+      : segmentOrBytes;
+
+  const mod = options.wasmModule;
+  const dbHandle = options.dbHandle;
+  if (mod && typeof mod._fb_replicate_changelog === 'function' && dbHandle && dbHandle > 0) {
+    const ptr = mod._malloc(segment.rawBytes.byteLength);
+    try {
+      mod.HEAPU8.set(segment.rawBytes, ptr);
+      const rc = mod._fb_replicate_changelog(dbHandle, ptr, segment.rawBytes.byteLength);
+      if (rc >= 0) {
+        return {
+          sequence: segment.header.sequence,
+          blocksProcessed: rc,
+          ddlExecuted: segment.executedSql,
+          usedNativeReplicator: true,
+        };
+      }
+    } finally {
+      mod._free(ptr);
+    }
+  }
+
+  const ddlExecuted: string[] = [];
+  for (const sql of segment.executedSql) {
+    await execStatement(targetDb, sql);
+    ddlExecuted.push(sql);
+  }
+
+  return {
+    sequence: segment.header.sequence,
+    blocksProcessed: segment.blocks.length,
+    ddlExecuted,
+    usedNativeReplicator: false,
+  };
+}
+
 

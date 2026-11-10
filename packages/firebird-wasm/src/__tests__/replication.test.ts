@@ -51,7 +51,23 @@ import {
   classifyDdlStatement,
   resolveDdlConflict,
   checkReplicationSchemaCompatibility,
+  FB_CHANGELOG_MAGIC,
+  FB_CHANGELOG_HEADER_BYTES,
+  FB_CHANGELOG_BLOCK_HEADER_BYTES,
+  FbChangelogOpcode,
+  includeTablesInPublication,
+  excludeTablesFromPublication,
+  enableEnginePublication,
+  disableEnginePublication,
+  getEnginePublicationStatus,
+  buildReplicationConf,
+  configureWasmReplicationConf,
+  isFbChangelogSegment,
+  parseFbChangelogSegment,
+  readWasmChangelogSegments,
+  applyFbChangelogSegmentToDatabase,
   type ReplicableDatabase,
+  type ReplicationEmscriptenFS,
   type WebSocketLike,
 } from '../replication';
 import type { QueryParams, QueryResult, Row } from '../types';
@@ -72,6 +88,9 @@ function createMockReplDb(): ReplicableDatabase & {
   const ddlLog: string[] = [];
   const triggerDdlLog: string[] = [];
   const contextLog: string[] = [];
+  let pubActive = 0;
+  let pubAutoEnable = 0;
+  const pubTables = new Set<string>();
 
   const getTable = (name: string): Row[] => {
     const upper = name.replace(/"/g, '').toUpperCase();
@@ -89,6 +108,32 @@ function createMockReplDb(): ReplicableDatabase & {
     if (/RDB\$SET_CONTEXT\s*\(/i.test(trimmed)) {
       contextLog.push(trimmed);
       return { rows: [{ RESULT: 1 }] };
+    }
+
+    if (/FROM\s+RDB\$PUBLICATIONS\b/i.test(trimmed)) {
+      return {
+        rows: [
+          {
+            PUB_NAME: 'RDB$DEFAULT',
+            ACTIVE_FLAG: pubActive,
+            AUTO_ENABLE: pubAutoEnable,
+          },
+        ],
+      };
+    }
+
+    if (/FROM\s+RDB\$PUBLICATION_TABLES\b/i.test(trimmed)) {
+      return {
+        rows: Array.from(pubTables)
+          .sort()
+          .map((t) => ({ TABLE_NAME: t })),
+      };
+    }
+
+    if (/RDB\$GET_CONTEXT\s*\(\s*'SYSTEM'\s*,\s*'REPLICA_MODE'\s*\)/i.test(trimmed)) {
+      return {
+        rows: [{ REPL_MODE: 'NONE', REPL_SEQ: pubActive ? 1 : 0 }],
+      };
     }
 
     // MAX(col) AS alias
@@ -175,6 +220,33 @@ function createMockReplDb(): ReplicableDatabase & {
     }
 
     if (/^\s*CREATE\s+SEQUENCE\b/i.test(trimmed)) {
+      return;
+    }
+
+    if (/^\s*ALTER\s+DATABASE\b/i.test(trimmed)) {
+      ddlLog.push(trimmed);
+      if (/ENABLE\s+PUBLICATION/i.test(trimmed)) {
+        pubActive = 1;
+      } else if (/DISABLE\s+PUBLICATION/i.test(trimmed)) {
+        pubActive = 0;
+      } else if (/INCLUDE\s+ALL\s+TO\s+PUBLICATION/i.test(trimmed)) {
+        pubAutoEnable = 1;
+        for (const t of tables.keys()) {
+          if (!t.startsWith('FB_REPL_')) pubTables.add(t);
+        }
+      } else if (/EXCLUDE\s+ALL\s+FROM\s+PUBLICATION/i.test(trimmed)) {
+        pubAutoEnable = 0;
+        pubTables.clear();
+      } else {
+        const incMatch = /INCLUDE\s+TABLE\s+([A-Za-z0-9_$"]+)\s+TO\s+PUBLICATION/i.exec(trimmed);
+        if (incMatch) {
+          pubTables.add(incMatch[1]!.replace(/"/g, '').toUpperCase());
+        }
+        const excMatch = /EXCLUDE\s+TABLE\s+([A-Za-z0-9_$"]+)\s+FROM\s+PUBLICATION/i.exec(trimmed);
+        if (excMatch) {
+          pubTables.delete(excMatch[1]!.replace(/"/g, '').toUpperCase());
+        }
+      }
       return;
     }
 
@@ -2373,5 +2445,168 @@ describe('firebird-wasm/replication - real-engine regressions', () => {
     expect(compatReport.compatible).toBe(false);
     expect(compatReport.issues.some((i) => i.code === 'missing-replica-column' && i.column === 'NEW_SOURCE_COL')).toBe(true);
     expect(compatReport.remediationDdl[0]).toContain('ALTER TABLE USERS ADD NEW_SOURCE_COL');
+  });
+
+  // -------------------------------------------------------------------------
+  // M16 Items 1–4: Native Firebird Engine Publication DDL, replication.conf,
+  // "FBCHANGELOG\0" Binary Segment Parser & Applier Bridge
+  // -------------------------------------------------------------------------
+  it('manages native RDB$PUBLICATIONS catalog DDL, provisions replication.conf, and parses/applies "FBCHANGELOG\\0" binary segments (M16 Items 1–4)', async () => {
+    const db = createMockReplDb();
+    db.tables.set('USERS', [{ ID: 1, NAME: 'Ada' }]);
+    db.tables.set('ORDERS', [{ ID: 10, TOTAL: 100 }]);
+
+    // 1. Enable native engine publication for specific tables
+    const status1 = await enableEnginePublication(db, { tables: ['USERS', 'ORDERS'] });
+    expect(status1.name).toBe('RDB$DEFAULT');
+    expect(status1.active).toBe(true);
+    expect(status1.publishedTables).toEqual(['ORDERS', 'USERS']);
+    expect(status1.replicaMode).toBe('NONE');
+
+    // Exclude one table
+    await excludeTablesFromPublication(db, ['ORDERS']);
+    const status2 = await getEnginePublicationStatus(db);
+    expect(status2.publishedTables).toEqual(['USERS']);
+
+    // Include all tables (`*`) and disable
+    await includeTablesInPublication(db, '*');
+    const status3 = await disableEnginePublication(db);
+    expect(status3.active).toBe(false);
+    expect(status3.autoEnable).toBe(true);
+    expect(status3.publishedTables).toEqual(['ORDERS', 'USERS']);
+
+    // Unified engineMode: 'native' in createPublication
+    const pub = await createPublication(db, {
+      name: 'native_pub',
+      tables: ['USERS'],
+      engineMode: 'native',
+    });
+    expect(pub.name).toBe('native_pub');
+    expect((await getEnginePublicationStatus(db)).active).toBe(true);
+
+    // 2. Provision replication.conf in a mock Emscripten FS
+    const files = new Map<string, Uint8Array | string>();
+    const dirs = new Set<string>();
+    const mockFs: ReplicationEmscriptenFS = {
+      mkdir(p) {
+        dirs.add(p);
+      },
+      writeFile(p, data) {
+        files.set(p, data);
+      },
+      readFile(p) {
+        const v = files.get(p);
+        if (v === undefined) throw new Error(`ENOENT: ${p}`);
+        return v;
+      },
+      readdir(p) {
+        const prefix = p.endsWith('/') ? p : p + '/';
+        const out = ['.', '..'];
+        for (const k of files.keys()) {
+          if (k.startsWith(prefix)) {
+            const rest = k.slice(prefix.length);
+            if (!rest.includes('/')) out.push(rest);
+          }
+        }
+        return out;
+      },
+      analyzePath(p) {
+        return { exists: dirs.has(p) || files.has(p) };
+      },
+    };
+
+    const confText = configureWasmReplicationConf(mockFs, {
+      database: '/data/primary.fdb',
+      journalDirectory: '/repl_log',
+      journalArchiveDirectory: '/repl_arch',
+      journalArchiveTimeout: 1,
+      verboseLogging: true,
+    });
+    expect(confText).toBe(
+      buildReplicationConf({
+        database: '/data/primary.fdb',
+        journalDirectory: '/repl_log',
+        journalArchiveDirectory: '/repl_arch',
+        journalArchiveTimeout: 1,
+        verboseLogging: true,
+      }),
+    );
+    expect(confText).toContain('journal_directory = /repl_log');
+    expect(confText).toContain('journal_archive_directory = /repl_arch');
+    expect(dirs.has('/repl_log')).toBe(true);
+    expect(dirs.has('/repl_arch')).toBe(true);
+    expect(files.get('/usr/local/firebird/replication.conf')).toBe(confText);
+
+    // 3. Construct a binary "FBCHANGELOG\0" segment with two blocks (DDL + Atom + Commit)
+    const sqlText = 'ALTER TABLE USERS ADD SCORE INT';
+    const sqlBytes = new TextEncoder().encode(sqlText);
+    // Block 1 payload: opDefineAtom (6, 0x10, 6, "PUBLIC"), opExecuteSqlIntl (15, 0x10, 0, 1, 0, 4, 0, 0, 0, len_le32, sqlBytes), opCommitTransaction (3)
+    const atomBytes = new Uint8Array([
+      FbChangelogOpcode.opDefineAtom,
+      0x10,
+      5,
+      0x55,
+      0x53,
+      0x45,
+      0x52,
+      0x53, // "USERS"
+    ]);
+    const sqlBlockPayload = new Uint8Array(atomBytes.length + 1 + 8 + 4 + sqlBytes.length + 1);
+    sqlBlockPayload.set(atomBytes, 0);
+    let pOff = atomBytes.length;
+    sqlBlockPayload[pOff++] = FbChangelogOpcode.opExecuteSqlIntl;
+    // 8 metadata header bytes before 32-bit SQL length
+    sqlBlockPayload.set([0x10, 0x00, 0x01, 0x00, 0x04, 0x00, 0x00, 0x00], pOff);
+    pOff += 8;
+    new DataView(sqlBlockPayload.buffer).setUint32(pOff, sqlBytes.length, true);
+    pOff += 4;
+    sqlBlockPayload.set(sqlBytes, pOff);
+
+    const totalLen =
+      FB_CHANGELOG_HEADER_BYTES + FB_CHANGELOG_BLOCK_HEADER_BYTES + sqlBlockPayload.length;
+    const segmentBytes = new Uint8Array(totalLen);
+    const segView = new DataView(segmentBytes.buffer);
+    for (let i = 0; i < FB_CHANGELOG_MAGIC.length; i++) {
+      segmentBytes[i] = FB_CHANGELOG_MAGIC.charCodeAt(i);
+    }
+    segView.setUint16(12, 1, true); // version = 1
+    segView.setUint16(14, 3, true); // state = 3 (ARCHIVABLE)
+    for (let i = 0; i < 16; i++) segmentBytes[16 + i] = i + 1; // guid
+    segView.setBigUint64(32, 1n, true); // sequence = 1
+    segView.setBigUint64(40, BigInt(totalLen), true); // length
+
+    // Block header at offset 48
+    segView.setBigUint64(48, 7n, true); // traNumber = 7
+    segView.setUint16(56, 2, true); // protocol = 2
+    segView.setUint16(58, 3, true); // flags = BEGIN | END
+    segView.setUint32(60, sqlBlockPayload.length, true);
+    segmentBytes.set(sqlBlockPayload, 64);
+
+    mockFs.writeFile('/repl_arch/primary.fdb_GUID.journal-000000001', segmentBytes);
+
+    expect(isFbChangelogSegment(segmentBytes)).toBe(true);
+    expect(parseFbChangelogSegment(segmentBytes).header.sequence).toBe(1);
+    const parsedSegments = readWasmChangelogSegments(mockFs, '/repl_arch');
+    expect(parsedSegments).toHaveLength(1);
+    const seg = parsedSegments[0]!;
+    expect(seg.header.version).toBe(1);
+    expect(seg.header.state).toBe(3);
+    expect(seg.header.sequence).toBe(1);
+    expect(seg.header.guid).toBe('01020304-0506-0708-090A-0B0C0D0E0F10');
+    expect(seg.blocks).toHaveLength(1);
+    expect(seg.blocks[0]!.traNumber).toBe(7);
+    expect(seg.blocks[0]!.protocol).toBe(2);
+    expect(seg.blocks[0]!.beginTrans).toBe(true);
+    expect(seg.blocks[0]!.endTrans).toBe(true);
+    expect(seg.atoms).toContain('USERS');
+    expect(seg.executedSql).toEqual(['ALTER TABLE USERS ADD SCORE INT']);
+
+    // 4. Apply segment to replica database
+    const replicaDb = createMockReplDb();
+    const applyRes = await applyFbChangelogSegmentToDatabase(replicaDb, seg);
+    expect(applyRes.sequence).toBe(1);
+    expect(applyRes.blocksProcessed).toBe(1);
+    expect(applyRes.ddlExecuted).toEqual(['ALTER TABLE USERS ADD SCORE INT']);
+    expect(replicaDb.ddlLog).toContain('ALTER TABLE USERS ADD SCORE INT');
   });
 });

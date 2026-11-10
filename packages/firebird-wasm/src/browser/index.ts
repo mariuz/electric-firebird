@@ -249,6 +249,23 @@ export {
   classifyDdlStatement,
   resolveDdlConflict,
   checkReplicationSchemaCompatibility,
+  FB_CHANGELOG_MAGIC,
+  FB_CHANGELOG_HEADER_BYTES,
+  FB_CHANGELOG_BLOCK_HEADER_BYTES,
+  FB_CHANGELOG_BLOCK_BEGIN_TRANS,
+  FB_CHANGELOG_BLOCK_END_TRANS,
+  FbChangelogOpcode,
+  includeTablesInPublication,
+  excludeTablesFromPublication,
+  enableEnginePublication,
+  disableEnginePublication,
+  getEnginePublicationStatus,
+  buildReplicationConf,
+  configureWasmReplicationConf,
+  isFbChangelogSegment,
+  parseFbChangelogSegment,
+  readWasmChangelogSegments,
+  applyFbChangelogSegmentToDatabase,
 } from '../replication';
 export type {
   ReplicableDatabase,
@@ -335,6 +352,14 @@ export type {
   DdlConflictResolution,
   SchemaColumnCompatibilityIssue,
   ReplicationSchemaCompatibilityReport,
+  EnginePublicationStatus,
+  EnableEnginePublicationOptions,
+  ReplicationConfEntry,
+  ReplicationEmscriptenFS,
+  FbChangelogHeader,
+  FbChangelogBlock,
+  ParsedFbChangelogSegment,
+  ApplyFbChangelogResult,
 } from '../replication';
 export type { ScriptStatement } from './sql-script';
 

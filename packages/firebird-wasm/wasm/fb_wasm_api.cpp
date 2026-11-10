@@ -7982,4 +7982,151 @@ int fb_stmt_set_timeout(int stmt_handle, unsigned timeout_ms)
 	return 0;
 }
 
+/**
+ * Configure a database's native replica mode (`isc_dpb_set_db_replica` = 90)
+ * on the database header page:
+ *   - `mode == 0`: none (`fb_shutrs_none` / normal primary database)
+ *   - `mode == 1`: read-only replica
+ *   - `mode == 2`: read-write replica
+ *
+ * Returns 0 on success, non-zero on failure.
+ */
+FB_WASM_EXPORT
+int fb_set_replica_mode(int db_handle, int mode)
+{
+	clearError();
+
+	DbEntry* entry = lookupEntry(db_handle);
+	if (!entry || !entry->attachment)
+	{
+		setError("fb_set_replica_mode: unknown database handle");
+		return 1;
+	}
+
+	endReadTransaction(*entry);
+
+	if (entry->path.empty() || !g_provider)
+	{
+		setError("fb_set_replica_mode: database path unavailable");
+		return 2;
+	}
+
+	Status status;
+	IXpbBuilder* dpb = buildDpb(status, false);
+	if (status.failed() || !dpb)
+	{
+		setErrorFromStatus("fb_set_replica_mode: could not build DPB", status.ptr());
+		return 3;
+	}
+
+	constexpr unsigned char DPB_SET_DB_REPLICA = 90; // isc_dpb_set_db_replica
+	const unsigned char replicaFlag = static_cast<unsigned char>(mode < 0 ? 0 : (mode > 2 ? 2 : mode));
+	dpb->insertBytes(status.ptr(), DPB_SET_DB_REPLICA, &replicaFlag, 1);
+	if (status.failed())
+	{
+		dpb->dispose();
+		setErrorFromStatus("fb_set_replica_mode: could not set isc_dpb_set_db_replica", status.ptr());
+		return 4;
+	}
+
+	IAttachment* modeAttachment = g_provider->attachDatabase(status.ptr(),
+		entry->path.c_str(),
+		dpb->getBufferLength(status.ptr()),
+		dpb->getBuffer(status.ptr()));
+	dpb->dispose();
+
+	if (status.failed() || !modeAttachment)
+	{
+		setErrorFromStatus("fb_set_replica_mode: attach failed", status.ptr());
+		return 5;
+	}
+
+	Status detachStatus;
+	modeAttachment->detach(detachStatus.ptr());
+	return 0;
+}
+
+/**
+ * Apply a native Firebird binary changelog segment (`"FBCHANGELOG\0"` 48-byte
+ * header followed by 16-byte `Replication::Block` records, or a raw stream of
+ * `Replication::Block` records) to `db_handle` via Firebird's public OO
+ * `IAttachment::createReplicator` (`IReplicator::process` / `IReplicator::close`).
+ *
+ * Returns the number of changelog blocks processed (`>= 0`) on success, or `< 0`
+ * on failure (with the error message stored in `fb_last_error()`).
+ */
+FB_WASM_EXPORT
+int fb_replicate_changelog(int db_handle, const unsigned char* data, unsigned byte_length)
+{
+	clearError();
+
+	DbEntry* entry = lookupEntry(db_handle);
+	if (!entry || !entry->attachment)
+	{
+		setError("fb_replicate_changelog: unknown database handle");
+		return -1;
+	}
+
+	if (!data || byte_length < 16)
+	{
+		setError("fb_replicate_changelog: changelog buffer is empty or truncated");
+		return -2;
+	}
+
+	endReadTransaction(*entry);
+	forgetMetadata(*entry);
+
+	size_t offset = 0;
+	// Skip the 48-byte ChangeLog::Header if the buffer starts with "FBCHANGELOG\0".
+	if (byte_length >= 48 && memcmp(data, "FBCHANGELOG\0", 12) == 0)
+	{
+		offset = 48;
+	}
+
+	Status status;
+	IReplicator* replicator = entry->attachment->createReplicator(status.ptr());
+	if (status.failed() || !replicator)
+	{
+		setErrorFromStatus("fb_replicate_changelog: createReplicator failed", status.ptr());
+		return -3;
+	}
+
+	int blocksApplied = 0;
+	while (offset + 16 <= byte_length)
+	{
+		unsigned blockPayloadLen = 0;
+		memcpy(&blockPayloadLen, data + offset + 12, sizeof(blockPayloadLen));
+		const size_t totalBlockLen = 16u + static_cast<size_t>(blockPayloadLen);
+		if (offset + totalBlockLen > byte_length)
+		{
+			Status closeStatus;
+			replicator->close(closeStatus.ptr());
+			setError("fb_replicate_changelog: truncated changelog block");
+			return -4;
+		}
+
+		replicator->process(status.ptr(), static_cast<unsigned>(totalBlockLen), data + offset);
+		if (status.failed())
+		{
+			setErrorFromStatus("fb_replicate_changelog: process failed", status.ptr());
+			Status closeStatus;
+			replicator->close(closeStatus.ptr());
+			return -5;
+		}
+
+		offset += totalBlockLen;
+		blocksApplied++;
+	}
+
+	replicator->close(status.ptr());
+	if (status.failed())
+	{
+		setErrorFromStatus("fb_replicate_changelog: close failed", status.ptr());
+		return -6;
+	}
+
+	fb_wasm_metadata_commits.fetch_add(1, std::memory_order_release);
+	return blocksApplied;
+}
+
 } /* extern "C" */

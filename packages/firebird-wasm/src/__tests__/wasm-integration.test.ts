@@ -24,6 +24,13 @@ import { DirectTransport } from '../browser/engine-transport';
 import type { EngineTransport } from '../browser/engine-transport';
 import { createKysely } from '../kysely';
 import { drizzle, firebirdTable, integer, varchar, eq, asc } from '../drizzle';
+import {
+  enableEnginePublication,
+  disableEnginePublication,
+  getEnginePublicationStatus,
+  configureWasmReplicationConf,
+  readWasmChangelogSegments,
+} from '../replication';
 
 // The WASM artifacts live at dist/wasm/ after `npm run build:wasm` +
 // `npm run build`.  The suite runs once per build: with threads
@@ -1178,6 +1185,78 @@ for (const variant of VARIANTS) {
         await kdb.destroy();
       } finally {
         await fb.close();
+      }
+    });
+
+    it('manages native RDB$PUBLICATIONS catalog and emits real "FBCHANGELOG\\0" binary segments on the threaded WASM engine (M16 Item 5)', async () => {
+      const dbName = `native-repl-${variant.threads ? 'mt' : 'st'}`;
+      if (variant.threads) {
+        // Omit `database` filter so the global `database { ... }` block in
+        // `/usr/local/firebird/replication.conf` applies to the ephemeral
+        // `/data/native-repl-mt-<counter>.fdb` file created by FirebirdBrowser.
+        configureWasmReplicationConf(mod.FS as unknown as Parameters<typeof configureWasmReplicationConf>[0], {
+          journalDirectory: '/repl_log_m16',
+          journalArchiveDirectory: '/repl_arch_m16',
+          journalArchiveTimeout: 1,
+          verboseLogging: true,
+        });
+      }
+
+      const fb = new FirebirdBrowser(`memory://${dbName}`, {
+        transport: new DirectTransport({ threads: variant.threads }),
+      });
+      try {
+        await fb.exec('CREATE TABLE T_REPL (ID INT NOT NULL PRIMARY KEY, VAL VARCHAR(40))');
+
+        const statusEnabled = await enableEnginePublication(fb, { tables: ['T_REPL'] });
+        expect(statusEnabled.name).toBe('RDB$DEFAULT');
+        expect(statusEnabled.active).toBe(true);
+        expect(statusEnabled.publishedTables).toContain('T_REPL');
+
+        if (!variant.threads) {
+          const statusDisabled = await disableEnginePublication(fb);
+          expect(statusDisabled.active).toBe(false);
+          const statusFinal = await getEnginePublicationStatus(fb);
+          expect(statusFinal.publishedTables).toContain('T_REPL');
+        } else {
+          await fb.exec("INSERT INTO T_REPL (ID, VAL) VALUES (1, 'alpha')");
+          await fb.exec("UPDATE T_REPL SET VAL = 'alpha_v2' WHERE ID = 1");
+          await fb.exec('ALTER TABLE T_REPL ADD SCORE INT');
+          await fb.exec('DELETE FROM T_REPL WHERE ID = 1');
+        }
+      } finally {
+        await fb.close();
+      }
+
+      if (variant.threads) {
+        const segments = [
+          ...readWasmChangelogSegments(
+            mod.FS as unknown as Parameters<typeof readWasmChangelogSegments>[0],
+            '/repl_arch_m16',
+          ),
+          ...readWasmChangelogSegments(
+            mod.FS as unknown as Parameters<typeof readWasmChangelogSegments>[0],
+            '/repl_log_m16',
+          ),
+        ];
+        expect(segments.length).toBeGreaterThanOrEqual(1);
+        const firstSeg = segments[0]!;
+        expect(firstSeg.header.version).toBe(1);
+        expect(firstSeg.header.sequence).toBeGreaterThanOrEqual(1);
+        expect(firstSeg.header.guid).toMatch(
+          /^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$/,
+        );
+        expect(firstSeg.blocks.length).toBeGreaterThanOrEqual(4);
+        const allAtoms = new Set(segments.flatMap((s) => s.atoms));
+        expect(allAtoms.has('T_REPL')).toBe(true);
+        const allSql = segments.flatMap((s) => s.executedSql);
+        expect(allSql).toContain('ALTER TABLE T_REPL ADD SCORE INT');
+        // Clean up global replication.conf so subsequent tests do not spawn archiver threads
+        try {
+          mod.FS.unlink('/usr/local/firebird/replication.conf');
+        } catch {
+          // Ignore
+        }
       }
     });
   },
