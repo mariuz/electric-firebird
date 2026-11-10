@@ -746,4 +746,48 @@ for (const seg of segments) {
 }
 ```
 
+---
+
+## 24. `"FBCHANGELOG\0"` Binary Opcode Decoder, JRD Record/Sequence Extractor & Continuous Changelog Poller (`decodeFbChangelogOperations` / `fbChangelogToLogicalEntries` / `createWasmChangelogPoller`)
+
+Decode all 16 Firebird `Replication::Block` opcodes (`opStartTransaction`..`opDefineAtom`), convert uncompressed JRD record buffers, BLOB chunks (`opStoreBlob`), and sequence watermarks (`opSetSequence`) into logical `ReplicationLogEntry` items (honoring transaction & savepoint rollbacks), configure `hdr_replica_mode` on replica `.fdb` files, and stream archived `.journal-NNNNNNNNN` segments continuously:
+
+```ts
+import {
+  decodeFbChangelogOperations,
+  fbChangelogToLogicalEntries,
+  setWasmDatabaseReplicaMode,
+  createWasmChangelogPoller,
+} from 'firebird-wasm/replication';
+
+// 1. Decode raw operations or convert committed transactions into ReplicationLogEntry[]
+const ops = decodeFbChangelogOperations(segmentBytes);
+const { entries, sequences, ddlStatements } = fbChangelogToLogicalEntries(segmentBytes, {
+  tableSchemas: {
+    ORDERS: [
+      { name: 'ID', type: 'INTEGER', primaryKey: true },
+      { name: 'CUSTOMER', type: 'VARCHAR', charLength: 64 },
+      { name: 'TOTAL', type: 'BIGINT' },
+    ],
+  },
+});
+
+// 2. Configure ODS header_page::hdr_replica_mode ('read_write' = 2) before attaching replica
+setWasmDatabaseReplicaMode(wasmModule.FS, '/data/replica.fdb', 'read_write');
+
+// 3. Continuously poll & apply sealed segments via C++ IAttachment::createReplicator (or SQL fallback)
+const poller = createWasmChangelogPoller({
+  fs: wasmModule.FS,
+  targetDb: replicaDb,
+  journalArchiveDirectory: '/repl_arch',
+  journalDirectory: '/repl_log',
+  unlinkArchivedSegments: true,
+  wasmModule,
+  dbHandle: replicaHandle,
+});
+
+await poller.pollOnce(); // or poller.start(100)
+```
+
+
 

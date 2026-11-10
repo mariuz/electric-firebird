@@ -66,6 +66,14 @@ import {
   parseFbChangelogSegment,
   readWasmChangelogSegments,
   applyFbChangelogSegmentToDatabase,
+  decodeFbChangelogOperations,
+  decodeJrdRecordBuffer,
+  encodeJrdRecordBuffer,
+  encodeFbChangelogSegment,
+  fbChangelogToLogicalEntries,
+  setWasmDatabaseReplicaMode,
+  createWasmChangelogPoller,
+  type JrdColumnDescriptor,
   type ReplicableDatabase,
   type ReplicationEmscriptenFS,
   type WebSocketLike,
@@ -2537,30 +2545,39 @@ describe('firebird-wasm/replication - real-engine regressions', () => {
     expect(dirs.has('/repl_arch')).toBe(true);
     expect(files.get('/usr/local/firebird/replication.conf')).toBe(confText);
 
-    // 3. Construct a binary "FBCHANGELOG\0" segment with two blocks (DDL + Atom + Commit)
+    // 3. Construct a binary "FBCHANGELOG\0" segment with Protocol=2 block (StartTx + DefineAtom + ExecuteSqlIntl + CommitTx)
     const sqlText = 'ALTER TABLE USERS ADD SCORE INT';
     const sqlBytes = new TextEncoder().encode(sqlText);
-    // Block 1 payload: opDefineAtom (6, 0x10, 6, "PUBLIC"), opExecuteSqlIntl (15, 0x10, 0, 1, 0, 4, 0, 0, 0, len_le32, sqlBytes), opCommitTransaction (3)
     const atomBytes = new Uint8Array([
+      FbChangelogOpcode.opStartTransaction,
       FbChangelogOpcode.opDefineAtom,
-      0x10,
+      6,
+      0x53,
+      0x59,
+      0x53,
+      0x44,
+      0x42,
+      0x41, // atom[0] = "SYSDBA"
+      FbChangelogOpcode.opDefineAtom,
       5,
       0x55,
       0x53,
       0x45,
       0x52,
-      0x53, // "USERS"
+      0x53, // atom[1] = "USERS"
     ]);
-    const sqlBlockPayload = new Uint8Array(atomBytes.length + 1 + 8 + 4 + sqlBytes.length + 1);
+    // opExecuteSqlIntl (15): i32 ownerAtom (0), i32 schemaSearchPathAtom (1), u8 charset (4 = UTF8), u32 sqlLen, sqlBytes, opCommitTransaction (3)
+    const sqlBlockPayload = new Uint8Array(atomBytes.length + 1 + 9 + 4 + sqlBytes.length + 1);
     sqlBlockPayload.set(atomBytes, 0);
     let pOff = atomBytes.length;
     sqlBlockPayload[pOff++] = FbChangelogOpcode.opExecuteSqlIntl;
-    // 8 metadata header bytes before 32-bit SQL length
-    sqlBlockPayload.set([0x10, 0x00, 0x01, 0x00, 0x04, 0x00, 0x00, 0x00], pOff);
-    pOff += 8;
+    sqlBlockPayload.set([0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04], pOff);
+    pOff += 9;
     new DataView(sqlBlockPayload.buffer).setUint32(pOff, sqlBytes.length, true);
     pOff += 4;
     sqlBlockPayload.set(sqlBytes, pOff);
+    pOff += sqlBytes.length;
+    sqlBlockPayload[pOff] = FbChangelogOpcode.opCommitTransaction;
 
     const totalLen =
       FB_CHANGELOG_HEADER_BYTES + FB_CHANGELOG_BLOCK_HEADER_BYTES + sqlBlockPayload.length;
@@ -2608,5 +2625,220 @@ describe('firebird-wasm/replication - real-engine regressions', () => {
     expect(applyRes.blocksProcessed).toBe(1);
     expect(applyRes.ddlExecuted).toEqual(['ALTER TABLE USERS ADD SCORE INT']);
     expect(replicaDb.ddlLog).toContain('ALTER TABLE USERS ADD SCORE INT');
+  });
+
+  // -------------------------------------------------------------------------
+  // M17 Items 1, 2 & 5: Full "FBCHANGELOG\0" Binary Operation Decoder,
+  // JRD Record/BLOB/Sequence Decoder, Replica Mode Header & Changelog Poller
+  // -------------------------------------------------------------------------
+  it('decodes all "FBCHANGELOG\\0" opcodes (JRD records, BLOBs, sequences, savepoints) and streams archived segments via createWasmChangelogPoller (M17 Items 1, 2 & 5)', async () => {
+    const itemColumns: readonly JrdColumnDescriptor[] = [
+      { name: 'ID', type: 'INTEGER', primaryKey: true },
+      { name: 'TITLE', type: 'VARCHAR', charLength: 16 },
+      { name: 'QTY', type: 'BIGINT' },
+      { name: 'ACTIVE', type: 'BOOLEAN' },
+      { name: 'NOTE', type: 'BLOB', blobSubType: 'TEXT' },
+    ];
+
+    const blobIdHex = '8000000000000000';
+    const blobBytes = new TextEncoder().encode('Warp coil online');
+    const row1v1 = encodeJrdRecordBuffer(
+      { ID: 1, TITLE: 'Warp Coil', QTY: 10, ACTIVE: true, NOTE: blobIdHex },
+      itemColumns,
+    );
+    expect(decodeJrdRecordBuffer(row1v1, itemColumns).TITLE).toBe('Warp Coil');
+    const row1v2 = encodeJrdRecordBuffer(
+      { ID: 1, TITLE: 'Warp Coil Mk2', QTY: 25, ACTIVE: true, NOTE: blobIdHex },
+      itemColumns,
+    );
+    const row2RolledBack = encodeJrdRecordBuffer(
+      { ID: 2, TITLE: 'Ghost Item', QTY: 99, ACTIVE: false, NOTE: null },
+      itemColumns,
+    );
+    const row3Deleted = encodeJrdRecordBuffer(
+      { ID: 3, TITLE: 'Temp Fuse', QTY: 1, ACTIVE: false, NOTE: null },
+      itemColumns,
+    );
+
+    const enc = new TextEncoder();
+    const pushU32 = (arr: number[], v: number) => {
+      const b = new Uint8Array(4);
+      new DataView(b.buffer).setUint32(0, v, true);
+      arr.push(...b);
+    };
+    const pushI64 = (arr: number[], v: bigint) => {
+      const b = new Uint8Array(8);
+      new DataView(b.buffer).setBigInt64(0, v, true);
+      arr.push(...b);
+    };
+    const pushAtom = (arr: number[], name: string) => {
+      const nb = enc.encode(name);
+      arr.push(FbChangelogOpcode.opDefineAtom, nb.length, ...nb);
+    };
+
+    // Block 1 (tra=0): opSetSequence ("PUBLIC"."SEQ_ITEM" = 42)
+    const b1: number[] = [];
+    pushAtom(b1, 'PUBLIC');
+    pushAtom(b1, 'SEQ_ITEM');
+    b1.push(FbChangelogOpcode.opSetSequence);
+    pushU32(b1, 0);
+    pushU32(b1, 1);
+    pushI64(b1, 42n);
+
+    // Block 2 (tra=10): committed tx with StoreBlob + Insert(1) + Savepoint(Insert(2) -> RollbackSavepoint) + Update(1) + Insert(3) + Delete(3) + Commit
+    const b2: number[] = [FbChangelogOpcode.opStartTransaction];
+    pushAtom(b2, 'PUBLIC'); // 0
+    pushAtom(b2, 'ITEMS'); // 1
+    // opStoreBlob
+    b2.push(FbChangelogOpcode.opStoreBlob, 0x80, 0, 0, 0, 0, 0, 0, 0);
+    b2.push(blobBytes.length & 0xff, (blobBytes.length >> 8) & 0xff, ...blobBytes, 0, 0);
+    // Insert row 1
+    b2.push(FbChangelogOpcode.opStartSavepoint, FbChangelogOpcode.opInsertRecord);
+    pushU32(b2, 0);
+    pushU32(b2, 1);
+    pushU32(b2, row1v1.length);
+    b2.push(...row1v1, FbChangelogOpcode.opReleaseSavepoint);
+    // Savepoint that rolls back row 2!
+    b2.push(FbChangelogOpcode.opStartSavepoint, FbChangelogOpcode.opInsertRecord);
+    pushU32(b2, 0);
+    pushU32(b2, 1);
+    pushU32(b2, row2RolledBack.length);
+    b2.push(...row2RolledBack, FbChangelogOpcode.opRollbackSavepoint);
+    // Update row 1 -> row1v2
+    b2.push(FbChangelogOpcode.opUpdateRecord);
+    pushU32(b2, 0);
+    pushU32(b2, 1);
+    pushU32(b2, row1v1.length);
+    b2.push(...row1v1);
+    pushU32(b2, row1v2.length);
+    b2.push(...row1v2);
+    // Insert & Delete row 3
+    b2.push(FbChangelogOpcode.opInsertRecord);
+    pushU32(b2, 0);
+    pushU32(b2, 1);
+    pushU32(b2, row3Deleted.length);
+    b2.push(...row3Deleted);
+    b2.push(FbChangelogOpcode.opDeleteRecord);
+    pushU32(b2, 0);
+    pushU32(b2, 1);
+    pushU32(b2, row3Deleted.length);
+    b2.push(...row3Deleted);
+    b2.push(FbChangelogOpcode.opPrepareTransaction, FbChangelogOpcode.opCommitTransaction);
+
+    // Block 3 (tra=11): rolled-back transaction (must NOT appear in logical entries!)
+    const b3: number[] = [FbChangelogOpcode.opStartTransaction];
+    pushAtom(b3, 'PUBLIC');
+    pushAtom(b3, 'ITEMS');
+    b3.push(FbChangelogOpcode.opInsertRecord);
+    pushU32(b3, 0);
+    pushU32(b3, 1);
+    pushU32(b3, row2RolledBack.length);
+    b3.push(...row2RolledBack, FbChangelogOpcode.opRollbackTransaction);
+
+    const seg1 = encodeFbChangelogSegment({
+      sequence: 1,
+      guid: '11223344-5566-7788-99AA-BBCCDDEEFF00',
+      blocks: [
+        { traNumber: 0, flags: 0, payload: new Uint8Array(b1) },
+        { traNumber: 10, flags: 3, payload: new Uint8Array(b2) },
+        { traNumber: 11, flags: 3, payload: new Uint8Array(b3) },
+      ],
+    });
+
+    const ops = decodeFbChangelogOperations(seg1);
+    expect(ops.some((o) => o.kind === 'set_sequence' && o.sequenceName === 'SEQ_ITEM' && o.value === 42)).toBe(true);
+    expect(ops.some((o) => o.kind === 'store_blob' && o.chunkCount === 1)).toBe(true);
+    expect(ops.some((o) => o.kind === 'rollback_savepoint')).toBe(true);
+    expect(ops.some((o) => o.kind === 'rollback_transaction')).toBe(true);
+
+    const logical = fbChangelogToLogicalEntries(seg1, {
+      tableSchemas: { ITEMS: itemColumns },
+      origin: 'primary_node',
+    });
+    expect(logical.committedTransactions).toEqual([10]);
+    expect(logical.rolledBackTransactions).toEqual([11]);
+    expect(logical.sequences).toEqual([{ name: 'SEQ_ITEM', currentValue: 42 }]);
+    // Actions in tra=10 after savepoint rollback: INSERT(1), UPDATE(1), INSERT(3), DELETE(3)
+    expect(logical.entries).toHaveLength(4);
+    expect(logical.entries[0]!.operation).toBe('INSERT');
+    expect(logical.entries[0]!.after).toEqual({
+      ID: 1,
+      TITLE: 'Warp Coil',
+      QTY: 10,
+      ACTIVE: true,
+      NOTE: 'Warp coil online',
+    });
+    expect(logical.entries[1]!.operation).toBe('UPDATE');
+    expect(logical.entries[1]!.after?.TITLE).toBe('Warp Coil Mk2');
+    expect(logical.entries[1]!.after?.QTY).toBe(25);
+    expect(logical.entries[3]!.operation).toBe('DELETE');
+    expect(logical.entries[3]!.key).toEqual({ ID: 3 });
+
+    // Continuous poller & archiver with unlinkArchivedSegments: true
+    const fsMap = new Map<string, Uint8Array | string>();
+    const mockFs: ReplicationEmscriptenFS = {
+      mkdir() {},
+      writeFile(p, d) {
+        fsMap.set(p, d);
+      },
+      readFile(p) {
+        const v = fsMap.get(p);
+        if (v === undefined) throw new Error(`ENOENT: ${p}`);
+        return v;
+      },
+      readdir(p) {
+        const pref = p.endsWith('/') ? p : p + '/';
+        const out = ['.', '..'];
+        for (const k of fsMap.keys()) {
+          if (k.startsWith(pref)) out.push(k.slice(pref.length));
+        }
+        return out;
+      },
+      unlink(p) {
+        fsMap.delete(p);
+      },
+    };
+
+    // Verify setWasmDatabaseReplicaMode sets byte 26 on a valid ODS header page
+    const fakeHeader = new Uint8Array(8192);
+    fakeHeader[0] = 1; // pag_header
+    new DataView(fakeHeader.buffer).setUint16(16, 8192, true); // hdr_page_size = 8192
+    mockFs.writeFile('/data/replica.fdb', fakeHeader);
+    const modeInfo = setWasmDatabaseReplicaMode(mockFs, '/data/replica.fdb', 'read_write');
+    expect(modeInfo.modeCode).toBe(2);
+    expect((mockFs.readFile('/data/replica.fdb') as Uint8Array)[26]).toBe(2);
+
+    fsMap.set('/arch/db.journal-000000001', seg1);
+    const replicaDb = createMockReplDb();
+    replicaDb.tables.set('ITEMS', []);
+
+    const observedSeqs: number[] = [];
+    const poller = createWasmChangelogPoller({
+      fs: mockFs,
+      targetDb: replicaDb,
+      journalArchiveDirectory: '/arch',
+      journalDirectory: '/jrn',
+      unlinkArchivedSegments: true,
+      tableSchemas: { ITEMS: itemColumns },
+      onSegment(seg) {
+        observedSeqs.push(seg.header.sequence);
+      },
+    });
+
+    const poll1 = await poller.pollOnce();
+    expect(poll1).toHaveLength(1);
+    expect(poller.lastAppliedSequence()).toBe(1);
+    expect(observedSeqs).toEqual([1]);
+    expect(fsMap.has('/arch/db.journal-000000001')).toBe(false); // unlinked!
+    expect(replicaDb.sequences.get('SEQ_ITEM')).toBe(42);
+    expect(replicaDb.tables.get('ITEMS')).toEqual([
+      { ID: 1, TITLE: 'Warp Coil Mk2', QTY: 25, ACTIVE: true, NOTE: 'Warp coil online' },
+    ]);
+    expect(poller.stats()).toMatchObject({
+      pollCount: 1,
+      segmentsApplied: 1,
+      filesUnlinked: 1,
+      lastAppliedSequence: 1,
+    });
   });
 });

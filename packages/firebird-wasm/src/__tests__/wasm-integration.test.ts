@@ -30,6 +30,10 @@ import {
   getEnginePublicationStatus,
   configureWasmReplicationConf,
   readWasmChangelogSegments,
+  decodeFbChangelogOperations,
+  fbChangelogToLogicalEntries,
+  setWasmDatabaseReplicaMode,
+  createWasmChangelogPoller,
 } from '../replication';
 
 // The WASM artifacts live at dist/wasm/ after `npm run build:wasm` +
@@ -1257,6 +1261,140 @@ for (const variant of VARIANTS) {
         } catch {
           // Ignore
         }
+      }
+    });
+
+    it('replays real "FBCHANGELOG\\0" binary segments between two live WASM databases via C++ _fb_replicate_changelog and decodes all opcodes (M17 Items 1, 2 & 5)', async () => {
+      expect(typeof mod._fb_replicate_changelog).toBe('function');
+      expect(typeof mod._fb_set_replica_mode).toBe('function');
+
+      if (!variant.threads) {
+        return;
+      }
+
+      const fsHandle = mod.FS as unknown as Parameters<typeof configureWasmReplicationConf>[0];
+      configureWasmReplicationConf(fsHandle, {
+        journalDirectory: '/repl_log_m17',
+        journalArchiveDirectory: '/repl_arch_m17',
+        journalArchiveTimeout: 1,
+        verboseLogging: true,
+      });
+
+      const primary = new FirebirdBrowser('memory://native-m17-pri', {
+        transport: new DirectTransport({ threads: true }),
+      });
+      try {
+        await enableEnginePublication(primary, { tables: '*' });
+        await primary.exec(
+          'CREATE TABLE ITEMS_M17 (ID INT NOT NULL PRIMARY KEY, TITLE VARCHAR(32), QTY INT)',
+        );
+        await primary.exec('CREATE SEQUENCE SEQ_M17');
+        await primary.query('SELECT NEXT VALUE FOR SEQ_M17 FROM RDB$DATABASE');
+        await primary.exec("INSERT INTO ITEMS_M17 (ID, TITLE, QTY) VALUES (1, 'Quantum Core', 10)");
+        await primary.exec("INSERT INTO ITEMS_M17 (ID, TITLE, QTY) VALUES (2, 'Flux Capacitor', 5)");
+        await primary.exec('UPDATE ITEMS_M17 SET QTY = 42 WHERE ID = 1');
+        await primary.exec('DELETE FROM ITEMS_M17 WHERE ID = 2');
+      } finally {
+        await primary.close();
+      }
+
+      try {
+        mod.FS.unlink('/usr/local/firebird/replication.conf');
+      } catch {
+        // Ignore
+      }
+
+      // Create a second live WASM database in MEMFS, configure hdr_replica_mode = read_write (2), and attach it
+      const repPathPtr = allocString(mod, '/data/replica-m17.fdb');
+      let repHandle = 0;
+      try {
+        const createdHandle = mod._fb_create_database(repPathPtr);
+        expect(createdHandle).toBeGreaterThan(0);
+        expect(mod._fb_detach_database(createdHandle)).toBe(0);
+
+        const modeInfo = setWasmDatabaseReplicaMode(fsHandle, '/data/replica-m17.fdb', 'read_write');
+        expect(modeInfo.modeCode).toBe(2);
+
+        repHandle = mod._fb_attach_database(repPathPtr);
+        expect(repHandle).toBeGreaterThan(0);
+
+        // Decode real engine-generated "FBCHANGELOG\0" operations before applying
+        const rawSegments = [
+          ...readWasmChangelogSegments(fsHandle, '/repl_arch_m17'),
+          ...readWasmChangelogSegments(fsHandle, '/repl_log_m17'),
+        ];
+        expect(rawSegments.length).toBeGreaterThanOrEqual(1);
+        const decodedOps = decodeFbChangelogOperations(rawSegments[0]!);
+        expect(decodedOps.some((o) => o.kind === 'insert_record' && o.tableName === 'ITEMS_M17')).toBe(true);
+        expect(decodedOps.some((o) => o.kind === 'update_record' && o.tableName === 'ITEMS_M17')).toBe(true);
+        expect(decodedOps.some((o) => o.kind === 'delete_record' && o.tableName === 'ITEMS_M17')).toBe(true);
+        expect(decodedOps.some((o) => o.kind === 'set_sequence' && o.sequenceName === 'SEQ_M17' && o.value === 1)).toBe(true);
+
+        const logical = fbChangelogToLogicalEntries(rawSegments[0]!, {
+          tableSchemas: {
+            ITEMS_M17: [
+              { name: 'ID', type: 'INTEGER', primaryKey: true },
+              { name: 'TITLE', type: 'VARCHAR', charLength: 32 },
+              { name: 'QTY', type: 'INTEGER' },
+            ],
+          },
+        });
+        expect(logical.sequences).toEqual([{ name: 'SEQ_M17', currentValue: 1 }]);
+        expect(
+          logical.entries.some(
+            (e) => e.operation === 'UPDATE' && e.table === 'ITEMS_M17' && e.after?.QTY === 42,
+          ),
+        ).toBe(true);
+
+        // Stream & apply via createWasmChangelogPoller using native C++ _fb_replicate_changelog!
+        const dummyTarget = {
+          query: async () => ({ fields: [], rows: [] }),
+        };
+        const poller = createWasmChangelogPoller({
+          fs: fsHandle,
+          targetDb: dummyTarget,
+          journalArchiveDirectory: '/repl_arch_m17',
+          journalDirectory: '/repl_log_m17',
+          unlinkArchivedSegments: true,
+          wasmModule: mod,
+          dbHandle: repHandle,
+        });
+
+        const applied = await poller.pollOnce();
+        expect(applied.length).toBeGreaterThanOrEqual(1);
+        expect(applied[0]!.usedNativeReplicator).toBe(true);
+        expect(applied[0]!.blocksProcessed).toBeGreaterThanOrEqual(6);
+
+        // Query the live replica database to confirm DDL + DML + Sequence were applied natively!
+        const tx = mod._fb_start_transaction(repHandle);
+        expect(tx).toBeGreaterThan(0);
+        try {
+          const qPtr = allocString(mod, 'SELECT ID, TITLE, QTY FROM ITEMS_M17 ORDER BY ID');
+          const resPtr = mod._fb_query(repHandle, tx, qPtr, 0);
+          mod._free(qPtr);
+          expect(resPtr).toBeGreaterThan(0);
+          const parsedRows = JSON.parse(mod.UTF8ToString(resPtr)) as { rows: unknown[][] };
+          mod._fb_free_result(resPtr);
+          expect(parsedRows.rows).toEqual([[1, 'Quantum Core', 42]]);
+
+          const sPtr = allocString(
+            mod,
+            "SELECT GEN_ID(SEQ_M17, 0), RDB$GET_CONTEXT('SYSTEM', 'REPLICA_MODE') FROM RDB$DATABASE",
+          );
+          const sResPtr = mod._fb_query(repHandle, tx, sPtr, 0);
+          mod._free(sPtr);
+          expect(sResPtr).toBeGreaterThan(0);
+          const seqJson = JSON.parse(mod.UTF8ToString(sResPtr)) as { rows: unknown[][] };
+          mod._fb_free_result(sResPtr);
+          expect(seqJson.rows).toEqual([[1, 'READ-WRITE']]);
+        } finally {
+          mod._fb_commit(tx);
+        }
+      } finally {
+        if (repHandle > 0) {
+          mod._fb_detach_database(repHandle);
+        }
+        mod._free(repPathPtr);
       }
     });
   },

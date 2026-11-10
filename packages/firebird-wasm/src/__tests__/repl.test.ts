@@ -504,6 +504,28 @@ describe('firebird-wasm/repl', () => {
               rows: [[7, 'sub_edge_1', 'CHECK constraint failed', 2, '1730800001000']],
             };
           }
+          if (sqlText.includes('FROM RDB$PUBLICATIONS')) {
+            return {
+              fields: [
+                { name: 'PUB_NAME' },
+                { name: 'ACTIVE_FLAG' },
+                { name: 'AUTO_ENABLE' },
+              ],
+              rows: [['RDB$DEFAULT', 1, 1]],
+            };
+          }
+          if (sqlText.includes('FROM RDB$PUBLICATION_TABLES')) {
+            return {
+              fields: [{ name: 'TABLE_NAME' }],
+              rows: [['ORGS'], ['USERS']],
+            };
+          }
+          if (sqlText.includes("RDB$GET_CONTEXT('SYSTEM', 'REPLICA_MODE')")) {
+            return {
+              fields: [{ name: 'REPL_MODE' }, { name: 'REPL_SEQ' }],
+              rows: [['NONE', 12]],
+            };
+          }
           return { fields: [], rows: [] };
         }),
         transaction: vi.fn(async (fn) =>
@@ -658,6 +680,18 @@ describe('firebird-wasm/repl', () => {
       expect(inspectorNode.allText()).toContain('#6');
       expect(inspectorNode.allText()).toContain('Dead-Letter Queue (1)');
       expect(inspectorNode.allText()).toContain('CHECK constraint failed');
+      expect(replEntry?.replication?.enginePublication).toEqual({
+        name: 'RDB$DEFAULT',
+        active: true,
+        autoEnable: true,
+        publishedTables: ['ORGS', 'USERS'],
+        replicaMode: 'NONE',
+        replicationSequence: 12,
+      });
+      expect(inspectorNode.allText()).toContain('Native Engine Publication (RDB$PUBLICATIONS):');
+      expect(inspectorNode.allText()).toContain('RDB$DEFAULT (ACTIVE · INCLUDE ALL)');
+      expect(inspectorNode.allText()).toContain('ORGS, USERS');
+      expect(inspectorNode.allText()).toContain('NONE / seq 12');
 
       // 6. Toggle inspector closed
       await el.toggleInspector('replication');

@@ -310,6 +310,14 @@ export {
   parseFbChangelogSegment,
   readWasmChangelogSegments,
   applyFbChangelogSegmentToDatabase,
+  decodeFbChangelogBlockOperations,
+  decodeFbChangelogOperations,
+  decodeJrdRecordBuffer,
+  encodeJrdRecordBuffer,
+  encodeFbChangelogSegment,
+  fbChangelogToLogicalEntries,
+  setWasmDatabaseReplicaMode,
+  createWasmChangelogPoller,
 } from './replication';
 export type {
   ReplicableDatabase,
@@ -404,6 +412,16 @@ export type {
   FbChangelogBlock,
   ParsedFbChangelogSegment,
   ApplyFbChangelogResult,
+  DecodedFbChangelogOpBase,
+  DecodedFbChangelogOperation,
+  JrdColumnDescriptor,
+  EncodeFbChangelogSegmentOptions,
+  FbChangelogLogicalDecodeOptions,
+  FbChangelogLogicalDecodeResult,
+  WasmReplicaMode,
+  WasmChangelogPollerOptions,
+  WasmChangelogPollerStats,
+  WasmChangelogPoller,
 } from './replication';
 export {
   ENCRYPTED_PAGE_MAGIC,

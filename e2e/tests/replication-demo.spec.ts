@@ -137,6 +137,10 @@ test.describe('Replication Simulator v2 (replication.html)', () => {
     await page.locator('#show-binary-hex').click();
     await expect(page.locator('#code-inspector')).toContainText('Native Binary Replication Segment');
 
+    await page.locator('#show-fbchangelog').click();
+    await expect(page.locator('#code-inspector')).toContainText('ChangeLog::Header (48 bytes)');
+    await expect(page.locator('#code-inspector')).toContainText('FBCHANGELOG');
+
     await page.locator('#show-encrypted-hex').click();
     await expect(page.locator('#code-inspector')).toContainText('0x53444246');
     await expect(page.locator('#code-inspector')).toContainText('AES-256-GCM');
@@ -162,5 +166,22 @@ test.describe('Replication Simulator v2 (replication.html)', () => {
     await expect(page.locator('#code-inspector')).toContainText('Dead-Letter Queue (FB_REPL_DLQ$)');
     await expect(page.locator('#code-inspector')).toContainText('validateEntry rejected row');
     await expect(page.locator('#event-feed')).toContainText('Scenario 10');
+  });
+
+  test('Scenario 11: Native Engine Replication (RDB$PUBLICATIONS + FBCHANGELOG\\0 48B Header & Replication::Block Inspector)', async ({
+    page,
+  }) => {
+    await openReplicationSim(page);
+    await expect(page.locator('#engine-pub-badge')).toContainText('RDB$PUBLICATIONS: RDB$DEFAULT');
+
+    await page.locator('.scenario-card[data-scenario="fbchangelog"]').click();
+
+    await expect(page.locator('#primary-rows')).toContainText('Native FBCHANGELOG Task');
+    await expect(page.locator('#replica-rows')).toContainText('Native FBCHANGELOG Task');
+    await expect(page.locator('#engine-pub-badge')).toContainText('seq 2');
+    await expect(page.locator('#code-inspector')).toContainText('ChangeLog::Header (48 bytes)');
+    await expect(page.locator('#code-inspector')).toContainText('opSetSequence');
+    await expect(page.locator('#code-inspector')).toContainText('opInsertRecord');
+    await expect(page.locator('#event-feed')).toContainText('Scenario 11');
   });
 });

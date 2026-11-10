@@ -8557,9 +8557,10 @@ export const FbChangelogOpcode = {
   opPrepareTransaction: 2,
   opCommitTransaction: 3,
   opRollbackTransaction: 4,
-  opCleanupTransaction: 7,
-  opStartSavepoint: 5,
-  opDefineAtom: 6,
+  opCleanupTransaction: 5,
+  opStartSavepoint: 6,
+  opReleaseSavepoint: 7,
+  opRollbackSavepoint: 8,
   opInsertRecord: 9,
   opUpdateRecord: 10,
   opDeleteRecord: 11,
@@ -8567,6 +8568,7 @@ export const FbChangelogOpcode = {
   opExecuteSql: 13,
   opSetSequence: 14,
   opExecuteSqlIntl: 15,
+  opDefineAtom: 16,
 } as const;
 
 /** Status of Firebird's built-in `RDB$PUBLICATIONS` / `RDB$PUBLICATION_TABLES` catalog (`M16 Item 1`). */
@@ -8810,6 +8812,7 @@ export interface ReplicationEmscriptenFS {
   writeFile(path: string, data: Uint8Array | string, opts?: { encoding?: string }): void;
   readFile(path: string, opts?: { encoding?: string }): Uint8Array | string;
   readdir?(path: string): string[];
+  unlink?(path: string): void;
   analyzePath?(path: string): { exists: boolean };
 }
 
@@ -9045,11 +9048,7 @@ export function parseFbChangelogSegment(
 
     const payload = bytes.slice(payloadStart, payloadEnd);
     const leadingOpcode = payload.length > 0 ? payload[0]! : null;
-    const { atoms, executedSql } = extractAtomsAndSqlFromPayload(payload, protocol);
-    for (const a of atoms) allAtoms.add(a);
-    for (const s of executedSql) allExecutedSql.push(s);
-
-    blocks.push({
+    const tempBlock: FbChangelogBlock = {
       offset,
       traNumber,
       protocol,
@@ -9059,6 +9058,29 @@ export function parseFbChangelogSegment(
       length: blockLen,
       payload,
       leadingOpcode,
+      atoms: [],
+      executedSql: [],
+    };
+    let atoms: string[];
+    let executedSql: string[];
+    try {
+      const ops = decodeFbChangelogBlockOperationsStrict(tempBlock);
+      atoms = [];
+      executedSql = [];
+      for (const op of ops) {
+        if (op.kind === 'define_atom') atoms.push(op.name);
+        else if (op.kind === 'execute_sql') executedSql.push(op.sql);
+      }
+    } catch {
+      const fallback = extractAtomsAndSqlFromPayload(payload, protocol);
+      atoms = fallback.atoms;
+      executedSql = fallback.executedSql;
+    }
+    for (const a of atoms) allAtoms.add(a);
+    for (const s of executedSql) allExecutedSql.push(s);
+
+    blocks.push({
+      ...tempBlock,
       atoms,
       executedSql,
     });
@@ -9120,26 +9142,32 @@ export function readWasmChangelogSegments(
   return segments;
 }
 
-/** Result returned by {@link applyFbChangelogSegmentToDatabase} (`M16 Item 3`). */
+/** Result returned by {@link applyFbChangelogSegmentToDatabase} (`M16 Item 3` / `M17 Item 1`). */
 export interface ApplyFbChangelogResult {
   /** Segment sequence number from the `"FBCHANGELOG\0"` header. */
   readonly sequence: number;
   /** Number of `Replication::Block` records processed. */
   readonly blocksProcessed: number;
-  /** Number of SQL DDL statements replayed. */
+  /** SQL DDL statements replayed. */
   readonly ddlExecuted: readonly string[];
+  /** Number of logical DML (`INSERT`/`UPDATE`/`DELETE`) row operations replayed in fallback mode. */
+  readonly entriesApplied?: number;
+  /** Number of `opSetSequence` watermarks replayed in fallback mode. */
+  readonly sequencesApplied?: number;
   /** Whether the native C++ `_fb_replicate_changelog` (`IReplicator`) fast-path was used. */
   readonly usedNativeReplicator: boolean;
 }
 
 /**
- * Apply a parsed or raw `"FBCHANGELOG\0"` segment to a target database (`M16 Item 3`).
+ * Apply a parsed or raw `"FBCHANGELOG\0"` segment to a target database (`M16 Item 3` / `M17 Item 1`).
  *
  * - When `wasmModule` and `dbHandle` are provided and `wasmModule._fb_replicate_changelog`
  *   is compiled into the WASM binary, invokes Firebird's native `IAttachment::createReplicator`
  *   (`IReplicator::process` / `IReplicator::close`) directly in C++.
- * - Otherwise, replays any `opExecuteSql` / `opExecuteSqlIntl` DDL statements extracted
- *   from the `"FBCHANGELOG\0"` blocks onto `targetDb` via SQL execution.
+ * - Otherwise, decodes committed transactions via {@link fbChangelogToLogicalEntries}
+ *   and replays DDL (`opExecuteSql` / `opExecuteSqlIntl`), sequence watermarks
+ *   (`opSetSequence`), and decoded row mutations (`opInsertRecord` / `opUpdateRecord` /
+ *   `opDeleteRecord` when `tableSchemas` is supplied) onto `targetDb`.
  */
 export async function applyFbChangelogSegmentToDatabase(
   targetDb: ReplicableDatabase,
@@ -9152,6 +9180,7 @@ export async function applyFbChangelogSegmentToDatabase(
       HEAPU8: Uint8Array;
     };
     dbHandle?: number;
+    tableSchemas?: Readonly<Record<string, ReadonlyArray<JrdColumnDescriptor>>>;
   } = {},
 ): Promise<ApplyFbChangelogResult> {
   const segment =
@@ -9162,10 +9191,16 @@ export async function applyFbChangelogSegmentToDatabase(
   const mod = options.wasmModule;
   const dbHandle = options.dbHandle;
   if (mod && typeof mod._fb_replicate_changelog === 'function' && dbHandle && dbHandle > 0) {
-    const ptr = mod._malloc(segment.rawBytes.byteLength);
+    const effectiveLen =
+      segment.header.length >= FB_CHANGELOG_HEADER_BYTES &&
+      segment.header.length < segment.rawBytes.byteLength
+        ? segment.header.length
+        : segment.rawBytes.byteLength;
+    const effectiveBytes = segment.rawBytes.subarray(0, effectiveLen);
+    const ptr = mod._malloc(effectiveBytes.byteLength);
     try {
-      mod.HEAPU8.set(segment.rawBytes, ptr);
-      const rc = mod._fb_replicate_changelog(dbHandle, ptr, segment.rawBytes.byteLength);
+      mod.HEAPU8.set(effectiveBytes, ptr);
+      const rc = mod._fb_replicate_changelog(dbHandle, ptr, effectiveBytes.byteLength);
       if (rc >= 0) {
         return {
           sequence: segment.header.sequence,
@@ -9179,18 +9214,1287 @@ export async function applyFbChangelogSegmentToDatabase(
     }
   }
 
+  let decoded: FbChangelogLogicalDecodeResult | null = null;
+  try {
+    decoded = fbChangelogToLogicalEntries(segment, {
+      ...(options.tableSchemas !== undefined ? { tableSchemas: options.tableSchemas } : {}),
+    });
+  } catch {
+    decoded = null;
+  }
+
   const ddlExecuted: string[] = [];
-  for (const sql of segment.executedSql) {
-    await execStatement(targetDb, sql);
-    ddlExecuted.push(sql);
+  let entriesApplied = 0;
+  let sequencesApplied = 0;
+
+  if (decoded && (decoded.entries.length > 0 || decoded.sequences.length > 0)) {
+    for (const entry of decoded.entries) {
+      if (entry.operation === 'DDL' && entry.ddlSql) {
+        await execStatement(targetDb, entry.ddlSql);
+        ddlExecuted.push(entry.ddlSql);
+      } else if (
+        entry.operation === 'INSERT' ||
+        entry.operation === 'UPDATE' ||
+        entry.operation === 'DELETE'
+      ) {
+        const pkCols = Object.keys(entry.key);
+        if (pkCols.length > 0) {
+          await applyRowMutationToTable(
+            targetDb,
+            entry.table,
+            pkCols,
+            entry.operation,
+            entry.key,
+            entry.after,
+          );
+          entriesApplied++;
+        }
+      }
+    }
+    if (decoded.sequences.length > 0) {
+      sequencesApplied = await applySequences(targetDb, decoded.sequences);
+    }
+  } else {
+    for (const sql of segment.executedSql) {
+      await execStatement(targetDb, sql);
+      ddlExecuted.push(sql);
+    }
   }
 
   return {
     sequence: segment.header.sequence,
     blocksProcessed: segment.blocks.length,
     ddlExecuted,
+    entriesApplied,
+    sequencesApplied,
     usedNativeReplicator: false,
   };
 }
+
+// ---------------------------------------------------------------------------
+// 17. Full "FBCHANGELOG\0" Binary Operation & Sequence Decoder, Replica Mode
+//     Header Helper & Continuous Changelog Poller (M17 Items 1, 2 & 5)
+// ---------------------------------------------------------------------------
+
+/** Common fields shared by every decoded `Replication::Block` operation (`M17 Item 1`). */
+export interface DecodedFbChangelogOpBase {
+  /** Firebird transaction number (`traNumber`). */
+  readonly traNumber: number;
+  /** Replication protocol version (`1` in Firebird 4/5, `2` in Firebird 6). */
+  readonly protocol: number;
+  /** Byte offset of the enclosing `Replication::Block` inside the segment file. */
+  readonly blockOffset: number;
+  /** Raw numeric opcode from `src/jrd/replication/Protocol.h` (`1..16`). */
+  readonly opcode: number;
+}
+
+/** Discriminated union of all 16 Firebird `Replication::Block` operations (`M17 Item 1`). */
+export type DecodedFbChangelogOperation =
+  | (DecodedFbChangelogOpBase & {
+      readonly kind:
+        | 'start_transaction'
+        | 'prepare_transaction'
+        | 'commit_transaction'
+        | 'rollback_transaction'
+        | 'cleanup_transaction'
+        | 'start_savepoint'
+        | 'release_savepoint'
+        | 'rollback_savepoint';
+    })
+  | (DecodedFbChangelogOpBase & {
+      readonly kind: 'define_atom';
+      /** 0-based per-block atom index assigned to `name`. */
+      readonly atomIndex: number;
+      /** Identifier string stored in the block's local atom table. */
+      readonly name: string;
+    })
+  | (DecodedFbChangelogOpBase & {
+      readonly kind: 'insert_record';
+      /** Schema name (`"PUBLIC"`, etc.) in `protocol >= 2`, or `null` in `protocol === 1`. */
+      readonly schemaName: string | null;
+      /** Relation/table name from the block atom table. */
+      readonly tableName: string;
+      /** Uncompressed JRD record byte length. */
+      readonly recordLength: number;
+      /** Uncompressed JRD record buffer (`recordLength` bytes). */
+      readonly recordData: Uint8Array;
+    })
+  | (DecodedFbChangelogOpBase & {
+      readonly kind: 'update_record';
+      readonly schemaName: string | null;
+      readonly tableName: string;
+      readonly oldRecordLength: number;
+      readonly oldRecordData: Uint8Array;
+      readonly newRecordLength: number;
+      readonly newRecordData: Uint8Array;
+    })
+  | (DecodedFbChangelogOpBase & {
+      readonly kind: 'delete_record';
+      readonly schemaName: string | null;
+      readonly tableName: string;
+      readonly oldRecordLength: number;
+      readonly oldRecordData: Uint8Array;
+    })
+  | (DecodedFbChangelogOpBase & {
+      readonly kind: 'store_blob';
+      /** High 32-bit word (`bid_quad_high`) of the 8-byte `ISC_QUAD` BLOB ID. */
+      readonly blobIdHigh: number;
+      /** Low 32-bit word (`bid_quad_low`) of the 8-byte `ISC_QUAD` BLOB ID. */
+      readonly blobIdLow: number;
+      /** Canonical 16-hex-char representation of the 8-byte `ISC_QUAD` bytes in record order. */
+      readonly blobIdHex: string;
+      /** Reassembled BLOB payload across all segments before the `0x0000` terminator. */
+      readonly data: Uint8Array;
+      /** Number of non-empty chunks read for this BLOB. */
+      readonly chunkCount: number;
+    })
+  | (DecodedFbChangelogOpBase & {
+      readonly kind: 'execute_sql';
+      /** User/owner atom name (e.g. `'SYSDBA'`). */
+      readonly ownerName: string;
+      /** Schema search path string in `protocol >= 2` for `opExecuteSqlIntl`, else `null`. */
+      readonly schemaSearchPath: string | null;
+      /** Firebird character set ID (`4` = `CS_UTF8`). */
+      readonly charsetId: number;
+      /** Executed SQL DDL/DML text. */
+      readonly sql: string;
+      /** `true` when encoded as `opExecuteSqlIntl` (`15`), `false` for `opExecuteSql` (`13`). */
+      readonly intl: boolean;
+    })
+  | (DecodedFbChangelogOpBase & {
+      readonly kind: 'set_sequence';
+      readonly schemaName: string | null;
+      readonly sequenceName: string;
+      /** Sequence value as JS `number`. */
+      readonly value: number;
+      /** Exact 64-bit signed integer sequence value (`SINT64`). */
+      readonly bigValue: bigint;
+    });
+
+function bytesToHexLower(bytes: Uint8Array): string {
+  let out = '';
+  for (let i = 0; i < bytes.length; i++) {
+    out += bytes[i]!.toString(16).padStart(2, '0');
+  }
+  return out;
+}
+
+function decodeFbChangelogBlockOperationsStrict(
+  block: FbChangelogBlock,
+): DecodedFbChangelogOperation[] {
+  const payload = block.payload;
+  const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+  const utf8 = new TextDecoder('utf-8', { fatal: false });
+  const atoms: string[] = [];
+  const ops: DecodedFbChangelogOperation[] = [];
+  let pos = 0;
+
+  const ensure = (n: number): void => {
+    if (pos + n > payload.byteLength) {
+      throw new Error(
+        `Truncated Replication::Block at byte ${pos} (needed ${n}, remaining ${payload.byteLength - pos}).`,
+      );
+    }
+  };
+  const readU8 = (): number => {
+    ensure(1);
+    return payload[pos++]!;
+  };
+  const readU16 = (): number => {
+    ensure(2);
+    const v = view.getUint16(pos, true);
+    pos += 2;
+    return v;
+  };
+  const readI32 = (): number => {
+    ensure(4);
+    const v = view.getInt32(pos, true);
+    pos += 4;
+    return v;
+  };
+  const readU32 = (): number => {
+    ensure(4);
+    const v = view.getUint32(pos, true);
+    pos += 4;
+    return v;
+  };
+  const readI64 = (): bigint => {
+    ensure(8);
+    const v = view.getBigInt64(pos, true);
+    pos += 8;
+    return v;
+  };
+  const readBytes = (len: number): Uint8Array => {
+    if (len < 0) throw new Error(`Negative binary length ${len} in Replication::Block.`);
+    ensure(len);
+    const slice = payload.slice(pos, pos + len);
+    pos += len;
+    return slice;
+  };
+  const readAtom = (): string => {
+    const idx = readI32();
+    if (idx < 0 || idx >= atoms.length) {
+      throw new Error(`Invalid atom index ${idx} (atoms defined: ${atoms.length}).`);
+    }
+    return atoms[idx]!;
+  };
+  const readQualifiedAtom = (): { schemaName: string | null; objectName: string } => {
+    if (block.protocol >= 2) {
+      const schemaName = readAtom();
+      const objectName = readAtom();
+      return { schemaName, objectName };
+    }
+    return { schemaName: null, objectName: readAtom() };
+  };
+
+  while (pos < payload.byteLength) {
+    const opcode = readU8();
+    const base: DecodedFbChangelogOpBase = {
+      traNumber: block.traNumber,
+      protocol: block.protocol,
+      blockOffset: block.offset,
+      opcode,
+    };
+
+    switch (opcode) {
+      case FbChangelogOpcode.opStartTransaction:
+        ops.push({ ...base, kind: 'start_transaction' });
+        break;
+      case FbChangelogOpcode.opPrepareTransaction:
+        ops.push({ ...base, kind: 'prepare_transaction' });
+        break;
+      case FbChangelogOpcode.opCommitTransaction:
+        ops.push({ ...base, kind: 'commit_transaction' });
+        break;
+      case FbChangelogOpcode.opRollbackTransaction:
+        ops.push({ ...base, kind: 'rollback_transaction' });
+        break;
+      case FbChangelogOpcode.opCleanupTransaction:
+        ops.push({ ...base, kind: 'cleanup_transaction' });
+        break;
+      case FbChangelogOpcode.opStartSavepoint:
+        ops.push({ ...base, kind: 'start_savepoint' });
+        break;
+      case FbChangelogOpcode.opReleaseSavepoint:
+        ops.push({ ...base, kind: 'release_savepoint' });
+        break;
+      case FbChangelogOpcode.opRollbackSavepoint:
+        ops.push({ ...base, kind: 'rollback_savepoint' });
+        break;
+      case FbChangelogOpcode.opDefineAtom: {
+        const nameLen = readU8();
+        const nameBytes = readBytes(nameLen);
+        const name = utf8.decode(nameBytes);
+        const atomIndex = atoms.length;
+        atoms.push(name);
+        ops.push({ ...base, kind: 'define_atom', atomIndex, name });
+        break;
+      }
+      case FbChangelogOpcode.opInsertRecord: {
+        const { schemaName, objectName } = readQualifiedAtom();
+        const recordLength = readU32();
+        const recordData = readBytes(recordLength);
+        ops.push({
+          ...base,
+          kind: 'insert_record',
+          schemaName,
+          tableName: objectName,
+          recordLength,
+          recordData,
+        });
+        break;
+      }
+      case FbChangelogOpcode.opUpdateRecord: {
+        const { schemaName, objectName } = readQualifiedAtom();
+        const oldRecordLength = readU32();
+        const oldRecordData = readBytes(oldRecordLength);
+        const newRecordLength = readU32();
+        const newRecordData = readBytes(newRecordLength);
+        ops.push({
+          ...base,
+          kind: 'update_record',
+          schemaName,
+          tableName: objectName,
+          oldRecordLength,
+          oldRecordData,
+          newRecordLength,
+          newRecordData,
+        });
+        break;
+      }
+      case FbChangelogOpcode.opDeleteRecord: {
+        const { schemaName, objectName } = readQualifiedAtom();
+        const oldRecordLength = readU32();
+        const oldRecordData = readBytes(oldRecordLength);
+        ops.push({
+          ...base,
+          kind: 'delete_record',
+          schemaName,
+          tableName: objectName,
+          oldRecordLength,
+          oldRecordData,
+        });
+        break;
+      }
+      case FbChangelogOpcode.opStoreBlob: {
+        ensure(8);
+        const quadBytes = payload.slice(pos, pos + 8);
+        const blobIdHigh = readU32();
+        const blobIdLow = readU32();
+        const blobIdHex = bytesToHexLower(quadBytes);
+        const chunks: Uint8Array[] = [];
+        let totalBytes = 0;
+        while (pos < payload.byteLength) {
+          const chunkLen = readU16();
+          if (chunkLen === 0) break;
+          const chunk = readBytes(chunkLen);
+          chunks.push(chunk);
+          totalBytes += chunk.byteLength;
+        }
+        const data = new Uint8Array(totalBytes);
+        let writeOff = 0;
+        for (const c of chunks) {
+          data.set(c, writeOff);
+          writeOff += c.byteLength;
+        }
+        ops.push({
+          ...base,
+          kind: 'store_blob',
+          blobIdHigh,
+          blobIdLow,
+          blobIdHex,
+          data,
+          chunkCount: chunks.length,
+        });
+        break;
+      }
+      case FbChangelogOpcode.opExecuteSql:
+      case FbChangelogOpcode.opExecuteSqlIntl: {
+        const intl = opcode === FbChangelogOpcode.opExecuteSqlIntl;
+        const ownerName = readAtom();
+        const schemaSearchPath = intl && block.protocol >= 2 ? readAtom() : null;
+        const charsetId = intl ? readU8() : 4;
+        const sqlLen = readU32();
+        const sqlBytes = readBytes(sqlLen);
+        const sql = utf8.decode(sqlBytes);
+        ops.push({
+          ...base,
+          kind: 'execute_sql',
+          ownerName,
+          schemaSearchPath,
+          charsetId,
+          sql,
+          intl,
+        });
+        break;
+      }
+      case FbChangelogOpcode.opSetSequence: {
+        const { schemaName, objectName } = readQualifiedAtom();
+        const bigValue = readI64();
+        ops.push({
+          ...base,
+          kind: 'set_sequence',
+          schemaName,
+          sequenceName: objectName,
+          value: Number(bigValue),
+          bigValue,
+        });
+        break;
+      }
+      default:
+        throw new Error(`Unsupported Firebird replication opcode ${opcode} at byte ${pos - 1}.`);
+    }
+  }
+
+  return ops;
+}
+
+/**
+ * Decode all binary `Replication::Block` opcodes inside a single {@link FbChangelogBlock}
+ * according to Firebird's `BlockReader` (`src/jrd/replication/Applier.cpp`) (`M17 Item 1`).
+ */
+export function decodeFbChangelogBlockOperations(
+  block: FbChangelogBlock,
+): DecodedFbChangelogOperation[] {
+  return decodeFbChangelogBlockOperationsStrict(block);
+}
+
+/**
+ * Decode all binary `Replication::Block` operations across an entire `"FBCHANGELOG\0"`
+ * segment (`opStartTransaction`, `opCommitTransaction`, `opRollbackTransaction`,
+ * `opStartSavepoint`, `opReleaseSavepoint`, `opRollbackSavepoint`, `opDefineAtom`,
+ * `opInsertRecord`, `opUpdateRecord`, `opDeleteRecord`, `opStoreBlob`,
+ * `opExecuteSql`, `opSetSequence`, `opExecuteSqlIntl`) (`M17 Item 1`).
+ */
+export function decodeFbChangelogOperations(
+  segmentOrBytes: Uint8Array | ParsedFbChangelogSegment,
+): DecodedFbChangelogOperation[] {
+  const segment =
+    segmentOrBytes instanceof Uint8Array
+      ? parseFbChangelogSegment(segmentOrBytes)
+      : segmentOrBytes;
+  const out: DecodedFbChangelogOperation[] = [];
+  for (const block of segment.blocks) {
+    out.push(...decodeFbChangelogBlockOperationsStrict(block));
+  }
+  return out;
+}
+
+/** Column layout descriptor for decoding/encoding uncompressed Firebird JRD record buffers (`M17 Item 1`). */
+export interface JrdColumnDescriptor {
+  /** Column name (e.g. `'ID'`, `'TITLE'`). */
+  readonly name: string;
+  /** SQL column type in the Firebird relation format. */
+  readonly type:
+    | 'SMALLINT'
+    | 'INTEGER'
+    | 'INT'
+    | 'BIGINT'
+    | 'INT64'
+    | 'FLOAT'
+    | 'DOUBLE PRECISION'
+    | 'DOUBLE'
+    | 'BOOLEAN'
+    | 'VARCHAR'
+    | 'CHAR'
+    | 'BLOB';
+  /**
+   * Storage byte length of the text buffer for `VARCHAR` / `CHAR`
+   * (for UTF-8 `VARCHAR(N)`, `maxBytes = N * 4`; defaults to `charLength * 4` or `128`).
+   */
+  readonly maxBytes?: number;
+  /** Declared character length `N` for `VARCHAR(N)` / `CHAR(N)`. */
+  readonly charLength?: number;
+  /** Optional negative decimal scale (e.g. `-2` for `NUMERIC(9, 2)`). */
+  readonly scale?: number;
+  /** Whether this column is part of the table's primary key. */
+  readonly primaryKey?: boolean;
+  /** For `BLOB`: `'TEXT'` (decoded as UTF-8 `string`) or `'BINARY'` (`Uint8Array`). @default 'TEXT' */
+  readonly blobSubType?: 'TEXT' | 'BINARY';
+}
+
+function alignOffset(offset: number, alignment: number): number {
+  if (alignment <= 1) return offset;
+  const rem = offset % alignment;
+  return rem === 0 ? offset : offset + (alignment - rem);
+}
+
+/**
+ * Decode an uncompressed Firebird JRD record buffer (`opInsertRecord` /
+ * `opUpdateRecord` / `opDeleteRecord`) into a typed JavaScript row object (`M17 Item 1`).
+ */
+export function decodeJrdRecordBuffer(
+  recordData: Uint8Array,
+  columns: ReadonlyArray<JrdColumnDescriptor>,
+  blobs?: ReadonlyMap<string, Uint8Array>,
+): Record<string, unknown> {
+  const view = new DataView(recordData.buffer, recordData.byteOffset, recordData.byteLength);
+  const utf8 = new TextDecoder('utf-8', { fatal: false });
+  const row: Record<string, unknown> = {};
+
+  // Null bitmap at offset 0: 4-byte aligned array of bits (bit i == 1 => NULL, 0 => NOT NULL).
+  const nullBitmapBytes = Math.max(4, Math.ceil(columns.length / 32) * 4);
+  let offset = nullBitmapBytes;
+
+  for (let i = 0; i < columns.length; i++) {
+    const col = columns[i]!;
+    const byteIdx = i >> 3;
+    const bitMask = 1 << (i & 7);
+    const isNull = byteIdx < recordData.byteLength ? (recordData[byteIdx]! & bitMask) !== 0 : true;
+    const upperType = col.type.toUpperCase();
+    const scaleFactor = col.scale && col.scale < 0 ? Math.pow(10, col.scale) : 1;
+
+    switch (upperType) {
+      case 'SMALLINT': {
+        offset = alignOffset(offset, 2);
+        const raw = offset + 2 <= recordData.byteLength ? view.getInt16(offset, true) : 0;
+        offset += 2;
+        row[col.name] = isNull ? null : scaleFactor !== 1 ? raw * scaleFactor : raw;
+        break;
+      }
+      case 'INTEGER':
+      case 'INT': {
+        offset = alignOffset(offset, 4);
+        const raw = offset + 4 <= recordData.byteLength ? view.getInt32(offset, true) : 0;
+        offset += 4;
+        row[col.name] = isNull ? null : scaleFactor !== 1 ? raw * scaleFactor : raw;
+        break;
+      }
+      case 'BIGINT':
+      case 'INT64': {
+        offset = alignOffset(offset, 8);
+        const raw = offset + 8 <= recordData.byteLength ? view.getBigInt64(offset, true) : 0n;
+        offset += 8;
+        if (isNull) {
+          row[col.name] = null;
+        } else {
+          const num = Number(raw);
+          row[col.name] = scaleFactor !== 1 ? num * scaleFactor : num;
+        }
+        break;
+      }
+      case 'FLOAT': {
+        offset = alignOffset(offset, 4);
+        const raw = offset + 4 <= recordData.byteLength ? view.getFloat32(offset, true) : 0;
+        offset += 4;
+        row[col.name] = isNull ? null : raw;
+        break;
+      }
+      case 'DOUBLE PRECISION':
+      case 'DOUBLE': {
+        offset = alignOffset(offset, 8);
+        const raw = offset + 8 <= recordData.byteLength ? view.getFloat64(offset, true) : 0;
+        offset += 8;
+        row[col.name] = isNull ? null : raw;
+        break;
+      }
+      case 'BOOLEAN': {
+        const raw = offset < recordData.byteLength ? recordData[offset]! : 0;
+        offset += 1;
+        row[col.name] = isNull ? null : raw !== 0;
+        break;
+      }
+      case 'VARCHAR': {
+        offset = alignOffset(offset, 2);
+        const maxBytes = col.maxBytes ?? (col.charLength ?? 32) * 4;
+        const actualLen =
+          offset + 2 <= recordData.byteLength
+            ? Math.min(maxBytes, view.getUint16(offset, true))
+            : 0;
+        const strStart = offset + 2;
+        row[col.name] = isNull
+          ? null
+          : utf8.decode(
+              recordData.subarray(strStart, Math.min(recordData.byteLength, strStart + actualLen)),
+            );
+        offset += 2 + maxBytes;
+        break;
+      }
+      case 'CHAR': {
+        const maxBytes = col.maxBytes ?? (col.charLength ?? 1) * 4;
+        if (isNull) {
+          row[col.name] = null;
+        } else {
+          const rawStr = utf8.decode(
+            recordData.subarray(offset, Math.min(recordData.byteLength, offset + maxBytes)),
+          );
+          row[col.name] =
+            col.charLength !== undefined ? rawStr.slice(0, col.charLength).trimEnd() : rawStr.trimEnd();
+        }
+        offset += maxBytes;
+        break;
+      }
+      case 'BLOB': {
+        offset = alignOffset(offset, 4);
+        const quadSlice = recordData.slice(offset, Math.min(recordData.byteLength, offset + 8));
+        offset += 8;
+        if (isNull || quadSlice.every((b) => b === 0)) {
+          row[col.name] = null;
+        } else {
+          const hex = bytesToHexLower(quadSlice);
+          const blobBytes = blobs?.get(hex);
+          if (!blobBytes) {
+            row[col.name] = hex;
+          } else if ((col.blobSubType ?? 'TEXT') === 'BINARY') {
+            row[col.name] = blobBytes;
+          } else {
+            row[col.name] = utf8.decode(blobBytes);
+          }
+        }
+        break;
+      }
+      default:
+        row[col.name] = null;
+        break;
+    }
+  }
+
+  return row;
+}
+
+/**
+ * Encode a JavaScript row object into Firebird's uncompressed JRD record buffer
+ * format (`M17 Item 1` / `M17 Item 4`).
+ */
+export function encodeJrdRecordBuffer(
+  row: Readonly<Record<string, unknown>>,
+  columns: ReadonlyArray<JrdColumnDescriptor>,
+): Uint8Array {
+  const utf8Enc = new TextEncoder();
+  const nullBitmapBytes = Math.max(4, Math.ceil(columns.length / 32) * 4);
+
+  // First pass: calculate total byte length
+  let totalLen = nullBitmapBytes;
+  for (const col of columns) {
+    const upperType = col.type.toUpperCase();
+    switch (upperType) {
+      case 'SMALLINT':
+        totalLen = alignOffset(totalLen, 2) + 2;
+        break;
+      case 'INTEGER':
+      case 'INT':
+      case 'FLOAT':
+        totalLen = alignOffset(totalLen, 4) + 4;
+        break;
+      case 'BIGINT':
+      case 'INT64':
+      case 'DOUBLE PRECISION':
+      case 'DOUBLE':
+        totalLen = alignOffset(totalLen, 8) + 8;
+        break;
+      case 'BOOLEAN':
+        totalLen += 1;
+        break;
+      case 'VARCHAR':
+        totalLen = alignOffset(totalLen, 2) + 2 + (col.maxBytes ?? (col.charLength ?? 32) * 4);
+        break;
+      case 'CHAR':
+        totalLen += col.maxBytes ?? (col.charLength ?? 1) * 4;
+        break;
+      case 'BLOB':
+        totalLen = alignOffset(totalLen, 4) + 8;
+        break;
+    }
+  }
+
+  const buf = new Uint8Array(totalLen);
+  // Firebird initializes unused null-bitmap bits in the first 32-bit word to 1 (e.g. 0xFC for 2 NOT NULL cols)
+  for (let b = 0; b < nullBitmapBytes; b++) {
+    buf[b] = 0xff;
+  }
+  const view = new DataView(buf.buffer);
+  let offset = nullBitmapBytes;
+
+  for (let i = 0; i < columns.length; i++) {
+    const col = columns[i]!;
+    const val = row[col.name] ?? row[col.name.toUpperCase()] ?? row[col.name.toLowerCase()];
+    const isNull = val === null || val === undefined;
+    if (!isNull) {
+      buf[i >> 3]! &= ~(1 << (i & 7));
+    }
+
+    const upperType = col.type.toUpperCase();
+    const invScale = col.scale && col.scale < 0 ? Math.pow(10, -col.scale) : 1;
+
+    switch (upperType) {
+      case 'SMALLINT':
+        offset = alignOffset(offset, 2);
+        if (!isNull) view.setInt16(offset, Math.round(Number(val) * invScale), true);
+        offset += 2;
+        break;
+      case 'INTEGER':
+      case 'INT':
+        offset = alignOffset(offset, 4);
+        if (!isNull) view.setInt32(offset, Math.round(Number(val) * invScale), true);
+        offset += 4;
+        break;
+      case 'BIGINT':
+      case 'INT64':
+        offset = alignOffset(offset, 8);
+        if (!isNull) {
+          const bv = typeof val === 'bigint' ? val : BigInt(Math.round(Number(val) * invScale));
+          view.setBigInt64(offset, bv, true);
+        }
+        offset += 8;
+        break;
+      case 'FLOAT':
+        offset = alignOffset(offset, 4);
+        if (!isNull) view.setFloat32(offset, Number(val), true);
+        offset += 4;
+        break;
+      case 'DOUBLE PRECISION':
+      case 'DOUBLE':
+        offset = alignOffset(offset, 8);
+        if (!isNull) view.setFloat64(offset, Number(val), true);
+        offset += 8;
+        break;
+      case 'BOOLEAN':
+        buf[offset] = !isNull && Boolean(val) ? 1 : 0;
+        offset += 1;
+        break;
+      case 'VARCHAR': {
+        offset = alignOffset(offset, 2);
+        const maxBytes = col.maxBytes ?? (col.charLength ?? 32) * 4;
+        if (!isNull) {
+          const encoded = utf8Enc.encode(String(val));
+          const copyLen = Math.min(maxBytes, encoded.byteLength);
+          view.setUint16(offset, copyLen, true);
+          buf.set(encoded.subarray(0, copyLen), offset + 2);
+        }
+        offset += 2 + maxBytes;
+        break;
+      }
+      case 'CHAR': {
+        const maxBytes = col.maxBytes ?? (col.charLength ?? 1) * 4;
+        buf.fill(0x20, offset, offset + maxBytes);
+        if (!isNull) {
+          const encoded = utf8Enc.encode(String(val));
+          buf.set(encoded.subarray(0, Math.min(maxBytes, encoded.byteLength)), offset);
+        }
+        offset += maxBytes;
+        break;
+      }
+      case 'BLOB': {
+        offset = alignOffset(offset, 4);
+        if (!isNull && typeof val === 'string' && /^[0-9a-fA-F]{16}$/.test(val)) {
+          for (let j = 0; j < 8; j++) {
+            buf[offset + j] = parseInt(val.slice(j * 2, j * 2 + 2), 16);
+          }
+        } else if (!isNull && val instanceof Uint8Array && val.byteLength === 8) {
+          buf.set(val, offset);
+        }
+        offset += 8;
+        break;
+      }
+    }
+  }
+
+  return buf;
+}
+
+/** Input specification for encoding a `"FBCHANGELOG\0"` binary segment (`M17 Item 1` / `M17 Item 4`). */
+export interface EncodeFbChangelogSegmentOptions {
+  /** Changelog segment sequence number (`1`, `2`, ...). @default 1 */
+  sequence?: number;
+  /** Segment state (`1` = `USED`, `2` = `FULL`, `3` = `ARCHIVABLE`). @default 3 */
+  state?: number;
+  /** 16-byte database GUID or formatted UUID (`XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX`). */
+  guid?: Uint8Array | string;
+  /** Replication protocol version (`2` for Firebird 6, `1` for Firebird 4/5). @default 2 */
+  protocol?: number;
+  /** Ordered `Replication::Block` definitions to pack into the segment. */
+  blocks: ReadonlyArray<{
+    traNumber: number;
+    flags?: number;
+    protocol?: number;
+    payload: Uint8Array;
+  }>;
+}
+
+/**
+ * Pack a 48-byte `"FBCHANGELOG\0"` `ChangeLog::Header` and a sequence of 16-byte
+ * `Replication::Block` records into a valid Firebird binary changelog segment (`M17 Item 1`).
+ */
+export function encodeFbChangelogSegment(options: EncodeFbChangelogSegmentOptions): Uint8Array {
+  const defaultProtocol = options.protocol ?? 2;
+  let totalLen = FB_CHANGELOG_HEADER_BYTES;
+  for (const b of options.blocks) {
+    totalLen += FB_CHANGELOG_BLOCK_HEADER_BYTES + b.payload.byteLength;
+  }
+
+  const out = new Uint8Array(totalLen);
+  const view = new DataView(out.buffer);
+  for (let i = 0; i < FB_CHANGELOG_MAGIC.length; i++) {
+    out[i] = FB_CHANGELOG_MAGIC.charCodeAt(i);
+  }
+  view.setUint16(12, 1, true); // version = 1
+  view.setUint16(14, options.state ?? 3, true); // state = ARCHIVABLE (3)
+
+  if (options.guid instanceof Uint8Array && options.guid.byteLength === 16) {
+    out.set(options.guid, 16);
+  } else if (typeof options.guid === 'string') {
+    const cleanHex = options.guid.replace(/-/g, '');
+    for (let i = 0; i < 16 && i * 2 + 2 <= cleanHex.length; i++) {
+      out[16 + i] = parseInt(cleanHex.slice(i * 2, i * 2 + 2), 16) || 0;
+    }
+  } else {
+    for (let i = 0; i < 16; i++) out[16 + i] = (i + 1) & 0xff;
+  }
+
+  view.setBigUint64(32, BigInt(options.sequence ?? 1), true);
+  view.setBigUint64(40, BigInt(totalLen), true);
+
+  let offset = FB_CHANGELOG_HEADER_BYTES;
+  for (const b of options.blocks) {
+    view.setBigUint64(offset, BigInt(b.traNumber), true);
+    view.setUint16(offset + 8, b.protocol ?? defaultProtocol, true);
+    view.setUint16(
+      offset + 10,
+      b.flags ?? (FB_CHANGELOG_BLOCK_BEGIN_TRANS | FB_CHANGELOG_BLOCK_END_TRANS),
+      true,
+    );
+    view.setUint32(offset + 12, b.payload.byteLength, true);
+    out.set(b.payload, offset + FB_CHANGELOG_BLOCK_HEADER_BYTES);
+    offset += FB_CHANGELOG_BLOCK_HEADER_BYTES + b.payload.byteLength;
+  }
+
+  return out;
+}
+
+/** Options for {@link fbChangelogToLogicalEntries} (`M17 Item 1`). */
+export interface FbChangelogLogicalDecodeOptions {
+  /** Per-table JRD column layouts (case-insensitive table name) for decoding record buffers. */
+  tableSchemas?: Readonly<Record<string, ReadonlyArray<JrdColumnDescriptor>>>;
+  /** Origin node label assigned to emitted `ReplicationLogEntry` items. @default 'fb_native' */
+  origin?: string;
+  /** Publication name assigned to emitted `ReplicationLogEntry` items. @default 'RDB$DEFAULT' */
+  publication?: string;
+  /** Starting LSN counter for emitted `ReplicationLogEntry` items. @default 1 */
+  startLsn?: number;
+  /** Epoch timestamp (`Date.now()`) assigned to emitted entries. */
+  timestamp?: number;
+}
+
+/** Result returned by {@link fbChangelogToLogicalEntries} (`M17 Item 1`). */
+export interface FbChangelogLogicalDecodeResult {
+  /** Committed logical `INSERT`, `UPDATE`, `DELETE`, and `DDL` entries in commit order. */
+  readonly entries: ReplicationLogEntry[];
+  /** Latest generator/sequence watermarks (`opSetSequence`) emitted across the segment. */
+  readonly sequences: SequenceWatermark[];
+  /** Committed SQL DDL statements (`opExecuteSql` / `opExecuteSqlIntl`). */
+  readonly ddlStatements: string[];
+  /** Transaction numbers that committed (`opCommitTransaction`). */
+  readonly committedTransactions: number[];
+  /** Transaction numbers that rolled back or were cleaned up (`opRollbackTransaction` / `opCleanupTransaction`). */
+  readonly rolledBackTransactions: number[];
+}
+
+/**
+ * Convert a binary Firebird `"FBCHANGELOG\0"` segment into committed logical
+ * {@link ReplicationLogEntry} items and {@link SequenceWatermark} updates (`M17 Item 1`).
+ *
+ * Honors transaction boundaries (`opCommitTransaction` vs `opRollbackTransaction` /
+ * `opCleanupTransaction`), nested savepoint rollbacks (`opStartSavepoint` /
+ * `opReleaseSavepoint` / `opRollbackSavepoint`), `opStoreBlob` payloads, and
+ * non-transactional `opSetSequence` watermarks (`traNumber === 0` or inside a tx).
+ */
+export function fbChangelogToLogicalEntries(
+  segmentOrBytes: Uint8Array | ParsedFbChangelogSegment,
+  options: FbChangelogLogicalDecodeOptions = {},
+): FbChangelogLogicalDecodeResult {
+  const ops = decodeFbChangelogOperations(segmentOrBytes);
+  const origin = options.origin ?? 'fb_native';
+  const publication = options.publication ?? 'RDB$DEFAULT';
+  const ts = options.timestamp ?? Date.now();
+  let nextLsn = options.startLsn ?? 1;
+
+  const normalizedSchemas = new Map<string, ReadonlyArray<JrdColumnDescriptor>>();
+  if (options.tableSchemas) {
+    for (const [tbl, cols] of Object.entries(options.tableSchemas)) {
+      normalizedSchemas.set(tbl.trim().toUpperCase(), cols);
+    }
+  }
+
+  interface PendingTxAction {
+    readonly op: DecodedFbChangelogOperation;
+  }
+  interface TxState {
+    actions: PendingTxAction[];
+    savepointStack: number[];
+    blobs: Map<string, Uint8Array>;
+  }
+
+  const activeTxs = new Map<number, TxState>();
+  const getOrCreateTx = (traNum: number): TxState => {
+    let tx = activeTxs.get(traNum);
+    if (!tx) {
+      tx = { actions: [], savepointStack: [], blobs: new Map() };
+      activeTxs.set(traNum, tx);
+    }
+    return tx;
+  };
+
+  const entries: ReplicationLogEntry[] = [];
+  const ddlStatements: string[] = [];
+  const sequenceMap = new Map<string, number>();
+  const committedTransactions: number[] = [];
+  const rolledBackTransactions: number[] = [];
+
+  const extractPrimaryKey = (
+    cols: ReadonlyArray<JrdColumnDescriptor>,
+    row: Record<string, unknown>,
+  ): Record<string, unknown> => {
+    const pkCols = cols.filter((c) => c.primaryKey);
+    const chosen = pkCols.length > 0 ? pkCols : cols.slice(0, 1);
+    const key: Record<string, unknown> = {};
+    for (const c of chosen) {
+      key[c.name] = row[c.name];
+    }
+    return key;
+  };
+
+  const flushCommittedTx = (traNumber: number, tx: TxState): void => {
+    const txid = String(traNumber);
+    for (const { op } of tx.actions) {
+      if (op.kind === 'execute_sql') {
+        ddlStatements.push(op.sql);
+        entries.push({
+          lsn: nextLsn++,
+          txid,
+          origin,
+          publication,
+          table: '$DDL',
+          operation: 'DDL',
+          key: {},
+          after: null,
+          before: null,
+          ddlSql: op.sql,
+          timestamp: ts,
+        });
+      } else if (op.kind === 'insert_record') {
+        const tableUpper = op.tableName.trim().toUpperCase();
+        const cols = normalizedSchemas.get(tableUpper);
+        const after = cols ? decodeJrdRecordBuffer(op.recordData, cols, tx.blobs) : {};
+        const key = cols ? extractPrimaryKey(cols, after) : {};
+        entries.push({
+          lsn: nextLsn++,
+          txid,
+          origin,
+          publication,
+          table: tableUpper,
+          operation: 'INSERT',
+          key,
+          after,
+          before: null,
+          timestamp: ts,
+        });
+      } else if (op.kind === 'update_record') {
+        const tableUpper = op.tableName.trim().toUpperCase();
+        const cols = normalizedSchemas.get(tableUpper);
+        const before = cols ? decodeJrdRecordBuffer(op.oldRecordData, cols, tx.blobs) : {};
+        const after = cols ? decodeJrdRecordBuffer(op.newRecordData, cols, tx.blobs) : {};
+        const key = cols ? extractPrimaryKey(cols, after) : {};
+        entries.push({
+          lsn: nextLsn++,
+          txid,
+          origin,
+          publication,
+          table: tableUpper,
+          operation: 'UPDATE',
+          key,
+          after,
+          before,
+          timestamp: ts,
+        });
+      } else if (op.kind === 'delete_record') {
+        const tableUpper = op.tableName.trim().toUpperCase();
+        const cols = normalizedSchemas.get(tableUpper);
+        const before = cols ? decodeJrdRecordBuffer(op.oldRecordData, cols, tx.blobs) : {};
+        const key = cols ? extractPrimaryKey(cols, before) : {};
+        entries.push({
+          lsn: nextLsn++,
+          txid,
+          origin,
+          publication,
+          table: tableUpper,
+          operation: 'DELETE',
+          key,
+          after: null,
+          before,
+          timestamp: ts,
+        });
+      }
+    }
+  };
+
+  for (const op of ops) {
+    // Sequences in Firebird are non-transactional and replicate immediately!
+    if (op.kind === 'set_sequence') {
+      const seqUpper = op.sequenceName.trim().toUpperCase();
+      const prev = sequenceMap.get(seqUpper);
+      if (prev === undefined || op.value >= prev) {
+        sequenceMap.set(seqUpper, op.value);
+      }
+      continue;
+    }
+
+    switch (op.kind) {
+      case 'start_transaction':
+        activeTxs.set(op.traNumber, { actions: [], savepointStack: [], blobs: new Map() });
+        break;
+      case 'prepare_transaction':
+      case 'define_atom':
+        break;
+      case 'start_savepoint': {
+        const tx = getOrCreateTx(op.traNumber);
+        tx.savepointStack.push(tx.actions.length);
+        break;
+      }
+      case 'release_savepoint': {
+        const tx = getOrCreateTx(op.traNumber);
+        if (tx.savepointStack.length > 0) tx.savepointStack.pop();
+        break;
+      }
+      case 'rollback_savepoint': {
+        const tx = getOrCreateTx(op.traNumber);
+        const targetLen = tx.savepointStack.pop();
+        if (targetLen !== undefined) {
+          tx.actions.length = targetLen;
+        }
+        break;
+      }
+      case 'store_blob': {
+        const tx = getOrCreateTx(op.traNumber);
+        tx.blobs.set(op.blobIdHex, op.data);
+        break;
+      }
+      case 'insert_record':
+      case 'update_record':
+      case 'delete_record':
+      case 'execute_sql': {
+        const tx = getOrCreateTx(op.traNumber);
+        tx.actions.push({ op });
+        break;
+      }
+      case 'commit_transaction': {
+        const tx = activeTxs.get(op.traNumber);
+        if (tx) {
+          flushCommittedTx(op.traNumber, tx);
+          activeTxs.delete(op.traNumber);
+        }
+        committedTransactions.push(op.traNumber);
+        break;
+      }
+      case 'rollback_transaction':
+      case 'cleanup_transaction': {
+        if (op.traNumber === 0 && op.kind === 'cleanup_transaction') {
+          for (const k of activeTxs.keys()) rolledBackTransactions.push(k);
+          activeTxs.clear();
+        } else {
+          activeTxs.delete(op.traNumber);
+          rolledBackTransactions.push(op.traNumber);
+        }
+        break;
+      }
+    }
+  }
+
+  const sequences: SequenceWatermark[] = Array.from(sequenceMap.entries()).map(
+    ([name, currentValue]) => ({ name, currentValue }),
+  );
+
+  return {
+    entries,
+    sequences,
+    ddlStatements,
+    committedTransactions,
+    rolledBackTransactions,
+  };
+}
+
+/** Replica mode flag stored in `Ods::header_page::hdr_replica_mode` (offset `26`) (`M17 Item 5`). */
+export type WasmReplicaMode = 'none' | 'read_only' | 'read_write' | 0 | 1 | 2;
+
+/**
+ * Configure `Ods::header_page::hdr_replica_mode` (byte offset `26` on page `0`,
+ * per Firebird `src/jrd/ods.h`) on an unattached `.fdb` database file in
+ * Emscripten `MEMFS` so `IAttachment::createReplicator` (`_fb_replicate_changelog`)
+ * accepts incoming `"FBCHANGELOG\0"` binary blocks (`M17 Item 5`).
+ */
+export function setWasmDatabaseReplicaMode(
+  fs: ReplicationEmscriptenFS,
+  dbPath: string,
+  mode: WasmReplicaMode = 'read_write',
+): { dbPath: string; mode: 'none' | 'read_only' | 'read_write'; modeCode: 0 | 1 | 2 } {
+  const modeCode: 0 | 1 | 2 =
+    mode === 0 || mode === 'none'
+      ? 0
+      : mode === 1 || mode === 'read_only'
+        ? 1
+        : 2;
+  const modeName: 'none' | 'read_only' | 'read_write' =
+    modeCode === 0 ? 'none' : modeCode === 1 ? 'read_only' : 'read_write';
+
+  const raw = fs.readFile(dbPath);
+  if (!(raw instanceof Uint8Array) || raw.byteLength < 152) {
+    throw new Error(`Invalid Firebird database file at "${dbPath}": expected >= 152 header bytes.`);
+  }
+  const view = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
+  const pagType = raw[0];
+  const pageSize = view.getUint16(16, true);
+  if (pagType !== 1 || pageSize < 4096) {
+    throw new Error(
+      `Invalid Firebird ODS header page at "${dbPath}" (pag_type=${pagType}, hdr_page_size=${pageSize}).`,
+    );
+  }
+
+  const copy = raw.slice();
+  // Ods::header_page::hdr_replica_mode is at byte offset 26 (static_assert in src/jrd/ods.h).
+  copy[26] = modeCode;
+  fs.writeFile(dbPath, copy);
+  return { dbPath, mode: modeName, modeCode };
+}
+
+/** Options for {@link createWasmChangelogPoller} (`M17 Item 2`). */
+export interface WasmChangelogPollerOptions {
+  /** Emscripten `MEMFS` (or Node.js FS adapter) containing changelog directories. */
+  fs: ReplicationEmscriptenFS;
+  /** Target replica database receiving `"FBCHANGELOG\0"` segments. */
+  targetDb: ReplicableDatabase;
+  /** Directory where sealed `"FBCHANGELOG\0"` segments are archived (`journal_archive_directory`). */
+  journalArchiveDirectory: string;
+  /** Optional active `journal_directory` fallback when segments have not yet rotated to archive. */
+  journalDirectory?: string;
+  /** Initial acknowledged changelog `sequence` watermark (`0` = apply from sequence `1`). @default 0 */
+  initialSequence?: number;
+  /** Unlink acknowledged archive segment files from `journalArchiveDirectory` after applying. @default false */
+  unlinkArchivedSegments?: boolean;
+  /** Default polling interval in milliseconds when `start()` is called. @default 100 */
+  intervalMs?: number;
+  /** Optional compiled WASM module for native C++ `_fb_replicate_changelog` (`IReplicator`) replay. */
+  wasmModule?: {
+    _fb_replicate_changelog?(dbHandle: number, dataPtr: number, byteLength: number): number;
+    _malloc(size: number): number;
+    _free(ptr: number): void;
+    HEAPU8: Uint8Array;
+  };
+  /** Optional replica `dbHandle` inside `wasmModule` for native C++ `_fb_replicate_changelog`. */
+  dbHandle?: number;
+  /** Optional JRD column descriptors for SQL/logical fallback when `_fb_replicate_changelog` is absent. */
+  tableSchemas?: Readonly<Record<string, ReadonlyArray<JrdColumnDescriptor>>>;
+  /** Optional callback invoked for each newly applied segment. */
+  onSegment?: (
+    segment: ParsedFbChangelogSegment,
+    result: ApplyFbChangelogResult,
+  ) => void | Promise<void>;
+  /** Optional error callback invoked if polling/applying throws during background timer execution. */
+  onError?: (error: Error) => void;
+}
+
+/** Cumulative telemetry returned by `poller.stats()` (`M17 Item 2`). */
+export interface WasmChangelogPollerStats {
+  readonly running: boolean;
+  readonly pollCount: number;
+  readonly segmentsApplied: number;
+  readonly blocksApplied: number;
+  readonly filesUnlinked: number;
+  readonly lastAppliedSequence: number;
+}
+
+/** Continuous native `"FBCHANGELOG\0"` poller & archiver handle returned by {@link createWasmChangelogPoller} (`M17 Item 2`). */
+export interface WasmChangelogPoller {
+  /** Scan `journalArchiveDirectory` (and `journalDirectory`), apply new segments in `sequence` order, and return results. */
+  pollOnce(): Promise<ApplyFbChangelogResult[]>;
+  /** Start background timer polling every `intervalMs` milliseconds. */
+  start(intervalMs?: number): void;
+  /** Stop background timer polling. */
+  stop(): void;
+  /** Highest segment `sequence` successfully applied so far. */
+  lastAppliedSequence(): number;
+  /** Inspect cumulative poller & archiver telemetry. */
+  stats(): WasmChangelogPollerStats;
+}
+
+/**
+ * Create a continuous poller and archiver transport for native Firebird
+ * `"FBCHANGELOG\0"` segment files in Emscripten `MEMFS` (`M17 Item 2`).
+ */
+export function createWasmChangelogPoller(
+  options: WasmChangelogPollerOptions,
+): WasmChangelogPoller {
+  let currentSeq = options.initialSequence ?? 0;
+  let pollCount = 0;
+  let segmentsApplied = 0;
+  let blocksApplied = 0;
+  let filesUnlinked = 0;
+  let timer: ReturnType<typeof setInterval> | null = null;
+  let inFlight: Promise<ApplyFbChangelogResult[]> | null = null;
+
+  const cleanArchiveDir = options.journalArchiveDirectory.endsWith('/')
+    ? options.journalArchiveDirectory.slice(0, -1)
+    : options.journalArchiveDirectory;
+
+  const runPoll = async (): Promise<ApplyFbChangelogResult[]> => {
+    pollCount++;
+    const bySeq = new Map<number, { seg: ParsedFbChangelogSegment; fromArchive: boolean }>();
+
+    const archived = readWasmChangelogSegments(options.fs, options.journalArchiveDirectory, {
+      sinceSequence: currentSeq,
+    });
+    for (const seg of archived) {
+      bySeq.set(seg.header.sequence, { seg, fromArchive: true });
+    }
+
+    if (options.journalDirectory) {
+      const active = readWasmChangelogSegments(options.fs, options.journalDirectory, {
+        sinceSequence: currentSeq,
+      });
+      for (const seg of active) {
+        if (!bySeq.has(seg.header.sequence)) {
+          bySeq.set(seg.header.sequence, { seg, fromArchive: false });
+        }
+      }
+    }
+
+    const ordered = [...bySeq.values()].sort(
+      (a, b) => a.seg.header.sequence - b.seg.header.sequence,
+    );
+    const results: ApplyFbChangelogResult[] = [];
+
+    for (const { seg, fromArchive } of ordered) {
+      if (seg.header.sequence <= currentSeq) continue;
+      const res = await applyFbChangelogSegmentToDatabase(options.targetDb, seg, {
+        ...(options.wasmModule !== undefined ? { wasmModule: options.wasmModule } : {}),
+        ...(options.dbHandle !== undefined ? { dbHandle: options.dbHandle } : {}),
+        ...(options.tableSchemas !== undefined ? { tableSchemas: options.tableSchemas } : {}),
+      });
+      currentSeq = seg.header.sequence;
+      segmentsApplied++;
+      blocksApplied += res.blocksProcessed;
+      results.push(res);
+
+      if (options.onSegment) {
+        await options.onSegment(seg, res);
+      }
+
+      if (
+        fromArchive &&
+        options.unlinkArchivedSegments &&
+        seg.filename &&
+        typeof options.fs.unlink === 'function'
+      ) {
+        try {
+          options.fs.unlink(`${cleanArchiveDir}/${seg.filename}`);
+          filesUnlinked++;
+        } catch {
+          // Ignore if already unlinked
+        }
+      }
+    }
+
+    return results;
+  };
+
+  return {
+    async pollOnce(): Promise<ApplyFbChangelogResult[]> {
+      if (inFlight) return inFlight;
+      inFlight = runPoll().finally(() => {
+        inFlight = null;
+      });
+      return inFlight;
+    },
+    start(intervalMs?: number): void {
+      if (timer !== null) return;
+      const ms = Math.max(10, intervalMs ?? options.intervalMs ?? 100);
+      timer = setInterval(() => {
+        void this.pollOnce().catch((err) => {
+          if (options.onError) {
+            options.onError(err instanceof Error ? err : new Error(String(err)));
+          }
+        });
+      }, ms);
+    },
+    stop(): void {
+      if (timer !== null) {
+        clearInterval(timer);
+        timer = null;
+      }
+    },
+    lastAppliedSequence(): number {
+      return currentSeq;
+    },
+    stats(): WasmChangelogPollerStats {
+      return {
+        running: timer !== null,
+        pollCount,
+        segmentsApplied,
+        blocksApplied,
+        filesUnlinked,
+        lastAppliedSequence: currentSeq,
+      };
+    },
+  };
+}
+
 
 

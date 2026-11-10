@@ -852,6 +852,7 @@ const codeInspectorEl = document.getElementById('code-inspector');
 
 const primaryLsnBadge = document.getElementById('primary-lsn-badge');
 const primaryHlcBadge = document.getElementById('primary-hlc-badge');
+const enginePubBadge = document.getElementById('engine-pub-badge');
 const replicaWatermarkBadge = document.getElementById('replica-watermark-badge');
 const replicaHlcBadge = document.getElementById('replica-hlc-badge');
 const journalCountBadge = document.getElementById('journal-count-badge');
@@ -1062,11 +1063,198 @@ async function formatEncryptedHexDump(entries) {
 }
 
 let simDlqEntries = [];
+let simChangelogSeq = 1;
+let simEnginePubState = {
+  name: 'RDB$DEFAULT',
+  active: true,
+  autoEnable: true,
+  publishedTables: ['TASKS'],
+  replicaMode: 'READ-WRITE',
+  sequenceValue: 3,
+};
 let simMeshMatrix = {
   hub: { edge_eu: 3, edge_us: 3 },
   edge_eu: { hub: 5 },
   edge_us: { hub: 5 },
 };
+
+function buildFbChangelogSegmentBytes(entries = [], sequence = 1, seqGenValue = 3) {
+  const enc = new TextEncoder();
+  const pushU32 = (arr, v) => {
+    const b = new Uint8Array(4);
+    new DataView(b.buffer).setUint32(0, v >>> 0, true);
+    arr.push(...b);
+  };
+  const pushI64 = (arr, v) => {
+    const b = new Uint8Array(8);
+    new DataView(b.buffer).setBigInt64(0, BigInt(v), true);
+    arr.push(...b);
+  };
+  const pushAtom = (arr, name) => {
+    const nb = enc.encode(name);
+    arr.push(16, nb.length, ...nb); // opDefineAtom = 16
+  };
+  const encodeTaskRecord = (row) => {
+    const r = row || {};
+    const titleBytes = enc.encode(String(r.TITLE || '').slice(0, 32));
+    const buf = new Uint8Array(4 + 4 + 2 + 32 + 4);
+    buf[0] = 0xf8; // 3 NOT NULL columns (ID, TITLE, STOCK)
+    const dv = new DataView(buf.buffer);
+    dv.setInt32(4, Number(r.ID || 0), true);
+    dv.setUint16(8, titleBytes.length, true);
+    buf.set(titleBytes, 10);
+    dv.setInt32(42, Number(r.STOCK || 0), true);
+    return buf;
+  };
+
+  const blocks = [];
+
+  // Block 0 (traNumber = 0): opSetSequence ("PUBLIC"."SEQ_TASKS_ID")
+  const seqPayload = [];
+  pushAtom(seqPayload, 'PUBLIC');
+  pushAtom(seqPayload, 'SEQ_TASKS_ID');
+  seqPayload.push(14); // opSetSequence = 14
+  pushU32(seqPayload, 0);
+  pushU32(seqPayload, 1);
+  pushI64(seqPayload, seqGenValue);
+  blocks.push({ traNumber: 0, protocol: 2, flags: 0, payload: new Uint8Array(seqPayload), summary: `opDefineAtom("PUBLIC","SEQ_TASKS_ID") -> opSetSequence(val=${seqGenValue})` });
+
+  const sample = entries.slice(0, 4);
+  let tra = 100 + sequence * 10;
+  for (const e of sample) {
+    tra++;
+    const p = [1, 6]; // opStartTransaction=1, opStartSavepoint=6
+    let desc = '';
+    if (e.operation === 'DDL' && e.ddlSql) {
+      pushAtom(p, 'SYSDBA');
+      pushAtom(p, '"PUBLIC", "SYSTEM"');
+      p.push(15); // opExecuteSqlIntl = 15
+      pushU32(p, 0);
+      pushU32(p, 1);
+      p.push(4); // CS_UTF8
+      const sb = enc.encode(e.ddlSql);
+      pushU32(p, sb.length);
+      p.push(...sb);
+      desc = `opExecuteSqlIntl("${e.ddlSql}")`;
+    } else {
+      pushAtom(p, 'PUBLIC');
+      pushAtom(p, e.table || 'TASKS');
+      if (e.operation === 'INSERT') {
+        const rec = encodeTaskRecord(e.after);
+        p.push(9); // opInsertRecord = 9
+        pushU32(p, 0);
+        pushU32(p, 1);
+        pushU32(p, rec.length);
+        p.push(...rec);
+        desc = `opInsertRecord(PUBLIC.${e.table || 'TASKS'}, len=${rec.length})`;
+      } else if (e.operation === 'UPDATE') {
+        const oldRec = encodeTaskRecord(e.before || e.after);
+        const newRec = encodeTaskRecord(e.after);
+        p.push(10); // opUpdateRecord = 10
+        pushU32(p, 0);
+        pushU32(p, 1);
+        pushU32(p, oldRec.length);
+        p.push(...oldRec);
+        pushU32(p, newRec.length);
+        p.push(...newRec);
+        desc = `opUpdateRecord(PUBLIC.${e.table || 'TASKS'}, old=${oldRec.length}B, new=${newRec.length}B)`;
+      } else {
+        const oldRec = encodeTaskRecord(e.before || e.key);
+        p.push(11); // opDeleteRecord = 11
+        pushU32(p, 0);
+        pushU32(p, 1);
+        pushU32(p, oldRec.length);
+        p.push(...oldRec);
+        desc = `opDeleteRecord(PUBLIC.${e.table || 'TASKS'}, len=${oldRec.length}B)`;
+      }
+    }
+    p.push(7, 3); // opReleaseSavepoint=7, opCommitTransaction=3
+    blocks.push({
+      traNumber: tra,
+      protocol: 2,
+      flags: 3, // BLOCK_BEGIN_TRANS | BLOCK_END_TRANS
+      payload: new Uint8Array(p),
+      summary: `opStartTransaction -> opStartSavepoint -> ${desc} -> opReleaseSavepoint -> opCommitTransaction`,
+    });
+  }
+
+  let totalLen = 48;
+  for (const b of blocks) totalLen += 16 + b.payload.byteLength;
+
+  const seg = new Uint8Array(totalLen);
+  const magic = 'FBCHANGELOG\0';
+  for (let i = 0; i < magic.length; i++) seg[i] = magic.charCodeAt(i);
+  const dv = new DataView(seg.buffer);
+  dv.setUint16(12, 1, true); // version = 1
+  dv.setUint16(14, 3, true); // state = 3 (ARCHIVABLE)
+  const guidHex = 'A1B2C3D4E5F647118899AABBCCDDEEFF';
+  for (let i = 0; i < 16; i++) {
+    seg[16 + i] = parseInt(guidHex.slice(i * 2, i * 2 + 2), 16);
+  }
+  dv.setBigUint64(32, BigInt(sequence), true);
+  dv.setBigUint64(40, BigInt(totalLen), true);
+
+  let off = 48;
+  for (const b of blocks) {
+    b.offset = off;
+    dv.setBigUint64(off, BigInt(b.traNumber), true);
+    dv.setUint16(off + 8, b.protocol, true);
+    dv.setUint16(off + 10, b.flags, true);
+    dv.setUint32(off + 12, b.payload.byteLength, true);
+    seg.set(b.payload, off + 16);
+    off += 16 + b.payload.byteLength;
+  }
+
+  return { seg, blocks, totalLen, guid: 'A1B2C3D4-E5F6-4711-8899-AABBCCDDEEFF' };
+}
+
+function formatFbChangelogInspector(allEntries = []) {
+  const { seg, blocks, totalLen, guid } = buildFbChangelogSegmentBytes(
+    allEntries,
+    simChangelogSeq,
+    simEnginePubState.sequenceValue,
+  );
+  const lines = [
+    `// Native Firebird Engine Binary Changelog Segment ("FBCHANGELOG\\0")`,
+    `// RDB$PUBLICATIONS: ${simEnginePubState.name} (active=${simEnginePubState.active}, autoEnable=${simEnginePubState.autoEnable}, tables=[${simEnginePubState.publishedTables.join(', ')}], replicaMode=${simEnginePubState.replicaMode})`,
+    `// ChangeLog::Header (48 bytes):`,
+    `//   magic:    "FBCHANGELOG\\0" (12B)`,
+    `//   version:  1`,
+    `//   state:    3 (CHANGELOG_STATE_ARCHIVABLE)`,
+    `//   guid:     ${guid}`,
+    `//   sequence: ${simChangelogSeq} (.journal-${String(simChangelogSeq).padStart(9, '0')})`,
+    `//   length:   ${totalLen} bytes (${blocks.length} Replication::Block records)`,
+    ``,
+    `// Decoded Replication::Block Stream (16-byte header + Protocol=2 opcodes):`,
+  ];
+
+  for (let i = 0; i < blocks.length; i++) {
+    const b = blocks[i];
+    lines.push(
+      `//   Block[${i}] @+${b.offset}: tra=${b.traNumber}, proto=${b.protocol}, flags=0x0${b.flags} (${b.flags === 3 ? 'BEGIN|END' : 'META'}), len=${b.payload.byteLength}B`,
+    );
+    lines.push(`//     ops: ${b.summary}`);
+  }
+  lines.push(``);
+
+  const maxBytesToShow = Math.min(seg.byteLength, 384);
+  for (let offset = 0; offset < maxBytesToShow; offset += 16) {
+    const slice = seg.subarray(offset, Math.min(offset + 16, maxBytesToShow));
+    const hexPart = Array.from(slice, (b) => b.toString(16).padStart(2, '0'))
+      .join(' ')
+      .padEnd(47, ' ');
+    const asciiPart = Array.from(slice, (b) =>
+      b >= 32 && b <= 126 ? String.fromCharCode(b) : '.',
+    ).join('');
+    lines.push(
+      `${offset.toString(16).padStart(4, '0')}:  ${hexPart}  |${asciiPart}|`,
+    );
+  }
+  if (seg.byteLength > maxBytesToShow) {
+    lines.push(`... (${seg.byteLength - maxBytesToShow} more bytes)`);
+  }
+  return lines.join('\n');
+}
 
 function formatMeshAndDlqInspector(allEntries = []) {
   const pLsn = allEntries.length > 0 ? Math.max(...allEntries.map((e) => e.lsn)) : 0;
@@ -1107,6 +1295,8 @@ async function updateCodeInspector(allEntries = []) {
     codeInspectorEl.textContent = built.ddl;
   } else if (activeCodeTab === 'hex') {
     codeInspectorEl.textContent = formatBinaryHexDump(allEntries.slice(0, 8));
+  } else if (activeCodeTab === 'fbchangelog') {
+    codeInspectorEl.textContent = formatFbChangelogInspector(allEntries.slice(0, 8));
   } else if (activeCodeTab === 'encrypted') {
     codeInspectorEl.textContent = await formatEncryptedHexDump(
       allEntries.slice(0, 8),
@@ -1228,6 +1418,9 @@ async function renderAll() {
 
   primaryLsnBadge.textContent = `Journal LSN: ${primaryLsn}`;
   primaryHlcBadge.textContent = `HLC: ${primaryDb.getLastHlc()}`;
+  if (enginePubBadge) {
+    enginePubBadge.textContent = `RDB$PUBLICATIONS: ${simEnginePubState.name} (${simEnginePubState.active ? 'ACTIVE' : 'INACTIVE'} · seq ${simChangelogSeq})`;
+  }
   replicaWatermarkBadge.textContent = `Watermark LSN: ${watermarkLsn}`;
   replicaHlcBadge.textContent = `HLC: ${replicaDb.getLastHlc()}`;
 
@@ -1565,6 +1758,11 @@ document.getElementById('show-binary-hex').addEventListener('click', () => {
   void renderAll();
 });
 
+document.getElementById('show-fbchangelog').addEventListener('click', () => {
+  activeCodeTab = 'fbchangelog';
+  void renderAll();
+});
+
 document.getElementById('show-encrypted-hex').addEventListener('click', () => {
   activeCodeTab = 'encrypted';
   void renderAll();
@@ -1834,6 +2032,37 @@ for (const btn of document.querySelectorAll('.scenario-card')) {
       activeCodeTab = 'mesh-dlq';
       logEvent(
         `Scenario 10 (<code>FB_REPL_DLQ$</code> &amp; <code>compactJournal</code>): Quarantined poison entry <code>LSN #${headLsn + 1}</code> into <code>FB_REPL_DLQ$</code> without blocking valid rows, and compacted <strong>${compactRes.entriesRemoved}</strong> superseded row mutations!`,
+        true,
+      );
+      await renderAll();
+    } else if (kind === 'fbchangelog') {
+      const id = nextTaskId++;
+      simChangelogSeq++;
+      simEnginePubState = {
+        name: 'RDB$DEFAULT',
+        active: true,
+        autoEnable: true,
+        publishedTables: ['TASKS'],
+        replicaMode: 'READ-WRITE',
+        sequenceValue: id,
+      };
+      await primaryDb.execute(
+        'INSERT INTO TASKS (ID, TENANT_ID, TITLE, PRIORITY, STOCK, TAGS, DONE, SECRET_HASH) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        [
+          id,
+          'acme',
+          `Native FBCHANGELOG Task #${id}`,
+          'HIGH',
+          32,
+          'fbchangelog,ireplicator',
+          0,
+          `sha256:fbc${id}`,
+        ],
+      );
+      const res = await replicator.sync();
+      activeCodeTab = 'fbchangelog';
+      logEvent(
+        `Scenario 11 (<code>RDB$PUBLICATIONS</code> + <code>"FBCHANGELOG\\0"</code>): Enabled <code>RDB$DEFAULT</code> (<code>INCLUDE ALL</code>), sealed <code>.journal-${String(simChangelogSeq).padStart(9, '0')}</code> with <code>opSetSequence</code> + <code>opInsertRecord</code> blocks, and replayed <strong>${res.primaryToReplica.appliedCount}</strong> native change(s) onto Replica (<code>REPLICA_MODE = READ-WRITE</code>)!`,
         true,
       );
       await renderAll();

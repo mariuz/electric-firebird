@@ -468,6 +468,10 @@
           <strong>10. Dead-Letter Queue (<code>FB_REPL_DLQ$</code>) &amp; Compaction</strong>
           <span>Quarantine a poison row into FB_REPL_DLQ$, retry with sanitization, and compact superseded journal updates!</span>
         </button>
+        <button type="button" class="scenario-card" data-scenario="fbchangelog">
+          <strong>11. Native Engine (<code>RDB$PUBLICATIONS</code> + <code>FBCHANGELOG\0</code>)</strong>
+          <span>Enable RDB$DEFAULT publication, emit 48B ChangeLog::Header + 16B Replication::Block segments, and replay to Replica!</span>
+        </button>
       </section>
 
       <!-- Dual Database Nodes Grid -->
@@ -479,6 +483,7 @@
               <h2>Node A — Primary</h2>
               <span class="badge accent">node_id: primary</span>
               <span class="badge" id="primary-hlc-badge">HLC: 0:0:primary</span>
+              <span class="badge ok" id="engine-pub-badge">RDB$PUBLICATIONS: RDB$DEFAULT (ACTIVE)</span>
             </div>
             <span class="badge" id="primary-lsn-badge">Journal LSN: 0</span>
           </div>
@@ -608,6 +613,7 @@
               <button type="button" class="btn-sm" id="show-setup-code">Setup TS</button>
               <button type="button" class="btn-sm" id="show-trigger-ddl">PSQL Trigger DDL</button>
               <button type="button" class="btn-sm" id="show-binary-hex">Binary Segment (0x52444246)</button>
+              <button type="button" class="btn-sm" id="show-fbchangelog">FBCHANGELOG\0 (48B + Blocks)</button>
               <button type="button" class="btn-sm" id="show-encrypted-hex">AES-GCM + Gzip (0x53444246)</button>
               <button type="button" class="btn-sm" id="show-mesh-dlq">Mesh Matrix &amp; DLQ</button>
             </div>

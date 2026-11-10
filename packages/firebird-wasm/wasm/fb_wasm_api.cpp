@@ -7983,11 +7983,11 @@ int fb_stmt_set_timeout(int stmt_handle, unsigned timeout_ms)
 }
 
 /**
- * Configure a database's native replica mode (`isc_dpb_set_db_replica` = 90)
+ * Configure a database's native replica mode (`isc_dpb_set_db_replica` = 92)
  * on the database header page:
- *   - `mode == 0`: none (`fb_shutrs_none` / normal primary database)
- *   - `mode == 1`: read-only replica
- *   - `mode == 2`: read-write replica
+ *   - `mode == 0`: none (`isc_dpb_replica_none` / normal primary database)
+ *   - `mode == 1`: read-only replica (`isc_dpb_replica_read_only`)
+ *   - `mode == 2`: read-write replica (`isc_dpb_replica_read_write`)
  *
  * Returns 0 on success, non-zero on failure.
  */
@@ -8004,6 +8004,7 @@ int fb_set_replica_mode(int db_handle, int mode)
 	}
 
 	endReadTransaction(*entry);
+	forgetMetadata(*entry);
 
 	if (entry->path.empty() || !g_provider)
 	{
@@ -8019,7 +8020,7 @@ int fb_set_replica_mode(int db_handle, int mode)
 		return 3;
 	}
 
-	constexpr unsigned char DPB_SET_DB_REPLICA = 90; // isc_dpb_set_db_replica
+	constexpr unsigned char DPB_SET_DB_REPLICA = 92; // isc_dpb_set_db_replica
 	const unsigned char replicaFlag = static_cast<unsigned char>(mode < 0 ? 0 : (mode > 2 ? 2 : mode));
 	dpb->insertBytes(status.ptr(), DPB_SET_DB_REPLICA, &replicaFlag, 1);
 	if (status.failed())
@@ -8029,8 +8030,15 @@ int fb_set_replica_mode(int db_handle, int mode)
 		return 4;
 	}
 
+	// Detach existing attachment so the shared JRD Database instance reloads
+	// hdr_replica_mode cleanly and grants exclusive header modification.
+	const std::string dbPath = entry->path;
+	Status oldDetachStatus;
+	entry->attachment->detach(oldDetachStatus.ptr());
+	entry->attachment = nullptr;
+
 	IAttachment* modeAttachment = g_provider->attachDatabase(status.ptr(),
-		entry->path.c_str(),
+		dbPath.c_str(),
 		dpb->getBufferLength(status.ptr()),
 		dpb->getBuffer(status.ptr()));
 	dpb->dispose();
@@ -8038,11 +8046,41 @@ int fb_set_replica_mode(int db_handle, int mode)
 	if (status.failed() || !modeAttachment)
 	{
 		setErrorFromStatus("fb_set_replica_mode: attach failed", status.ptr());
+		// Best-effort restore of normal attachment
+		Status restoreStatus;
+		IXpbBuilder* rDpb = buildDpb(restoreStatus, false);
+		if (!restoreStatus.failed() && rDpb)
+		{
+			entry->attachment = g_provider->attachDatabase(restoreStatus.ptr(),
+				dbPath.c_str(),
+				rDpb->getBufferLength(restoreStatus.ptr()),
+				rDpb->getBuffer(restoreStatus.ptr()));
+			rDpb->dispose();
+		}
 		return 5;
 	}
 
 	Status detachStatus;
 	modeAttachment->detach(detachStatus.ptr());
+
+	Status reattachStatus;
+	IXpbBuilder* normalDpb = buildDpb(reattachStatus, false);
+	if (reattachStatus.failed() || !normalDpb)
+	{
+		setErrorFromStatus("fb_set_replica_mode: could not build reattach DPB", reattachStatus.ptr());
+		return 6;
+	}
+	entry->attachment = g_provider->attachDatabase(reattachStatus.ptr(),
+		dbPath.c_str(),
+		normalDpb->getBufferLength(reattachStatus.ptr()),
+		normalDpb->getBuffer(reattachStatus.ptr()));
+	normalDpb->dispose();
+	if (reattachStatus.failed() || !entry->attachment)
+	{
+		setErrorFromStatus("fb_set_replica_mode: reattach failed", reattachStatus.ptr());
+		return 7;
+	}
+
 	return 0;
 }
 
@@ -8077,9 +8115,17 @@ int fb_replicate_changelog(int db_handle, const unsigned char* data, unsigned by
 	forgetMetadata(*entry);
 
 	size_t offset = 0;
-	// Skip the 48-byte ChangeLog::Header if the buffer starts with "FBCHANGELOG\0".
+	size_t effectiveLength = static_cast<size_t>(byte_length);
+	// Skip the 48-byte ChangeLog::Header if the buffer starts with "FBCHANGELOG\0"
+	// and clamp to the recorded header length when preallocated trailing space exists.
 	if (byte_length >= 48 && memcmp(data, "FBCHANGELOG\0", 12) == 0)
 	{
+		uint64_t headerLength = 0;
+		memcpy(&headerLength, data + 40, sizeof(headerLength));
+		if (headerLength >= 48 && headerLength < effectiveLength)
+		{
+			effectiveLength = static_cast<size_t>(headerLength);
+		}
 		offset = 48;
 	}
 
@@ -8092,12 +8138,12 @@ int fb_replicate_changelog(int db_handle, const unsigned char* data, unsigned by
 	}
 
 	int blocksApplied = 0;
-	while (offset + 16 <= byte_length)
+	while (offset + 16 <= effectiveLength)
 	{
 		unsigned blockPayloadLen = 0;
 		memcpy(&blockPayloadLen, data + offset + 12, sizeof(blockPayloadLen));
 		const size_t totalBlockLen = 16u + static_cast<size_t>(blockPayloadLen);
-		if (offset + totalBlockLen > byte_length)
+		if (offset + totalBlockLen > effectiveLength)
 		{
 			Status closeStatus;
 			replicator->close(closeStatus.ptr());

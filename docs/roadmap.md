@@ -1608,6 +1608,41 @@ and Node (`FirebirdLite`):
 
 ---
 
+### M17 — `"FBCHANGELOG\0"` Binary Record & Sequence Decoder, Continuous Changelog Archiver Transport, `<firebird-repl>` Native Publication Inspector & Simulator v4
+
+- [x] **1. Full `"FBCHANGELOG\0"` Binary Operation & Sequence Decoder (`decodeFbChangelogOperations` / `fbChangelogToLogicalEntries`).**
+      Decode all internal Firebird `Replication::Block` opcodes inside `"FBCHANGELOG\0"`
+      segments (`opStartTransaction`, `opPrepareTransaction`, `opCommitTransaction`,
+      `opRollbackTransaction`, `opCleanupTransaction`, `opStartSavepoint`,
+      `opReleaseSavepoint`, `opRollbackSavepoint`, `opDefineAtom`, `opInsertRecord`,
+      `opUpdateRecord`, `opDeleteRecord`, `opStoreBlob`, `opExecuteSql`,
+      `opSetSequence`, `opExecuteSqlIntl`), extracting atom-table mappings,
+      sequence watermarks (`opSetSequence`), and record buffers.
+- [x] **2. Continuous Native Changelog Poller, Archiver & Transport Stream (`createWasmChangelogPoller`).**
+      Watch/poll `journal_archive_directory` and `journal_directory` in Emscripten
+      `MEMFS` (or Node.js filesystem), streaming newly sealed `.journal-NNNNNNNNN`
+      `"FBCHANGELOG\0"` segments to subscribers, applying them via
+      `applyFbChangelogSegmentToDatabase()`, tracking the replica's last applied
+      native `sequence`, and optionally unlinking acknowledged archive files.
+- [x] **3. `<firebird-repl>` Native Engine Publication (`RDB$PUBLICATIONS`) & Changelog Inspector.**
+      Extend `<firebird-repl>`'s `Replication` tab and `el.replication()` summary
+      to inspect Firebird's native `RDB$PUBLICATIONS` and `RDB$PUBLICATION_TABLES`
+      catalogs (`active`, `autoEnable`, `publishedTables`, `replicaMode`,
+      `replicationSequence`) alongside logical `FB_REPL_JOURNAL$` metrics.
+- [x] **4. Replication Simulator v4: Native `"FBCHANGELOG\0"` Segment Builder, Hex/Block Inspector & Guided Scenario 11 (`demo/public/replication.html`).**
+      Upgrade `demo/public/replication.html` and `demo/public/replication.js` with
+      a live `"FBCHANGELOG\0"` 48-byte `ChangeLog::Header` + 16-byte
+      `Replication::Block` packet inspector, `RDB$PUBLICATIONS` status badge, and
+      **Scenario 11: Native Engine Replication (`RDB$PUBLICATIONS` + `"FBCHANGELOG\0"` Segments)**,
+      covered by Playwright E2E tests in `e2e/tests/replication-demo.spec.ts`.
+- [x] **5. Rebuild WASM Artifacts (`firebird-embedded.{js,wasm}` & `firebird-embedded-st.{js,wasm}`) with `_fb_replicate_changelog` & `_fb_set_replica_mode`.**
+      Link `_fb_replicate_changelog` (`IAttachment::createReplicator`) and
+      `_fb_set_replica_mode` (`isc_dpb_set_db_replica`) into the distributed WASM
+      binaries on the next `build:wasm` pass and verify direct binary block
+      application between two WASM databases.
+
+---
+
 ## 5. Test coverage added alongside this review
 
 `src/browser/` was excluded from Jest and had no browser tests.  It now has 73

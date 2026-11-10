@@ -112,6 +112,16 @@ export interface ReplReplicationDlqEntrySummary {
   readonly quarantinedAt: string;
 }
 
+/** Native Firebird engine `RDB$PUBLICATIONS` / `RDB$PUBLICATION_TABLES` catalog summary displayed in `<firebird-repl>`. */
+export interface ReplEnginePublicationInfo {
+  readonly name: string;
+  readonly active: boolean;
+  readonly autoEnable: boolean;
+  readonly publishedTables: readonly string[];
+  readonly replicaMode: string | null;
+  readonly replicationSequence: number | null;
+}
+
 /** Structured replication state returned by `el.replication()` in `<firebird-repl>`. */
 export interface ReplReplicationInfo {
   readonly journalTableExists: boolean;
@@ -124,6 +134,7 @@ export interface ReplReplicationInfo {
   readonly dlqTableExists?: boolean;
   readonly dlqEntryCount?: number;
   readonly dlqEntries?: ReplReplicationDlqEntrySummary[];
+  readonly enginePublication?: ReplEnginePublicationInfo | null;
   readonly liveStats?: ReplicationStats | null;
 }
 
@@ -920,6 +931,76 @@ export function defineFirebirdRepl(
         }
       }
 
+      let enginePublication: ReplEnginePublicationInfo | null = null;
+      try {
+        const pubRes = await db.query(
+          `SELECT TRIM(RDB$PUBLICATION_NAME), RDB$ACTIVE_FLAG, RDB$AUTO_ENABLE
+           FROM RDB$PUBLICATIONS`,
+          [],
+          { rowMode: 'array' },
+        );
+        const pubRow = pubRes.rows[0];
+        if (pubRow) {
+          const pubName = String(pubRow[0] ?? 'RDB$DEFAULT').trim() || 'RDB$DEFAULT';
+          const active = Number(pubRow[1] ?? 0) === 1;
+          const autoEnable = Number(pubRow[2] ?? 0) === 1;
+
+          const publishedTables: string[] = [];
+          try {
+            const tblRes = await db.query(
+              `SELECT TRIM(RDB$TABLE_NAME)
+               FROM RDB$PUBLICATION_TABLES
+               ORDER BY RDB$TABLE_NAME`,
+              [],
+              { rowMode: 'array' },
+            );
+            for (const tr of tblRes.rows) {
+              const tName = String(tr[0] ?? '').trim().toUpperCase();
+              if (tName) publishedTables.push(tName);
+            }
+          } catch {
+            // Ignore if RDB$PUBLICATION_TABLES is unavailable
+          }
+
+          let replicaMode: string | null = null;
+          let replicationSequence: number | null = null;
+          try {
+            const ctxRes = await db.query(
+              `SELECT RDB$GET_CONTEXT('SYSTEM', 'REPLICA_MODE'),
+                      RDB$GET_CONTEXT('SYSTEM', 'REPLICATION_SEQUENCE')
+               FROM RDB$DATABASE`,
+              [],
+              { rowMode: 'array' },
+            );
+            const ctxRow = ctxRes.rows[0];
+            if (ctxRow) {
+              if (ctxRow[0] !== null && ctxRow[0] !== undefined) {
+                replicaMode = String(ctxRow[0]).trim();
+              }
+              if (ctxRow[1] !== null && ctxRow[1] !== undefined) {
+                const parsedSeq = Number(ctxRow[1]);
+                if (Number.isFinite(parsedSeq)) {
+                  replicationSequence = parsedSeq;
+                }
+              }
+            }
+          } catch {
+            // Ignore if SYSTEM context variables are unavailable
+          }
+
+          enginePublication = {
+            name: pubName,
+            active,
+            autoEnable,
+            publishedTables,
+            replicaMode,
+            replicationSequence,
+          };
+        }
+      } catch {
+        enginePublication = null;
+      }
+
       let liveStats: ReplicationStats | null = null;
       if (this.replicatorHandle && typeof this.replicatorHandle.stats === 'function') {
         try {
@@ -940,6 +1021,7 @@ export function defineFirebirdRepl(
         dlqTableExists: existingTables.has(DEFAULT_REPL_DLQ_TABLE),
         dlqEntryCount: dlqEntries.length,
         dlqEntries,
+        enginePublication,
         liveStats,
       };
     }
@@ -1227,6 +1309,40 @@ export function defineFirebirdRepl(
           `${repl.watermarks.length} ${repl.watermarks.length === 1 ? 'watermark' : 'watermarks'} · ` +
           `${dlqList.length} DLQ`;
         panel.append(summaryEl);
+
+        if (repl.enginePublication) {
+          const ep = repl.enginePublication;
+          const engDiv = el('div', 'schema-sub replication-engine-pub');
+          const engLabel = el('span', 'schema-sub-label');
+          engLabel.textContent = 'Native Engine Publication (RDB$PUBLICATIONS):';
+          engDiv.append(engLabel);
+          const engList = el('ul', 'schema-list replication-engine-metrics');
+          const engMetrics: Array<[string, string]> = [
+            [
+              'Publication',
+              `${ep.name} (${ep.active ? 'ACTIVE' : 'INACTIVE'}${ep.autoEnable ? ' · INCLUDE ALL' : ''})`,
+            ],
+            [
+              'Published tables',
+              ep.publishedTables.length > 0 ? ep.publishedTables.join(', ') : 'none',
+            ],
+            [
+              'Replica mode / sequence',
+              `${ep.replicaMode ?? 'NONE'} / seq ${ep.replicationSequence ?? 0}`,
+            ],
+          ];
+          for (const [label, value] of engMetrics) {
+            const li = el('li', 'schema-meta-item');
+            const k = el('span', 'col-name');
+            k.textContent = `${label}:`;
+            const v = el('span', 'col-type');
+            v.textContent = value;
+            li.append(k, v);
+            engList.append(li);
+          }
+          engDiv.append(engList);
+          panel.append(engDiv);
+        }
 
         if (repl.liveStats) {
           const st = repl.liveStats;
@@ -2198,6 +2314,13 @@ export function defineFirebirdRepl(
                 : '0 quarantined',
             ],
           ];
+          if (r.enginePublication) {
+            const ep = r.enginePublication;
+            rows.push([
+              'Native Engine Publication (RDB$PUBLICATIONS)',
+              `${ep.name} (${ep.active ? 'ACTIVE' : 'INACTIVE'}${ep.autoEnable ? ', INCLUDE ALL' : ''}) · tables: ${ep.publishedTables.length > 0 ? ep.publishedTables.join(', ') : 'none'} · mode: ${ep.replicaMode ?? 'NONE'} · seq: ${ep.replicationSequence ?? 0}`,
+            ]);
+          }
           if (r.liveStats) {
             rows.push(
               [
