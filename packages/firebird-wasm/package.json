@@ -85,6 +85,7 @@
     "size": "node scripts/size-budget.mjs",
     "lint": "eslint src --ext .ts",
     "clean": "rm -rf dist",
+    "check:engine": "node scripts/check-engine.mjs",
     "prepublishOnly": "node scripts/check-publish.mjs"
   },
   "keywords": [

@@ -4,6 +4,12 @@ All notable changes to `firebird-wasm`. This project follows
 [semantic versioning](https://semver.org/); while the major version is 0 the
 API may still move between minor releases.
 
+## Unreleased
+
+### Fixed
+
+- **Publishing:** the npm 0.20.1 package shipped `firebird-embedded.wasm` and `firebird-embedded-st.wasm` that trap on every attach under Node (`createDatabase` and `attachDatabase` alike: `RuntimeError: null function or function signature mismatch`, so no statement runs); they were not the CI build of the same sources, whose files (byte-identical to 0.16.0's) run. `prepublishOnly` now runs each engine build in `dist/wasm` before publishing (`scripts/check-engine.mjs`, also `npm run check:engine`): it creates a database, answers `SELECT 1 FROM rdb$database` and keeps a row, each build in a child process with a time limit (`CHECK_ENGINE_TIMEOUT_MS`, 60 s), since the threaded build's trap leaves the engine silent rather than throwing. Republishing with the CI-built engine attached to the `v0.20.2` release fixes installs of 0.20.x.
+
 ## 0.20.2 — 2026-11-07
 
 ### Fixed

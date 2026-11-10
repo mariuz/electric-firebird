@@ -74,6 +74,22 @@ if (fs.existsSync(shippedTests)) {
   );
 }
 
+// The files being there is not the engine working: 0.20.1 shipped a pair of the
+// right names and sizes that could not open a database (check-engine.mjs). With
+// every file present, each build is run through a database's life before publish.
+if (problems.length === 0) {
+  const { checkEngine } = await import('./check-engine.mjs');
+  for (const r of await checkEngine()) {
+    if (r.skipped) console.log(`publish check: the ${r.name} build not run here (${r.skipped})`);
+    else if (!r.ok) {
+      problems.push(
+        `dist/wasm/${r.file} (the ${r.name} build) does not work: ${r.problem}. ` +
+          'Rebuild it (`npm run build:wasm`) or take the CI build from the release',
+      );
+    }
+  }
+}
+
 if (problems.length > 0) {
   console.error('\nRefusing to publish:\n');
   for (const problem of problems) console.error(`  • ${problem}`);
@@ -87,4 +103,4 @@ if (problems.length > 0) {
   process.exit(1);
 }
 
-console.log('publish check: all required files present');
+console.log('publish check: all required files present, and the engine runs');
