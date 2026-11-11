@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Firebird WASM — Interactive Replication Simulator v2 &amp; Demo</title>
+    <title>Firebird WASM — Interactive Replication Simulator v5 &amp; Demo</title>
     <meta
       name="description"
       content="Interactive Primary/Replica and Bidirectional Database Replication Simulator v2 with HLC, Per-Column CRDTs, Row/Column Filtering, Replication Slots, and Native Binary Segment Hex Inspector."
@@ -348,7 +348,7 @@
   <body>
     <header class="masthead">
       <div class="masthead-text">
-        <h1>Firebird Database Replication Simulator v2 &amp; Demo</h1>
+        <h1>Firebird Database Replication Simulator v5 &amp; Demo</h1>
         <p>
           Interactive logical &amp; journal-based replication (<code>FB_REPL_JOURNAL$</code>,
           <code>FB_REPL_SLOTS$</code>, <code>FB_REPL_WATERMARKS$</code>, and <code>FB_REPL_TRG$</code> PSQL triggers).
@@ -362,7 +362,7 @@
       </div>
       <div class="status" id="engine-status" data-state="ready">
         <span class="status-dot"></span>
-        <span class="status-text" id="engine-status-text">Replication Simulator v2 Ready</span>
+        <span class="status-text" id="engine-status-text">Replication Simulator v5 Ready</span>
       </div>
     </header>
 
@@ -471,6 +471,10 @@
         <button type="button" class="scenario-card" data-scenario="fbchangelog">
           <strong>11. Native Engine (<code>RDB$PUBLICATIONS</code> + <code>FBCHANGELOG\0</code>)</strong>
           <span>Enable RDB$DEFAULT publication, emit 48B ChangeLog::Header + 16B Replication::Block segments, and replay to Replica!</span>
+        </button>
+        <button type="button" class="scenario-card" data-scenario="oneliner-batch">
+          <strong>12. One-Liner <code>syncDatabases()</code> + <code>IBatch</code> &amp; WS <code>FBCHANGELOG\0</code></strong>
+          <span>Open via <code>openDatabase()</code>, batch-apply 4 mutations with <code>UPDATE OR INSERT ... MATCHING</code>, and gzip-stream <code>FBCHANGELOG\0</code>!</span>
         </button>
       </section>
 

@@ -17,6 +17,34 @@
  */
 
 export { FirebirdLite, FirebirdTransaction } from './firebird';
+export { FirebirdBrowser, FirebirdBrowserTransaction } from './browser/firebird-browser';
+export type { FirebirdBrowserOptions } from './browser/firebird-browser';
+export { openDatabase } from './open-database';
+export type { OpenDatabaseOptions } from './open-database';
+export { openBrowserDatabase } from './browser/open-database';
+export type { OpenBrowserDatabaseOptions } from './browser/open-database';
+export {
+  DatabaseCoreSubsystems,
+  validateTimeoutMs,
+  toAbortError,
+  createTimeoutError,
+  assertNotAborted,
+  runWithCancellation,
+  validateSavepointName,
+  SAVEPOINT_NAME_PATTERN,
+} from './database-core';
+export type {
+  FirebirdDatabase,
+  FirebirdTransactionClient,
+  UnifiedExecuteResult,
+} from './database-core';
+export {
+  FirebirdError,
+  isFirebirdError,
+  parseFirebirdError,
+  toFirebirdError,
+} from './errors';
+export type { FirebirdErrorDetails } from './errors';
 
 export { sql, SqlFragment, RawSql, isSqlFragment, toStatement } from './sql-tag';
 export { statementKind } from './statement-types';
@@ -318,6 +346,9 @@ export {
   fbChangelogToLogicalEntries,
   setWasmDatabaseReplicaMode,
   createWasmChangelogPoller,
+  introspectJrdTableSchemas,
+  syncDatabases,
+  syncWithPeer,
 } from './replication';
 export type {
   ReplicableDatabase,
@@ -422,6 +453,11 @@ export type {
   WasmChangelogPollerOptions,
   WasmChangelogPollerStats,
   WasmChangelogPoller,
+  ReplicableTransactionRunner,
+  ChangelogSegmentSource,
+  SyncDatabasesOptions,
+  SyncWithOptions,
+  SyncHandle,
 } from './replication';
 export {
   ENCRYPTED_PAGE_MAGIC,

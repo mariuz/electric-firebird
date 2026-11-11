@@ -8020,7 +8020,11 @@ int fb_set_replica_mode(int db_handle, int mode)
 		return 3;
 	}
 
-	constexpr unsigned char DPB_SET_DB_REPLICA = 92; // isc_dpb_set_db_replica
+#ifdef isc_dpb_set_db_replica
+	constexpr unsigned char DPB_SET_DB_REPLICA = isc_dpb_set_db_replica;
+#else
+	constexpr unsigned char DPB_SET_DB_REPLICA = 90; // isc_dpb_set_db_replica in Firebird 4.0/5.0
+#endif
 	const unsigned char replicaFlag = static_cast<unsigned char>(mode < 0 ? 0 : (mode > 2 ? 2 : mode));
 	dpb->insertBytes(status.ptr(), DPB_SET_DB_REPLICA, &replicaFlag, 1);
 	if (status.failed())

@@ -34,6 +34,8 @@ export type EngineOp =
   | 'explain'
   | 'databaseInfo'
   | 'sweep'
+  | 'setReplicaMode'
+  | 'replicateChangelog'
   | 'prepare'
   | 'stmtClose'
   | 'stmtSetTimeout'

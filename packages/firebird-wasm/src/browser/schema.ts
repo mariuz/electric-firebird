@@ -61,6 +61,7 @@ function isInternalTableName(name: string): boolean {
   const upper = name.toUpperCase();
   return (
     INTERNAL_TABLES.has(upper) ||
+    upper.startsWith('FB_REPL_') ||
     upper.startsWith('ELECTRIC_SHADOW$') ||
     upper.startsWith('ELECTRIC_META$')
   );
@@ -68,12 +69,16 @@ function isInternalTableName(name: string): boolean {
 
 function isInternalTriggerName(name: string): boolean {
   const upper = name.toUpperCase();
-  return upper.startsWith('FB$LIVE_') || upper.startsWith('ELECTRIC_TRIG$');
+  return (
+    upper.startsWith('FB$LIVE_') ||
+    upper.startsWith('FB_REPL_') ||
+    upper.startsWith('ELECTRIC_TRIG$')
+  );
 }
 
 function isInternalSequenceName(name: string): boolean {
   const upper = name.toUpperCase();
-  return upper.startsWith('ELECTRIC_');
+  return upper.startsWith('ELECTRIC_') || upper.startsWith('FB_REPL_');
 }
 
 function matchesTableFilter(relationName: string, filter?: string): boolean {
@@ -244,7 +249,7 @@ export async function introspect(
   const relRes = await db.query(
     'SELECT TRIM(RDB$RELATION_NAME) AS REL_NAME, ' +
       'CASE WHEN RDB$VIEW_BLR IS NULL THEN 0 ELSE 1 END AS IS_VIEW, ' +
-      'TRIM(CAST(RDB$VIEW_SOURCE AS VARCHAR(4096))) AS VIEW_SOURCE, ' +
+      'TRIM(CAST(LEFT(RDB$VIEW_SOURCE, 4096) AS VARCHAR(4096))) AS VIEW_SOURCE, ' +
       'COALESCE(RDB$SYSTEM_FLAG, 0) AS SYS_FLAG ' +
       'FROM RDB$RELATIONS ' +
       'ORDER BY RDB$RELATION_NAME',
@@ -505,7 +510,7 @@ export async function introspect(
       'COALESCE(RDB$TRIGGER_TYPE, 0) AS TRG_TYPE, ' +
       'COALESCE(RDB$TRIGGER_SEQUENCE, 0) AS TRG_SEQ, ' +
       'COALESCE(RDB$TRIGGER_INACTIVE, 0) AS TRG_INACTIVE, ' +
-      'TRIM(CAST(RDB$TRIGGER_SOURCE AS VARCHAR(4096))) AS TRG_SOURCE, ' +
+      'TRIM(CAST(LEFT(RDB$TRIGGER_SOURCE, 4096) AS VARCHAR(4096))) AS TRG_SOURCE, ' +
       'COALESCE(RDB$SYSTEM_FLAG, 0) AS SYS_FLAG ' +
       'FROM RDB$TRIGGERS ' +
       'ORDER BY RDB$RELATION_NAME, RDB$TRIGGER_SEQUENCE, RDB$TRIGGER_NAME',

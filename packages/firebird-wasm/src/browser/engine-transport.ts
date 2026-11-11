@@ -186,6 +186,24 @@ export interface EngineTransport {
   databaseInfo?(dbHandle: EngineHandle): Promise<DatabaseInfo>;
   /** Trigger an immediate garbage-collection sweep and return before/after diagnostics. */
   sweep?(dbHandle: EngineHandle): Promise<SweepResult>;
+  /**
+   * Configure Firebird's native database replica mode (`0 | 'none'`,
+   * `1 | 'read_only'`, or `2 | 'read_write'`) on the database header page.
+   */
+  setReplicaMode?(
+    dbHandle: EngineHandle,
+    mode: 0 | 1 | 2 | 'none' | 'read_only' | 'read_write',
+  ): Promise<void>;
+  /**
+   * Apply a native Firebird `"FBCHANGELOG\0"` binary changelog segment to
+   * `dbHandle` via `IAttachment::createReplicator`, returning the number of
+   * changelog blocks processed.
+   */
+  replicateChangelog?(
+    dbHandle: EngineHandle,
+    data: Uint8Array,
+    transfer?: boolean,
+  ): Promise<number>;
   prepare?(
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
@@ -264,7 +282,7 @@ export interface EngineTransport {
   mkdir(path: string): Promise<void>;
   exists(path: string): Promise<boolean>;
   readFile(path: string): Promise<Uint8Array>;
-  writeFile(path: string, data: Uint8Array): Promise<void>;
+  writeFile(path: string, data: Uint8Array, transfer?: boolean): Promise<void>;
   /** Return the byte size of `path` (0 when absent) without reading its contents. */
   fileSize?(path: string): Promise<number>;
   /** Read at most `length` bytes from `path` starting at byte `offset`. */
@@ -275,6 +293,7 @@ export interface EngineTransport {
     data: Uint8Array,
     offset: number,
     truncate?: boolean,
+    transfer?: boolean,
   ): Promise<void>;
   /** Remove a file.  Used to discard an ephemeral database on close. */
   unlink(path: string): Promise<void>;
@@ -2291,6 +2310,64 @@ export class DirectTransport implements EngineTransport {
 
     const after = await this.databaseInfo(dbHandle);
     return buildSweepResult(before, after, tablesScanned, performance.now() - started);
+  }
+
+  async setReplicaMode(
+    dbHandle: EngineHandle,
+    mode: 0 | 1 | 2 | 'none' | 'read_only' | 'read_write',
+  ): Promise<void> {
+    const mod = this.module;
+    const modeCode: 0 | 1 | 2 =
+      mode === 'none' || mode === 0
+        ? 0
+        : mode === 'read_only' || mode === 1
+          ? 1
+          : 2;
+
+    for (const [stmtHandle, entry] of this.preparedStatements) {
+      if (entry.dbHandle === dbHandle) {
+        this.preparedStatements.delete(stmtHandle);
+      }
+    }
+
+    if (typeof mod._fb_set_replica_mode === 'function') {
+      const rc = mod._fb_set_replica_mode(dbHandle, modeCode);
+      if (rc !== 0) {
+        throw engineError(mod, 'Failed to set database replica mode', rc);
+      }
+      return;
+    }
+
+    throw new Error(
+      'Native _fb_set_replica_mode is not exported by the loaded Firebird WASM module.',
+    );
+  }
+
+  async replicateChangelog(
+    dbHandle: EngineHandle,
+    data: Uint8Array,
+  ): Promise<number> {
+    const mod = this.module;
+    if (typeof mod._fb_replicate_changelog !== 'function') {
+      throw new Error(
+        'Native _fb_replicate_changelog (IAttachment::createReplicator) is not exported by the loaded Firebird WASM module.',
+      );
+    }
+    if (data.byteLength === 0) {
+      return 0;
+    }
+    const ptr = mod._malloc(data.byteLength);
+    let processed: number;
+    try {
+      mod.HEAPU8.set(data, ptr);
+      processed = mod._fb_replicate_changelog(dbHandle, ptr, data.byteLength);
+    } finally {
+      mod._free(ptr);
+    }
+    if (processed < 0) {
+      throw engineError(mod, 'Failed to apply Firebird changelog segment', processed);
+    }
+    return processed;
   }
 
   private async fallbackDatabaseInfo(dbHandle: EngineHandle): Promise<DatabaseInfo> {

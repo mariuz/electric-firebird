@@ -2643,6 +2643,73 @@ test.describe('FirebirdBrowser', () => {
     expect(second.statements).toBe(4);
   });
 
+  test('supports openDatabase(), db.execute(), Symbol.asyncDispose, and structured FirebirdError in browser', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      window.__stub.affectedRows = 3;
+      const db = await window.FB.openDatabase('memory://m18-browser-unified', {
+        autoPersist: false,
+      });
+
+      const execRes = await db.execute('UPDATE items SET active = 1 WHERE active = ?', [0]);
+      const attachmentsBeforeDispose = window.__stub.stats().openAttachments;
+
+      const disposeSym = Symbol.asyncDispose ?? Symbol.for('Symbol.asyncDispose');
+      await (db as unknown as Record<symbol, () => Promise<void>>)[disposeSym]();
+      const attachmentsAfterDispose = window.__stub.stats().openAttachments;
+
+      const parsedUnique = window.FB.toFirebirdError(
+        new Error(
+          'violation of PRIMARY or UNIQUE KEY constraint "PK_ITEMS" on table "ITEMS" (gdscode 335544665)',
+        ),
+      );
+      const parsedMissing = window.FB.parseFirebirdError(
+        'Dynamic SQL Error\n-SQL error code = -204\n-Table unknown\n-MISSING_TBL',
+      );
+
+      return {
+        execRes,
+        attachmentsBeforeDispose,
+        attachmentsAfterDispose,
+        hasSyncDatabases: typeof window.FB.syncDatabases === 'function',
+        hasSyncWith: typeof db.syncWith === 'function',
+        isFbError: window.FB.isFirebirdError(parsedUnique),
+        uniqueMeta: {
+          gdscode: parsedUnique.gdscode,
+          sqlState: parsedUnique.sqlState,
+          constraint: parsedUnique.constraint,
+          table: parsedUnique.table,
+          hasHint: Boolean(parsedUnique.hint),
+        },
+        missingMeta: {
+          sqlcode: parsedMissing.sqlcode,
+          sqlState: parsedMissing.sqlState,
+          table: parsedMissing.table,
+        },
+      };
+    });
+
+    expect(result.execRes).toEqual({ affectedRows: 3, changes: 3 });
+    expect(result.attachmentsBeforeDispose).toBe(1);
+    expect(result.attachmentsAfterDispose).toBe(0);
+    expect(result.hasSyncDatabases).toBe(true);
+    expect(result.hasSyncWith).toBe(true);
+    expect(result.isFbError).toBe(true);
+    expect(result.uniqueMeta).toEqual({
+      gdscode: 335544665,
+      sqlState: '23000',
+      constraint: 'PK_ITEMS',
+      table: 'ITEMS',
+      hasHint: true,
+    });
+    expect(result.missingMeta).toEqual({
+      sqlcode: -204,
+      sqlState: '42S02',
+      table: 'MISSING_TBL',
+    });
+  });
+
   test('streams rows in batches with queryStream() and closes cursor on early break', async ({
     page,
   }) => {

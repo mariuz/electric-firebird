@@ -7,7 +7,37 @@ This page documents every public symbol exported by the `firebird-wasm` package.
 ## `firebird-wasm` (Node.js entry point)
 
 ```ts
-import { FirebirdLite, FirebirdTransaction } from 'firebird-wasm';
+import {
+  openDatabase,
+  FirebirdLite,
+  FirebirdTransaction,
+  FirebirdError,
+  isFirebirdError,
+  parseFirebirdError,
+  toFirebirdError,
+  syncDatabases,
+} from 'firebird-wasm';
+```
+
+---
+
+### `openDatabase(uri, options?)` & `FirebirdDatabase`
+
+Isomorphic async factory exported from both `firebird-wasm` and `firebird-wasm/browser`. Parses storage scheme URIs (`memory://name`, `opfs://name`, `idb://name`, bare browser store names, or Node.js `.fdb` / `host:/path/to/db.fdb` paths) and returns an initialized `FirebirdDatabase` supporting `execute()` (`{ affectedRows, changes }`), `syncWith()`, and Explicit Resource Management (`await using db = await openDatabase(...)`):
+
+```ts
+function openDatabase(uri: string, options?: OpenDatabaseOptions): Promise<FirebirdDatabase>
+
+interface UnifiedExecuteResult {
+  affectedRows: number;
+  changes: number;
+}
+```
+
+```ts
+await using db = await openDatabase('memory://app');
+await db.execute('CREATE TABLE todos (id INT NOT NULL PRIMARY KEY, title VARCHAR(100))');
+const { affectedRows } = await db.execute('INSERT INTO todos VALUES (?, ?)', [1, 'Ship M18']);
 ```
 
 ---
@@ -21,6 +51,7 @@ class FirebirdLite {
   constructor(dbPath: string, options?: FirebirdLiteOptions)
 
   exec(sql: string | SqlFragment, params?: QueryParams, options?: StatementExecutionOptions): Promise<void>
+  execute(sql: string | SqlFragment, params?: QueryParams, options?: StatementExecutionOptions): Promise<UnifiedExecuteResult>
   execBatch(sql: string, rows: QueryParams[]): Promise<void>
   query<T extends Row = Row>(sql: SqlFragment, options?: QueryOptions): Promise<QueryResult<T>>
   query<T extends Row = Row>(
@@ -65,6 +96,8 @@ class FirebirdLite {
   monitorStats(): Promise<MonitorStats>
   resetMonitorStats(): void
   cancelOperation(): Promise<void>
+  syncWith(peer: FirebirdDatabase | string | WebSocketLike, options?: SyncWithOptions): Promise<SyncHandle>
+  [Symbol.asyncDispose](): Promise<void>
   close(): Promise<void>
 }
 ```
@@ -484,10 +517,15 @@ class FirebirdBrowser {
   dumpDataStream(options?: DataStreamOptions): ReadableStream<Uint8Array>
   loadDataStream(stream: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array>, options?: DataStreamOptions): Promise<void>
   loadIcuLocaleData(data: Uint8Array | ArrayBufferLike): Promise<void>
+  setReplicaMode(mode: 'none' | 'read_only' | 'read_write'): Promise<void>
+  applyChangelog(segmentBytes: Uint8Array): Promise<boolean>
+  execute(sql: string | SqlFragment, params?: QueryParams, options?: StatementExecutionOptions): Promise<UnifiedExecuteResult>
   onQuery(listener: QueryProfileListener): () => void
   monitorStats(): Promise<MonitorStats>
   resetMonitorStats(): void
   cancelOperation(): Promise<void>
+  syncWith(peer: FirebirdDatabase | string | WebSocketLike, options?: SyncWithOptions): Promise<SyncHandle>
+  [Symbol.asyncDispose](): Promise<void>
   persist(): Promise<void>
   close(): Promise<void>
 }
@@ -835,6 +873,28 @@ call `mod._free(ptr)` to avoid a memory leak.
 ---
 
 ## Types
+
+### `FirebirdError`, `parseFirebirdError`, `toFirebirdError`, `isFirebirdError`
+
+Structured error subclass emitted across both Node.js (`FirebirdLite`) and Browser WASM (`FirebirdBrowser`) backends with parsed ISC status metadata:
+
+```ts
+class FirebirdError extends Error {
+  readonly gdscode?: number;        // e.g. 335544665
+  readonly sqlcode?: number;        // e.g. -803
+  readonly sqlState?: string;       // 5-char SQLSTATE, e.g. '23000', '42S02', '40001'
+  readonly symbol?: string;         // e.g. 'unique_key_violation', 'table_unknown'
+  readonly table?: string;          // Extracted table/relation identifier when present
+  readonly column?: string;         // Extracted column/field identifier when present
+  readonly constraint?: string;     // Extracted PK/FK/UNIQUE/CHECK constraint name when present
+  readonly sql?: string;            // Triggering SQL text when supplied
+  readonly hint?: string;           // Actionable remediation hint
+}
+
+function parseFirebirdError(errorOrMessage: unknown, sql?: string): FirebirdErrorDetails
+function toFirebirdError(err: unknown): FirebirdError
+function isFirebirdError(err: unknown): err is FirebirdError
+```
 
 ### `FirebirdLiteOptions`
 
@@ -1503,4 +1563,4 @@ Reactive query and live-query hooks/stores across all four UI frameworks:
 
 ### `firebird-wasm/replication`
 
-Logical, journal-based (`FB_REPL_JOURNAL$`), and native Firebird C++ engine (`RDB$PUBLICATIONS`, `replication.conf`, `"FBCHANGELOG\0"`, `IReplicator`) replication: `replicateDatabases`, `createPublication`, `createSubscription`, `createReplicationMesh`, `createReplicationHub`, `installReplicationTriggers`, `bootstrapReplica`, `publishAllTables`, `syncCatalog`, `createHlc`, `createCrdtConflictResolver`, `promoteReplica`, `encodeEncryptedJournalSegment`, `asOfLsn`, `rewindToLsn`, `createReplicationDlq`, `createPiiMaskingTransformer`, `exportJournalArchive`, `applyJournalArchive`, `compactJournal`, `applyRetentionPolicy`, `createReplicationMetricsCollector`, `checkReplicationSchemaCompatibility`, `enableEnginePublication`, `readWasmChangelogSegments`, `decodeFbChangelogOperations`, `fbChangelogToLogicalEntries`, `createWasmChangelogPoller`, and `applyFbChangelogSegmentToDatabase`. See the full [Database Replication Guide](./replication.md).
+Logical, journal-based (`FB_REPL_JOURNAL$`), and native Firebird C++ engine (`RDB$PUBLICATIONS`, `replication.conf`, `"FBCHANGELOG\0"`, `IReplicator`) replication: `syncDatabases`, `syncWithPeer` (`db.syncWith`), `replicateDatabases`, `createPublication`, `createSubscription`, `createReplicationMesh`, `createReplicationHub`, `installReplicationTriggers`, `bootstrapReplica`, `publishAllTables`, `syncCatalog`, `createHlc`, `createCrdtConflictResolver`, `promoteReplica`, `encodeEncryptedJournalSegment`, `asOfLsn`, `rewindToLsn`, `createReplicationDlq`, `createPiiMaskingTransformer`, `exportJournalArchive`, `applyJournalArchive`, `compactJournal`, `applyRetentionPolicy`, `createReplicationMetricsCollector`, `checkReplicationSchemaCompatibility`, `enableEnginePublication`, `readWasmChangelogSegments`, `decodeFbChangelogOperations`, `fbChangelogToLogicalEntries`, `introspectJrdTableSchemas`, `createWasmChangelogPoller`, and `applyFbChangelogSegmentToDatabase`. See the full [Database Replication Guide](./replication.md).

@@ -5,6 +5,10 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "browser": "dist/browser/index.js",
+  "sideEffects": [
+    "./dist/browser/worker-entry.js",
+    "./dist/repl/index.js"
+  ],
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",

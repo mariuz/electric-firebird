@@ -57,16 +57,31 @@ import {
 import { applyTypes, applySerializers } from './browser/value-types';
 import { buildCopyToStream, executeCopyFromStream } from './browser/copy-stream';
 import { introspect as introspectSchema, migrate as runMigrations } from './browser/schema';
-import { UdrManager } from './browser/udr';
+import type { UdrManager } from './browser/udr';
 import {
-  CowSnapshotStore,
   type DatabaseSnapshot,
   type DatabaseSnapshotInfo,
   type SnapshotOptions,
   type PageDiffOptions,
   type ApplyPageDiffOptions,
 } from './browser/snapshots';
-import { QueryProfiler } from './browser/profiler';
+import {
+  assertNotAborted,
+  createTimeoutError,
+  DatabaseCoreSubsystems,
+  type FirebirdDatabase,
+  type FirebirdTransactionClient,
+  runWithCancellation,
+  type UnifiedExecuteResult,
+  validateSavepointName,
+  validateTimeoutMs,
+} from './database-core';
+import type { ReplicableDatabase } from './replication/types';
+import {
+  syncWithPeer,
+  type SyncHandle,
+  type SyncWithOptions,
+} from './replication/presets';
 import type {
   JsFunctionHandler,
   JsProcedureHandler,
@@ -129,94 +144,6 @@ function loadNativeDriver(): NativeDriver {
 type ArrayModeOptions = QueryOptions & { rowMode: 'array' };
 /** `QueryStreamOptions` with the array mode pinned, for the overloads below. */
 type ArrayStreamOptions = QueryStreamOptions & { rowMode: 'array' };
-
-function validateTimeoutMs(timeoutMs?: number): number | undefined {
-  if (timeoutMs === undefined) return undefined;
-  if (
-    typeof timeoutMs !== 'number' ||
-    !Number.isFinite(timeoutMs) ||
-    timeoutMs < 0
-  ) {
-    throw new RangeError('timeoutMs must be a non-negative finite number');
-  }
-  return Math.floor(timeoutMs);
-}
-
-function toAbortError(reason: unknown): Error {
-  if (reason instanceof Error) return reason;
-  const err = new Error(
-    reason !== undefined && reason !== null
-      ? String(reason)
-      : 'The operation was aborted',
-  );
-  err.name = 'AbortError';
-  return err;
-}
-
-function createTimeoutError(timeoutMs: number): Error {
-  const err = new Error(`Statement timed out after ${timeoutMs}ms`);
-  err.name = 'TimeoutError';
-  return err;
-}
-
-function assertNotAborted(signal?: AbortSignal): void {
-  if (signal?.aborted) {
-    throw toAbortError(signal.reason);
-  }
-}
-
-async function runWithCancellation<T>(
-  work: () => Promise<T>,
-  options: StatementExecutionOptions | undefined,
-  onCancel: () => Promise<void>,
-): Promise<T> {
-  const signal = options?.signal;
-  const timeoutMs = validateTimeoutMs(options?.timeoutMs);
-  assertNotAborted(signal);
-
-  if (!signal && (!timeoutMs || timeoutMs <= 0)) {
-    return work();
-  }
-
-  let cleanup = (): void => undefined;
-  const cancelPromise = new Promise<never>((_resolve, reject) => {
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const onAbort = (): void => {
-      void onCancel().catch(() => undefined);
-      reject(toAbortError(signal?.reason));
-    };
-    if (signal) {
-      if (signal.aborted) {
-        onAbort();
-        return;
-      }
-      signal.addEventListener('abort', onAbort, { once: true });
-    }
-    if (timeoutMs && timeoutMs > 0) {
-      timer = setTimeout(() => {
-        void onCancel().catch(() => undefined);
-        reject(createTimeoutError(timeoutMs));
-      }, timeoutMs);
-    }
-    cleanup = () => {
-      if (signal) {
-        signal.removeEventListener('abort', onAbort);
-      }
-      if (timer !== null) {
-        clearTimeout(timer);
-        timer = null;
-      }
-    };
-  });
-
-  try {
-    const workPromise = work();
-    workPromise.catch(() => undefined);
-    return await Promise.race([workPromise, cancelPromise]);
-  } finally {
-    cleanup();
-  }
-}
 
 async function cancelAttachmentOperation(
   attachment: Attachment | null,
@@ -298,7 +225,7 @@ async function applyStatementHandleTimeout(
  * await db.close();
  * ```
  */
-export class FirebirdLite {
+export class FirebirdLite implements FirebirdDatabase {
   private readonly dbPath: string;
   private readonly libraryPath: string | undefined;
   private readonly connectOptions: { username?: string; password?: string; charSetForNONE?: string };
@@ -314,9 +241,16 @@ export class FirebirdLite {
   /** Statements kept prepared by their SQL text, once connected (`statementCache`). */
   private statements: StatementCache | null = null;
   private readonly preparedStatements = new Set<PreparedStatement>();
-  private readonly udr = new UdrManager();
-  private readonly snapshotStore = new CowSnapshotStore(8192);
-  private readonly profiler = new QueryProfiler();
+  private readonly core = new DatabaseCoreSubsystems(8192);
+  private get udr() {
+    return this.core.udr;
+  }
+  private get snapshotStore() {
+    return this.core.snapshotStore;
+  }
+  private get profiler() {
+    return this.core.profiler;
+  }
   private readonly types: TypeOptions | undefined;
 
   constructor(dbPath: string, options: FirebirdLiteOptions = {}) {
@@ -417,6 +351,54 @@ export class FirebirdLite {
       });
       throw err;
     }
+  }
+
+  /**
+   * Execute a single DDL or DML statement and return `{ affectedRows, changes }` (`M18 Item 3`).
+   */
+  async execute(
+    sql: string | SqlFragment,
+    params: QueryParams = [],
+    options: StatementExecutionOptions = {},
+  ): Promise<UnifiedExecuteResult> {
+    assertNotAborted(options.signal);
+    validateTimeoutMs(options.timeoutMs);
+    const script = toStatement(sql, params);
+    const startedAt = this.profiler.begin();
+    try {
+      const res = await this.transaction((tx) => tx.execute(sql, params, options));
+      this.profiler.end({
+        startedAt,
+        sql: script.sql,
+        params: script.params,
+        kind: 'exec',
+        rowCount: res.affectedRows,
+        cacheHit: false,
+      });
+      return res;
+    } catch (err) {
+      this.profiler.end({
+        startedAt,
+        sql: script.sql,
+        params: script.params,
+        kind: 'exec',
+        cacheHit: false,
+        error: err,
+      });
+      throw err;
+    }
+  }
+
+  /**
+   * One-liner synchronization with another `FirebirdBrowser`/`FirebirdLite`
+   * instance, an HTTP(S) replication URL, or a `broadcast://<channel>` URI (`M18 Item 5`).
+   */
+  async syncWith(
+    peerOrUrl: ReplicableDatabase | string,
+    options: SyncWithOptions = {},
+  ): Promise<SyncHandle> {
+    await this.ensureReady();
+    return syncWithPeer(this, peerOrUrl, options);
   }
 
   /**
@@ -2108,9 +2090,7 @@ export class FirebirdLite {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
-    this.udr.clear();
-    this.snapshotStore.clear();
-    this.profiler.clear();
+    this.core.clear();
 
     await this.endReadTransaction();
     for (const stmt of [...this.preparedStatements]) {
@@ -2127,24 +2107,18 @@ export class FirebirdLite {
       this.client = null;
     }
   }
-}
 
-const SAVEPOINT_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_$]{0,62}$/;
-
-function validateSavepointName(name: string): string {
-  if (typeof name !== 'string' || !SAVEPOINT_NAME_PATTERN.test(name)) {
-    throw new Error(
-      `Invalid savepoint name "${String(name)}": must be a valid SQL identifier (1-63 ASCII letters, digits, '_', or '$', starting with a letter or '_')`,
-    );
+  /** Async resource disposal (`await using db = ...`) (`M18 Item 3`). */
+  async [Symbol.asyncDispose](): Promise<void> {
+    await this.close();
   }
-  return name;
 }
 
 /**
  * A handle to an active Firebird transaction (or nested savepoint), exposed to
  * callers of `FirebirdLite.transaction()`.
  */
-export class FirebirdTransaction {
+export class FirebirdTransaction implements FirebirdTransactionClient {
   private finished = false;
   private readonly nextSavepointId: () => number;
 
@@ -2366,6 +2340,33 @@ export class FirebirdTransaction {
         options,
         () => cancelAttachmentOperation(this.attachment),
       );
+    }
+  }
+
+  /**
+   * Execute a DDL or DML statement inside this transaction and return `{ affectedRows, changes }` (`M18 Item 3`).
+   */
+  async execute(
+    sql: string | SqlFragment,
+    params: QueryParams = [],
+    options: StatementExecutionOptions = {},
+  ): Promise<UnifiedExecuteResult> {
+    const stmtText = toStatement(sql, params).sql;
+    await this.exec(sql, params, options);
+    if (/^\s*(CREATE|ALTER|DROP|RECREATE|SET|GRANT|REVOKE|COMMENT|DECLARE)\b/i.test(stmtText)) {
+      return { affectedRows: 0, changes: 0 };
+    }
+    try {
+      const rcRes = await this.query<Row>(
+        `SELECT CAST(RDB$GET_CONTEXT('SYSTEM', 'ROW_COUNT') AS INTEGER) AS RC FROM RDB$DATABASE`,
+      );
+      const affectedRows = Math.max(
+        0,
+        Number(rcRes.rows[0]?.RC ?? rcRes.rows[0]?.rc ?? 0) || 0,
+      );
+      return { affectedRows, changes: affectedRows };
+    } catch {
+      return { affectedRows: 0, changes: 0 };
     }
   }
 

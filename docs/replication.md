@@ -10,6 +10,7 @@
 
 1. [Architecture Overview](#1-architecture-overview)
 2. [Quick Start — Replication Setup](#2-quick-start--replication-setup)
+   - [2.0 One-Liner `syncDatabases()` & `db.syncWith()`](#20-one-liner-syncdatabases--dbsyncwith)
    - [2.1 High-Level `replicateDatabases()` Setup](#21-high-level-replicatedatabases-setup)
    - [2.2 Explicit Publication & Subscription Setup](#22-explicit-publication--subscription-setup)
 3. [SQL Trigger-Based Change Capture](#3-sql-trigger-based-change-capture)
@@ -77,6 +78,31 @@ flowchart LR
 ---
 
 ## 2. Quick Start — Replication Setup
+
+### 2.0 One-Liner `syncDatabases()` & `db.syncWith()`
+
+For common peer, BroadcastChannel, WebSocket, or HTTP sync setups, `syncDatabases(source, target, options?)` (or the instance method `db.syncWith(peerOrUrlOrChannel, options?)`) automatically introspects user tables (`tables: '*'`), syncs missing schema DDL + sequence watermarks, bootstraps initial rows via batched `IBatch` `UPDATE OR INSERT`, installs `FB_REPL_TRG$*` triggers, and returns an `AsyncDisposable` `SyncHandle`:
+
+```ts
+import { openDatabase, syncDatabases } from 'firebird-wasm/browser';
+
+await using primary = await openDatabase('memory://primary');
+await using replica = await openDatabase('memory://replica');
+
+await primary.execute('CREATE TABLE TASKS (ID INT NOT NULL PRIMARY KEY, TITLE VARCHAR(120))');
+await primary.execute('INSERT INTO TASKS VALUES (?, ?)', [1, 'Seeded before sync']);
+
+// 1-liner bidirectional sync (auto-bootstraps schema + row #1 onto replica):
+await using sync = await syncDatabases(primary, replica); // or: await primary.syncWith(replica)
+
+await replica.execute('INSERT INTO TASKS VALUES (?, ?)', [2, 'Added on replica']);
+await sync.syncOnce();
+console.log(await sync.stats());
+
+// Also accepts an HTTP endpoint URL, WebSocket, or BroadcastChannel name:
+// const remoteSync = await replica.syncWith('https://api.example.com/replication');
+// const tabSync = await replica.syncWith('broadcast://my-app-tabs');
+```
 
 ### 2.1 High-Level `replicateDatabases()` Setup
 
@@ -364,7 +390,7 @@ const pruneResult = await primaryPublication.pruneAcked();
 // { expiredSlots: [], activeSlotCount: 2, safeLsn: 42, prunedEntries: 42 }
 ```
 
-### 5.5 Network Transports (HTTP/SSE, WebSocket & `BroadcastChannel`)
+### 5.5 Network Transports (HTTP/SSE, WebSocket, `BroadcastChannel` & Gzipped `"FBCHANGELOG\0"` Streaming)
 
 Connect `FirebirdLite` (server) and `FirebirdBrowser` (WASM) across HTTP/SSE, duplex WebSockets, or browser tabs:
 
@@ -402,7 +428,17 @@ const tabTransport = createBroadcastChannelTransport({
 });
 ```
 
-### 5.6 Binary (`0x52444246`) & AES-256-GCM Encrypted (`0x53444246`) Journal Segments
+### 5.6 Binary (`0x52444246`), Encrypted (`0x53444246`), & Raw/Gzip `"FBCHANGELOG\0"` Wire Streaming
+
+`createHttpReplicationHandler` / `createHttpReplicationClient` (`GET /changelog?sinceSeq=...`, `POST /changelog`) and `createWebSocketReplicationPeer` (`sendChangelogSegment`, `onChangelogSegment`) also stream native Firebird `"FBCHANGELOG\0"` binary segments (raw or `CompressionStream('gzip')`-compressed):
+
+```ts
+const segments = await client.fetchChangelogSegments(1);
+await client.pushChangelogSegment(segments[0], { sequence: 1, compress: true });
+await wsPeer.sendChangelogSegment(segments[0], { sequence: 1, compress: true });
+```
+
+### 5.6.1 Binary (`0x52444246`) & AES-256-GCM Encrypted (`0x53444246`) Journal Segments
 
 Encode/decode binary journal segments (`0x52444246` `'FBDR'` header + FNV-1a checksum), optionally Gzip-compressed (`CompressionStream('gzip')`) and end-to-end encrypted with WebCrypto AES-256-GCM (`0x53444246` `'FBDS'` envelope):
 
@@ -666,7 +702,16 @@ for (const seg of segments) {
 }
 ```
 
-### 7.2 `"FBCHANGELOG\0"` Binary Opcode Decoder, JRD Record/Sequence Extractor & Continuous Changelog Poller
+### 7.2 `"FBCHANGELOG\0"` Binary Opcode Decoder, Auto-Introspected JRD Schemas & Continuous Changelog Poller
+
+On `FirebirdBrowser`, call `await replicaDb.setReplicaMode('read_write')` and `await replicaDb.applyChangelog(segmentBytes)` directly across `DirectTransport`, `WorkerTransport`, and `SharedEngineTransport`. When calling `applyFbChangelogSegmentToDatabase(replicaDb, segment)`, JRD column descriptors are automatically queried from `RDB$RELATION_FIELDS` / `RDB$FIELDS` via `introspectJrdTableSchemas(replicaDb)` whenever `tableSchemas` is omitted:
+
+```ts
+await replicaBrowserDb.setReplicaMode('read_write');
+const applied = await replicaBrowserDb.applyChangelog(segments[0].bytes);
+// Or via applyFbChangelogSegmentToDatabase() with automatic introspectJrdTableSchemas(db):
+await applyFbChangelogSegmentToDatabase(replicaBrowserDb, segments[0]);
+```
 
 Decode all 16 Firebird `Replication::Block` opcodes (`opStartTransaction`..`opDefineAtom`), convert uncompressed JRD record buffers, BLOB chunks (`opStoreBlob`), and sequence watermarks (`opSetSequence`) into logical `ReplicationLogEntry` items (honoring transaction & savepoint rollbacks), configure `hdr_replica_mode` on replica `.fdb` files, and stream archived `.journal-NNNNNNNNN` segments continuously:
 
@@ -734,7 +779,9 @@ await poller.pollOnce(); // or poller.start(100)
 
 | Export | Description |
 |---|---|
-| `replicateDatabases(options)` | High-level helper pairing `primary` and `replica` in `'one-way'` or `'bidirectional'` mode. |
+| `syncDatabases(source, target, options?)` | Zero-boilerplate preset that auto-discovers tables, syncs schema + sequences, bootstraps rows via `IBatch`, installs triggers, and returns a `SyncHandle` (`syncOnce()`, `pause()`, `resume()`, `stats()`, `close()`, `[Symbol.asyncDispose]()`). |
+| `syncWithPeer(db, peer, options?)` / `db.syncWith(peer, options?)` | Syncs `db` with another `FirebirdDatabase`, HTTP URL, `WebSocket`, or `BroadcastChannel` (`'broadcast://name'`). |
+| `replicateDatabases(options)` | High-level helper pairing `primary` and `replica` in `'one-way'` or `'bidirectional'` mode (using batched `UPDATE OR INSERT ... MATCHING` `IBatch` catch-up with savepoint + `FB_REPL_DLQ$` fallback). |
 | `createPublication(db, options)` | Provisions `FB_REPL_JOURNAL$` (and optionally native `RDB$PUBLICATIONS` via `engineMode`) and returns a `ReplicationPublication`. |
 | `createSubscription(db, options)` | Provisions `FB_REPL_WATERMARKS$` and returns a `ReplicationSubscription`. |
 | `createReplicationMesh(options)` | Coordinates $N \ge 2$ database nodes in `'mesh'` or `'hub-and-spoke'` topologies with transitive routing, `watermarkMatrix()`, and `pruneQuorum()`. |
@@ -819,3 +866,5 @@ await poller.pollOnce(); // or poller.start(100)
 | `fbChangelogToLogicalEntries(segOrBytes, opts?)` | Converts a `"FBCHANGELOG\0"` segment into committed `ReplicationLogEntry[]`, `sequences`, and `ddlStatements` (honoring tx & savepoint rollbacks). |
 | `setWasmDatabaseReplicaMode(fs, dbPath, mode?)` | Configures `Ods::header_page::hdr_replica_mode` (`'none' \| 'read_only' \| 'read_write'`) on an unattached `.fdb` file in `MEMFS`. |
 | `createWasmChangelogPoller(options)` | Continuous poller & archiver applying `"FBCHANGELOG\0"` segments in sequence order (`pollOnce()`, `start()`, `stop()`, `stats()`). |
+| `introspectJrdTableSchemas(db)` | Queries `RDB$RELATION_FIELDS`, `RDB$FIELDS`, and primary-key constraints to build exact `JrdColumnDescriptor[]` maps automatically for `"FBCHANGELOG\0"` JRD record decoding. |
+| `db.setReplicaMode(mode)` / `db.applyChangelog(bytes)` | Worker-safe `FirebirdBrowser` methods invoking C++ `isc_dpb_set_db_replica` / `IAttachment::createReplicator` (`IReplicator`) across `DirectTransport`, `WorkerTransport`, and `SharedEngineTransport`. |

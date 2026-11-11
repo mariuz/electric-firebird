@@ -170,6 +170,8 @@ const MUTATING: ReadonlySet<SharedOp> = new Set<SharedOp>([
   'createDatabase',
   'writeFile',
   'sweep',
+  'setReplicaMode',
+  'replicateChangelog',
 ]);
 
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -854,6 +856,20 @@ export class SharedEngineTransport implements EngineTransport {
 
   sweep(dbHandle: EngineHandle): Promise<SweepResult> {
     return this.call<SweepResult>('sweep', dbHandle);
+  }
+
+  setReplicaMode(
+    dbHandle: EngineHandle,
+    mode: 0 | 1 | 2 | 'none' | 'read_only' | 'read_write',
+  ): Promise<void> {
+    return this.call<void>('setReplicaMode', dbHandle, mode);
+  }
+
+  replicateChangelog(
+    dbHandle: EngineHandle,
+    data: Uint8Array,
+  ): Promise<number> {
+    return this.call<number>('replicateChangelog', dbHandle, data);
   }
 
   prepare(

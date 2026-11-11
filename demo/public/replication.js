@@ -901,14 +901,19 @@ function getSetupCodeSnippet() {
 
   return [
     `import {`,
-    `  FirebirdBrowser,`,
+    `  openDatabase,`,
+    `  syncDatabases,`,
     `  replicateDatabases,`,
     `  createCrdtConflictResolver,`,
     `} from 'firebird-wasm/browser';`,
     ``,
-    `const primary = await FirebirdBrowser.create({ database: 'primary.fdb' });`,
-    `const replica = await FirebirdBrowser.create({ database: 'replica.fdb' });`,
+    `await using primary = await openDatabase('opfs://primary');`,
+    `await using replica = await openDatabase('opfs://replica');`,
     ``,
+    `// Zero-boilerplate 1-liner (auto-discovers tables, syncs DDL + sequences & bootstraps via IBatch):`,
+    `// await using sync = await syncDatabases(primary, replica); // or: await primary.syncWith(replica)`,
+    ``,
+    `// Or full explicit configuration via replicateDatabases():`,
     `const replicator = await replicateDatabases({`,
     `  primary,`,
     `  replica,`,
@@ -2063,6 +2068,50 @@ for (const btn of document.querySelectorAll('.scenario-card')) {
       activeCodeTab = 'fbchangelog';
       logEvent(
         `Scenario 11 (<code>RDB$PUBLICATIONS</code> + <code>"FBCHANGELOG\\0"</code>): Enabled <code>RDB$DEFAULT</code> (<code>INCLUDE ALL</code>), sealed <code>.journal-${String(simChangelogSeq).padStart(9, '0')}</code> with <code>opSetSequence</code> + <code>opInsertRecord</code> blocks, and replayed <strong>${res.primaryToReplica.appliedCount}</strong> native change(s) onto Replica (<code>REPLICA_MODE = READ-WRITE</code>)!`,
+        true,
+      );
+      await renderAll();
+    } else if (kind === 'oneliner-batch') {
+      const batchIds = [nextTaskId++, nextTaskId++, nextTaskId++];
+      for (const id of batchIds) {
+        await primaryDb.execute(
+          'INSERT INTO TASKS (ID, TENANT_ID, TITLE, PRIORITY, STOCK, TAGS, DONE, SECRET_HASH) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+          [
+            id,
+            'acme',
+            `IBatch Sync Task #${id}`,
+            'HIGH',
+            25,
+            'syncDatabases,ibatch,ws-gzip',
+            0,
+            `sha256:b${id}`,
+          ],
+        );
+      }
+      await primaryDb.execute('UPDATE TASKS SET DONE = ? WHERE ID = ?', [1, 1]);
+      simChangelogSeq++;
+      simEnginePubState.sequenceValue = batchIds[batchIds.length - 1];
+
+      const res = await replicator.sync();
+      const recentEntries = await replicator.primaryPublication.fetchChangesSince(0);
+      const { seg } = buildFbChangelogSegmentBytes(
+        recentEntries.slice(-4),
+        simChangelogSeq,
+        simEnginePubState.sequenceValue,
+      );
+      let wireLen = seg.byteLength;
+      if (typeof CompressionStream !== 'undefined') {
+        const cs = new CompressionStream('gzip');
+        const gzPromise = new Response(cs.readable).arrayBuffer();
+        const writer = cs.writable.getWriter();
+        void writer.write(new Uint8Array(seg)).catch(() => {});
+        await writer.close();
+        wireLen = (await gzPromise).byteLength;
+      }
+
+      activeCodeTab = 'setup';
+      logEvent(
+        `Scenario 12 (<code>syncDatabases()</code> + <code>IBatch</code> + WS <code>"FBCHANGELOG\\0"</code>): Applied <strong>${res.primaryToReplica.appliedCount}</strong> mutations in one <code>UPDATE OR INSERT INTO "TASKS" ... MATCHING ("ID")</code> batch, and streamed gzipped <code>.journal-${String(simChangelogSeq).padStart(9, '0')}</code> via <code>sendChangelogSegment()</code> (${seg.byteLength}B → ${wireLen}B wire)!`,
         true,
       );
       await renderAll();

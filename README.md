@@ -80,6 +80,31 @@ await db.persist();
 await db.close();
 ```
 
+### Isomorphic `openDatabase(uri)` + Explicit Resource Management & One-Liner Sync
+
+`openDatabase(uri)` opens `memory://`, `opfs://`, `idb://` (browser WASM) or `.fdb` / `host:/path.fdb` (Node.js) behind one `FirebirdDatabase` interface with `db.execute()`, `await using` (`Symbol.asyncDispose`), structured `FirebirdError` codes, and zero-boilerplate replication:
+
+```ts
+import { openDatabase, syncDatabases, isFirebirdError } from 'firebird-wasm/browser'; // or 'firebird-wasm' in Node.js
+
+await using primary = await openDatabase('memory://primary');
+await using replica = await openDatabase('memory://replica');
+
+await primary.execute('CREATE TABLE todos (id INT NOT NULL PRIMARY KEY, title VARCHAR(100))');
+const { affectedRows } = await primary.execute('INSERT INTO todos VALUES (?, ?)', [1, 'Ship M18']);
+
+// Auto-bootstraps schema + initial rows, installs triggers, and keeps peers in sync:
+await using sync = await syncDatabases(primary, replica); // or: await primary.syncWith(replica)
+
+try {
+  await primary.execute('INSERT INTO todos VALUES (?, ?)', [1, 'Duplicate PK']);
+} catch (err) {
+  if (isFirebirdError(err)) {
+    console.error(err.gdscode, err.sqlState, err.constraint, err.hint); // 335544665, '23000', ...
+  }
+}
+```
+
 Two other names change where the database lives — `opfs://mydb` writes through
 to a file with no persist step at all, and `memory://` keeps nothing — and a
 statement can re-run itself when the data changes:
@@ -110,8 +135,8 @@ function Items() {
 
 | Import | Description |
 |--------|-------------|
-| `firebird-wasm` | `FirebirdLite` — Node.js native/embedded driver + shared schema, vector, and replication helpers |
-| `firebird-wasm/browser` | `FirebirdBrowser`, `IndexedDBVFS`, `OPFSVFS`, snapshots/page diffs, and AES-256-GCM encryption helpers |
+| `firebird-wasm` | `openDatabase`, `FirebirdLite`, `FirebirdError` — Node.js native/embedded driver + shared schema, vector, and replication helpers |
+| `firebird-wasm/browser` | `openDatabase`, `FirebirdBrowser`, `FirebirdError`, `IndexedDBVFS`, `OPFSVFS`, snapshots/page diffs, and AES-256-GCM encryption helpers |
 | `firebird-wasm/browser/worker-entry` | Dedicated Web Worker entry point for the WASM engine |
 | `firebird-wasm/react` | React `<FirebirdProvider>`, `useFirebird`, `useQuery`, `useLiveQuery` |
 | `firebird-wasm/vue` | Vue 3 `provideFirebird`, `useFirebird`, `useQuery`, `useLiveQuery` |
@@ -126,7 +151,7 @@ function Items() {
 | `firebird-wasm/drizzle` | Drizzle-style query builder (`drizzle`, `firebirdTable`) & schema codegen (`generateDrizzleSchema`) |
 | `firebird-wasm/vector` | Float32/Int8 vector codec, persistent HNSW ANN index (`HnswIndex`, `createVectorIndex`), SQL UDRs, and `vectorSearch` |
 | `firebird-wasm/fts` | Okapi BM25 full-text search (`Bm25Index`, `createFtsIndex`), stemming/highlighting SQL UDRs, and RRF `hybridSearch` |
-| `firebird-wasm/replication` | Logical, journal & native Firebird engine replication (`replicateDatabases`, CRDTs, mesh/hub, DLQ, PITR archives, `"FBCHANGELOG\0"` parser & `IReplicator`) |
+| `firebird-wasm/replication` | One-liner (`syncDatabases`, `db.syncWith`), logical/journal & native Firebird engine replication (`replicateDatabases`, CRDTs, mesh/hub, DLQ, PITR, `"FBCHANGELOG\0"` & `IReplicator`) |
 
 See [docs/integration.md](./docs/integration.md), [docs/replication.md](./docs/replication.md), and [docs/api.md](./docs/api.md) for full details and usage examples.
 
@@ -297,6 +322,7 @@ The library provides two execution backends:
 - [x] Vector embeddings, HNSW ANN index (`firebird-wasm/vector`), BM25 full-text & RRF hybrid search (`firebird-wasm/fts`), Kysely / Drizzle adapters + schema codegen (`firebird-wasm/kysely`, `firebird-wasm/drizzle`), and TanStack Query/DB & RxDB adapters (`firebird-wasm/tanstack`, `firebird-wasm/rxdb`)
 - [x] Full database replication (`firebird-wasm/replication`) — PSQL trigger capture, replication slots, HLC/CRDT conflict resolution, multi-node mesh/hub coordinator, DLQ (`FB_REPL_DLQ$`), AES-256-GCM PITR journal archives, time-travel (`asOfLsn`/`rewindToLsn`), and native Firebird `"FBCHANGELOG\0"` / `IReplicator` engine replication
 - [x] Typed binary result wire format (`FBR\x01`), on-demand ICU locale collation packs (`loadIcuLocaleData`), and Firebird 5.0 LTS + 6.0 WASM build targets
+- [x] Unified isomorphic `openDatabase(uri)` + `FirebirdDatabase` (`db.execute()`, `Symbol.asyncDispose`), structured `FirebirdError` (`gdscode`/`sqlState`/`hint`), one-liner `syncDatabases()` / `db.syncWith()`, `IBatch` `UPDATE OR INSERT` catch-up, Worker-safe `db.setReplicaMode()` / `db.applyChangelog()`, and HTTP/WebSocket `"FBCHANGELOG\0"` gzip streaming
 
 See [docs/roadmap.md](./docs/roadmap.md) for the full status audit, a
 feature-by-feature comparison with PGlite, and the staged plan.

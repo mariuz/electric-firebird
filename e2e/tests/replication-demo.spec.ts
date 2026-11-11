@@ -184,4 +184,22 @@ test.describe('Replication Simulator v2 (replication.html)', () => {
     await expect(page.locator('#code-inspector')).toContainText('opInsertRecord');
     await expect(page.locator('#event-feed')).toContainText('Scenario 11');
   });
+
+  test('Scenario 12: One-Liner syncDatabases() + Batched IBatch Replay & WebSocket FBCHANGELOG\\0 Streaming', async ({
+    page,
+  }) => {
+    await openReplicationSim(page);
+
+    await page.locator('.scenario-card[data-scenario="oneliner-batch"]').click();
+
+    await expect(page.locator('#primary-rows tr')).toHaveCount(6);
+    await expect(page.locator('#replica-rows tr')).toHaveCount(6);
+    await expect(page.locator('#primary-rows')).toContainText('IBatch Sync Task #4');
+    await expect(page.locator('#replica-rows')).toContainText('IBatch Sync Task #6');
+    await expect(page.locator('#code-inspector')).toContainText('openDatabase');
+    await expect(page.locator('#code-inspector')).toContainText('syncDatabases');
+    await expect(page.locator('#event-feed')).toContainText('Scenario 12');
+    await expect(page.locator('#event-feed')).toContainText('UPDATE OR INSERT');
+    await expect(page.locator('#event-feed')).toContainText('sendChangelogSegment()');
+  });
 });

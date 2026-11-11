@@ -1643,6 +1643,53 @@ and Node (`FirebirdLite`):
 
 ---
 
+### M18 — Replication Speed, Worker/Network Native Changelog Streaming, Modular Architecture, Unified Client API & One-Liner Sync DX
+
+Next-horizon improvements across **Replication**, **Speed & Performance**, **Interface & Unified API**, **Refactoring & Modularity**, and **Ease of Use**:
+
+- [x] **1. Native Engine Replication Across Workers, `opfs://`, Network Transports & Auto-Introspected JRD Schemas (`setReplicaMode` / `applyChangelog` / `introspectJrdTableSchemas`).**
+      Expose `_fb_set_replica_mode` and `_fb_replicate_changelog` directly on
+      `EngineTransport` (`DirectTransport`, `WorkerTransport`, `SharedEngineTransport`,
+      `serveEngine`) and `FirebirdBrowser` (`db.setReplicaMode()`,
+      `db.applyChangelog()`) with zero-copy `Transferable` buffer handoff; extend
+      HTTP/SSE & WebSocket replication transports (`createHttpReplicationHandler`
+      / `createHttpReplicationClient` / `createWebSocketReplicationPeer`) to stream
+      raw/gzipped `"FBCHANGELOG\0"` binary segments; and automatically derive
+      `JrdColumnDescriptor[]` from `RDB$RELATION_FIELDS` + `RDB$FIELDS`
+      (`introspectJrdTableSchemas()`).
+- [x] **2. High-Speed Batched Replication Replay (`UPDATE OR INSERT ... MATCHING` + `execBatch` / `IBatch`) & Lazy Journal Decoding.**
+      Eliminate the `2x` per-row `SELECT *` + single-row `INSERT`/`UPDATE` round-trip
+      bottleneck in logical subscription replay and `bootstrapReplica()` by grouping
+      contiguous `(table, operation)` mutations into single-statement
+      `UPDATE OR INSERT INTO <table> (...) VALUES (...) MATCHING (<pk>)` / `DELETE`
+      batches executed via `execBatch` (`IBatch`), with automatic per-row savepoint
+      fallback on constraint quarantine (`FB_REPL_DLQ$`), SQL `ROWS 1 TO ?` limit
+      pushdown, and lazy `BEFORE_JSON` parsing.
+- [x] **3. Unified `FirebirdDatabase` Interface, Universal `openDatabase(uri)` Factory, `Symbol.asyncDispose` & Structured `FirebirdError`.**
+      Provide an isomorphic `openDatabase(uri, options?)` factory (`memory://`,
+      `idb://`, `opfs://`, local `.fdb` paths, `firebird://` URLs) returning a
+      unified `FirebirdDatabase` contract across `FirebirdBrowser` and
+      `FirebirdLite` (harmonizing `exec()` / `execute()` and `Symbol.asyncDispose`
+      for `await using db = await openDatabase(...)`), alongside structured
+      `FirebirdError` (`parseFirebirdError` / `toFirebirdError`) with `sqlcode`,
+      `gdscode`, `symbol`, `table`, `constraint`, and remediation `hint` fields.
+- [x] **4. Modular Architecture Refactoring (Decomposing `src/replication/` & Shared `DatabaseCore` Subsystems).**
+      Split the 10,500-line `src/replication/index.ts` monolith into 11 focused,
+      acyclic submodules (`types.ts`, `shared.ts`, `hlc-crdt.ts`, `catalog.ts`,
+      `ddl-guard.ts`, `segments.ts`, `native-changelog.ts`, `transports.ts`,
+      `metrics.ts`, `core.ts`, `presets.ts`) behind a 100% backward-compatible
+      barrel with `"sideEffects": false`, and extract shared higher-level database
+      subsystem glue (`DatabaseCoreSubsystems` + cancellation/savepoint helpers in
+      `src/database-core.ts`) across `FirebirdLite` and `FirebirdBrowser`.
+- [x] **5. One-Liner `syncDatabases()` & `db.syncWith()` Progressive-Disclosure DX Presets.**
+      Provide high-level `syncDatabases(primary, replica, options?)` and
+      `db.syncWith(peerOrUrl, options?)` helpers (`tables: '*'`,
+      `mode: 'auto' | 'native' | 'logical'`, `bootstrap: true`, `live: true`)
+      returning a unified `SyncHandle` (`waitForIdle()`, `syncNow()`, `pause()`,
+      `resume()`, `stats()`, `stop()`, `[Symbol.asyncDispose]()`).
+
+---
+
 ## 5. Test coverage added alongside this review
 
 `src/browser/` was excluded from Jest and had no browser tests.  It now has 73

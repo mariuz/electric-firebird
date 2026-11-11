@@ -41,14 +41,12 @@ import {
   CrossTabLiveBridge,
 } from './live-tables';
 import {
-  CowSnapshotStore,
   type DatabaseSnapshot,
   type DatabaseSnapshotInfo,
   type SnapshotOptions,
   type PageDiffOptions,
   type ApplyPageDiffOptions,
 } from './snapshots';
-import { QueryProfiler } from './profiler';
 import { ICU_LOCALE_DATA_PATH, isValidIcuDataPackage } from './icu-locales';
 import { introspect as introspectSchema, migrate as runMigrations } from './schema';
 import {
@@ -70,7 +68,24 @@ import { SharedEngineTransport } from './shared-transport';
 import type { DatabaseLock } from './db-lock';
 import { toStatement, resolveQueryCall, resolveBatchSize } from '../sql-tag';
 import type { SqlFragment, Statement } from '../sql-tag';
-import { UdrManager } from './udr';
+import type { UdrManager } from './udr';
+import {
+  assertNotAborted,
+  createTimeoutError,
+  DatabaseCoreSubsystems,
+  type FirebirdDatabase,
+  type FirebirdTransactionClient,
+  runWithCancellation,
+  type UnifiedExecuteResult,
+  validateSavepointName,
+  validateTimeoutMs,
+} from '../database-core';
+import type { ReplicableDatabase } from '../replication/types';
+import {
+  syncWithPeer,
+  type SyncHandle,
+  type SyncWithOptions,
+} from '../replication/presets';
 import type {
   ArrayRow,
   QueryResult,
@@ -112,94 +127,6 @@ import type {
 type ArrayModeOptions = QueryOptions & { rowMode: 'array' };
 /** `QueryStreamOptions` with the array mode pinned, for the overloads below. */
 type ArrayStreamOptions = QueryStreamOptions & { rowMode: 'array' };
-
-function validateTimeoutMs(timeoutMs?: number): number | undefined {
-  if (timeoutMs === undefined) return undefined;
-  if (
-    typeof timeoutMs !== 'number' ||
-    !Number.isFinite(timeoutMs) ||
-    timeoutMs < 0
-  ) {
-    throw new RangeError('timeoutMs must be a non-negative finite number');
-  }
-  return Math.floor(timeoutMs);
-}
-
-function toAbortError(reason: unknown): Error {
-  if (reason instanceof Error) return reason;
-  const err = new Error(
-    reason !== undefined && reason !== null
-      ? String(reason)
-      : 'The operation was aborted',
-  );
-  err.name = 'AbortError';
-  return err;
-}
-
-function createTimeoutError(timeoutMs: number): Error {
-  const err = new Error(`Statement timed out after ${timeoutMs}ms`);
-  err.name = 'TimeoutError';
-  return err;
-}
-
-function assertNotAborted(signal?: AbortSignal): void {
-  if (signal?.aborted) {
-    throw toAbortError(signal.reason);
-  }
-}
-
-async function runWithCancellation<T>(
-  work: () => Promise<T>,
-  options: StatementExecutionOptions | undefined,
-  onCancel: () => Promise<void>,
-): Promise<T> {
-  const signal = options?.signal;
-  const timeoutMs = validateTimeoutMs(options?.timeoutMs);
-  assertNotAborted(signal);
-
-  if (!signal && (!timeoutMs || timeoutMs <= 0)) {
-    return work();
-  }
-
-  let cleanup = (): void => undefined;
-  const cancelPromise = new Promise<never>((_resolve, reject) => {
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const onAbort = (): void => {
-      void onCancel().catch(() => undefined);
-      reject(toAbortError(signal?.reason));
-    };
-    if (signal) {
-      if (signal.aborted) {
-        onAbort();
-        return;
-      }
-      signal.addEventListener('abort', onAbort, { once: true });
-    }
-    if (timeoutMs && timeoutMs > 0) {
-      timer = setTimeout(() => {
-        void onCancel().catch(() => undefined);
-        reject(createTimeoutError(timeoutMs));
-      }, timeoutMs);
-    }
-    cleanup = () => {
-      if (signal) {
-        signal.removeEventListener('abort', onAbort);
-      }
-      if (timer !== null) {
-        clearTimeout(timer);
-        timer = null;
-      }
-    };
-  });
-
-  try {
-    const workPromise = work();
-    workPromise.catch(() => undefined);
-    return await Promise.race([workPromise, cancelPromise]);
-  } finally {
-    cleanup();
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -481,6 +408,9 @@ const MEMORY_PREFIX = 'memory://';
 /** Prefix marking a database whose pages live in OPFS rather than IndexedDB. */
 const OPFS_PREFIX = 'opfs://';
 
+/** Explicit prefix alias for an IndexedDB-backed database (`idb://mydb` === `'mydb'`). */
+const IDB_PREFIX = 'idb://';
+
 /**
  * Distinguishes ephemeral databases opened in one page.
  *
@@ -514,7 +444,7 @@ function ephemeralFileName(dbName: string): string {
  * Mirrors the `FirebirdLite` API so application code can switch between the
  * Node.js native driver and the in-browser WASM engine with minimal changes.
  */
-export class FirebirdBrowser {
+export class FirebirdBrowser implements FirebirdDatabase {
   private readonly dbName: string;
   /** True for a `memory://` database: never stored, discarded on close. */
   private readonly ephemeral: boolean;
@@ -557,14 +487,19 @@ export class FirebirdBrowser {
   private readonly preparedStatements = new Set<PreparedStatement>();
   /** Per-table auto-installed live trigger promises (table -> event name). */
   private readonly liveTriggerPromises = new Map<string, Promise<string>>();
-  /** JavaScript user-defined functions & procedures registry. */
-  private readonly udr = new UdrManager();
-  /** Copy-on-write point-in-time page snapshot store. */
-  private readonly snapshotStore: CowSnapshotStore;
+  /** Shared UDR, copy-on-write snapshot, and query profiler subsystems (`M18 Item 4`). */
+  private readonly core: DatabaseCoreSubsystems;
+  private get udr() {
+    return this.core.udr;
+  }
+  private get snapshotStore() {
+    return this.core.snapshotStore;
+  }
+  private get profiler() {
+    return this.core.profiler;
+  }
   /** Cross-tab BroadcastChannel + POST_EVENT live query invalidation bridge. */
   private readonly liveBridge: CrossTabLiveBridge;
-  /** Query profiler and MON$ telemetry collector. */
-  private readonly profiler = new QueryProfiler();
   /** Set only in shared mode; owns the election and the channel. */
   private shared: SharedEngineTransport | null = null;
 
@@ -574,14 +509,17 @@ export class FirebirdBrowser {
    * @param options Optional configuration.
    */
   constructor(dbName: string, options: FirebirdBrowserOptions = {}) {
-    this.dbName = dbName;
-    this.ephemeral = dbName.startsWith(MEMORY_PREFIX);
-    this.opfs = dbName.startsWith(OPFS_PREFIX);
+    const normalizedDbName = dbName.startsWith(IDB_PREFIX)
+      ? dbName.slice(IDB_PREFIX.length)
+      : dbName;
+    this.dbName = normalizedDbName;
+    this.ephemeral = normalizedDbName.startsWith(MEMORY_PREFIX);
+    this.opfs = normalizedDbName.startsWith(OPFS_PREFIX);
     this.fileName = this.ephemeral
-      ? ephemeralFileName(dbName)
+      ? ephemeralFileName(normalizedDbName)
       : this.opfs
-        ? dbName.slice(OPFS_PREFIX.length)
-        : dbName;
+        ? normalizedDbName.slice(OPFS_PREFIX.length)
+        : normalizedDbName;
     this.options = options;
     this.vfs = new IndexedDBVFS({
       ...options.vfs,
@@ -589,9 +527,9 @@ export class FirebirdBrowser {
         ? { encryptionKey: options.encryptionKey }
         : {}),
     });
-    this.snapshotStore = new CowSnapshotStore(options.vfs?.pageSize ?? 8192);
+    this.core = new DatabaseCoreSubsystems(options.vfs?.pageSize ?? 8192);
     this.liveBridge = new CrossTabLiveBridge({
-      dbName,
+      dbName: normalizedDbName,
       enabled: options.crossTabLive ?? !this.ephemeral,
     });
 
@@ -819,6 +757,129 @@ export class FirebirdBrowser {
     }
 
     return results;
+  }
+
+  /**
+   * Execute a single DDL or DML statement and return `{ affectedRows, changes }` (`M18 Item 3`).
+   */
+  async execute(
+    sql: string | SqlFragment,
+    params: QueryParams = [],
+    options: StatementExecutionOptions = {},
+  ): Promise<UnifiedExecuteResult> {
+    const results = await this.exec(sql, params, options);
+    const affectedRows = results.reduce((sum, r) => sum + r.affectedRows, 0);
+    return { affectedRows, changes: affectedRows };
+  }
+
+  /**
+   * Configure Firebird's ODS header `hdr_replica_mode` (`'none'`, `'read_only'`,
+   * or `'read_write'`) on this WASM database across `DirectTransport`,
+   * `WorkerTransport`, or `SharedEngineTransport` (`M18 Item 1`).
+   */
+  async setReplicaMode(
+    mode: 'none' | 'read_only' | 'read_write' | 0 | 1 | 2 = 'read_write',
+  ): Promise<void> {
+    await this.ensureReady();
+    const modeCode: 0 | 1 | 2 =
+      mode === 0 || mode === 'none'
+        ? 0
+        : mode === 1 || mode === 'read_only'
+          ? 1
+          : 2;
+    const expectedContext =
+      modeCode === 0 ? null : modeCode === 1 ? 'READ-ONLY' : 'READ-WRITE';
+
+    for (const stmt of [...this.preparedStatements]) {
+      await stmt.close().catch(() => undefined);
+    }
+
+    if (typeof this.engine.setReplicaMode === 'function') {
+      try {
+        await this.engine.setReplicaMode(this.dbHandle, modeCode);
+      } catch {
+        // Fall through to ODS header page update if DPB/bridge call is unsupported
+      }
+    }
+
+    // Verify `RDB$GET_CONTEXT('SYSTEM', 'REPLICA_MODE')`; if the loaded WASM
+    // binary did not update `Ods::header_page::hdr_replica_mode` (offset 26)
+    // in-place, detach, patch byte 26 on disk/MEMFS/OPFS, and re-attach cleanly.
+    let currentMode: string | null = null;
+    try {
+      const ctxRes = await this.query<{ REPL_MODE: string | null }>(
+        "SELECT RDB$GET_CONTEXT('SYSTEM', 'REPLICA_MODE') AS REPL_MODE FROM RDB$DATABASE",
+      );
+      const raw = ctxRes.rows[0]?.REPL_MODE;
+      currentMode = raw === null || raw === undefined ? null : String(raw).trim().toUpperCase();
+    } catch {
+      currentMode = expectedContext;
+    }
+
+    if (currentMode !== expectedContext) {
+      if (this.dbHandle) {
+        await this.engine.detachDatabase(this.dbHandle);
+        this.dbHandle = 0;
+      }
+      try {
+        if (typeof this.engine.writeFileChunk === 'function') {
+          await this.engine.writeFileChunk(
+            this.dbPath,
+            new Uint8Array([modeCode]),
+            26,
+            false,
+          );
+        } else {
+          const rawBytes = await this.engine.readFile(this.dbPath);
+          if (rawBytes.byteLength >= 152) {
+            const copy = rawBytes.slice();
+            copy[26] = modeCode;
+            await this.engine.writeFile(this.dbPath, copy);
+          }
+        }
+      } finally {
+        this.dbHandle = await this.engine.attachDatabase(this.dbPath);
+        if (this.options.sharedReads) {
+          await this.engine.setSharedReads!(this.dbHandle, true);
+        }
+      }
+    }
+
+    this.markDirty();
+  }
+
+  /**
+   * Replay a raw `"FBCHANGELOG\0"` binary segment directly through Firebird's
+   * native C++ `IAttachment::createReplicator` (`_fb_replicate_changelog`)
+   * across `DirectTransport`, `WorkerTransport`, or `SharedEngineTransport` (`M18 Item 1`).
+   */
+  async applyChangelog(
+    segment: Uint8Array,
+    options: { transfer?: boolean } = {},
+  ): Promise<number> {
+    await this.ensureReady();
+    if (typeof this.engine.replicateChangelog !== 'function') {
+      throw new Error('The configured EngineTransport does not support applyChangelog()');
+    }
+    const blocksProcessed = await this.engine.replicateChangelog(
+      this.dbHandle,
+      segment,
+      options.transfer === true,
+    );
+    this.markDirty();
+    return blocksProcessed;
+  }
+
+  /**
+   * One-liner synchronization with another `FirebirdBrowser`/`FirebirdLite`
+   * instance, an HTTP(S) replication URL, or a `broadcast://<channel>` URI (`M18 Item 5`).
+   */
+  async syncWith(
+    peerOrUrl: ReplicableDatabase | string,
+    options: SyncWithOptions = {},
+  ): Promise<SyncHandle> {
+    await this.ensureReady();
+    return syncWithPeer(this, peerOrUrl, options);
   }
 
   /**
@@ -2909,11 +2970,8 @@ export class FirebirdBrowser {
 
     this.closed = true;
     this.liveTriggerPromises.clear();
-    this.udr.clear();
-    this.snapshotStore.clear();
+    this.core.clear();
     this.liveBridge.close();
-    this.profiler.clear();
-    this.liveTriggerPromises.clear();
 
     if (this.dbHandle) {
       // Persist before closing.
@@ -2940,6 +2998,11 @@ export class FirebirdBrowser {
       // locks the database out of every future tab until the page is gone.
       await this.releaseLock();
     }
+  }
+
+  /** Async resource disposal (`await using db = ...`) (`M18 Item 3`). */
+  async [Symbol.asyncDispose](): Promise<void> {
+    await this.close();
   }
 
   /** Release the cross-tab lock, if this instance holds one. */
@@ -3185,24 +3248,13 @@ export class FirebirdBrowser {
 // Transaction handle
 // ---------------------------------------------------------------------------
 
-const SAVEPOINT_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_$]{0,62}$/;
-
-function validateSavepointName(name: string): string {
-  if (typeof name !== 'string' || !SAVEPOINT_NAME_PATTERN.test(name)) {
-    throw new Error(
-      `Invalid savepoint name "${String(name)}": must be a valid SQL identifier (1-63 ASCII letters, digits, '_', or '$', starting with a letter or '_')`,
-    );
-  }
-  return name;
-}
-
 /**
  * A handle to an active transaction (or nested savepoint) in the browser WASM engine.
  *
  * Statements issued here are bound to the transaction handle, so a rollback
  * really does undo them.
  */
-export class FirebirdBrowserTransaction {
+export class FirebirdBrowserTransaction implements FirebirdTransactionClient {
   private finished = false;
   private readonly nextSavepointId: () => number;
   private readonly mutatedTablesSet = new Set<string>();
@@ -3434,6 +3486,18 @@ export class FirebirdBrowserTransaction {
       }
     }
     return this.finishTxExec(stmt.sql, stmt.params, execOpts);
+  }
+
+  /**
+   * Execute a DDL/DML statement inside this transaction and return `{ affectedRows, changes }` (`M18 Item 3`).
+   */
+  async execute(
+    sql: string | SqlFragment,
+    params: QueryParams = [],
+    options: StatementExecutionOptions = {},
+  ): Promise<UnifiedExecuteResult> {
+    const res = await this.exec(sql, params, options);
+    return { affectedRows: res.affectedRows, changes: res.affectedRows };
   }
 
   private async finishTxExec(

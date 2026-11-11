@@ -19,6 +19,33 @@ export type {
   ListenOptions,
   BranchOptions,
 } from './firebird-browser';
+export {
+  openBrowserDatabase,
+  openBrowserDatabase as openDatabase,
+} from './open-database';
+export type { OpenBrowserDatabaseOptions } from './open-database';
+export {
+  DatabaseCoreSubsystems,
+  validateTimeoutMs,
+  toAbortError,
+  createTimeoutError,
+  assertNotAborted,
+  runWithCancellation,
+  validateSavepointName,
+  SAVEPOINT_NAME_PATTERN,
+} from '../database-core';
+export type {
+  FirebirdDatabase,
+  FirebirdTransactionClient,
+  UnifiedExecuteResult,
+} from '../database-core';
+export {
+  FirebirdError,
+  isFirebirdError,
+  parseFirebirdError,
+  toFirebirdError,
+} from '../errors';
+export type { FirebirdErrorDetails } from '../errors';
 
 export { sql, SqlFragment, RawSql, isSqlFragment, toStatement } from '../sql-tag';
 export type { SqlTag, Statement } from '../sql-tag';
@@ -274,6 +301,9 @@ export {
   fbChangelogToLogicalEntries,
   setWasmDatabaseReplicaMode,
   createWasmChangelogPoller,
+  introspectJrdTableSchemas,
+  syncDatabases,
+  syncWithPeer,
 } from '../replication';
 export type {
   ReplicableDatabase,
@@ -378,6 +408,11 @@ export type {
   WasmChangelogPollerOptions,
   WasmChangelogPollerStats,
   WasmChangelogPoller,
+  ReplicableTransactionRunner,
+  ChangelogSegmentSource,
+  SyncDatabasesOptions,
+  SyncWithOptions,
+  SyncHandle,
 } from '../replication';
 export type { ScriptStatement } from './sql-script';
 

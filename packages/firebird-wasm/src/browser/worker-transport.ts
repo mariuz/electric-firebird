@@ -118,6 +118,14 @@ export class WorkerTransport implements EngineTransport {
   }
 
   private call<T>(op: EngineOp, ...args: unknown[]): Promise<T> {
+    return this.callWithTransfer<T>([], op, ...args);
+  }
+
+  private callWithTransfer<T>(
+    transfer: Transferable[],
+    op: EngineOp,
+    ...args: unknown[]
+  ): Promise<T> {
     if (this.failure) {
       return Promise.reject(this.failure);
     }
@@ -137,7 +145,11 @@ export class WorkerTransport implements EngineTransport {
         timer,
       });
 
-      this.worker.postMessage(request);
+      if (transfer.length > 0) {
+        this.worker.postMessage(request, transfer);
+      } else {
+        this.worker.postMessage(request);
+      }
     });
   }
 
@@ -372,6 +384,32 @@ export class WorkerTransport implements EngineTransport {
     return this.call<SweepResult>('sweep', dbHandle);
   }
 
+  setReplicaMode(
+    dbHandle: EngineHandle,
+    mode: 0 | 1 | 2 | 'none' | 'read_only' | 'read_write',
+  ): Promise<void> {
+    return this.call<void>('setReplicaMode', dbHandle, mode);
+  }
+
+  replicateChangelog(
+    dbHandle: EngineHandle,
+    data: Uint8Array,
+    transfer = false,
+  ): Promise<number> {
+    const canTransfer =
+      transfer &&
+      data.byteOffset === 0 &&
+      data.byteLength === data.buffer.byteLength &&
+      (typeof SharedArrayBuffer === 'undefined' ||
+        !(data.buffer instanceof SharedArrayBuffer));
+    return this.callWithTransfer<number>(
+      canTransfer ? [data.buffer] : [],
+      'replicateChangelog',
+      dbHandle,
+      data,
+    );
+  }
+
   prepare(
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
@@ -517,8 +555,19 @@ export class WorkerTransport implements EngineTransport {
     return this.call<Uint8Array>('readFile', path);
   }
 
-  writeFile(path: string, data: Uint8Array): Promise<void> {
-    return this.call<void>('writeFile', path, data);
+  writeFile(path: string, data: Uint8Array, transfer = false): Promise<void> {
+    const canTransfer =
+      transfer &&
+      data.byteOffset === 0 &&
+      data.byteLength === data.buffer.byteLength &&
+      (typeof SharedArrayBuffer === 'undefined' ||
+        !(data.buffer instanceof SharedArrayBuffer));
+    return this.callWithTransfer<void>(
+      canTransfer ? [data.buffer] : [],
+      'writeFile',
+      path,
+      data,
+    );
   }
 
   fileSize(path: string): Promise<number> {
@@ -538,8 +587,22 @@ export class WorkerTransport implements EngineTransport {
     data: Uint8Array,
     offset: number,
     truncate = false,
+    transfer = false,
   ): Promise<void> {
-    return this.call<void>('writeFileChunk', path, data, offset, truncate);
+    const canTransfer =
+      transfer &&
+      data.byteOffset === 0 &&
+      data.byteLength === data.buffer.byteLength &&
+      (typeof SharedArrayBuffer === 'undefined' ||
+        !(data.buffer instanceof SharedArrayBuffer));
+    return this.callWithTransfer<void>(
+      canTransfer ? [data.buffer] : [],
+      'writeFileChunk',
+      path,
+      data,
+      offset,
+      truncate,
+    );
   }
 
   unlink(path: string): Promise<void> {
