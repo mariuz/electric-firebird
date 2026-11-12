@@ -1563,4 +1563,51 @@ Reactive query and live-query hooks/stores across all four UI frameworks:
 
 ### `firebird-wasm/replication`
 
-Logical, journal-based (`FB_REPL_JOURNAL$`), and native Firebird C++ engine (`RDB$PUBLICATIONS`, `replication.conf`, `"FBCHANGELOG\0"`, `IReplicator`) replication: `syncDatabases`, `syncWithPeer` (`db.syncWith`), `replicateDatabases`, `createPublication`, `createSubscription`, `createReplicationMesh`, `createReplicationHub`, `installReplicationTriggers`, `bootstrapReplica`, `publishAllTables`, `syncCatalog`, `createHlc`, `createCrdtConflictResolver`, `promoteReplica`, `encodeEncryptedJournalSegment`, `asOfLsn`, `rewindToLsn`, `createReplicationDlq`, `createPiiMaskingTransformer`, `exportJournalArchive`, `applyJournalArchive`, `compactJournal`, `applyRetentionPolicy`, `createReplicationMetricsCollector`, `checkReplicationSchemaCompatibility`, `enableEnginePublication`, `readWasmChangelogSegments`, `decodeFbChangelogOperations`, `fbChangelogToLogicalEntries`, `introspectJrdTableSchemas`, `createWasmChangelogPoller`, and `applyFbChangelogSegmentToDatabase`. See the full [Database Replication Guide](./replication.md).
+Logical, journal-based (`FB_REPL_JOURNAL$`), and native Firebird C++ engine (`RDB$PUBLICATIONS`, `replication.conf`, `"FBCHANGELOG\0"`, `IReplicator`) replication: `syncDatabases` (`mode: 'logical' | 'native' | 'auto'`), `syncWithPeer` (`db.syncWith`), `replicateDatabases`, `createPublication`, `createSubscription` (`tableSchemas` + `onApplyError: 'dlq'`), `createWebRtcReplicationPeer`, `createResilientWebSocketPeer`, `createHttpReplicationHandler`, `createHttpReplicationClient` (`retry` + `fetchSnapshotResumable`), `createReplicationMesh`, `createReplicationHub`, `installReplicationTriggers`, `bootstrapReplica`, `publishAllTables`, `syncCatalog`, `createHlc`, `createCrdtConflictResolver`, `promoteReplica`, `encodeEncryptedJournalSegment`, `asOfLsn`, `rewindToLsn`, `createReplicationDlq`, `createPiiMaskingTransformer`, `exportJournalArchive`, `applyJournalArchive`, `compactJournal`, `applyRetentionPolicy`, `createReplicationMetricsCollector`, `checkReplicationSchemaCompatibility`, `enableEnginePublication`, `readWasmChangelogSegments`, `decodeFbChangelogOperations`, `fbChangelogToLogicalEntries`, `logicalEntriesToFbChangelogSegment`, `flushDatabaseFbChangelogSegment`, `introspectJrdTableSchemas`, `createWasmChangelogPoller`, and `applyFbChangelogSegmentToDatabase`. See the full [Database Replication Guide](./replication.md).
+
+### `db.queryColumnar()` & `db.queryArrow()` — Zero-Copy Columnar Vectors & Apache Arrow IPC
+
+Decode `"FBR\x01"` binary query payloads directly into typed columnar vectors (`Int32Array`, `Float64Array`, `BigInt64Array`, bit-packed `BoolColumnVector`, and Arrow-offset `Utf8ColumnVector` / `BytesColumnVector`) or standard **Apache Arrow IPC V5** streams without allocating per-row JS objects:
+
+```ts
+import { decodeArrowIpc } from 'firebird-wasm';
+
+const col = await db.queryColumnar('SELECT id, score, label FROM metrics');
+const ids = col.getColumn('ID'); // Int32ColumnVector (`data: Int32Array`, `validity: Uint8Array`)
+
+const arrowBytes = await db.queryArrow(
+  'SELECT id, score, label FROM metrics',
+  [],
+  { metadata: { source: 'firebird-wasm' } },
+);
+const roundTripped = decodeArrowIpc(arrowBytes);
+```
+
+### Standard Schema v1 Validation (`schema`) & `createTypedSql<DB>(db?)`
+
+Validate and transform query rows (and replicated rows) with any [Standard Schema v1](https://standardschema.dev) validator (`zod`, `valibot`, `arktype`, or built-in `createRowSchema`), and build compile-time schema-checked SQL fragments via `createTypedSql<DB>()`:
+
+```ts
+import { createRowSchema, createTypedSql, sql } from 'firebird-wasm';
+
+const UserSchema = createRowSchema<{ id: number; handle: string }>({
+  id: 'number',
+  handle: (_v, row) => `@${String(row.USERNAME)}`,
+});
+
+const tsql = createTypedSql<{ USERS: { ID: number; USERNAME: string } }>(db);
+const { rows } = await db.query(
+  tsql.selectFrom('USERS', ['ID', 'USERNAME'], sql`ORDER BY "ID"`).withSchema(UserSchema),
+);
+```
+
+### `firebird-wasm/cli` (`npx firebird-wasm`)
+
+Zero-dependency developer CLI (`bin`: `firebird-wasm`, programmatic `runCli(argv, io)` from `firebird-wasm/cli`) supporting:
+
+- `npx firebird-wasm query <uri> "<sql>" [--format table|json|csv|jsonl]`
+- `npx firebird-wasm repl [uri]`
+- `npx firebird-wasm codegen <uri> [--kysely | --drizzle] [--out <file>]`
+- `npx firebird-wasm migrate <uri> --dir <dir> [--down] [--target <version>]`
+- `npx firebird-wasm dump <uri> --out <file> [--gzip]` & `restore <uri> --in <file> [--gzip]`
+- `npx firebird-wasm inspect-changelog <segment-file> [--json]`

@@ -903,6 +903,8 @@ function getSetupCodeSnippet() {
     `import {`,
     `  openDatabase,`,
     `  syncDatabases,`,
+    `  createWebRtcReplicationPeer,`,
+    `  createRowSchema,`,
     `  replicateDatabases,`,
     `  createCrdtConflictResolver,`,
     `} from 'firebird-wasm/browser';`,
@@ -910,8 +912,8 @@ function getSetupCodeSnippet() {
     `await using primary = await openDatabase('opfs://primary');`,
     `await using replica = await openDatabase('opfs://replica');`,
     ``,
-    `// Zero-boilerplate 1-liner (auto-discovers tables, syncs DDL + sequences & bootstraps via IBatch):`,
-    `// await using sync = await syncDatabases(primary, replica); // or: await primary.syncWith(replica)`,
+    `// Zero-boilerplate 1-liner (supports mode: 'native' | 'logical' | 'auto', WebRTC/WS/HTTP, and StandardSchemaV1):`,
+    `// await using sync = await syncDatabases(primary, replica, { mode: 'native' });`,
     ``,
     `// Or full explicit configuration via replicateDatabases():`,
     `const replicator = await replicateDatabases({`,
@@ -2112,6 +2114,67 @@ for (const btn of document.querySelectorAll('.scenario-card')) {
       activeCodeTab = 'setup';
       logEvent(
         `Scenario 12 (<code>syncDatabases()</code> + <code>IBatch</code> + WS <code>"FBCHANGELOG\\0"</code>): Applied <strong>${res.primaryToReplica.appliedCount}</strong> mutations in one <code>UPDATE OR INSERT INTO "TASKS" ... MATCHING ("ID")</code> batch, and streamed gzipped <code>.journal-${String(simChangelogSeq).padStart(9, '0')}</code> via <code>sendChangelogSegment()</code> (${seg.byteLength}B → ${wireLen}B wire)!`,
+        true,
+      );
+      await renderAll();
+    } else if (kind === 'webrtc-arrow-schema') {
+      const validIds = [nextTaskId++, nextTaskId++];
+      for (const id of validIds) {
+        await primaryDb.execute(
+          'INSERT INTO TASKS (ID, TENANT_ID, TITLE, PRIORITY, STOCK, TAGS, DONE, SECRET_HASH) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+          [
+            id,
+            'acme',
+            `WebRTC P2P Native Task #${id}`,
+            'HIGH',
+            40 + id,
+            'webrtc,native,arrow-ipc',
+            0,
+            `sha256:rtc${id}`,
+          ],
+        );
+      }
+
+      simChangelogSeq++;
+      simEnginePubState.sequenceValue = validIds[validIds.length - 1];
+      const res = await replicator.sync();
+
+      const recentEntries = await replicator.primaryPublication.fetchChangesSince(0);
+      const { seg } = buildFbChangelogSegmentBytes(
+        recentEntries.slice(-2),
+        simChangelogSeq,
+        simEnginePubState.sequenceValue,
+      );
+
+      // Compute 16 KB SCTP 'WRTC' (0x57525443) chunk count + IEEE 802.3 CRC-32
+      let crc = 0xffffffff;
+      for (let i = 0; i < seg.byteLength; i++) {
+        crc ^= seg[i];
+        for (let k = 0; k < 8; k++) {
+          crc = (crc & 1) !== 0 ? 0xedb88320 ^ (crc >>> 1) : crc >>> 1;
+        }
+      }
+      const crcHex = `0x${((crc ^ 0xffffffff) >>> 0).toString(16).padStart(8, '0')}`;
+      const wrtcChunks = Math.max(1, Math.ceil(seg.byteLength / (16384 - 24)));
+
+      const headLsn = await replicator.primaryPublication.currentLsn();
+      const quarantinedId = nextTaskId++;
+      simDlqEntries = [
+        {
+          lsn: headLsn + 1,
+          subscriptionName: 'sub_replica',
+          table: 'TASKS',
+          key: { ID: quarantinedId },
+          errorMessage:
+            'SchemaValidationError (StandardSchemaV1 ~standard on table "TASKS"): STOCK: Expected STOCK >= 0, got -15',
+          retryCount: 0,
+          quarantinedAt: Date.now(),
+        },
+      ];
+
+      activeCodeTab = 'mesh-dlq';
+      logEvent(
+        `Scenario 13 (<code>mode: 'native'</code> + <code>createWebRtcReplicationPeer</code> + <code>StandardSchemaV1</code>): Streamed <code>"FBCHANGELOG\\0"</code> seq #${simChangelogSeq} across <strong>${wrtcChunks}</strong> <code>'WRTC'</code> SCTP frame(s) (CRC-32 <code>${crcHex}</code>), applied <strong>${res.primaryToReplica.appliedCount}</strong> row(s) via native replay, and quarantined invalid row <code>ID=${quarantinedId}</code> via <code>tableSchemas</code> into <code>FB_REPL_DLQ$</code>!`,
         true,
       );
       await renderAll();

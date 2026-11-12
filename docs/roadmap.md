@@ -1690,6 +1690,44 @@ Next-horizon improvements across **Replication**, **Speed & Performance**, **Int
 
 ---
 
+### M19 — End-to-End Native Engine Sync (`mode: 'native'`), Columnar & Apache Arrow IPC Queries, WebRTC & Resilient Transports, Standard Schema / Typed SQL & `firebird-wasm` CLI
+
+- [x] **1. End-to-End Native Engine Sync Preset (`mode: 'native'`) & Single-Thread Inline `"FBCHANGELOG\0"` Emission.**
+      Wire `syncDatabases()` and `db.syncWith()` (`mode: 'native' | 'auto'`) end-to-end
+      across WASM and network peers (`enableEnginePublication` / `replication.conf`
+      provisioning, `.journal-*` harvesting via `createWasmChangelogPoller` or inline
+      single-thread `"FBCHANGELOG\0"` builder/flusher when `SharedArrayBuffer` /
+      `pthread` archivers are unavailable, gzipped HTTP/WebSocket streaming, and
+      `db.applyChangelog()` / `IReplicator` replay), plus patch `fb_wasm_api.cpp` for
+      synchronous single-thread changelog flushing.
+- [x] **2. Zero-Copy Columnar Result Buffers & Apache Arrow IPC Streaming (`queryColumnar()` / `queryArrow()`).**
+      Extend the binary result decoder and `FirebirdDatabase` (`FirebirdBrowser` &
+      `FirebirdLite`) with typed columnar result buffers (`Int32Array`, `Float64Array`,
+      `BigInt64Array`, dictionary/offset UTF-8 buffers, `Uint8Array` validity bitmaps)
+      and standard **Apache Arrow IPC** stream/file serialization (`encodeArrowIpc`,
+      `decodeArrowIpc`, `db.queryColumnar()`, `db.queryArrow()`) for zero-per-row-object
+      analytical queries, data grids, and vector/FTS scans.
+- [x] **3. WebRTC DataChannel Peer-to-Peer Sync (`createWebRtcReplicationPeer`) & Resilient Auto-Reconnecting Transports.**
+      Add `createWebRtcReplicationPeer()` (with automatic SCTP 16–64 KB frame chunking,
+      CRC/sequence reassembly, and backpressure control for large snapshots and
+      `"FBCHANGELOG\0"` segments across browser/desktop peers), and upgrade HTTP/SSE &
+      WebSocket replication transports with exponential backoff + jitter, connection
+      lifecycle state events (`'connecting' | 'online' | 'backoff' | 'offline'`), and
+      resumable chunked snapshot bootstrap.
+- [x] **4. Standard Schema v1 Validation (`Zod` / `Valibot` / `ArkType`) & Typed SQL Helpers (`createTypedSql<DB>()`).**
+      Support Standard Schema v1 (`~standard`) validators on `db.query(..., { schema })`
+      and replication table configs (`validateSchema` with automatic `FB_REPL_DLQ$`
+      quarantine on invalid incoming rows), and provide `createTypedSql<DB>(db)` for
+      compile-time table/column checking and typed result rows on tagged SQL queries.
+- [x] **5. Driver Modularization (`firebird-browser` / `firebird` Submodules) & `npx firebird-wasm` Developer CLI.**
+      Decompose `src/browser/firebird-browser.ts` and `src/firebird.ts` by extracting
+      focused submodules (snapshots/diffing, UDR registration, live event subscriptions,
+      and shared stream/copy helpers), and ship a zero-dependency `firebird-wasm/cli`
+      (`bin`: `firebird-wasm` supporting `repl`, `query`, `migrate`,
+      `codegen --kysely|--drizzle`, `dump`, `restore`, and `inspect-changelog`).
+
+---
+
 ## 5. Test coverage added alongside this review
 
 `src/browser/` was excluded from Jest and had no browser tests.  It now has 73

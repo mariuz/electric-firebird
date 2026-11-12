@@ -3,6 +3,7 @@
  */
 
 import type { TypeOptions } from './browser/value-types';
+import type { StandardSchemaV1 } from './schema-validation';
 
 /**
  * Options for creating a FirebirdLite instance.
@@ -193,7 +194,7 @@ export interface StatementExecutionOptions {
  * a query may start a transaction of its own, and it decides the shape of what
  * comes back.
  */
-export interface QueryOptions extends TransactionOptions, StatementExecutionOptions {
+export interface QueryOptions<T = unknown> extends TransactionOptions, StatementExecutionOptions {
   /**
    * How to shape each row.
    *
@@ -205,6 +206,11 @@ export interface QueryOptions extends TransactionOptions, StatementExecutionOpti
    * @default 'object'
    */
   rowMode?: RowMode;
+  /**
+   * Optional Standard Schema v1 (`zod`, `valibot`, `arktype`, or
+   * `createRowSchema`) validator applied to every returned row (`M19 Item 4`).
+   */
+  schema?: StandardSchemaV1<unknown, T>;
 }
 
 /** A row in `rowMode: 'array'` — values in column order. */
@@ -213,7 +219,7 @@ export type ArrayRow = unknown[];
 /**
  * Options accepted by `queryStream()`.
  */
-export interface QueryStreamOptions extends QueryOptions {
+export interface QueryStreamOptions<T = unknown> extends QueryOptions<T> {
   /**
    * Maximum number of rows fetched per cursor batch.
    *
@@ -386,8 +392,8 @@ export interface PreparedStatement {
     options: QueryOptions & { rowMode: 'array' },
   ): Promise<QueryResult<ArrayRow>>;
   query<T extends Row = Row>(
-    params?: QueryParams | QueryOptions,
-    options?: QueryOptions,
+    params?: QueryParams | QueryOptions<T>,
+    options?: QueryOptions<T>,
   ): Promise<QueryResult<T>>;
 
   /**

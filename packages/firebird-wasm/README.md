@@ -42,7 +42,8 @@ See [Firebird server packages](https://firebirdsql.org/en/server-packages/) if y
 | `firebird-wasm/drizzle` | Drizzle-style query builder (`drizzle`, `firebirdTable`) & schema codegen (`generateDrizzleSchema`) | Drizzle ORM 0.30+ (optional) |
 | `firebird-wasm/vector` | Float32/Int8 vector codec, persistent HNSW ANN index (`HnswIndex`, `createVectorIndex`), SQL UDRs, and `vectorSearch` | `FirebirdBrowser` / `FirebirdLite` |
 | `firebird-wasm/fts` | Okapi BM25 full-text search (`Bm25Index`, `createFtsIndex`), stemming/highlighting UDRs, and RRF `hybridSearch` | `FirebirdBrowser` / `FirebirdLite` |
-| `firebird-wasm/replication` | Logical, journal & native Firebird engine replication (`replicateDatabases`, CRDTs, mesh/hub, DLQ, PITR, `"FBCHANGELOG\0"`) | `FirebirdBrowser` / `FirebirdLite` |
+| `firebird-wasm/replication` | Logical, journal & native Firebird engine replication (`syncDatabases`, `db.syncWith`, WebRTC/WS/HTTP, CRDTs, mesh/hub, DLQ, PITR, `"FBCHANGELOG\0"`) | `FirebirdBrowser` / `FirebirdLite` |
+| `firebird-wasm/cli` | `npx firebird-wasm` developer CLI (`query`, `repl`, `codegen --kysely\|--drizzle`, `migrate`, `dump`, `restore`, `inspect-changelog`) | Node.js 18+ |
 
 ## Quick start — Browser (WASM)
 
@@ -95,7 +96,9 @@ await db.close();
 
 ### Core API (`FirebirdBrowser` & `FirebirdLite`)
 
-- **Queries & scripts**: `db.exec(sql, params?)`, `db.execBatch(sql, rows)`, `db.query<T>(sql, params?, options?)`, `db.queryStream<T>(sql, params?, options?)`, `db.prepare(sql)`, `` sql`...` `` template tag
+- **Unified & columnar queries**: `openDatabase(uri, opts?)`, `db.execute(sql, params?)`, `db.exec(sql, params?)`, `db.execBatch(sql, rows)`, `db.query<T>(sql, params?, { schema? })`, `db.queryColumnar(sql, params?)`, `db.queryArrow(sql, params?, opts?)` (`encodeArrowIpc` / `decodeArrowIpc`), `db.queryStream<T>(sql, params?, opts?)`, `db.prepare(sql)`, `` sql`...` `` & `createTypedSql<DB>(db)`
+- **Standard Schema v1 & errors**: `Zod` / `Valibot` / `ArkType` / `createRowSchema` validation (`{ schema }`, `SchemaValidationError`), structured `FirebirdError` (`gdscode`, `sqlcode`, `sqlState`, `hint`), `[Symbol.asyncDispose]()` (`await using db = ...`)
+- **Replication & P2P sync**: `syncDatabases(primary, replica, { mode: 'native' | 'logical' | 'auto' })`, `db.syncWith(peerOrUrl)`, `createWebRtcReplicationPeer()` (16 KB SCTP chunking + CRC-32 + backpressure), `createResilientWebSocketPeer()`, `fetchSnapshotResumable()`, `flushDatabaseFbChangelogSegment()`
 - **Transactions**: `db.transaction(fn, options?)`, `tx.savepoint(fn)`, `tx.rollback()`
 - **Schema & migrations**: `db.describeQuery(sql)`, `db.explain(sql, options?)`, `db.introspect()`, `db.migrate(migrations)`, `diffSchema()`, `generateMigration()`
 - **Bulk & BLOB streaming**: `db.copyFromStream()`, `db.copyToStream()`, `db.createBlobStream()`, `db.openBlobStream()`, `db.dumpDataDir()`, `db.dumpDataStream()`, `db.loadDataStream()`

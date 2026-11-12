@@ -5,9 +5,13 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "browser": "dist/browser/index.js",
+  "bin": {
+    "firebird-wasm": "./dist/cli.js"
+  },
   "sideEffects": [
     "./dist/browser/worker-entry.js",
-    "./dist/repl/index.js"
+    "./dist/repl/index.js",
+    "./dist/cli.js"
   ],
   "exports": {
     ".": {
@@ -77,6 +81,10 @@
     "./replication": {
       "types": "./dist/replication/index.d.ts",
       "default": "./dist/replication/index.js"
+    },
+    "./cli": {
+      "types": "./dist/cli.d.ts",
+      "default": "./dist/cli.js"
     },
     "./package.json": "./package.json"
   },

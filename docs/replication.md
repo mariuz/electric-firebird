@@ -823,9 +823,11 @@ await poller.pollOnce(); // or poller.start(100)
 | Export | Description |
 |---|---|
 | `createHttpReplicationHandler(options)` | Web Fetch API `(Request) => Promise<Response>` handler serving `/changes`, `/ack`, `/heartbeat`, `/snapshot`, `/push`, and `/events` (SSE). |
-| `createHttpReplicationClient(options)` | Remote HTTP replication client compatible with `createSubscription()`. |
+| `createHttpReplicationClient(options)` | Remote HTTP replication client with exponential backoff + jitter (`retry`), connection `state` / `onStateChange`, and `fetchSnapshotResumable({ chunkSize, checkpoint, onProgress })`. |
 | `createBroadcastChannelTransport(options?)` | Cross-tab / cross-worker replication transport backed by `BroadcastChannel`. |
-| `createWebSocketReplicationPeer(options)` | Duplex WebSocket replication peer streaming entries, pull requests, and slot acks. |
+| `createWebSocketReplicationPeer(options)` | Duplex WebSocket replication peer streaming entries, pull requests, slot acks, and binary/gzipped `"FBCHANGELOG\0"` frames. |
+| `createResilientWebSocketPeer(options)` | Auto-reconnecting WebSocket peer with exponential backoff + jitter (`computeBackoffDelayMs`), lifecycle states (`'connecting' \| 'online' \| 'backoff' \| 'offline'`), offline changelog queueing, and automatic watermark catch-up. |
+| `createWebRtcReplicationPeer(options)` | Peer-to-peer WebRTC `RTCDataChannel` transport with automatic 16 KB SCTP frame chunking (`chunkWebRtcPayload` / `WebRtcChunkAssembler`), IEEE 802.3 CRC-32 verification, and `bufferedAmount` backpressure. |
 | `encodeNativeJournalSegment(entries, opts?)` | Encodes journal entries into a binary journal segment (`0x52444246` `'FBDR'`). |
 | `decodeNativeJournalSegment(bytes)` | Validates FNV-1a checksum and decodes a `0x52444246` binary journal segment. |
 | `encodeEncryptedJournalSegment(entries, opts?)` | Gzip-compresses and encrypts a journal segment with WebCrypto AES-256-GCM (`0x53444246` `'FBDS'`). |
@@ -868,3 +870,6 @@ await poller.pollOnce(); // or poller.start(100)
 | `createWasmChangelogPoller(options)` | Continuous poller & archiver applying `"FBCHANGELOG\0"` segments in sequence order (`pollOnce()`, `start()`, `stop()`, `stats()`). |
 | `introspectJrdTableSchemas(db)` | Queries `RDB$RELATION_FIELDS`, `RDB$FIELDS`, and primary-key constraints to build exact `JrdColumnDescriptor[]` maps automatically for `"FBCHANGELOG\0"` JRD record decoding. |
 | `db.setReplicaMode(mode)` / `db.applyChangelog(bytes)` | Worker-safe `FirebirdBrowser` methods invoking C++ `isc_dpb_set_db_replica` / `IAttachment::createReplicator` (`IReplicator`) across `DirectTransport`, `WorkerTransport`, and `SharedEngineTransport`. |
+| `logicalEntriesToFbChangelogSegment(entries, opts?)` | Encodes logical `ReplicationLogEntry[]` (including JRD record buffers, `opStoreBlob` chunks, `opExecuteSqlIntl`, and `opSetSequence` blocks) into a genuine `"FBCHANGELOG\0"` binary segment for single-thread WASM or cross-peer C++ `IReplicator` replay. |
+| `flushDatabaseFbChangelogSegment(db, opts?)` | Captures pending publication changes (auto-introspecting `RDB$RELATION_FIELDS`), packs a `"FBCHANGELOG\0"` segment, and optionally archives `<prefix>.journal-NNNNNNNNN` into `MEMFS`. |
+| `syncDatabases(primary, replica, { mode: 'native' })` / `db.syncWith(peer, { mode: 'native' })` | End-to-end native engine sync preset (`mode: 'native' \| 'auto'`) across local WASM (both threaded `.journal-*` and single-thread inline `"FBCHANGELOG\0"`), HTTP, WebSocket, and WebRTC `RTCDataChannel` peers. |

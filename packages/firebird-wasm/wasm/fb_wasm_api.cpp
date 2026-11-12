@@ -8179,4 +8179,21 @@ int fb_replicate_changelog(int db_handle, const unsigned char* data, unsigned by
 	return blocksApplied;
 }
 
+/**
+ * Query whether this WASM build was compiled with pthreads support (`1`) or
+ * single-threaded (`FB_WASM_NO_THREADS`, `0`). Single-threaded builds lack
+ * background `Replication::Manager` archiver pthreads and therefore emit
+ * `"FBCHANGELOG\0"` segments inline while still supporting native C++
+ * `fb_replicate_changelog` (`IAttachment::createReplicator`) replay (`M19 Item 1`).
+ */
+FB_WASM_EXPORT
+int fb_is_threaded()
+{
+#ifdef FB_WASM_NO_THREADS
+	return 0;
+#else
+	return 1;
+#endif
+}
+
 } /* extern "C" */

@@ -476,6 +476,10 @@
           <strong>12. One-Liner <code>syncDatabases()</code> + <code>IBatch</code> &amp; WS <code>FBCHANGELOG\0</code></strong>
           <span>Open via <code>openDatabase()</code>, batch-apply 4 mutations with <code>UPDATE OR INSERT ... MATCHING</code>, and gzip-stream <code>FBCHANGELOG\0</code>!</span>
         </button>
+        <button type="button" class="scenario-card" data-scenario="webrtc-arrow-schema">
+          <strong>13. Native <code>mode: 'native'</code> + WebRTC 16 KB P2P &amp; Standard Schema DLQ</strong>
+          <span>Chunk <code>FBCHANGELOG\0</code> across 16 KB <code>'WRTC'</code> SCTP frames with CRC-32, validate rows via Standard Schema v1, and export Arrow IPC!</span>
+        </button>
       </section>
 
       <!-- Dual Database Nodes Grid -->

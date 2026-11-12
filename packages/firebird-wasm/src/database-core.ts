@@ -38,6 +38,8 @@ import type {
   TransactionOptions,
 } from './types';
 import type { SqlFragment } from './sql-tag';
+import type { ArrowIpcOptions, ColumnarQueryResult } from './columnar';
+import type { StandardSchemaV1, TypedSqlFragment } from './schema-validation';
 import { UdrManager } from './browser/udr';
 import {
   CowSnapshotStore,
@@ -228,10 +230,24 @@ export interface FirebirdTransactionClient {
     options: ArrayModeOptions,
   ): Promise<QueryResult<ArrayRow>>;
   query<T extends Row = Row>(
+    sql: TypedSqlFragment<T>,
+    options?: { rowMode?: 'object' | 'array'; schema?: StandardSchemaV1<unknown, T> } & StatementExecutionOptions,
+  ): Promise<QueryResult<T>>;
+  query<T extends Row = Row>(
     sql: string | SqlFragment,
     params?: QueryParams,
-    options?: { rowMode?: 'object' | 'array' } & StatementExecutionOptions,
+    options?: { rowMode?: 'object' | 'array'; schema?: StandardSchemaV1<unknown, T> } & StatementExecutionOptions,
   ): Promise<QueryResult<T>>;
+  queryColumnar(
+    sql: string | SqlFragment,
+    params?: QueryParams | StatementExecutionOptions,
+    options?: StatementExecutionOptions,
+  ): Promise<ColumnarQueryResult>;
+  queryArrow(
+    sql: string | SqlFragment,
+    params?: QueryParams | (StatementExecutionOptions & ArrowIpcOptions),
+    options?: StatementExecutionOptions & ArrowIpcOptions,
+  ): Promise<Uint8Array>;
   queryStream<T extends Row = Row>(
     sql: string | SqlFragment,
     paramsOrOptions?: QueryParams | QueryStreamOptions,
@@ -295,14 +311,37 @@ export interface FirebirdDatabase {
     options: ArrayModeOptions,
   ): Promise<QueryResult<ArrayRow>>;
   query<T extends Row = Row>(
+    sql: TypedSqlFragment<T>,
+    options?: QueryOptions<T>,
+  ): Promise<QueryResult<T>>;
+  query<T extends Row = Row>(
     sql: SqlFragment,
-    options?: QueryOptions,
+    options?: QueryOptions<T>,
   ): Promise<QueryResult<T>>;
   query<T extends Row = Row>(
     sql: string | SqlFragment,
     params?: QueryParams,
-    options?: QueryOptions,
+    options?: QueryOptions<T>,
   ): Promise<QueryResult<T>>;
+  /**
+   * Execute a `SELECT` query and return typed columnar buffers (`Int32Array`,
+   * `Float64Array`, `BigInt64Array`, UTF-8 offset buffers) without allocating
+   * per-row JS objects (`M19 Item 2`).
+   */
+  queryColumnar(
+    sql: string | SqlFragment,
+    params?: QueryParams | StatementExecutionOptions,
+    options?: StatementExecutionOptions,
+  ): Promise<ColumnarQueryResult>;
+  /**
+   * Execute a `SELECT` query and return a standard **Apache Arrow IPC V5**
+   * stream (`Uint8Array`) (`M19 Item 2`).
+   */
+  queryArrow(
+    sql: string | SqlFragment,
+    params?: QueryParams | (StatementExecutionOptions & ArrowIpcOptions),
+    options?: StatementExecutionOptions & ArrowIpcOptions,
+  ): Promise<Uint8Array>;
   queryStream<T extends Row = Row>(
     sql: string | SqlFragment,
     paramsOrOptions?: QueryParams | QueryStreamOptions,

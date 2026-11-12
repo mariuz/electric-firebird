@@ -77,11 +77,32 @@ import {
   validateTimeoutMs,
 } from './database-core';
 import type { ReplicableDatabase } from './replication/types';
+import type { WebSocketLike } from './replication/transports';
+import type { RtcDataChannelLike } from './replication/webrtc-resilient';
 import {
   syncWithPeer,
   type SyncHandle,
   type SyncWithOptions,
 } from './replication/presets';
+import type { ColumnarQueryResult } from './columnar';
+import type { StandardSchemaV1, TypedSqlFragment } from './schema-validation';
+import {
+  assertBatchParameterRows,
+  assertPreparedParamCount,
+  assertUdrCallback,
+  executeArrowFromColumnar,
+  executeColumnarViaArrayQuery,
+  extractEffectiveQuerySchema,
+  finalizeQueryResultWithSchema,
+  isNonCountingDdlStatement,
+  querySystemRowCount,
+  resolveColumnarQueryCall,
+  resolvePreparedCallArgs,
+  runDriverApplyDiff,
+  runDriverExportDiff,
+  scanUserTablesForSweep,
+  type QueryArrowOptions,
+} from './shared-driver-ops';
 import type {
   JsFunctionHandler,
   JsProcedureHandler,
@@ -391,10 +412,11 @@ export class FirebirdLite implements FirebirdDatabase {
 
   /**
    * One-liner synchronization with another `FirebirdBrowser`/`FirebirdLite`
-   * instance, an HTTP(S) replication URL, or a `broadcast://<channel>` URI (`M18 Item 5`).
+   * instance, WebRTC `RTCDataChannel`, `WebSocket`, HTTP(S) replication URL,
+   * `ws(s)://` URL, or `broadcast://<channel>` URI (`M18 Item 5` / `M19 Item 3`).
    */
   async syncWith(
-    peerOrUrl: ReplicableDatabase | string,
+    peerOrUrl: ReplicableDatabase | string | RtcDataChannelLike | WebSocketLike,
     options: SyncWithOptions = {},
   ): Promise<SyncHandle> {
     await this.ensureReady();
@@ -456,13 +478,17 @@ export class FirebirdLite implements FirebirdDatabase {
     options: ArrayModeOptions,
   ): Promise<QueryResult<ArrayRow>>;
   async query<T extends Row = Row>(
+    sql: TypedSqlFragment<T>,
+    options?: QueryOptions<T>,
+  ): Promise<QueryResult<T>>;
+  async query<T extends Row = Row>(
     sql: SqlFragment,
-    options?: QueryOptions,
+    options?: QueryOptions<T>,
   ): Promise<QueryResult<T>>;
   async query<T extends Row = Row>(
     sql: string,
     params?: QueryParams,
-    options?: QueryOptions,
+    options?: QueryOptions<T>,
   ): Promise<QueryResult<T>>;
   // Both shapes at once, so a caller holding a `string | SqlFragment` — one
   // built conditionally — can call this without casting. Last, so the two
@@ -470,15 +496,16 @@ export class FirebirdLite implements FirebirdDatabase {
   async query<T extends Row = Row>(
     sql: string | SqlFragment,
     params?: QueryParams,
-    options?: QueryOptions,
+    options?: QueryOptions<T>,
   ): Promise<QueryResult<T>>;
   async query<T = Row>(
-    sql: string | SqlFragment,
-    paramsOrOptions: QueryParams | QueryOptions = [],
-    maybeOptions: QueryOptions = {},
+    sql: string | SqlFragment | TypedSqlFragment<T>,
+    paramsOrOptions: QueryParams | QueryOptions<T> = [],
+    maybeOptions: QueryOptions<T> = {},
   ): Promise<QueryResult<T>> {
     const { statement, options } = resolveQueryCall(sql, paramsOrOptions, maybeOptions);
-    const queryOpts = options as QueryOptions;
+    const queryOpts = options as QueryOptions<T>;
+    const schema = extractEffectiveQuerySchema<T>(sql, queryOpts);
     assertNotAborted(queryOpts.signal);
     validateTimeoutMs(queryOpts.timeoutMs);
 
@@ -498,7 +525,11 @@ export class FirebirdLite implements FirebirdDatabase {
         this.createUdrExecutor(),
       );
       if (intercepted) {
-        return applyTypes(intercepted, this.types, rowMode);
+        return finalizeQueryResultWithSchema(
+          applyTypes(intercepted, this.types, rowMode),
+          schema,
+          rowMode,
+        );
       }
     }
     const attachment = this.attachment!;
@@ -516,15 +547,20 @@ export class FirebirdLite implements FirebirdDatabase {
       ) {
         const shared = await this.sharedRead<T>(statement.sql, statement.params, rowMode);
         if (shared) {
+          const validatedShared = await finalizeQueryResultWithSchema(
+            shared.result,
+            schema,
+            rowMode,
+          );
           this.profiler.end({
             startedAt,
             sql: statement.sql,
             params: statement.params,
             kind: 'query',
-            rowCount: shared.result.rows.length,
+            rowCount: validatedShared.rows.length,
             cacheHit: shared.cacheHit,
           });
-          return shared.result;
+          return validatedShared;
         }
       }
       await this.endReadTransaction();
@@ -578,7 +614,11 @@ export class FirebirdLite implements FirebirdDatabase {
         throw err;
       }
 
-      const typed = applyTypes({ rows, fields }, this.types, rowMode);
+      const typed = await finalizeQueryResultWithSchema(
+        applyTypes({ rows, fields }, this.types, rowMode),
+        schema,
+        rowMode,
+      );
       this.profiler.end({
         startedAt,
         sql: statement.sql,
@@ -599,6 +639,48 @@ export class FirebirdLite implements FirebirdDatabase {
       });
       throw err;
     }
+  }
+
+  /**
+   * Execute a `SELECT` query and return typed columnar buffers (`Int32Array`,
+   * `Float64Array`, `BigInt64Array`, UTF-8 offset buffers) (`M19 Item 2`).
+   */
+  async queryColumnar(
+    sql: string | SqlFragment,
+    paramsOrOptions: QueryParams | StatementExecutionOptions = [],
+    maybeOptions: StatementExecutionOptions = {},
+  ): Promise<ColumnarQueryResult> {
+    const { statement, options } = resolveColumnarQueryCall(
+      sql,
+      paramsOrOptions,
+      maybeOptions,
+    );
+    return executeColumnarViaArrayQuery(() =>
+      this.query(statement.sql, statement.params, {
+        ...options,
+        rowMode: 'array',
+      }),
+    );
+  }
+
+  /**
+   * Execute a `SELECT` query and return a standard **Apache Arrow IPC V5**
+   * stream (`Uint8Array`) (`M19 Item 2`).
+   */
+  async queryArrow(
+    sql: string | SqlFragment,
+    paramsOrOptions: QueryParams | QueryArrowOptions = [],
+    maybeOptions: QueryArrowOptions = {},
+  ): Promise<Uint8Array> {
+    const { statement, options } = resolveColumnarQueryCall<QueryArrowOptions>(
+      sql,
+      paramsOrOptions,
+      maybeOptions,
+    );
+    return executeArrowFromColumnar(
+      () => this.queryColumnar(statement.sql, statement.params, options),
+      options,
+    );
   }
 
   /**
@@ -1087,9 +1169,7 @@ export class FirebirdLite implements FirebirdDatabase {
     maybeFn?: JsFunctionHandler,
   ): Promise<RegisteredRoutine> {
     await this.ensureReady();
-    if (typeof optionsOrFn !== 'function' && typeof maybeFn !== 'function') {
-      throw new TypeError('registerFunction requires a callback function');
-    }
+    assertUdrCallback('registerFunction', optionsOrFn, maybeFn);
     return this.udr.registerFunction(
       name,
       optionsOrFn,
@@ -1125,9 +1205,7 @@ export class FirebirdLite implements FirebirdDatabase {
     maybeFn?: JsProcedureHandler,
   ): Promise<RegisteredRoutine> {
     await this.ensureReady();
-    if (typeof optionsOrFn !== 'function' && typeof maybeFn !== 'function') {
-      throw new TypeError('registerProcedure requires a callback function');
-    }
+    assertUdrCallback('registerProcedure', optionsOrFn, maybeFn);
     return this.udr.registerProcedure(
       name,
       optionsOrFn,
@@ -1166,24 +1244,7 @@ export class FirebirdLite implements FirebirdDatabase {
     const started = performance.now();
     await this.endReadTransaction();
     const before = await this.databaseInfo();
-
-    let tablesScanned = 0;
-    try {
-      const relRes = await this.query<Record<string, unknown>>(
-        'SELECT TRIM(RDB$RELATION_NAME) AS REL FROM RDB$RELATIONS ' +
-          'WHERE COALESCE(RDB$SYSTEM_FLAG, 0) = 0 AND RDB$VIEW_BLR IS NULL ' +
-          'ORDER BY RDB$RELATION_NAME',
-      );
-      for (const row of relRes.rows) {
-        const rel = String(row['REL'] ?? row['rel'] ?? '').trim();
-        if (!rel) continue;
-        const escaped = rel.replace(/"/g, '""');
-        await this.query(`SELECT COUNT(*) AS C FROM "${escaped}"`);
-        tablesScanned += 1;
-      }
-    } catch {
-      // Ignore scan errors if a relation is inaccessible.
-    }
+    const tablesScanned = await scanUserTablesForSweep((s) => this.query(s));
 
     await this.endReadTransaction();
     const attachment = this.attachment!;
@@ -1237,11 +1298,7 @@ export class FirebirdLite implements FirebirdDatabase {
     };
 
     const checkParamCount = (actual: number): void => {
-      if (actual !== params.length) {
-        throw new Error(
-          `PreparedStatement expects ${params.length} parameter(s) but ${actual} were supplied`,
-        );
-      }
+      assertPreparedParamCount(params.length, actual);
     };
 
     const withStatement = async <R>(
@@ -1293,20 +1350,15 @@ export class FirebirdLite implements FirebirdDatabase {
         await applyStatementHandleTimeout(nativeStmt, validated);
       },
       query: (async <T = Row>(
-        paramsOrOptions: QueryParams | QueryOptions = [],
-        maybeOptions: QueryOptions = {},
+        paramsOrOptions: QueryParams | QueryOptions<T> = [],
+        maybeOptions: QueryOptions<T> = {},
       ): Promise<QueryResult<T>> => {
         assertOpen();
-        const callParams = Array.isArray(paramsOrOptions)
-          ? paramsOrOptions
-          : [];
-        const rawOptions = Array.isArray(paramsOrOptions)
-          ? maybeOptions
-          : (paramsOrOptions ?? {});
-        const callOptions: QueryOptions =
-          rawOptions.timeoutMs === undefined && currentTimeoutMs > 0
-            ? { ...rawOptions, timeoutMs: currentTimeoutMs }
-            : rawOptions;
+        const { callParams, rawOptions, callOptions } = resolvePreparedCallArgs<QueryOptions<T>>(
+          paramsOrOptions,
+          maybeOptions,
+          currentTimeoutMs,
+        );
         checkParamCount(callParams.length);
         assertNotAborted(callOptions.signal);
         validateTimeoutMs(callOptions.timeoutMs);
@@ -1341,9 +1393,13 @@ export class FirebirdLite implements FirebirdDatabase {
       throw err;
     }
           const outFields = fields.map((f) => ({ ...f }));
-          return applyTypes(
-            { rows: shapeRows<T>(rawRows, outFields, rowMode), fields: outFields },
-            this.types,
+          return finalizeQueryResultWithSchema(
+            applyTypes(
+              { rows: shapeRows<T>(rawRows, outFields, rowMode), fields: outFields },
+              this.types,
+              rowMode,
+            ),
+            callOptions.schema,
             rowMode,
           );
         } catch (err) {
@@ -1536,12 +1592,7 @@ export class FirebirdLite implements FirebirdDatabase {
       },
       execBatch: async (rows: QueryParams[]) => {
         assertOpen();
-        if (!Array.isArray(rows)) {
-          throw new TypeError('execBatch takes an array of parameter rows');
-        }
-        for (const row of rows) {
-          checkParamCount(row.length);
-        }
+        assertBatchParameterRows(rows, params.length);
         if (rows.length === 0) return { affectedRows: 0 };
         const serializedRows = this.types?.serializers?.length
           ? rows.map((row) => this.serialize(row))
@@ -1893,9 +1944,13 @@ export class FirebirdLite implements FirebirdDatabase {
       throw new Error('FirebirdLite instance has been closed');
     }
     await this.ensureReady();
-    const target =
-      toSnapshot !== undefined ? toSnapshot : await this.dumpDataDir();
-    return this.snapshotStore.exportDiff(fromSnapshot ?? null, target, options);
+    return runDriverExportDiff(
+      this.snapshotStore,
+      () => this.dumpDataDir(),
+      fromSnapshot,
+      toSnapshot,
+      options,
+    );
   }
 
   /**
@@ -1912,15 +1967,14 @@ export class FirebirdLite implements FirebirdDatabase {
       throw new Error('FirebirdLite instance has been closed');
     }
     await this.ensureReady();
-    const effectiveBase =
-      baseSnapshot !== undefined ? baseSnapshot : await this.dumpDataDir();
-    const nextBytes = this.snapshotStore.applyDiff(
+    return runDriverApplyDiff(
+      this.snapshotStore,
+      () => this.dumpDataDir(),
+      (bytes) => this.restoreSnapshot(bytes),
       diffBytes,
-      effectiveBase,
+      baseSnapshot,
       options,
     );
-    await this.restoreSnapshot(nextBytes);
-    return nextBytes;
   }
 
   async dumpDataDir(): Promise<Uint8Array> {
@@ -2353,21 +2407,11 @@ export class FirebirdTransaction implements FirebirdTransactionClient {
   ): Promise<UnifiedExecuteResult> {
     const stmtText = toStatement(sql, params).sql;
     await this.exec(sql, params, options);
-    if (/^\s*(CREATE|ALTER|DROP|RECREATE|SET|GRANT|REVOKE|COMMENT|DECLARE)\b/i.test(stmtText)) {
+    if (isNonCountingDdlStatement(stmtText)) {
       return { affectedRows: 0, changes: 0 };
     }
-    try {
-      const rcRes = await this.query<Row>(
-        `SELECT CAST(RDB$GET_CONTEXT('SYSTEM', 'ROW_COUNT') AS INTEGER) AS RC FROM RDB$DATABASE`,
-      );
-      const affectedRows = Math.max(
-        0,
-        Number(rcRes.rows[0]?.RC ?? rcRes.rows[0]?.rc ?? 0) || 0,
-      );
-      return { affectedRows, changes: affectedRows };
-    } catch {
-      return { affectedRows: 0, changes: 0 };
-    }
+    const affectedRows = await querySystemRowCount((s) => this.query<Row>(s));
+    return { affectedRows, changes: affectedRows };
   }
 
   /**
@@ -2493,20 +2537,29 @@ export class FirebirdTransaction implements FirebirdTransactionClient {
     options: ArrayModeOptions,
   ): Promise<QueryResult<ArrayRow>>;
   async query<T extends Row = Row>(
+    sql: TypedSqlFragment<T>,
+    options?: { rowMode?: RowMode; schema?: StandardSchemaV1<unknown, T> } & StatementExecutionOptions,
+  ): Promise<QueryResult<T>>;
+  async query<T extends Row = Row>(
     sql: string | SqlFragment,
     params?: QueryParams,
-    options?: { rowMode?: RowMode } & StatementExecutionOptions,
+    options?: { rowMode?: RowMode; schema?: StandardSchemaV1<unknown, T> } & StatementExecutionOptions,
   ): Promise<QueryResult<T>>;
   async query<T = Row>(
-    sql: string | SqlFragment,
-    params: QueryParams = [],
-    options: { rowMode?: RowMode } & StatementExecutionOptions = {},
+    sql: string | SqlFragment | TypedSqlFragment<T>,
+    paramsOrOptions:
+      | QueryParams
+      | ({ rowMode?: RowMode; schema?: StandardSchemaV1<unknown, T> } & StatementExecutionOptions) = [],
+    maybeOptions: { rowMode?: RowMode; schema?: StandardSchemaV1<unknown, T> } & StatementExecutionOptions = {},
   ): Promise<QueryResult<T>> {
     this.assertUsable();
+    const { statement, options } = resolveQueryCall<
+      { rowMode?: RowMode; schema?: StandardSchemaV1<unknown, T> } & StatementExecutionOptions
+    >(sql, paramsOrOptions, maybeOptions);
+    const schema = extractEffectiveQuerySchema<T>(sql, options);
     assertNotAborted(options.signal);
     validateTimeoutMs(options.timeoutMs);
     await this.beforeStatement();
-    const statement = toStatement(sql, params);
     const serialized = this.serialize(statement.params);
     const rowMode = options.rowMode ?? 'object';
     if (this.udr?.hasBridgeRoutines) {
@@ -2524,11 +2577,15 @@ export class FirebirdTransaction implements FirebirdTransactionClient {
             s: string,
             p: QueryParams = [],
             o?: { rowMode?: RowMode },
-          ) => this.query<R>(s, p, { ...options, rowMode: o?.rowMode ?? 'object' }),
+          ) => this.query<R>(s, p, { ...options, schema: undefined, rowMode: o?.rowMode ?? 'object' }),
         },
       );
       if (intercepted) {
-        return applyTypes(intercepted, this.types, rowMode);
+        return finalizeQueryResultWithSchema(
+          applyTypes(intercepted, this.types, rowMode),
+          schema,
+          rowMode,
+        );
       }
     }
 
@@ -2557,7 +2614,54 @@ export class FirebirdTransaction implements FirebirdTransactionClient {
       }
       await lease.release(failed);
     }
-    return applyTypes({ rows: shapeRows<T>(rawRows, fields, rowMode), fields }, this.types, rowMode);
+    return finalizeQueryResultWithSchema(
+      applyTypes({ rows: shapeRows<T>(rawRows, fields, rowMode), fields }, this.types, rowMode),
+      schema,
+      rowMode,
+    );
+  }
+
+  /**
+   * Execute a `SELECT` query inside this transaction and return typed columnar
+   * buffers (`M19 Item 2`).
+   */
+  async queryColumnar(
+    sql: string | SqlFragment,
+    paramsOrOptions: QueryParams | StatementExecutionOptions = [],
+    maybeOptions: StatementExecutionOptions = {},
+  ): Promise<ColumnarQueryResult> {
+    this.assertUsable();
+    const { statement, options } = resolveColumnarQueryCall(
+      sql,
+      paramsOrOptions,
+      maybeOptions,
+    );
+    return executeColumnarViaArrayQuery(() =>
+      this.query(statement.sql, statement.params, {
+        ...options,
+        rowMode: 'array',
+      }),
+    );
+  }
+
+  /**
+   * Execute a `SELECT` query inside this transaction and return an **Apache Arrow IPC V5**
+   * stream (`Uint8Array`) (`M19 Item 2`).
+   */
+  async queryArrow(
+    sql: string | SqlFragment,
+    paramsOrOptions: QueryParams | QueryArrowOptions = [],
+    maybeOptions: QueryArrowOptions = {},
+  ): Promise<Uint8Array> {
+    const { statement, options } = resolveColumnarQueryCall<QueryArrowOptions>(
+      sql,
+      paramsOrOptions,
+      maybeOptions,
+    );
+    return executeArrowFromColumnar(
+      () => this.queryColumnar(statement.sql, statement.params, options),
+      options,
+    );
   }
 
   /**
@@ -2638,11 +2742,7 @@ export class FirebirdTransaction implements FirebirdTransactionClient {
     };
 
     const checkParamCount = (actual: number): void => {
-      if (actual !== params.length) {
-        throw new Error(
-          `PreparedStatement expects ${params.length} parameter(s) but ${actual} were supplied`,
-        );
-      }
+      assertPreparedParamCount(params.length, actual);
     };
 
     const stmt: PreparedStatement = {
@@ -2668,20 +2768,15 @@ export class FirebirdTransaction implements FirebirdTransactionClient {
         await applyStatementHandleTimeout(nativeStmt, validated);
       },
       query: (async <T = Row>(
-        paramsOrOptions: QueryParams | QueryOptions = [],
-        maybeOptions: QueryOptions = {},
+        paramsOrOptions: QueryParams | QueryOptions<T> = [],
+        maybeOptions: QueryOptions<T> = {},
       ): Promise<QueryResult<T>> => {
         assertOpen();
-        const callParams = Array.isArray(paramsOrOptions)
-          ? paramsOrOptions
-          : [];
-        const rawOptions = Array.isArray(paramsOrOptions)
-          ? maybeOptions
-          : (paramsOrOptions ?? {});
-        const callOptions: QueryOptions =
-          rawOptions.timeoutMs === undefined && currentTimeoutMs > 0
-            ? { ...rawOptions, timeoutMs: currentTimeoutMs }
-            : rawOptions;
+        const { callParams, rawOptions, callOptions } = resolvePreparedCallArgs<QueryOptions<T>>(
+          paramsOrOptions,
+          maybeOptions,
+          currentTimeoutMs,
+        );
         checkParamCount(callParams.length);
         assertNotAborted(callOptions.signal);
         validateTimeoutMs(callOptions.timeoutMs);
@@ -2712,9 +2807,13 @@ export class FirebirdTransaction implements FirebirdTransactionClient {
           }
         }
         const outFields = fields.map((f) => ({ ...f }));
-        return applyTypes(
-          { rows: shapeRows<T>(rawRows, outFields, rowMode), fields: outFields },
-          this.types,
+        return finalizeQueryResultWithSchema(
+          applyTypes(
+            { rows: shapeRows<T>(rawRows, outFields, rowMode), fields: outFields },
+            this.types,
+            rowMode,
+          ),
+          callOptions.schema,
           rowMode,
         );
       }) as PreparedStatement['query'],

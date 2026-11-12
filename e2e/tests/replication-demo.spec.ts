@@ -202,4 +202,20 @@ test.describe('Replication Simulator v2 (replication.html)', () => {
     await expect(page.locator('#event-feed')).toContainText('UPDATE OR INSERT');
     await expect(page.locator('#event-feed')).toContainText('sendChangelogSegment()');
   });
+
+  test('Scenario 13: Native mode: "native" + WebRTC 16 KB P2P Chunking & Standard Schema v1 DLQ Quarantine', async ({
+    page,
+  }) => {
+    await openReplicationSim(page);
+
+    await page.locator('.scenario-card[data-scenario="webrtc-arrow-schema"]').click();
+
+    await expect(page.locator('#primary-rows')).toContainText('WebRTC P2P Native Task #4');
+    await expect(page.locator('#replica-rows')).toContainText('WebRTC P2P Native Task #5');
+    await expect(page.locator('#code-inspector')).toContainText('SchemaValidationError');
+    await expect(page.locator('#code-inspector')).toContainText('StandardSchemaV1');
+    await expect(page.locator('#event-feed')).toContainText('Scenario 13');
+    await expect(page.locator('#event-feed')).toContainText('createWebRtcReplicationPeer');
+    await expect(page.locator('#event-feed')).toContainText('CRC-32');
+  });
 });

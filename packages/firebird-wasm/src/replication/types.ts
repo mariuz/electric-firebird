@@ -3,6 +3,7 @@
  */
 
 import type { QueryParams, QueryResult, Row } from '../types';
+import type { StandardSchemaV1 } from '../schema-validation';
 
 // ---------------------------------------------------------------------------
 // Constants & Structural Database Contract
@@ -252,6 +253,11 @@ export interface PublishedTableConfig {
    * rows are emitted from this published table (`M14 Item 3`).
    */
   transformRow?: RowTransformer;
+  /**
+   * Optional Standard Schema v1 (`Zod` / `Valibot` / `ArkType`) validator applied
+   * to published/replicated rows on this table (`M19 Item 4`).
+   */
+  validateSchema?: StandardSchemaV1<unknown, Record<string, unknown>>;
 }
 
 /** Options for {@link buildReplicationTriggerDdl}. */
@@ -462,6 +468,7 @@ export interface NormalizedPublishedTableConfig {
   readonly where?: string | ((row: Record<string, unknown>) => boolean);
   readonly references?: readonly string[];
   readonly transformRow?: RowTransformer;
+  readonly validateSchema?: StandardSchemaV1<unknown, Record<string, unknown>>;
 }
 
 /** Options for {@link createPublication}. */
@@ -735,6 +742,12 @@ export interface CreateSubscriptionOptions {
    * Returning `false` or throwing an `Error` rejects the entry (`M14 Item 2`).
    */
   validateEntry?: (entry: ReplicationLogEntry) => boolean | void | Promise<boolean | void>;
+  /**
+   * Optional per-table Standard Schema v1 (`Zod` / `Valibot` / `ArkType`) row
+   * validators keyed by table name (case-insensitive). Invalid rows are routed
+   * through `onApplyError` (e.g. `'dlq'` quarantines them into `FB_REPL_DLQ$`) (`M19 Item 4`).
+   */
+  tableSchemas?: Readonly<Record<string, StandardSchemaV1<unknown, Record<string, unknown>>>>;
   /**
    * Error handling policy when applying an entry fails or `validateEntry` rejects:
    * - `'throw'` (default): abort the batch with the error.

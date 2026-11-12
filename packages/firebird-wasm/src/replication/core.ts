@@ -5,6 +5,10 @@
 
 import type { QueryParams, QueryResult, Row } from '../types';
 import {
+  validateValueWithSchema,
+  type StandardSchemaV1,
+} from '../schema-validation';
+import {
   DEFAULT_REPL_DLQ_TABLE,
   DEFAULT_REPL_JOURNAL_TABLE,
   DEFAULT_REPL_LSN_SEQUENCE,
@@ -163,6 +167,7 @@ export async function createPublication(
         ...(item.where ? { where: item.where } : {}),
         ...(references ? { references } : {}),
         ...(item.transformRow ? { transformRow: item.transformRow } : {}),
+        ...(item.validateSchema ? { validateSchema: item.validateSchema } : {}),
       });
     }
   };
@@ -729,6 +734,16 @@ export async function createPublication(
           ? null
           : normalizeRowKeysUpper({ ...(beforeNorm ?? {}), ...(afterNorm ?? {}), ...keyRec });
 
+      let validatedFullAfter = fullAfter;
+      if (tableCfg.validateSchema && validatedFullAfter) {
+        const validated = await validateValueWithSchema(
+          tableCfg.validateSchema,
+          validatedFullAfter,
+          { tableName: tableUpper },
+        );
+        validatedFullAfter = normalizeRowKeysUpper(validated as Record<string, unknown>);
+      }
+
       if (applyLocally) {
         const lsnBeforeApply = triggerCapture ? await publication.currentLsn() : 0;
         await applyRowMutationToTable(
@@ -737,7 +752,7 @@ export async function createPublication(
           pkCols,
           params.operation,
           keyRec,
-          fullAfter,
+          validatedFullAfter,
         );
         if (triggerCapture) {
           // The capture trigger already journalled this write; return its
@@ -750,16 +765,16 @@ export async function createPublication(
           );
           const last = captured[captured.length - 1];
           if (last) {
-            updateMirrorRow(tableUpper, pkCols, params.operation, keyRec, fullAfter);
+            updateMirrorRow(tableUpper, pkCols, params.operation, keyRec, validatedFullAfter);
             return last;
           }
         }
       }
 
-      updateMirrorRow(tableUpper, pkCols, params.operation, keyRec, fullAfter);
+      updateMirrorRow(tableUpper, pkCols, params.operation, keyRec, validatedFullAfter);
 
       const projectedAfter = projectReplicatedRow(
-        fullAfter,
+        validatedFullAfter,
         pkCols,
         tableCfg.columns,
         tableCfg.excludeColumns,
@@ -1532,6 +1547,23 @@ export async function createSubscription(
     dlqTable: options.dlqTable ?? DEFAULT_REPL_DLQ_TABLE,
   });
 
+  const normalizedTableSchemas = new Map<
+    string,
+    StandardSchemaV1<unknown, Record<string, unknown>>
+  >();
+  if (fullPub) {
+    for (const [tbl, cfg] of fullPub.tables) {
+      if (cfg.validateSchema) {
+        normalizedTableSchemas.set(normalizeTableName(tbl), cfg.validateSchema);
+      }
+    }
+  }
+  if (options.tableSchemas) {
+    for (const [tbl, schema] of Object.entries(options.tableSchemas)) {
+      normalizedTableSchemas.set(normalizeTableName(tbl), schema);
+    }
+  }
+
   let cachedWatermark: number | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
   let isSyncing = false;
@@ -1757,6 +1789,36 @@ export async function createSubscription(
                 continue;
               }
               eff = { ...cand, after: transformed };
+            }
+            const tableSchema = normalizedTableSchemas.get(runTable);
+            if (tableSchema && !candIsDelete && eff.after) {
+              try {
+                const validated = await validateValueWithSchema(
+                  tableSchema,
+                  eff.after,
+                  { tableName: runTable },
+                );
+                eff = { ...eff, after: normalizeRowKeysUpper(validated as Record<string, unknown>) };
+              } catch (schemaErr) {
+                const errorObj =
+                  schemaErr instanceof Error ? schemaErr : new Error(String(schemaErr));
+                const policy = options.onApplyError ?? 'throw';
+                const action =
+                  typeof policy === 'function'
+                    ? await policy(eff, errorObj)
+                    : policy;
+                if (action === 'dlq') {
+                  await dlqManager.recordFailure(eff, errorObj, subName);
+                  dlqCount++;
+                  scanIdx++;
+                  continue;
+                }
+                if (action === 'skip') {
+                  scanIdx++;
+                  continue;
+                }
+                throw errorObj;
+              }
             }
             runItems.push({ effectiveEntry: eff, normKey: candNormKey });
             scanIdx++;
@@ -2005,6 +2067,24 @@ export async function createSubscription(
           }
           throw errorObj;
         };
+
+        const singleTableSchema = normalizedTableSchemas.get(tableUpper);
+        if (singleTableSchema && effectiveEntry.operation !== 'DELETE' && effectiveEntry.after) {
+          try {
+            const validated = await validateValueWithSchema(
+              singleTableSchema,
+              effectiveEntry.after,
+              { tableName: tableUpper },
+            );
+            effectiveEntry = {
+              ...effectiveEntry,
+              after: normalizeRowKeysUpper(validated as Record<string, unknown>),
+            };
+          } catch (schemaErr) {
+            const handled = await handleEntryFailure(schemaErr);
+            if (handled) continue;
+          }
+        }
 
         if (options.validateEntry) {
           try {
@@ -2379,6 +2459,10 @@ export interface ReplicateDatabasesOptions {
    * applied on the replica.
    */
   onRowApplied?: (entry: ReplicationLogEntry) => void | Promise<void>;
+  /** Optional per-table Standard Schema v1 row validators (`M19 Item 4`). */
+  tableSchemas?: Readonly<Record<string, StandardSchemaV1<unknown, Record<string, unknown>>>>;
+  /** Error policy when row validation or SQL replay fails (`'throw' | 'dlq' | 'skip'`). */
+  onApplyError?: CreateSubscriptionOptions['onApplyError'];
 }
 
 /** Result of `replicator.sync()`. */
@@ -2471,6 +2555,8 @@ export async function replicateDatabases(
     autoBootstrap: options.autoBootstrap,
     indexHooks: options.indexHooks,
     onRowApplied: options.onRowApplied,
+    tableSchemas: options.tableSchemas,
+    onApplyError: options.onApplyError,
   });
 
   if (direction === 'bidirectional' && replicaPublication) {

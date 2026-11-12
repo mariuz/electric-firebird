@@ -2773,4 +2773,154 @@ test.describe('FirebirdBrowser', () => {
     expect(result.stats.openCursors).toBe(0);
     expect(result.stats.liveResults).toBe(0);
   });
+
+  test('supports M19 queryColumnar(), queryArrow(), StandardSchemaV1 typed SQL, WebRTC chunking, and native v2 changelog bridge in Chromium', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      window.__stub.queryResult = {
+        columns: [
+          { name: 'ID', type: 496, subType: 0, scale: 0, length: 4, nullable: false },
+          { name: 'LABEL', type: 448, subType: 0, scale: 0, length: 32, nullable: false },
+          { name: 'SCORE', type: 480, subType: 0, scale: 0, length: 8, nullable: true },
+        ],
+        rows: [
+          [1, 'alpha', 12.5],
+          [2, 'beta', null],
+          [3, 'gamma', 99.25],
+        ],
+      };
+
+      const db = new window.FB.FirebirdBrowser('memory://m19-browser-api', {
+        autoPersist: false,
+      });
+
+      // 1. Columnar typed vectors + validity bitmap
+      const col = await db.queryColumnar('SELECT id, label, score FROM metrics');
+      const ids = Array.from((col.columns.ID as { data: Int32Array }).data);
+      const labels = [0, 1, 2].map((i) => col.columns.LABEL.get(i));
+      const scoreNullFlags = [
+        window.FB.isColumnValueValid(col.columns.SCORE.validity, 0),
+        window.FB.isColumnValueValid(col.columns.SCORE.validity, 1),
+        window.FB.isColumnValueValid(col.columns.SCORE.validity, 2),
+      ];
+
+      // 2. Arrow IPC stream synthesis + decode round-trip with custom metadata
+      const arrowBytes = await db.queryArrow('SELECT id, label, score FROM metrics', [], {
+        metadata: { source: 'm19-e2e' },
+      });
+      const decodedArrow = window.FB.decodeArrowIpc(arrowBytes);
+
+      // 3. StandardSchemaV1 + createTypedSql<DB>()
+      interface MetricsSchema {
+        METRICS: { ID: number; LABEL: string; SCORE: number | null };
+      }
+      const rowSchema = window.FB.createRowSchema({
+        id: (_v, raw) => Number(raw.ID),
+        label: (_v, raw) => String(raw.LABEL).toUpperCase(),
+        score: (_v, raw) => (raw.SCORE === null ? null : Number(raw.SCORE)),
+      });
+      const tsql = window.FB.createTypedSql<MetricsSchema>();
+      const validated = await db.query(
+        tsql.selectFrom('METRICS', ['ID', 'LABEL', 'SCORE']).withSchema(rowSchema),
+      );
+
+      let rejectedInvalidRow = false;
+      const strictSchema = window.FB.createRowSchema({
+        SCORE: (v) => {
+          if (typeof v !== 'number') throw new Error('SCORE must be non-null number');
+          return v;
+        },
+      });
+      try {
+        await db.query('SELECT id, label, score FROM metrics', [], { schema: strictSchema });
+      } catch (err) {
+        rejectedInvalidRow = err instanceof window.FB.SchemaValidationError;
+      }
+
+      // 4. Native v2 changelog synthesis + WebRTC 16 KB 'WRTC' SCTP chunking + CRC-32
+      const jrdSchema = {
+        METRICS: [
+          { name: 'ID', type: 'INTEGER', nullable: false },
+          { name: 'LABEL', type: 'VARCHAR', charLength: 32, maxBytes: 128, nullable: false },
+        ],
+      };
+      const nativeSeg = window.FB.logicalEntriesToFbChangelogSegment(
+        [
+          {
+            lsn: 1,
+            txid: '101',
+            timestamp: 1_700_000_000_000,
+            origin: 'node-a',
+            publication: 'PUB_DEFAULT',
+            table: 'METRICS',
+            operation: 'INSERT',
+            key: { ID: 1 },
+            before: null,
+            after: { ID: 1, LABEL: 'alpha' },
+          },
+        ],
+        {
+          sequence: 1,
+          guid: '11111111-2222-3333-4444-555555555555',
+          tableSchemas: jrdSchema,
+          recordEncoding: 'jrd',
+        },
+      );
+      const chunks = window.FB.chunkWebRtcPayload(nativeSeg, {
+        transferId: 7,
+        payloadKind: window.FB.WebRtcPayloadKind.ChangelogRaw,
+        maxChunkBytes: 56,
+      });
+      const assembler = new window.FB.WebRtcChunkAssembler();
+      let reassembled: Uint8Array | null = null;
+      for (const frame of chunks) {
+        const out = assembler.pushChunk(frame);
+        if (out) reassembled = out.payload;
+      }
+      const parsedSeg = window.FB.parseFbChangelogSegment(reassembled!);
+      const roundTripLogical = window.FB.fbChangelogToLogicalEntries(reassembled!, {
+        tableSchemas: jrdSchema,
+      });
+
+      const stats = window.__stub.stats();
+      await db.close();
+
+      return {
+        rowCount: col.rowCount,
+        ids,
+        labels,
+        scoreNullFlags,
+        arrowByteLength: arrowBytes.byteLength,
+        arrowRowCount: decodedArrow.rowCount,
+        arrowCols: decodedArrow.fields.map((f) => f.name),
+        arrowMeta: decodedArrow.metadata,
+        validatedRows: validated.rows,
+        rejectedInvalidRow,
+        chunkCount: chunks.length,
+        changelogVersion: parsedSeg.header.version,
+        roundTripRow: roundTripLogical.entries[0]?.after ?? null,
+        liveResults: stats.liveResults,
+      };
+    });
+
+    expect(result.rowCount).toBe(3);
+    expect(result.ids).toEqual([1, 2, 3]);
+    expect(result.labels).toEqual(['alpha', 'beta', 'gamma']);
+    expect(result.scoreNullFlags).toEqual([true, false, true]);
+    expect(result.arrowByteLength).toBeGreaterThan(64);
+    expect(result.arrowRowCount).toBe(3);
+    expect(result.arrowCols).toEqual(['ID', 'LABEL', 'SCORE']);
+    expect(result.arrowMeta).toEqual({ source: 'm19-e2e' });
+    expect(result.validatedRows).toEqual([
+      { id: 1, label: 'ALPHA', score: 12.5 },
+      { id: 2, label: 'BETA', score: null },
+      { id: 3, label: 'GAMMA', score: 99.25 },
+    ]);
+    expect(result.rejectedInvalidRow).toBe(true);
+    expect(result.chunkCount).toBeGreaterThan(1);
+    expect(result.changelogVersion).toBe(1);
+    expect(result.roundTripRow).toEqual({ ID: 1, LABEL: 'alpha' });
+    expect(result.liveResults).toBe(0);
+  });
 });

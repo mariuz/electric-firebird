@@ -25,6 +25,14 @@ import {
   type ApplyFbChangelogResult,
   type JrdColumnDescriptor,
 } from './native-changelog';
+import {
+  computeBackoffDelayMs,
+  type BackoffRetryOptions,
+  type ConnectionLifecycleState,
+  type ConnectionStateChangeInfo,
+} from './webrtc-resilient';
+
+export * from './webrtc-resilient';
 
 // ---------------------------------------------------------------------------
 // 4. Network Replication Transports (HTTP/SSE, WebSocket & BroadcastChannel — M12 Item 7 / M18 Item 1)
@@ -79,11 +87,65 @@ export interface HttpReplicationClientOptions {
   fetch?: typeof globalThis.fetch;
   /** Optional API key sent as `Authorization: Bearer <apiKey>` and `x-replication-key`. */
   apiKey?: string;
+  /** Optional exponential backoff + jitter retry policy for transient network / 5xx / 429 failures (`M19 Item 3`). */
+  retry?: BackoffRetryOptions;
+  /** Optional connection lifecycle callback (`'connecting' | 'online' | 'backoff' | 'offline'`) (`M19 Item 3`). */
+  onStateChange?: (
+    state: ConnectionLifecycleState,
+    info?: ConnectionStateChangeInfo,
+  ) => void;
+}
+
+/** Manifest returned by `GET /snapshot/manifest` for resumable chunked bootstrap (`M19 Item 3`). */
+export interface ResumableSnapshotManifest {
+  readonly snapshotId: string;
+  readonly publication: string;
+  readonly origin: string;
+  readonly watermarkLsn: number;
+  readonly timestamp: number;
+  readonly tables: ReadonlyArray<{
+    readonly table: string;
+    readonly primaryKey: readonly string[];
+    readonly ddlSql?: string | null;
+    readonly totalRows: number;
+  }>;
+}
+
+/** Mutable checkpoint object passed to `client.fetchSnapshotResumable({ checkpoint })` (`M19 Item 3`). */
+export interface ResumableSnapshotCheckpoint {
+  manifest?: ResumableSnapshotManifest;
+  currentTableIndex: number;
+  currentRowOffset: number;
+  completedTables: Array<{
+    table: string;
+    primaryKey: readonly string[];
+    ddlSql?: string | null;
+    rows: Record<string, unknown>[];
+  }>;
+  partialRows: Record<string, unknown>[];
+}
+
+/** Options for `client.fetchSnapshotResumable()` (`M19 Item 3`). */
+export interface FetchSnapshotResumableOptions {
+  /** Number of rows fetched per `/snapshot/chunk` HTTP request. @default 500 */
+  chunkSize?: number;
+  /** Mutable checkpoint updated after each chunk so interrupted downloads resume without re-fetching completed chunks. */
+  checkpoint?: ResumableSnapshotCheckpoint;
+  /** Progress callback invoked after each chunk completes. */
+  onProgress?: (progress: {
+    readonly table: string;
+    readonly tableLoadedRows: number;
+    readonly tableTotalRows: number;
+    readonly totalLoadedRows: number;
+    readonly totalRows: number;
+  }) => void;
 }
 
 /** Remote publication client returned by {@link createHttpReplicationClient}. */
 export interface HttpReplicationClient {
   readonly name: string;
+  /** Current HTTP transport lifecycle state (`M19 Item 3`). */
+  readonly state: ConnectionLifecycleState;
   fetchChangesSince(
     sinceLsn: number,
     options?: { limit?: number; excludeOrigin?: string },
@@ -98,6 +160,10 @@ export interface HttpReplicationClient {
     options?: { nodeId?: string; ttlMs?: number },
   ): Promise<ReplicationSlot | null>;
   fetchSnapshot(): Promise<PublicationSnapshot>;
+  /** Fetch a `PublicationSnapshot` in resumable paginated chunks via `/snapshot/manifest` + `/snapshot/chunk` (`M19 Item 3`). */
+  fetchSnapshotResumable(
+    options?: FetchSnapshotResumableOptions,
+  ): Promise<PublicationSnapshot>;
   pushChanges(
     entries: readonly ReplicationLogEntry[],
   ): Promise<SubscriptionPullResult | { appliedCount: number }>;
@@ -146,6 +212,10 @@ export function createHttpReplicationHandler(
     changelogTargetDb,
     onChangelogSegment,
   } = options;
+
+  // Bounded point-in-time snapshot cache for resumable chunked downloads (`M19 Item 3`)
+  const snapshotCache = new Map<string, PublicationSnapshot>();
+  let snapshotCounter = 1;
 
   return async (request: Request): Promise<Response> => {
     if (apiKey) {
@@ -297,6 +367,59 @@ export function createHttpReplicationHandler(
       });
     }
 
+    if (request.method === 'GET' && path.endsWith('/snapshot/manifest')) {
+      const snapshot = await publication.exportSnapshot({ mode: 'logical' });
+      const snapshotId = `snap_${snapshot.watermarkLsn}_${snapshot.timestamp}_${snapshotCounter++}`;
+      snapshotCache.set(snapshotId, snapshot);
+      if (snapshotCache.size > 4) {
+        const oldestKey = snapshotCache.keys().next().value;
+        if (oldestKey !== undefined) snapshotCache.delete(oldestKey);
+      }
+      const manifest: ResumableSnapshotManifest = {
+        snapshotId,
+        publication: snapshot.publication,
+        origin: snapshot.origin,
+        watermarkLsn: snapshot.watermarkLsn,
+        timestamp: snapshot.timestamp,
+        tables: snapshot.tables.map((t) => ({
+          table: t.table,
+          primaryKey: t.primaryKey,
+          ddlSql: t.ddlSql,
+          totalRows: t.rows.length,
+        })),
+      };
+      return jsonResponse({ manifest });
+    }
+
+    if (request.method === 'GET' && path.endsWith('/snapshot/chunk')) {
+      const snapshotId = url.searchParams.get('snapshotId') ?? '';
+      const tableName = (url.searchParams.get('table') ?? '').trim().toUpperCase();
+      const offset = Math.max(0, Number(url.searchParams.get('offset') ?? '0'));
+      const limit = Math.max(1, Number(url.searchParams.get('limit') ?? '500'));
+
+      let snap = snapshotId ? snapshotCache.get(snapshotId) : undefined;
+      if (!snap) {
+        snap = await publication.exportSnapshot({ mode: 'logical' });
+        if (snapshotId) {
+          snapshotCache.set(snapshotId, snap);
+        }
+      }
+      const tbl = snap.tables.find((t) => t.table.toUpperCase() === tableName);
+      if (!tbl) {
+        return jsonResponse({ error: `Unknown snapshot table: ${tableName}` }, 404);
+      }
+      const rows = tbl.rows.slice(offset, offset + limit);
+      const hasMore = offset + rows.length < tbl.rows.length;
+      return jsonResponse({
+        snapshotId,
+        table: tbl.table,
+        offset,
+        rows,
+        totalRows: tbl.rows.length,
+        hasMore,
+      });
+    }
+
     if (request.method === 'GET' && path.endsWith('/snapshot')) {
       const snapshot = await publication.exportSnapshot({ mode: 'logical' });
       return jsonResponse({ snapshot });
@@ -389,8 +512,60 @@ export function createHttpReplicationClient(
   options: HttpReplicationClientOptions,
 ): HttpReplicationClient {
   const baseUrl = options.baseUrl.replace(/\/+$/, '');
-  const fetchFn = options.fetch ?? globalThis.fetch;
+  const rawFetchFn = options.fetch ?? globalThis.fetch;
   const pubName = (options.name ?? 'default').trim();
+  let clientState: ConnectionLifecycleState = 'online';
+
+  const setClientState = (
+    next: ConnectionLifecycleState,
+    info?: ConnectionStateChangeInfo,
+  ): void => {
+    if (clientState === next && !info) return;
+    clientState = next;
+    options.onStateChange?.(next, info);
+  };
+
+  const fetchFn = async (
+    input: string | URL | Request,
+    init?: RequestInit,
+  ): Promise<Response> => {
+    const maxRetries = options.retry ? (options.retry.maxRetries ?? 4) : 0;
+    let attempt = 0;
+    for (;;) {
+      try {
+        if (attempt > 0) {
+          setClientState('connecting', { attempt });
+        }
+        const res = await rawFetchFn(input, init);
+        if ((res.status === 429 || res.status >= 500) && attempt < maxRetries) {
+          const delayMs = computeBackoffDelayMs(attempt, options.retry);
+          attempt++;
+          setClientState('backoff', {
+            attempt,
+            delayMs,
+            error: new Error(`HTTP ${res.status}`),
+          });
+          await new Promise((r) => setTimeout(r, delayMs));
+          continue;
+        }
+        if (res.ok) {
+          setClientState('online');
+        }
+        return res;
+      } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        if (attempt < maxRetries) {
+          const delayMs = computeBackoffDelayMs(attempt, options.retry);
+          attempt++;
+          setClientState('backoff', { attempt, delayMs, error });
+          await new Promise((r) => setTimeout(r, delayMs));
+          continue;
+        }
+        setClientState('offline', { attempt, error });
+        throw error;
+      }
+    }
+  };
 
   const buildHeaders = (extra?: Record<string, string>): Record<string, string> => {
     const h: Record<string, string> = {
@@ -406,6 +581,9 @@ export function createHttpReplicationClient(
 
   return {
     name: pubName,
+    get state() {
+      return clientState;
+    },
 
     async fetchChangesSince(sinceLsn, fetchOpts = {}) {
       const params = new URLSearchParams({ sinceLsn: String(sinceLsn) });
@@ -469,6 +647,102 @@ export function createHttpReplicationClient(
       }
       const data = (await res.json()) as { snapshot: PublicationSnapshot };
       return data.snapshot;
+    },
+
+    async fetchSnapshotResumable(resumableOpts = {}) {
+      const chunkSize = Math.max(1, resumableOpts.chunkSize ?? 500);
+      const cp: ResumableSnapshotCheckpoint =
+        resumableOpts.checkpoint ?? {
+          currentTableIndex: 0,
+          currentRowOffset: 0,
+          completedTables: [],
+          partialRows: [],
+        };
+
+      if (!cp.manifest) {
+        const mRes = await fetchFn(`${baseUrl}/snapshot/manifest`, {
+          method: 'GET',
+          headers: buildHeaders(),
+        });
+        if (!mRes.ok) {
+          throw new Error(
+            `HTTP replication fetchSnapshotResumable manifest failed with status ${mRes.status}`,
+          );
+        }
+        const mJson = (await mRes.json()) as { manifest: ResumableSnapshotManifest };
+        cp.manifest = mJson.manifest;
+      }
+
+      const manifest = cp.manifest;
+      const grandTotalRows = manifest.tables.reduce((acc, t) => acc + t.totalRows, 0);
+      let loadedPriorTables = cp.completedTables.reduce(
+        (acc, t) => acc + t.rows.length,
+        0,
+      );
+
+      while (cp.currentTableIndex < manifest.tables.length) {
+        const tblMeta = manifest.tables[cp.currentTableIndex]!;
+
+        while (cp.currentRowOffset < tblMeta.totalRows) {
+          const params = new URLSearchParams({
+            snapshotId: manifest.snapshotId,
+            table: tblMeta.table,
+            offset: String(cp.currentRowOffset),
+            limit: String(chunkSize),
+          });
+          const cRes = await fetchFn(
+            `${baseUrl}/snapshot/chunk?${params.toString()}`,
+            {
+              method: 'GET',
+              headers: buildHeaders(),
+            },
+          );
+          if (!cRes.ok) {
+            throw new Error(
+              `HTTP replication fetchSnapshotResumable chunk failed with status ${cRes.status}`,
+            );
+          }
+          const cJson = (await cRes.json()) as {
+            rows?: Record<string, unknown>[];
+            hasMore?: boolean;
+          };
+          const rows = cJson.rows ?? [];
+          if (rows.length === 0) {
+            cp.currentRowOffset = tblMeta.totalRows;
+            break;
+          }
+          cp.partialRows.push(...rows);
+          cp.currentRowOffset += rows.length;
+
+          resumableOpts.onProgress?.({
+            table: tblMeta.table,
+            tableLoadedRows: cp.partialRows.length,
+            tableTotalRows: tblMeta.totalRows,
+            totalLoadedRows: loadedPriorTables + cp.partialRows.length,
+            totalRows: grandTotalRows,
+          });
+        }
+
+        cp.completedTables.push({
+          table: tblMeta.table,
+          primaryKey: tblMeta.primaryKey,
+          ddlSql: tblMeta.ddlSql,
+          rows: cp.partialRows,
+        });
+        loadedPriorTables += cp.partialRows.length;
+        cp.partialRows = [];
+        cp.currentRowOffset = 0;
+        cp.currentTableIndex++;
+      }
+
+      return {
+        publication: manifest.publication,
+        origin: manifest.origin,
+        watermarkLsn: manifest.watermarkLsn,
+        timestamp: manifest.timestamp,
+        mode: 'logical',
+        tables: cp.completedTables,
+      };
     },
 
     async pushChanges(entries) {
@@ -819,6 +1093,7 @@ export function createWebSocketReplicationPeer(
     changelogTargetDb,
     onChangelogSegment,
   } = options;
+
   let lastPushedLsn = 0;
 
   const handleBinaryChangelog = async (bytes: Uint8Array): Promise<boolean> => {
