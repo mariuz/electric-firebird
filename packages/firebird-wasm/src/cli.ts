@@ -46,6 +46,12 @@ import {
 import type { BootstrapStrategy, ReplicableDatabase } from './replication/types';
 import { collectArrowStreamBytes } from './columnar-stream';
 import { decodeArrowIpc } from './columnar';
+import { startCliReplicationServer } from './cli-sync-server';
+export {
+  startCliReplicationServer,
+  type CliReplicationServerHandle,
+  type StartCliReplicationServerOptions,
+} from './cli-sync-server';
 
 /** Injectable I/O handles for programmatic and unit-tested CLI execution. */
 export interface CliIo {
@@ -95,6 +101,7 @@ Commands:
   sync <src> <dst>               Sync two databases (--mode auto|native|logical --bootstrap binary-image|page-diff|logical)
   wal-ship <uri>                 Ship checkpoint/WAL segments to --dir <path> or --url <http-or-s3-url>
   pitr-restore <uri>             Restore database from --dir <path> or --url <url> [--lsn <n> | --timestamp <iso>]
+  serve-sync [uri]               Start HTTP/SSE replication & Arrow IPC server [--port <n>] [--api-key <k>] [--tenant-column <col>] [--cors]
   bench [uri]                    Benchmark IBatch, row query, columnar, Arrow IPC stream & preparePipeline [--rows <n>]
 
 Global Options:
@@ -602,7 +609,13 @@ function parseCliArgs(argv: readonly string[]): ParsedFlags {
             key === 'lsn' ||
             key === 'timestamp' ||
             key === 'hlc' ||
-            key === 'rows')
+            key === 'rows' ||
+            key === 'port' ||
+            key === 'host' ||
+            key === 'api-key' ||
+            key === 'tenant-column' ||
+            key === 'shared-tables' ||
+            key === 'duration-ms')
         ) {
           flags.set(key, next);
           i += 1;
@@ -1175,6 +1188,89 @@ export async function runCli(
           }
         } finally {
           await dstManaged.flushAndClose(true);
+        }
+        return 0;
+      }
+
+      case 'serve-sync': {
+        const uri = positional[1] ?? 'memory://cli_serve_sync';
+        const port =
+          typeof flags.get('port') === 'string'
+            ? Number(flags.get('port'))
+            : 8787;
+        const host =
+          typeof flags.get('host') === 'string'
+            ? String(flags.get('host'))
+            : '127.0.0.1';
+        const apiKey =
+          typeof flags.get('api-key') === 'string'
+            ? String(flags.get('api-key'))
+            : undefined;
+        const tenantColumn =
+          typeof flags.get('tenant-column') === 'string'
+            ? String(flags.get('tenant-column'))
+            : undefined;
+        const sharedTables =
+          typeof flags.get('shared-tables') === 'string'
+            ? String(flags.get('shared-tables'))
+                .split(',')
+                .map((s) => s.trim())
+                .filter(Boolean)
+            : undefined;
+        const cors = flags.get('no-cors') !== true;
+        const durationMs =
+          typeof flags.get('duration-ms') === 'string'
+            ? Number(flags.get('duration-ms'))
+            : undefined;
+
+        const managed = await openCliDatabase(uri, { cwd, backend });
+        const srv = await startCliReplicationServer({
+          db: managed.db,
+          port,
+          host,
+          apiKey,
+          tenantColumn,
+          sharedTables,
+          cors,
+        });
+
+        try {
+          if (flags.get('json') === true) {
+            out(
+              `${JSON.stringify(
+                {
+                  url: srv.url,
+                  host: srv.host,
+                  port: srv.port,
+                  publication: srv.publication.name,
+                  tenantColumn: tenantColumn ?? null,
+                },
+                null,
+                2,
+              )}\n`,
+            );
+          } else {
+            out(
+              `Serving Firebird replication & Arrow IPC on ${srv.url} (publication=${srv.publication.name}${tenantColumn ? `, tenant=${tenantColumn}` : ''})\n`,
+            );
+          }
+
+          if (durationMs !== undefined && Number.isFinite(durationMs) && durationMs >= 0) {
+            await new Promise<void>((resolve) => setTimeout(resolve, durationMs));
+          } else {
+            await new Promise<void>((resolve) => {
+              const onStop = () => {
+                process.off('SIGINT', onStop);
+                process.off('SIGTERM', onStop);
+                resolve();
+              };
+              process.on('SIGINT', onStop);
+              process.on('SIGTERM', onStop);
+            });
+          }
+        } finally {
+          await srv.close();
+          await managed.flushAndClose(true);
         }
         return 0;
       }

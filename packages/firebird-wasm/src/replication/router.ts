@@ -37,6 +37,11 @@ import type {
 } from '../types';
 import { isSqlFragment, toStatement, type SqlFragment } from '../sql-tag';
 import type { ArrowIpcOptions, ColumnarQueryResult } from '../columnar';
+import type {
+  ArrowIngestResult,
+  ArrowIngestSource,
+  LoadArrowIpcOptions,
+} from '../arrow-ingest';
 import type { TypedSqlFragment } from '../schema-validation';
 import type {
   PipelineOperation,
@@ -823,6 +828,14 @@ export function createReplicaRouter(options: ReplicaRouterOptions): ReplicaRoute
       copyOpts?: CopyFromOptions,
     ): Promise<CopyResult> {
       return runWrite((db) => db.copyFromStream(tableName, stream, copyOpts));
+    },
+
+    loadArrowIpc(
+      tableName: string,
+      source: ArrowIngestSource,
+      arrowOpts?: LoadArrowIpcOptions,
+    ): Promise<ArrowIngestResult> {
+      return runWrite((db) => db.loadArrowIpc(tableName, source, arrowOpts));
     },
 
     copyToStream(

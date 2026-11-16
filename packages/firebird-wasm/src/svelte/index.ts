@@ -41,10 +41,29 @@ import {
 } from '../frameworks/sync-store';
 import type { ColumnarQueryResult } from '../columnar';
 import type { LiveRowDelta, LiveRowKeySelector } from '../live-incremental';
+import {
+  createOptimisticMutationStore,
+  ReactiveTableStore,
+  type OptimisticMutationStore,
+  type OptimisticMutationStoreOptions,
+  type OptimisticStoreSnapshot,
+  type ReactiveTableDatabase,
+  type ReactiveTableState,
+  type ReactiveTableStoreOptions,
+} from '../optimistic-store';
+import type { TableExecutionHost, TableRepository } from '../table-api';
 import type { SqlFragment } from '../sql-tag';
 import type { QueryParams, Row } from '../types';
 
 export type { QueryableDatabase, QueryState } from '../frameworks/query-store';
+export type {
+  OptimisticMutationStore,
+  OptimisticMutationStoreOptions,
+  OptimisticStoreSnapshot,
+  ReactiveTableDatabase,
+  ReactiveTableState,
+  ReactiveTableStoreOptions,
+} from '../optimistic-store';
 export type {
   ColumnarQueryState,
   ColumnarQueryableDatabase,
@@ -501,6 +520,7 @@ export function createSyncStatus(
   };
 }
 
+
 /** Reactive Svelte store/Runes handle returned by {@link createColumnarQuery} (`M20 Item 4`). */
 export interface SvelteColumnarStore {
   readonly result: ColumnarQueryResult | undefined;
@@ -592,6 +612,7 @@ export function createColumnarQuery(
     destroy,
   };
 }
+
 
 /** Reactive Svelte store/Runes handle returned by {@link createLiveIncrementalQuery} (`M20 Item 4`). */
 export interface SvelteIncrementalStore<T = Row> {
@@ -685,6 +706,197 @@ export function createLiveIncrementalQuery<T extends Row = Row>(
       };
     },
     refresh: () => store.refresh(),
+    destroy,
+  };
+}
+
+/** Svelte store / Runes handle returned by {@link createOptimisticMutation} (`M22 Item 3`). */
+export interface SvelteOptimisticMutationStore {
+  readonly store: OptimisticMutationStore;
+  readonly current: OptimisticStoreSnapshot;
+  readonly pendingCount: number;
+  readonly flushing: boolean;
+  readonly lastError: Error | undefined;
+  subscribe(run: (value: OptimisticStoreSnapshot) => void): () => void;
+  insert: OptimisticMutationStore['insert'];
+  update: OptimisticMutationStore['update'];
+  upsert: OptimisticMutationStore['upsert'];
+  delete: OptimisticMutationStore['delete'];
+  revert: OptimisticMutationStore['revert'];
+  revertAll: OptimisticMutationStore['revertAll'];
+  flush: OptimisticMutationStore['flush'];
+  table: OptimisticMutationStore['table'];
+}
+
+/** Create a Svelte 5 Runes / `Readable` optimistic mutation store (`M22 Item 3`). */
+export function createOptimisticMutation(
+  options: OptimisticMutationStoreOptions & {
+    db?: TableExecutionHost;
+    store?: OptimisticMutationStore;
+  } = {},
+): SvelteOptimisticMutationStore {
+  const primitives = resolveSveltePrimitives();
+  const optStore =
+    options.store ??
+    createOptimisticMutationStore(
+      (options.db ?? useFirebird()) as unknown as TableExecutionHost,
+      options,
+    );
+  const stateBox = primitives.createStateBox
+    ? primitives.createStateBox<OptimisticStoreSnapshot>(optStore.getSnapshot())
+    : {
+        value: optStore.getSnapshot(),
+        get() {
+          return this.value;
+        },
+        set(next: OptimisticStoreSnapshot) {
+          this.value = next;
+        },
+      };
+
+  const unsub = optStore.subscribe(() => {
+    stateBox.set(optStore.getSnapshot());
+  });
+  if (typeof primitives.onDestroy === 'function') {
+    try {
+      primitives.onDestroy(unsub);
+    } catch {
+      // Ignore outside component init
+    }
+  }
+
+  return {
+    store: optStore,
+    get current() {
+      return stateBox.get();
+    },
+    get pendingCount() {
+      return stateBox.get().pendingCount;
+    },
+    get flushing() {
+      return stateBox.get().flushing;
+    },
+    get lastError() {
+      return stateBox.get().lastError;
+    },
+    subscribe(run) {
+      run(optStore.getSnapshot());
+      return optStore.subscribe(() => run(optStore.getSnapshot()));
+    },
+    insert: optStore.insert,
+    update: optStore.update,
+    upsert: optStore.upsert,
+    delete: optStore.delete,
+    revert: optStore.revert,
+    revertAll: optStore.revertAll,
+    flush: optStore.flush,
+    table: optStore.table,
+  };
+}
+
+/** Svelte store / Runes handle returned by {@link createTable} (`M22 Item 3`). */
+export interface SvelteTableStore<T extends Row = Row, K = unknown> {
+  readonly repository: TableRepository<T, K>;
+  readonly rows: T[] | undefined;
+  readonly deltas: readonly LiveRowDelta<T>[];
+  readonly version: number;
+  readonly loading: boolean;
+  readonly error: Error | undefined;
+  readonly pendingCount: number;
+  readonly flushing: boolean;
+  readonly current: ReactiveTableState<T>;
+  subscribe(run: (value: ReactiveTableState<T>) => void): () => void;
+  refresh(): Promise<void>;
+  insert(row: Partial<T> & Record<string, unknown>): Promise<T>;
+  update(key: K, patch: Partial<T> & Record<string, unknown>): Promise<{ affectedRows: number }>;
+  upsert(
+    row: Partial<T> & Record<string, unknown>,
+    matchingColumns?: ReadonlyArray<(keyof T & string) | string>,
+  ): Promise<T>;
+  remove(key: K): Promise<{ affectedRows: number }>;
+  destroy(): void;
+}
+
+/** Create a reactive typed table store for Svelte 5 Runes & `$store` (`M22 Item 3`). */
+export function createTable<T extends Row = Row, K = unknown>(
+  tableName: string,
+  options: ReactiveTableStoreOptions<T> & { db?: ReactiveTableDatabase } = {},
+): SvelteTableStore<T, K> {
+  const primitives = resolveSveltePrimitives();
+  const db = (options.db ?? useFirebird()) as unknown as ReactiveTableDatabase;
+  const store = new ReactiveTableStore<T, K>(db, tableName, options);
+  const stateBox = primitives.createStateBox
+    ? primitives.createStateBox<ReactiveTableState<T>>(store.getSnapshot())
+    : {
+        value: store.getSnapshot(),
+        get() {
+          return this.value;
+        },
+        set(next: ReactiveTableState<T>) {
+          this.value = next;
+        },
+      };
+
+  const subscribers = new Set<(v: ReactiveTableState<T>) => void>();
+  const unsub = store.subscribe(() => {
+    const snap = store.getSnapshot();
+    stateBox.set(snap);
+    for (const fn of [...subscribers]) fn(snap);
+  });
+  store.start();
+  stateBox.set(store.getSnapshot());
+
+  const destroy = () => {
+    unsub();
+    store.stop();
+    subscribers.clear();
+  };
+  if (typeof primitives.onDestroy === 'function') {
+    try {
+      primitives.onDestroy(destroy);
+    } catch {
+      // Ignore outside component init
+    }
+  }
+
+  return {
+    repository: store.repository,
+    get rows() {
+      return stateBox.get().rows;
+    },
+    get deltas() {
+      return stateBox.get().deltas;
+    },
+    get version() {
+      return stateBox.get().version;
+    },
+    get loading() {
+      return stateBox.get().loading;
+    },
+    get error() {
+      return stateBox.get().error;
+    },
+    get pendingCount() {
+      return stateBox.get().pendingCount;
+    },
+    get flushing() {
+      return stateBox.get().flushing;
+    },
+    get current() {
+      return stateBox.get();
+    },
+    subscribe(run) {
+      subscribers.add(run);
+      run(stateBox.get());
+      return () => {
+        subscribers.delete(run);
+      };
+    },
+    refresh: store.refresh,
+    insert: store.insert,
+    update: store.update,
+    upsert: store.upsert,
+    remove: store.remove,
     destroy,
   };
 }

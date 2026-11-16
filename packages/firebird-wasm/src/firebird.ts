@@ -1,6 +1,6 @@
 import * as fs from 'fs';
-import { Blob as FbBlob, TransactionIsolation } from 'node-firebird-driver';
-import type { Client, Attachment, Statement, Transaction } from 'node-firebird-driver';
+import { TransactionIsolation } from 'node-firebird-driver';
+import type { Client, Attachment, Transaction } from 'node-firebird-driver';
 import type {
   ArrayRow,
   FirebirdLiteOptions,
@@ -32,11 +32,6 @@ import type {
   FieldInfo,
 } from './types';
 import { statementKind } from './statement-types';
-import {
-  compressGzipStream,
-  readDatabaseStreamChunks,
-  resolveStreamChunkSize,
-} from './browser/data-stream';
 import {
   DATABASE_INFO_REQUEST_ITEMS,
   parseDatabaseInfoBuffer,
@@ -101,6 +96,12 @@ import {
   type TableRepository,
 } from './table-api';
 import {
+  loadArrowIpcIntoDatabase,
+  type ArrowIngestResult,
+  type ArrowIngestSource,
+  type LoadArrowIpcOptions,
+} from './arrow-ingest';
+import {
   createLiveColumnarQuery,
   createLiveIncrementalQuery,
   type IncrementalLiveSnapshot,
@@ -110,15 +111,12 @@ import {
   type LiveIncrementalQuery,
 } from './live-incremental';
 import {
-  assertBatchParameterRows,
-  assertPreparedParamCount,
   assertUdrCallback,
   executeArrowFromColumnar,
   executeColumnarViaArrayQuery,
   extractEffectiveQuerySchema,
   finalizeQueryResultWithSchema,
   resolveColumnarQueryCall,
-  resolvePreparedCallArgs,
   runDriverApplyDiff,
   runDriverExportDiff,
   scanUserTablesForSweep,
@@ -133,15 +131,6 @@ import type {
   MonitorStats,
   QueryProfileListener,
 } from './types';
-import {
-  BLOB_INTERNAL_DATA,
-  type InternalBlobHandle,
-  buildBlobReadableStream,
-  buildBlobWritableStream,
-  createBlobHandle,
-  isBlobHandle,
-  resolveBlobSegmentSize,
-} from './browser/blob-stream';
 import type { TypeOptions } from './browser/value-types';
 import { toStatement, resolveQueryCall, resolveBatchSize } from './sql-tag';
 import type { SqlFragment, Statement as ParsedStatement } from './sql-tag';
@@ -154,22 +143,28 @@ import {
   StatementCache,
   type StatementLease,
   applyStatementHandleTimeout,
-  bindParams,
   buildTransactionOptions,
   cancelAttachmentOperation,
   describeInputFields,
   explainStatement,
   fetchRows,
   loadNativeDriver,
-  openNativeQueryBlobStream,
   outputFields,
-  readAffectedRecords,
   shapeRows,
   streamRows,
-  tryExecuteNativeBatch,
 } from './node-native-bindings';
 import { FirebirdTransaction } from './firebird-tx';
 export { FirebirdTransaction } from './firebird-tx';
+import {
+  captureNodeSnapshot,
+  createNodeBlobStream,
+  createNodeDumpDataStream,
+  createNodePreparedStatement,
+  openNodeBlobStream,
+  restoreNodeSnapshot,
+  runNodeLoadDataStream,
+  type NodeStreamHost,
+} from './firebird-streams';
 
 /**
  * FirebirdLite – a PGlite-style wrapper around Firebird Embedded.
@@ -606,6 +601,15 @@ export class FirebirdLite implements FirebirdDatabase {
     options?: TableOptions<T>,
   ): TableRepository<T, K> {
     return createTableRepository<T, K>(this, tableName, options);
+  }
+
+  async loadArrowIpc(
+    tableName: string,
+    source: ArrowIngestSource,
+    options: LoadArrowIpcOptions = {},
+  ): Promise<ArrowIngestResult> {
+    await this.ensureReady();
+    return loadArrowIpcIntoDatabase(this, tableName, source, options);
   }
 
   /**
@@ -1436,395 +1440,41 @@ export class FirebirdLite implements FirebirdDatabase {
     return buildSweepResult(before, after, tablesScanned, performance.now() - started);
   }
 
+  private get streamHost(): NodeStreamHost {
+    return {
+      ensureReady: () => this.ensureReady(),
+      isClosed: () => this.closed,
+      dbPath: this.dbPath,
+      getClient: () => this.client,
+      connectOptions: this.connectOptions,
+      statementCacheSize: this.statementCacheSize,
+      types: this.types,
+      snapshotStore: this.snapshotStore,
+      preparedStatements: this.preparedStatements,
+      getAttachment: () => {
+        if (!this.attachment) {
+          throw new Error('FirebirdLite attachment is not connected');
+        }
+        return this.attachment;
+      },
+      setAttachmentAndCache: (att, stmts) => {
+        this.attachment = att;
+        this.statements = stmts;
+      },
+      getStatements: () => this.statements,
+      endReadTransaction: () => this.endReadTransaction(),
+      serialize: (p) => this.serialize(p),
+      cancelOperation: () => this.cancelOperation(),
+    };
+  }
+
   /**
    * Prepare a SQL statement explicitly and return a reusable
    * {@link PreparedStatement} handle exposing `fields`, `params`, `query()`,
    * `exec()`, `execBatch()`, and `close()`.
    */
   async prepare(sql: string | SqlFragment): Promise<PreparedStatement> {
-    await this.ensureReady();
-    const attachment = this.attachment!;
-    const sqlText = toStatement(sql).sql;
-
-    const prepareTx = await attachment.startTransaction();
-    let nativeStmt: Statement;
-    let params: FieldInfo[];
-    let fields: FieldInfo[];
-    let type: number;
-    try {
-      nativeStmt = await attachment.prepare(prepareTx, sqlText);
-      try {
-        params = await describeInputFields(nativeStmt);
-        fields = await outputFields(nativeStmt);
-        type = await nativeStmt.type;
-      } catch (err) {
-        await nativeStmt.dispose().catch(() => undefined);
-        throw err;
-      }
-    } finally {
-      await prepareTx.commit().catch(() => undefined);
-    }
-
-    const statementType = statementKind(type);
-    const hasResultSet = nativeStmt.hasResultSet;
-    let isClosed = false;
-    let busy = false;
-    let currentTimeoutMs = 0;
-    const isDbClosed = () => this.closed;
-
-    const assertOpen = (): void => {
-      if (isClosed || this.closed) {
-        throw new Error('PreparedStatement has been closed');
-      }
-    };
-
-    const checkParamCount = (actual: number): void => {
-      assertPreparedParamCount(params.length, actual);
-    };
-
-    const withStatement = async <R>(
-      transaction: Transaction,
-      fn: (target: Statement) => Promise<R>,
-    ): Promise<R> => {
-      if (!busy) {
-        busy = true;
-        try {
-          return await fn(nativeStmt);
-        } finally {
-          busy = false;
-          if (isClosed) {
-            await nativeStmt.dispose().catch(() => undefined);
-          }
-        }
-      }
-      const tempStmt = await attachment.prepare(transaction, sqlText);
-      try {
-        if (currentTimeoutMs > 0) {
-          await applyStatementHandleTimeout(tempStmt, currentTimeoutMs);
-        }
-        return await fn(tempStmt);
-      } finally {
-        await tempStmt.dispose().catch(() => undefined);
-      }
-    };
-
-    const stmt: PreparedStatement = {
-      sql: sqlText,
-      get params() {
-        return params.map((p) => ({ ...p }));
-      },
-      get fields() {
-        return fields.map((f) => ({ ...f }));
-      },
-      statementType,
-      hasResultSet,
-      get closed() {
-        return isClosed || isDbClosed();
-      },
-      get timeoutMs() {
-        return currentTimeoutMs;
-      },
-      setTimeout: async (timeoutMs: number) => {
-        assertOpen();
-        const validated = validateTimeoutMs(timeoutMs) ?? 0;
-        currentTimeoutMs = validated;
-        await applyStatementHandleTimeout(nativeStmt, validated);
-      },
-      query: (async <T = Row>(
-        paramsOrOptions: QueryParams | QueryOptions<T> = [],
-        maybeOptions: QueryOptions<T> = {},
-      ): Promise<QueryResult<T>> => {
-        assertOpen();
-        const { callParams, rawOptions, callOptions } = resolvePreparedCallArgs<QueryOptions<T>>(
-          paramsOrOptions,
-          maybeOptions,
-          currentTimeoutMs,
-        );
-        checkParamCount(callParams.length);
-        assertNotAborted(callOptions.signal);
-        validateTimeoutMs(callOptions.timeoutMs);
-        const rowMode: RowMode = callOptions.rowMode ?? 'object';
-        const serializedParams = this.serialize(callParams);
-        await this.endReadTransaction();
-        const txOptions = buildTransactionOptions(callOptions);
-        const transaction = await attachment.startTransaction(txOptions);
-        try {
-          const rawRows = await withStatement(transaction, async (target) => {
-            const hasPerCallTimeout =
-              rawOptions.timeoutMs !== undefined && rawOptions.timeoutMs !== currentTimeoutMs;
-            if (hasPerCallTimeout) {
-              await applyStatementHandleTimeout(target, rawOptions.timeoutMs);
-            }
-            try {
-              return await runWithCancellation(
-                () => fetchRows(target, transaction, serializedParams, fields, this.types),
-                callOptions,
-                () => this.cancelOperation(),
-              );
-            } finally {
-              if (hasPerCallTimeout && target === nativeStmt) {
-                await applyStatementHandleTimeout(target, currentTimeoutMs).catch(() => undefined);
-              }
-            }
-          });
-          try {
-      await transaction.commit();
-    } catch (err) {
-      await transaction.rollback().catch(() => undefined);
-      throw err;
-    }
-          const outFields = fields.map((f) => ({ ...f }));
-          return finalizeQueryResultWithSchema(
-            applyTypes(
-              { rows: shapeRows<T>(rawRows, outFields, rowMode), fields: outFields },
-              this.types,
-              rowMode,
-            ),
-            callOptions.schema,
-            rowMode,
-          );
-        } catch (err) {
-          await transaction.rollback().catch(() => undefined);
-          throw err;
-        }
-      }) as PreparedStatement['query'],
-      queryStream: (<T = Row>(
-        paramsOrOptions: QueryParams | QueryStreamOptions = [],
-        maybeOptions: QueryStreamOptions = {},
-      ): AsyncIterableIterator<QueryResult<T>> => {
-        assertOpen();
-        const callParams = Array.isArray(paramsOrOptions)
-          ? paramsOrOptions
-          : [];
-        const rawOptions = Array.isArray(paramsOrOptions)
-          ? maybeOptions
-          : (paramsOrOptions ?? {});
-        const callOptions: QueryStreamOptions =
-          rawOptions.timeoutMs === undefined && currentTimeoutMs > 0
-            ? { ...rawOptions, timeoutMs: currentTimeoutMs }
-            : rawOptions;
-        checkParamCount(callParams.length);
-        validateTimeoutMs(callOptions.timeoutMs);
-        const batchSize = resolveBatchSize(callOptions.batchSize);
-        const rowMode: RowMode = callOptions.rowMode ?? 'object';
-        const serializeParams = () => this.serialize(callParams);
-        const endReadTx = () => this.endReadTransaction();
-        const customTypes = this.types;
-
-        return (async function* (): AsyncIterableIterator<QueryResult<T>> {
-          assertOpen();
-          assertNotAborted(callOptions.signal);
-          const totalTimeoutMs = validateTimeoutMs(callOptions.timeoutMs);
-          const deadline =
-            totalTimeoutMs && totalTimeoutMs > 0
-              ? Date.now() + totalTimeoutMs
-              : undefined;
-          const checkStreamDeadline = (): void => {
-            assertNotAborted(callOptions.signal);
-            if (deadline !== undefined && Date.now() >= deadline) {
-              throw createTimeoutError(totalTimeoutMs!);
-            }
-          };
-
-          const serializedParams = serializeParams();
-          await endReadTx();
-          const txOptions = buildTransactionOptions(callOptions);
-          const transaction = await attachment.startTransaction(txOptions);
-
-          let engineFailed = false;
-          let txFinished = false;
-          let claimedPrimary = false;
-          let tempStmt: Statement | undefined;
-
-          try {
-            let target: Statement;
-            if (!busy) {
-              busy = true;
-              claimedPrimary = true;
-              target = nativeStmt;
-            } else {
-              try {
-                tempStmt = await attachment.prepare(transaction, sqlText);
-              } catch (err) {
-                engineFailed = true;
-                throw err;
-              }
-              target = tempStmt;
-            }
-
-            if (totalTimeoutMs !== undefined && totalTimeoutMs > 0) {
-              await applyStatementHandleTimeout(target, totalTimeoutMs);
-            }
-
-            for await (const batch of streamRows<T>(
-              target,
-              transaction,
-              serializedParams,
-              fields,
-              rowMode,
-              batchSize,
-              customTypes,
-              () => {
-                engineFailed = true;
-              },
-            )) {
-              checkStreamDeadline();
-              yield batch;
-              checkStreamDeadline();
-            }
-
-            if (claimedPrimary && totalTimeoutMs !== undefined && totalTimeoutMs !== currentTimeoutMs) {
-              await applyStatementHandleTimeout(nativeStmt, currentTimeoutMs).catch(() => undefined);
-            }
-
-            if (tempStmt) {
-              const toDispose = tempStmt;
-              tempStmt = undefined;
-              await toDispose.dispose().catch(() => undefined);
-            }
-            if (claimedPrimary) {
-              claimedPrimary = false;
-              busy = false;
-              if (isClosed) {
-                await nativeStmt.dispose().catch(() => undefined);
-              }
-            }
-
-            txFinished = true;
-            try {
-      await transaction.commit();
-    } catch (err) {
-      await transaction.rollback().catch(() => undefined);
-      throw err;
-    }
-          } finally {
-            if (tempStmt) {
-              await tempStmt.dispose().catch(() => undefined);
-            }
-            if (claimedPrimary) {
-              busy = false;
-              if (isClosed) {
-                await nativeStmt.dispose().catch(() => undefined);
-              }
-            }
-            if (!txFinished) {
-              if (engineFailed) {
-                await transaction.rollback().catch(() => undefined);
-              } else {
-                await transaction
-                  .commit()
-                  .catch(() => transaction.rollback().catch(() => undefined));
-              }
-            }
-          }
-        })();
-      }) as PreparedStatement['queryStream'],
-      exec: async (
-        callParams: QueryParams = [],
-        execOptions: StatementExecutionOptions = {},
-      ) => {
-        assertOpen();
-        checkParamCount(callParams.length);
-        const effectiveOptions: StatementExecutionOptions =
-          execOptions.timeoutMs === undefined && currentTimeoutMs > 0
-            ? { ...execOptions, timeoutMs: currentTimeoutMs }
-            : execOptions;
-        assertNotAborted(effectiveOptions.signal);
-        validateTimeoutMs(effectiveOptions.timeoutMs);
-        const serializedParams = this.serialize(callParams);
-        await this.endReadTransaction();
-        const transaction = await attachment.startTransaction();
-        try {
-          const affectedRows = await withStatement(transaction, async (target) => {
-            const hasPerCallTimeout =
-              execOptions.timeoutMs !== undefined && execOptions.timeoutMs !== currentTimeoutMs;
-            if (hasPerCallTimeout) {
-              await applyStatementHandleTimeout(target, execOptions.timeoutMs);
-            }
-            try {
-              await runWithCancellation(
-                async () => {
-                  await target.execute(
-                    transaction,
-                    await bindParams(target, transaction, serializedParams),
-                  );
-                },
-                effectiveOptions,
-                () => this.cancelOperation(),
-              );
-              return readAffectedRecords(target);
-            } finally {
-              if (hasPerCallTimeout && target === nativeStmt) {
-                await applyStatementHandleTimeout(target, currentTimeoutMs).catch(() => undefined);
-              }
-            }
-          });
-          try {
-      await transaction.commit();
-    } catch (err) {
-      await transaction.rollback().catch(() => undefined);
-      throw err;
-    }
-          return { affectedRows };
-        } catch (err) {
-          await transaction.rollback().catch(() => undefined);
-          throw err;
-        }
-      },
-      execBatch: async (rows: QueryParams[]) => {
-        assertOpen();
-        assertBatchParameterRows(rows, params.length);
-        if (rows.length === 0) return { affectedRows: 0 };
-        const serializedRows = this.types?.serializers?.length
-          ? rows.map((row) => this.serialize(row))
-          : rows;
-        await this.endReadTransaction();
-        const transaction = await attachment.startTransaction();
-        try {
-          const affectedRows = await withStatement(transaction, async (target) => {
-            if (
-              serializedRows.length > 1 &&
-              (await tryExecuteNativeBatch(target, transaction, serializedRows))
-            ) {
-              return serializedRows.length;
-            }
-            let total = 0;
-            for (const row of serializedRows) {
-              await target.execute(
-                transaction,
-                await bindParams(target, transaction, row),
-              );
-              total += (await readAffectedRecords(target)) || 1;
-            }
-            return total;
-          });
-          try {
-      await transaction.commit();
-    } catch (err) {
-      await transaction.rollback().catch(() => undefined);
-      throw err;
-    }
-          return { affectedRows };
-        } catch (err) {
-          await transaction.rollback().catch(() => undefined);
-          throw err;
-        }
-      },
-      close: async () => {
-        if (isClosed) return;
-        isClosed = true;
-        this.preparedStatements.delete(stmt);
-        if (!busy) {
-          await nativeStmt.dispose().catch(() => undefined);
-        }
-      },
-      [Symbol.asyncDispose]: async () => {
-        await stmt.close();
-      },
-    };
-
-    this.preparedStatements.add(stmt);
-    return stmt;
+    return createNodePreparedStatement(this.streamHost, sql);
   }
 
   /**
@@ -1895,32 +1545,7 @@ export class FirebirdLite implements FirebirdDatabase {
   async createBlobStream(
     options: BlobStreamOptions = {},
   ): Promise<BlobWritableStream> {
-    await this.ensureReady();
-    resolveBlobSegmentSize(options.segmentSize, true);
-
-    const chunks: Uint8Array[] = [];
-    return buildBlobWritableStream(
-      {
-        writeSegment: async (segment) => {
-          chunks.push(segment.slice());
-        },
-        close: async (totalBytes) => {
-          const stagedBytes = new Uint8Array(totalBytes);
-          let pos = 0;
-          for (const c of chunks) {
-            stagedBytes.set(c, pos);
-            pos += c.byteLength;
-          }
-          return createBlobHandle(new Uint8Array(8), totalBytes, {
-            stagedBytes,
-          });
-        },
-        abort: async () => {
-          chunks.length = 0;
-        },
-      },
-      options,
-    );
+    return createNodeBlobStream(() => this.ensureReady(), options);
   }
 
   /**
@@ -1945,87 +1570,7 @@ export class FirebirdLite implements FirebirdDatabase {
     paramsOrOptions: QueryParams | BlobStreamOptions = [],
     maybeOptions: BlobStreamOptions = {},
   ): Promise<ReadableStream<Uint8Array>> {
-    await this.ensureReady();
-    const attachment = this.attachment!;
-
-    if (isBlobHandle(sqlOrHandle)) {
-      const opts = Array.isArray(paramsOrOptions) ? maybeOptions : paramsOrOptions;
-      resolveBlobSegmentSize(opts.segmentSize, false);
-      const staged = (sqlOrHandle as InternalBlobHandle)[BLOB_INTERNAL_DATA]?.stagedBytes;
-      if (staged) {
-        let offset = 0;
-        return buildBlobReadableStream(
-          {
-            readSegment: async (maxBytes) => {
-              if (offset >= staged.byteLength) return null;
-              const end = Math.min(offset + maxBytes, staged.byteLength);
-              const slice = staged.slice(offset, end);
-              offset = end;
-              return slice;
-            },
-            close: async () => undefined,
-          },
-          opts,
-        );
-      }
-
-      await this.endReadTransaction();
-      const tx = await attachment.startTransaction(
-        buildTransactionOptions({ isolationLevel: 'READ_COMMITTED', readOnly: true }),
-      );
-      const fbBlob =
-        ((sqlOrHandle as InternalBlobHandle)[BLOB_INTERNAL_DATA]?.nativeBlob as FbBlob | undefined) ??
-        new FbBlob(attachment, sqlOrHandle.blobId);
-      let stream: Awaited<ReturnType<Attachment['openBlob']>>;
-      try {
-        stream = await attachment.openBlob(tx, fbBlob);
-      } catch (err) {
-        await tx.rollback().catch(() => undefined);
-        throw err;
-      }
-
-      return buildBlobReadableStream(
-        {
-          readSegment: async (maxBytes) => {
-            const buf = Buffer.alloc(maxBytes);
-            const n = await stream.read(buf);
-            if (n < 0) return null;
-            return new Uint8Array(buf.buffer, buf.byteOffset, n);
-          },
-          close: async () => {
-            await stream.close().catch(() => undefined);
-            await tx.commit().catch(() => tx.rollback().catch(() => undefined));
-          },
-        },
-        opts,
-      );
-    }
-
-    const { statement, options } = resolveQueryCall<BlobStreamOptions>(
-      sqlOrHandle,
-      paramsOrOptions,
-      maybeOptions,
-    );
-    resolveBlobSegmentSize(options.segmentSize, false);
-    await this.endReadTransaction();
-
-    const tx = await attachment.startTransaction(
-      buildTransactionOptions({ isolationLevel: 'READ_COMMITTED', readOnly: true }),
-    );
-    try {
-      return await openNativeQueryBlobStream(
-        attachment,
-        tx,
-        this.statements!,
-        statement.sql,
-        this.serialize(statement.params),
-        options,
-        true,
-      );
-    } catch (err) {
-      await tx.rollback().catch(() => undefined);
-      throw err;
-    }
+    return openNodeBlobStream(this.streamHost, sqlOrHandle, paramsOrOptions, maybeOptions);
   }
 
   /**
@@ -2035,35 +1580,7 @@ export class FirebirdLite implements FirebirdDatabase {
   async snapshot(
     labelOrOptions?: string | SnapshotOptions,
   ): Promise<DatabaseSnapshot> {
-    if (this.closed) {
-      throw new Error('FirebirdLite instance has been closed');
-    }
-    await this.ensureReady();
-    await this.endReadTransaction();
-    for (const stmt of [...this.preparedStatements]) {
-      await stmt.close().catch(() => undefined);
-    }
-    await this.statements?.flush();
-    this.statements = null;
-    if (this.attachment) {
-      await this.attachment.disconnect().catch(() => undefined);
-      this.attachment = null;
-    }
-
-    try {
-      const buf = await fs.promises.readFile(this.dbPath);
-      const image = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
-      return this.snapshotStore.createSnapshot(image, labelOrOptions);
-    } finally {
-      this.attachment = await this.client!.connect(
-        this.dbPath,
-        this.connectOptions,
-      );
-      this.statements = new StatementCache(
-        this.attachment,
-        this.statementCacheSize,
-      );
-    }
+    return captureNodeSnapshot(this.streamHost, labelOrOptions);
   }
 
   /**
@@ -2073,35 +1590,7 @@ export class FirebirdLite implements FirebirdDatabase {
   async restoreSnapshot(
     snapshotOrId: DatabaseSnapshot | string | Uint8Array,
   ): Promise<void> {
-    if (this.closed) {
-      throw new Error('FirebirdLite instance has been closed');
-    }
-    await this.ensureReady();
-    const bytes =
-      snapshotOrId instanceof Uint8Array
-        ? snapshotOrId
-        : this.snapshotStore.getSnapshot(snapshotOrId).toUint8Array();
-
-    await this.endReadTransaction();
-    for (const stmt of [...this.preparedStatements]) {
-      await stmt.close().catch(() => undefined);
-    }
-    await this.statements?.flush();
-    this.statements = null;
-    if (this.attachment) {
-      await this.attachment.disconnect().catch(() => undefined);
-      this.attachment = null;
-    }
-
-    await fs.promises.writeFile(this.dbPath, bytes);
-    this.attachment = await this.client!.connect(
-      this.dbPath,
-      this.connectOptions,
-    );
-    this.statements = new StatementCache(
-      this.attachment,
-      this.statementCacheSize,
-    );
+    return restoreNodeSnapshot(this.streamHost, snapshotOrId);
   }
 
   /** List metadata for all copy-on-write snapshots captured on this database. */
@@ -2176,58 +1665,7 @@ export class FirebirdLite implements FirebirdDatabase {
    * `CompressionStream('gzip')`.
    */
   dumpDataStream(options: DataStreamOptions = {}): ReadableStream<Uint8Array> {
-    const chunkSize = resolveStreamChunkSize(options.chunkSize);
-    let handle: fs.promises.FileHandle | null = null;
-    let totalSize = 0;
-    let offset = 0;
-
-    const closeHandle = async (): Promise<void> => {
-      if (handle) {
-        const h = handle;
-        handle = null;
-        await h.close().catch(() => undefined);
-      }
-    };
-
-    const raw = new ReadableStream<Uint8Array>({
-      pull: async (controller) => {
-        try {
-          await this.ensureReady();
-          if (!handle) {
-            handle = await fs.promises.open(this.dbPath, 'r');
-            const stat = await handle.stat();
-            totalSize = stat.size;
-          }
-          if (offset >= totalSize) {
-            await closeHandle();
-            controller.close();
-            return;
-          }
-          const toRead = Math.min(chunkSize, totalSize - offset);
-          const buf = new Uint8Array(toRead);
-          const { bytesRead } = await handle.read(buf, 0, toRead, offset);
-          if (bytesRead <= 0) {
-            await closeHandle();
-            controller.close();
-            return;
-          }
-          offset += bytesRead;
-          controller.enqueue(bytesRead === toRead ? buf : buf.slice(0, bytesRead));
-          if (offset >= totalSize) {
-            await closeHandle();
-            controller.close();
-          }
-        } catch (err) {
-          await closeHandle();
-          throw err;
-        }
-      },
-      cancel: async () => {
-        await closeHandle();
-      },
-    });
-
-    return options.compression === 'gzip' ? compressGzipStream(raw) : raw;
+    return createNodeDumpDataStream(() => this.ensureReady(), this.dbPath, options);
   }
 
   /**
@@ -2285,41 +1723,7 @@ export class FirebirdLite implements FirebirdDatabase {
     stream: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array>,
     options: DataStreamOptions = {},
   ): Promise<void> {
-    if (this.closed) {
-      throw new Error('FirebirdLite instance has been closed');
-    }
-    await this.ensureReady();
-
-    await this.endReadTransaction();
-    for (const stmt of [...this.preparedStatements]) {
-      await stmt.close().catch(() => undefined);
-    }
-    await this.statements?.flush();
-    this.statements = null;
-    if (this.attachment) {
-      await this.attachment.disconnect().catch(() => undefined);
-      this.attachment = null;
-    }
-
-    const handle = await fs.promises.open(this.dbPath, 'w');
-    let offset = 0;
-    try {
-      for await (const chunk of readDatabaseStreamChunks(stream, options)) {
-        await handle.write(chunk, 0, chunk.byteLength, offset);
-        offset += chunk.byteLength;
-      }
-    } finally {
-      await handle.close().catch(() => undefined);
-    }
-
-    if (offset === 0) {
-      throw new RangeError(
-        'loadDataStream received an empty stream; pass a stream from dumpDataStream()',
-      );
-    }
-
-    this.attachment = await this.client!.connect(this.dbPath, this.connectOptions);
-    this.statements = new StatementCache(this.attachment, this.statementCacheSize);
+    return runNodeLoadDataStream(this.streamHost, stream, options);
   }
 
   /**

@@ -1806,6 +1806,40 @@ Next-horizon improvements across **Replication**, **Speed & Performance**, **Int
 
 ---
 
+### M22 — Multi-Tenant Replication Slices & Isolation Guard, Zero-Copy Arrow IPC Ingestion & Cached `db.table<T>()`, Optimistic Local-First Store & Hooks, CLI `serve-sync` Server & Sub-2,000-Line Codebase Completion
+
+- [x] **1. Multi-Tenant Partitioned Replication Slices & Inbound Tenant Isolation Guard (`createTenantReplicationSlice`).**
+      Add `createTenantReplicationSlice({ primary, replica, tenantColumn, tenantId, sharedTables?, direction?, concurrency? })`
+      for per-tenant / per-workspace edge & browser replicas (`WHERE TENANT_ID = ?` +
+      shared read-only reference tables), enforce `TenantIsolationError` / HTTP `403`
+      inbound push guards across `createHttpReplicationHandler`,
+      `createWebSocketReplicationPeer`, and `createSubscription`, and add parallel
+      multi-table snapshot seeding (`concurrency`).
+- [x] **2. Zero-Copy Apache Arrow IPC Ingestion (`db.loadArrowIpc()` / `table.insertArrow()`) & Prepared-Statement Caching in `db.table<T>()`.**
+      Add `db.loadArrowIpc(tableName, source, { createTable?, upsertMatching?, batchSize? })`
+      and `table.insertArrow()` / `table.upsertArrow()` packing decoded Arrow IPC V5
+      vectors (or streaming `ReadableStream<Uint8Array>`) directly into `"FBP\x02"`
+      binary wire batches (`IBatch`) without intermediate JS row objects, plus automatic
+      LRU `PreparedStatement` caching inside `db.table<T>()`.
+- [x] **3. Optimistic Local-First Mutations & Reactive Table Hooks (`createOptimisticMutationStore` + `react`/`vue`/`svelte`/`solid`).**
+      Add `createOptimisticMutationStore(db, { syncHandle? })` with instant optimistic
+      local mutations, automatic inverse-row rollback on remote rejection or manual
+      `revert()`, and reactive `useTable<T>()` / `createTable<T>()` and
+      `useOptimisticMutation()` / `createOptimisticMutation()` hooks across all 4
+      framework adapters.
+- [x] **4. Zero-Config CLI Replication Server (`npx firebird-wasm serve-sync`) & `<firebird-repl>` Arrow Import/Export Actions.**
+      Add `npx firebird-wasm serve-sync <uri> [--port <port>] [--api-key <token>] [--tenant-column <col>] [--cors]`
+      (`startCliReplicationServer`) serving HTTP/SSE replication and `/arrow` IPC
+      queries out of the box, plus `repl.exportArrow()` / `repl.importArrow()` and UI
+      controls in `<firebird-repl>`.
+- [x] **5. Sub-2,000-Line Codebase Completion (`firebird-browser.ts`, `firebird.ts`, `udr.ts`).**
+      Decompose `src/browser/firebird-browser.ts` (`firebird-browser-streams.ts`,
+      `firebird-browser-storage.ts`), `src/firebird.ts` (`firebird-streams.ts`), and
+      `src/browser/udr.ts` (`udr-parser.ts`, `udr.ts`) so every non-test `.ts` source
+      file across the entire repository is strictly under 2,000 lines.
+
+---
+
 ## 5. Test coverage added alongside this review
 
 `src/browser/` was excluded from Jest and had no browser tests.  It now has 73

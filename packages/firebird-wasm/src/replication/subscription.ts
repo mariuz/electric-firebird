@@ -260,6 +260,9 @@ export async function createSubscription(
   const applyChanges = async (
     entries: readonly ReplicationLogEntry[],
   ): Promise<SubscriptionPullResult> => {
+    if (options.tenantGuard && entries.length > 0) {
+      options.tenantGuard.assertBatch(entries);
+    }
     const previousLsn = await getWatermark();
     if (entries.length === 0) {
       return {

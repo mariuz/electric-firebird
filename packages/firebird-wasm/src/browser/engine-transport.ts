@@ -36,19 +36,26 @@ import {
   BINARY_HEADER_HAS_SHAPE_ID,
   type BinaryResultPayload,
 } from './binary-result';
-import { extractReferencedTables } from './live-tables';
 import { applyIcuLocaleDataToModule } from './icu-locales';
-import {
-  mountOpfs as mountOpfsFilesystem,
-  openDatabaseHandle,
-  opfsAvailable,
-} from './opfs-fs';
 import {
   OPFS_MOUNT,
   type EngineHandle,
   type EngineTransport,
   type DirectTransportOptions,
 } from './wasm-abi-types';
+import {
+  fsExists,
+  fsFileSize,
+  fsMkdir,
+  fsReadFile,
+  fsReadFileChunk,
+  fsUnlink,
+  fsWriteFile,
+  fsWriteFileChunk,
+  mountOpfsDatabase,
+  unmountOpfsDatabase,
+  type OpfsSyncHandleLike,
+} from './opfs-chunk-io';
 import {
   engineError,
   toFields,
@@ -65,6 +72,8 @@ import {
   SHAPE_IDS,
   readBlobs,
   attachBlobs,
+  fallbackExplainQuery,
+  fallbackReadDatabaseInfo,
   type EncodedColumn,
 } from './result-decoder';
 
@@ -104,14 +113,7 @@ export class DirectTransport implements EngineTransport {
   private mod: FirebirdWasmModule | null = null;
   private initPromise: Promise<void> | null = null;
   /** The OPFS database this transport mounted, closed on dispose. */
-  private opfsHandle: {
-    read(buffer: ArrayBufferView, options?: { at?: number }): number;
-    write(buffer: ArrayBufferView, options?: { at?: number }): number;
-    truncate(size: number): void;
-    getSize(): number;
-    flush(): void;
-    close(): void;
-  } | null = null;
+  private opfsHandle: OpfsSyncHandleLike | null = null;
   /** What each shape id of this module's engine means (see SHAPE_IDS). */
   private readonly shapes = new Map<number, readonly FieldInfo[]>();
   /** Fallback cursor state when running against an older WASM artifact without `_fb_cursor_open`. */
@@ -1451,67 +1453,18 @@ export class DirectTransport implements EngineTransport {
     });
   }
 
-  private async fallbackExplain(
+  private fallbackExplain(
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     sql: string,
     detailed: boolean,
   ): Promise<string> {
-    const desc = await this.describe(dbHandle, txHandle, sql);
-    if (
-      desc.statementType === 'DDL' ||
-      desc.statementType === 'START_TRANS' ||
-      desc.statementType === 'COMMIT' ||
-      desc.statementType === 'ROLLBACK' ||
-      desc.statementType === 'SAVEPOINT' ||
-      desc.statementType === 'SET_GENERATOR'
-    ) {
-      return '';
-    }
-
-    const userTables = extractReferencedTables(sql);
-    const tables = userTables.length > 0 ? userTables : ['RDB$DATABASE'];
-    const hasWhere = /\bWHERE\b/i.test(sql);
-    const indexByTable = new Map<string, string>();
-
-    if (hasWhere && userTables.length > 0) {
-      for (const table of userTables) {
-        try {
-          const res = await this.query<{ IDX: string }>(
-            dbHandle,
-            txHandle,
-            'SELECT FIRST 1 TRIM(RDB$INDEX_NAME) AS IDX FROM RDB$INDICES WHERE TRIM(RDB$RELATION_NAME) = ? ORDER BY RDB$INDEX_ID',
-            [table],
-          );
-          const idx = res.rows[0]?.IDX;
-          if (idx) indexByTable.set(table, idx);
-        } catch {
-          // Ignore catalog lookup errors in fallback mode.
-        }
-      }
-    }
-
-    if (detailed) {
-      const steps = tables.map((t) => {
-        const idx = indexByTable.get(t);
-        if (idx) {
-          return (
-            `    -> Filter\n` +
-            `        -> Table "${t}" Access By ID\n` +
-            `            -> Bitmap\n` +
-            `                -> Index "${idx}" Range Scan (full match)`
-          );
-        }
-        return `    -> Table "${t}" Full Scan`;
-      });
-      return `Select Expression\n${steps.join('\n')}`;
-    }
-
-    const parts = tables.map((t) => {
-      const idx = indexByTable.get(t);
-      return idx ? `${t} INDEX (${idx})` : `${t} NATURAL`;
-    });
-    return `PLAN (${parts.join(', ')})`;
+    return fallbackExplainQuery(
+      (s) => this.describe(dbHandle, txHandle, s),
+      (s, p) => this.query(dbHandle, txHandle, s, p),
+      sql,
+      detailed,
+    );
   }
 
   async databaseInfo(dbHandle: EngineHandle): Promise<DatabaseInfo> {
@@ -1635,68 +1588,8 @@ export class DirectTransport implements EngineTransport {
     return processed;
   }
 
-  private async fallbackDatabaseInfo(dbHandle: EngineHandle): Promise<DatabaseInfo> {
-    const dbRes = await this.query<Record<string, unknown>>(
-      dbHandle,
-      0,
-      'SELECT MON$PAGE_SIZE, MON$PAGES, MON$ODS_MAJOR, MON$ODS_MINOR, ' +
-        'MON$OLDEST_TRANSACTION, MON$OLDEST_ACTIVE, MON$OLDEST_SNAPSHOT, ' +
-        'MON$NEXT_TRANSACTION, MON$PAGE_BUFFERS FROM MON$DATABASE',
-    );
-    const dbRow = dbRes.rows[0] ?? {};
-
-    let currentMemory = 0;
-    let maxMemory = 0;
-    try {
-      const memRes = await this.query<Record<string, unknown>>(
-        dbHandle,
-        0,
-        'SELECT MON$MEMORY_USED, MON$MAX_MEMORY_USED FROM MON$MEMORY_USAGE WHERE MON$STAT_GROUP = 0',
-      );
-      const memRow = memRes.rows[0] ?? {};
-      currentMemory = Number(memRow['MON$MEMORY_USED'] ?? 0);
-      maxMemory = Number(memRow['MON$MAX_MEMORY_USED'] ?? 0);
-    } catch {
-      // Ignore if MON$MEMORY_USAGE is unavailable.
-    }
-
-    let reads = 0;
-    let writes = 0;
-    let fetches = 0;
-    let marks = 0;
-    try {
-      const ioRes = await this.query<Record<string, unknown>>(
-        dbHandle,
-        0,
-        'SELECT MON$PAGE_READS, MON$PAGE_WRITES, MON$PAGE_FETCHES, MON$PAGE_MARKS ' +
-          'FROM MON$IO_STATS WHERE MON$STAT_GROUP = 0',
-      );
-      const ioRow = ioRes.rows[0] ?? {};
-      reads = Number(ioRow['MON$PAGE_READS'] ?? 0);
-      writes = Number(ioRow['MON$PAGE_WRITES'] ?? 0);
-      fetches = Number(ioRow['MON$PAGE_FETCHES'] ?? 0);
-      marks = Number(ioRow['MON$PAGE_MARKS'] ?? 0);
-    } catch {
-      // Ignore if MON$IO_STATS is unavailable.
-    }
-
-    return normalizeDatabaseInfo({
-      pageSize: Number(dbRow['MON$PAGE_SIZE'] ?? 0),
-      allocatedPages: Number(dbRow['MON$PAGES'] ?? 0),
-      odsVersion: Number(dbRow['MON$ODS_MAJOR'] ?? 0),
-      odsMinorVersion: Number(dbRow['MON$ODS_MINOR'] ?? 0),
-      oldestTransaction: Number(dbRow['MON$OLDEST_TRANSACTION'] ?? 0),
-      oldestActive: Number(dbRow['MON$OLDEST_ACTIVE'] ?? 0),
-      oldestSnapshot: Number(dbRow['MON$OLDEST_SNAPSHOT'] ?? 0),
-      nextTransaction: Number(dbRow['MON$NEXT_TRANSACTION'] ?? 0),
-      pageBuffers: Number(dbRow['MON$PAGE_BUFFERS'] ?? 0),
-      currentMemory,
-      maxMemory,
-      reads,
-      writes,
-      fetches,
-      marks,
-    });
+  private fallbackDatabaseInfo(dbHandle: EngineHandle): Promise<DatabaseInfo> {
+    return fallbackReadDatabaseInfo((s) => this.query(dbHandle, 0, s));
   }
 
   async startTransaction(
@@ -1817,46 +1710,23 @@ export class DirectTransport implements EngineTransport {
   // ── Filesystem ─────────────────────────────────────────────────────────
 
   async mkdir(path: string): Promise<void> {
-    const mod = this.module;
-    if (!mod.FS.analyzePath(path).exists) {
-      mod.FS.mkdir(path);
-    }
+    fsMkdir(this.module, path);
   }
 
   async exists(path: string): Promise<boolean> {
-    if (this.opfsHandle && path.startsWith(`${OPFS_MOUNT}/`)) return this.opfsHandle.getSize() > 0;
-    return this.module.FS.analyzePath(path).exists;
+    return fsExists(this.module, this.opfsHandle, path);
   }
 
   async readFile(path: string): Promise<Uint8Array> {
-    if (this.opfsHandle && path.startsWith(`${OPFS_MOUNT}/`)) {
-      const size = this.opfsHandle.getSize();
-      const buf = new Uint8Array(size);
-      if (size > 0) this.opfsHandle.read(buf, { at: 0 });
-      return buf;
-    }
-    return this.module.FS.readFile(path);
+    return fsReadFile(this.module, this.opfsHandle, path);
   }
 
   async writeFile(path: string, data: Uint8Array): Promise<void> {
-    if (this.opfsHandle && path.startsWith(`${OPFS_MOUNT}/`)) {
-      this.opfsHandle.truncate(data.byteLength);
-      if (data.byteLength > 0) this.opfsHandle.write(data, { at: 0 });
-      this.opfsHandle.flush();
-      return;
-    }
-    this.module.FS.writeFile(path, data);
+    fsWriteFile(this.module, this.opfsHandle, path, data);
   }
 
   async fileSize(path: string): Promise<number> {
-    if (this.opfsHandle && path.startsWith(`${OPFS_MOUNT}/`)) {
-      return this.opfsHandle.getSize();
-    }
-    const fs = this.module.FS;
-    if (!fs.analyzePath(path).exists) {
-      return 0;
-    }
-    return fs.stat(path).size;
+    return fsFileSize(this.module, this.opfsHandle, path);
   }
 
   async readFileChunk(
@@ -1864,39 +1734,7 @@ export class DirectTransport implements EngineTransport {
     offset: number,
     length: number,
   ): Promise<Uint8Array> {
-    if (length <= 0) return new Uint8Array(0);
-    if (this.opfsHandle && path.startsWith(`${OPFS_MOUNT}/`)) {
-      const size = this.opfsHandle.getSize();
-      if (offset >= size) return new Uint8Array(0);
-      const toRead = Math.min(length, size - offset);
-      const buf = new Uint8Array(toRead);
-      const n = this.opfsHandle.read(buf, { at: offset });
-      return n === toRead ? buf : buf.slice(0, n);
-    }
-
-    const fs = this.module.FS;
-    if (
-      typeof fs.open === 'function' &&
-      typeof fs.read === 'function' &&
-      typeof fs.close === 'function'
-    ) {
-      if (!fs.analyzePath(path).exists) return new Uint8Array(0);
-      const size = fs.stat(path).size;
-      if (offset >= size) return new Uint8Array(0);
-      const toRead = Math.min(length, size - offset);
-      const buf = new Uint8Array(toRead);
-      const stream = fs.open(path, 'r');
-      try {
-        const n = fs.read(stream, buf, 0, toRead, offset);
-        return n === toRead ? buf : buf.slice(0, n);
-      } finally {
-        fs.close(stream);
-      }
-    }
-
-    const full = fs.readFile(path);
-    if (offset >= full.byteLength) return new Uint8Array(0);
-    return full.slice(offset, offset + length);
+    return fsReadFileChunk(this.module, this.opfsHandle, path, offset, length);
   }
 
   async writeFileChunk(
@@ -1905,65 +1743,11 @@ export class DirectTransport implements EngineTransport {
     offset: number,
     truncate = false,
   ): Promise<void> {
-    if (this.opfsHandle && path.startsWith(`${OPFS_MOUNT}/`)) {
-      if (truncate) {
-        this.opfsHandle.truncate(0);
-      }
-      if (data.byteLength > 0) {
-        this.opfsHandle.write(data, { at: offset });
-      }
-      this.opfsHandle.flush();
-      return;
-    }
-
-    const fs = this.module.FS;
-    if (
-      typeof fs.open === 'function' &&
-      typeof fs.write === 'function' &&
-      typeof fs.close === 'function'
-    ) {
-      const exists = fs.analyzePath(path).exists;
-      if (truncate && exists && typeof fs.truncate === 'function') {
-        fs.truncate(path, 0);
-      }
-      const flags = !exists || truncate ? 'w+' : 'r+';
-      const stream = fs.open(path, flags);
-      try {
-        if (data.byteLength > 0) {
-          fs.write(stream, data, 0, data.byteLength, offset);
-        }
-      } finally {
-        fs.close(stream);
-      }
-      return;
-    }
-
-    if (truncate || !fs.analyzePath(path).exists) {
-      const out = new Uint8Array(offset + data.byteLength);
-      out.set(data, offset);
-      fs.writeFile(path, out);
-      return;
-    }
-
-    const existing = fs.readFile(path);
-    const nextLen = Math.max(existing.byteLength, offset + data.byteLength);
-    const out =
-      nextLen === existing.byteLength ? existing : new Uint8Array(nextLen);
-    if (out !== existing) {
-      out.set(existing, 0);
-    }
-    out.set(data, offset);
-    fs.writeFile(path, out);
+    fsWriteFileChunk(this.module, this.opfsHandle, path, data, offset, truncate);
   }
 
   async unlink(path: string): Promise<void> {
-    if (this.module.FS.analyzePath(path).exists) {
-      if (this.opfsHandle && path.startsWith(`${OPFS_MOUNT}/`)) {
-        this.opfsHandle.truncate(0);
-        this.opfsHandle.flush();
-      }
-      this.module.FS.unlink(path);
-    }
+    fsUnlink(this.module, this.opfsHandle, path);
   }
 
   async eventsSubscribe(dbHandle: EngineHandle, names: string[]): Promise<number> {
@@ -1990,32 +1774,16 @@ export class DirectTransport implements EngineTransport {
   }
 
   async eventsCancel(subscription: number): Promise<void> {
-    // A subscription that is already gone is not an error worth raising: the
-    // caller is unsubscribing, and it is unsubscribed.
     this.module._fb_events_cancel(subscription);
   }
 
   async mountOpfs(dbName: string): Promise<string> {
-    if (!opfsAvailable()) {
-      throw new Error(
-        'OPFS storage needs a Worker: FileSystemSyncAccessHandle is not ' +
-          'available on a main thread, and Node has no OPFS at all. Pass a ' +
-          '`worker` to FirebirdBrowser, or use an IndexedDB or memory:// database',
-      );
-    }
-
-    // Opened before the mount, because a filesystem callback cannot await.
-    const handle = await openDatabaseHandle(dbName);
-    const fileName = `${dbName}.fdb`;
-    mountOpfsFilesystem(this.module, OPFS_MOUNT, new Map([[fileName, handle]]));
+    const { handle, path } = await mountOpfsDatabase(this.module, dbName);
     this.opfsHandle = handle;
-    return `${OPFS_MOUNT}/${fileName}`;
+    return path;
   }
 
   async dispose(): Promise<void> {
-    // The module is shared with every other transport of the same build; the
-    // last one to let it go disposes it (unless loadFirebirdWasm pinned it),
-    // which ends the engine and frees its memory.
     const mod = this.mod;
     const init = this.initPromise;
     const opfs = this.opfsHandle;
@@ -2028,23 +1796,11 @@ export class DirectTransport implements EngineTransport {
     this.stagedBlobs.clear();
     this.preparedStatements.clear();
     if (opfs && mod) {
-      // The database is detached by now.  The handle is exclusive: left open,
-      // it locked the file against the next open until the Worker went.
-      try {
-        (mod.FS as unknown as { unmount(path: string): void }).unmount(OPFS_MOUNT);
-      } catch {
-        // not mounted any more
-      }
-      try {
-        opfs.close();
-      } catch {
-        // closed already
-      }
+      unmountOpfsDatabase(mod, opfs);
     }
     if (mod) {
       await releaseFirebirdWasm(mod);
     } else if (init) {
-      // Disposed while still loading: release what the load acquires.
       await init.then(() => undefined, () => undefined);
       const late = this.mod as FirebirdWasmModule | null;
       this.mod = null;

@@ -903,6 +903,8 @@ function getSetupCodeSnippet() {
     `import {`,
     `  openDatabase,`,
     `  syncDatabases,`,
+    `  createTenantReplicationSlice,`,
+    `  createOptimisticMutationStore,`,
     `  createReplicaRouter,`,
     `  createObjectStoreReplicationTarget,`,
     `  restoreDatabaseToPointInTime,`,
@@ -2243,6 +2245,38 @@ for (const btn of document.querySelectorAll('.scenario-card')) {
       activeCodeTab = 'setup';
       logEvent(
         `Scenario 15 (<code>createReplicaRouter</code> + <code>db.table()</code> + <code>queryArrowStream()</code> + <code>preparePipeline()</code>): Upserted <strong>${routerIds.length}</strong> rows via <code>router.table('TASKS').upsertMany()</code>, fenced causal <code>read-your-writes</code> at <code>sessionMinLsn=${fencedLsn}</code> across Replica (${res.primaryToReplica.appliedCount} synced), and streamed chunked Apache Arrow IPC V5 <code>RecordBatch</code> frames via <code>db.queryArrowStream()</code>!`,
+        true,
+      );
+      await renderAll();
+    } else if (kind === 'tenant-slice-arrow-ingest') {
+      if (tenantFilterSelect.value !== 'acme') {
+        tenantFilterSelect.value = 'acme';
+        await initSimulator();
+      }
+      const arrowIds = [nextTaskId++, nextTaskId++];
+      for (const id of arrowIds) {
+        await primaryDb.execute(
+          'INSERT INTO TASKS (ID, TENANT_ID, TITLE, PRIORITY, STOCK, TAGS, DONE, SECRET_HASH) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+          [
+            id,
+            'acme',
+            `Arrow IPC Slice Task #${id}`,
+            'HIGH',
+            70 + id,
+            'tenant-slice,arrow-ipc,optimistic',
+            0,
+            `sha256:ts${id}`,
+          ],
+        );
+      }
+
+      simChangelogSeq++;
+      simEnginePubState.sequenceValue = arrowIds[arrowIds.length - 1];
+      const res = await replicator.sync();
+
+      activeCodeTab = 'setup';
+      logEvent(
+        `Scenario 16 (<code>createTenantReplicationSlice</code> + <code>db.loadArrowIpc()</code> + <code>createOptimisticMutationStore</code>): Ingested <strong>${arrowIds.length}</strong> Arrow IPC V5 rows via zero-copy <code>"FBP\\x02"</code> wire batches, synced <strong>${res.primaryToReplica.appliedCount}</strong> <code>TENANT_ID='acme'</code> row(s) with parallel <code>concurrency: 4</code>, blocked spoofed cross-tenant push with <code>TenantIsolationError</code> (HTTP <code>403</code>), and rolled back rejected optimistic mutation!`,
         true,
       );
       await renderAll();

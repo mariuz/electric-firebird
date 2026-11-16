@@ -1614,6 +1614,7 @@ Zero-dependency developer CLI (`bin`: `firebird-wasm`, programmatic `runCli(argv
 - `npx firebird-wasm sync <source-uri> <target-uri> [--mode auto|native|logical] [--bootstrap binary-image|page-diff|logical] [--json]`
 - `npx firebird-wasm wal-ship <source-uri> (--dir <dir> | --url <url>) [--checkpoint] [--prune] [--key <passphrase>]`
 - `npx firebird-wasm pitr-restore <target-uri> (--dir <dir> | --url <url>) [--lsn <n> | --timestamp <iso>] [--key <passphrase>]`
+- `npx firebird-wasm serve-sync [uri] [--port <port>] [--host <host>] [--api-key <token>] [--tenant-column <col>] [--shared-tables <a,b>] [--cors] [--duration-ms <ms>] [--json]`
 - `npx firebird-wasm bench [uri] [--rows <n>] [--json]`
 
 ### `db.pipeline()` & `"FBP\x01"` / `"FBP\x02"` Binary Parameter Wire Frames
@@ -1645,8 +1646,21 @@ const [inserted, batched, rowsRes, colRes, arrowBytes] = await db.pipeline(
 - `db.queryArrowStream(sql, params?, { batchSize?, metadata? })`: Web Streams `ReadableStream<Uint8Array>` emitting an Apache Arrow IPC V5 `Schema` message, chunked `RecordBatch` frames, and EOS marker (`decodeArrowIpcBatches` / `decodeArrowIpc`).
 - `db.preparePipeline(templates)`: Pre-compiles multi-statement `stmtHandle`s once so repeated `prep.run(stepInputs, { transaction? })` calls send zero SQL text across Worker boundaries.
 
-### `db.table<T>(name, { primaryKey?, schema? })` — Typed CRUD, Upsert & Keyset Pagination
+### `db.table<T>(name, { primaryKey?, schema?, cacheStatements? })` — Typed CRUD, Cached Prepared Statements & Arrow Ingestion
 
 Zero-boilerplate repository on `FirebirdDatabase`, `FirebirdTransactionClient`, and `ReplicaRouter`:
 - `get(key)`, `findOne(opts?)`, `findMany(opts?)`, `findPage({ where, orderBy, limit, cursor })`, `count(where?)`, `exists(keyOrWhere)`
-- `insert(row)`, `insertMany(rows)` (`IBatch`), `upsert(row)` / `upsertMany(rows)` (`UPDATE OR INSERT ... MATCHING`), `update(key, patch)`, `updateWhere`, `delete`, `deleteWhere`, and `liveIncremental()`.
+- `insert(row)`, `insertMany(rows)` (`IBatch`), `insertArrow(source, opts?)`, `upsert(row)` / `upsertMany(rows)` / `upsertArrow(source, opts?)` (`UPDATE OR INSERT ... MATCHING`), `update(key, patch)`, `updateWhere`, `delete`, `deleteWhere`, and `liveIncremental()`
+- `cacheStatements?: boolean | number` (default `16`): Bounded LRU cache of pre-compiled `PreparedStatement` handles (`cachedStatementCount`, `await table.close()`, `[Symbol.asyncDispose]()`).
+
+### `db.loadArrowIpc(tableName, source, options?)` — Zero-Copy Apache Arrow IPC Ingestion
+
+Packs decoded Apache Arrow IPC V5 `RecordBatch` vectors (`Uint8Array`, `ArrayBuffer`, `ColumnarQueryResult`, `ReadableStream<Uint8Array>`, or `AsyncIterable<Uint8Array>`) directly into `"FBP\x02"` binary wire batches (`IBatch`) without intermediate JS row objects or UTF-8 string decoding:
+- Options: `{ createTable?: boolean, upsertMatching?: string | string[], columns?: string[], batchSize?: number, transaction?: boolean }`
+- `<firebird-repl>`: `await repl.exportArrow(sql?)`, `await repl.importArrow(tableName, source, options?)`, plus toolbar `Export .arrow` / `Import .arrow` buttons.
+
+### `createOptimisticMutationStore(db, options?)` & Framework Table Hooks
+
+Local-first optimistic mutations with pre-image capture, manual `revert(id)` / `revertAll()`, `flush()`, and automatic inverse-row rollback on remote rejection (`syncHandle` or custom `remoteSync`):
+- `useTable<T>(db, tableName, options?)` / `useOptimisticMutation(store)` in `firebird-wasm/react` & `firebird-wasm/vue`
+- `createTable<T>(db, tableName, options?)` / `createOptimisticMutation(store)` in `firebird-wasm/svelte` & `firebird-wasm/solid`.

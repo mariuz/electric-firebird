@@ -488,6 +488,10 @@
           <strong>15. Causal <code>createReplicaRouter()</code> + <code>db.table()</code> &amp; <code>queryArrowStream()</code></strong>
           <span>Route writes to Primary with causal <code>read-your-writes</code> fencing, upsert via <code>db.table()</code>, and stream Arrow IPC V5 batches!</span>
         </button>
+        <button type="button" class="scenario-card" data-scenario="tenant-slice-arrow-ingest">
+          <strong>16. Multi-Tenant <code>createTenantReplicationSlice()</code> + <code>db.loadArrowIpc()</code> &amp; Optimistic Rollback</strong>
+          <span>Isolate <code>TENANT_ID = 'acme'</code> with HTTP <code>403</code> guard, bulk-ingest Arrow IPC V5 via <code>FBP\x02</code>, and revert rejected optimistic writes!</span>
+        </button>
       </section>
 
       <!-- Dual Database Nodes Grid -->

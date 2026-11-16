@@ -251,4 +251,21 @@ test.describe('Replication Simulator v2 (replication.html)', () => {
     await expect(page.locator('#event-feed')).toContainText('queryArrowStream()');
     await expect(page.locator('#event-feed')).toContainText('preparePipeline()');
   });
+
+  test('Scenario 16: Multi-Tenant createTenantReplicationSlice() + db.loadArrowIpc() & Optimistic Rollback', async ({
+    page,
+  }) => {
+    await openReplicationSim(page);
+
+    await page.locator('.scenario-card[data-scenario="tenant-slice-arrow-ingest"]').click();
+
+    await expect(page.locator('#primary-rows')).toContainText('Arrow IPC Slice Task #4');
+    await expect(page.locator('#replica-rows')).toContainText('Arrow IPC Slice Task #5');
+    await expect(page.locator('#code-inspector')).toContainText('createTenantReplicationSlice');
+    await expect(page.locator('#code-inspector')).toContainText('createOptimisticMutationStore');
+    await expect(page.locator('#event-feed')).toContainText('Scenario 16');
+    await expect(page.locator('#event-feed')).toContainText('db.loadArrowIpc()');
+    await expect(page.locator('#event-feed')).toContainText('TenantIsolationError');
+    await expect(page.locator('#event-feed')).toContainText('403');
+  });
 });

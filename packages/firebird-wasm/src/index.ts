@@ -699,3 +699,48 @@ export type {
   EmscriptenFS,
   FbHandle,
 } from './wasm-loader';
+export {
+  TenantIsolationError,
+  createTenantIsolationGuard,
+  createTenantReplicationSlice,
+} from './replication/tenant-slice';
+export type {
+  TenantIsolationViolationReason,
+  TenantIsolationGuardOptions,
+  TenantIsolationGuard,
+  CreateTenantReplicationSliceOptions,
+  TenantReplicationSliceHandle,
+} from './replication/tenant-slice';
+export {
+  buildCreateTableDdlFromColumnar,
+  encodeColumnarBatchToWireRows,
+  iterateArrowIpcBatches,
+  loadArrowIpcIntoDatabase,
+} from './arrow-ingest';
+export type {
+  ArrowIngestSource,
+  LoadArrowIpcOptions,
+  ArrowIngestResult,
+  ArrowIngestHost,
+} from './arrow-ingest';
+export {
+  createOptimisticMutationStore,
+  ReactiveTableStore,
+} from './optimistic-store';
+export type {
+  OptimisticOperation,
+  PendingOptimisticMutation,
+  OptimisticStoreSnapshot,
+  OptimisticMutationStoreOptions,
+  OptimisticFlushResult,
+  OptimisticTableActions,
+  OptimisticMutationStore,
+  ReactiveTableDatabase,
+  ReactiveTableStoreOptions,
+  ReactiveTableState,
+} from './optimistic-store';
+export { startCliReplicationServer } from './cli-sync-server';
+export type {
+  StartCliReplicationServerOptions,
+  CliReplicationServerHandle,
+} from './cli-sync-server';

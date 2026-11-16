@@ -406,8 +406,42 @@ export async function fetchReplArrowInspector(db: ReplDatabase, editorValue: str
       };
     }
 
-export function renderArrowInspectorPanel(info: ReplArrowInspectorInfo | null): HTMLElement {
+export function renderArrowInspectorPanel(
+  info: ReplArrowInspectorInfo | null,
+  onExportArrow?: () => void,
+  onImportArrowFile?: (fileName: string, bytes: Uint8Array) => void,
+): HTMLElement {
   const panel = el('div', 'inspector-arrow');
+  const actionsRow = el('div', 'inspector-actions');
+  if (onExportArrow) {
+    const exportBtn = el('button', 'arrow-export-btn') as HTMLButtonElement;
+    exportBtn.type = 'button';
+    exportBtn.textContent = 'Export .arrow';
+    exportBtn.addEventListener('click', () => onExportArrow());
+    actionsRow.append(exportBtn);
+  }
+  if (onImportArrowFile) {
+    const importBtn = el('button', 'arrow-import-btn') as HTMLButtonElement;
+    importBtn.type = 'button';
+    importBtn.textContent = 'Import .arrow';
+    const fileInput = document.createElement('input');
+    fileInput.type = 'file';
+    fileInput.accept = '.arrow,.ipc,application/vnd.apache.arrow.stream';
+    fileInput.style.display = 'none';
+    importBtn.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', () => {
+      const f = fileInput.files?.[0];
+      if (!f) return;
+      void f.arrayBuffer().then((buf) => {
+        onImportArrowFile(f.name, new Uint8Array(buf));
+        fileInput.value = '';
+      });
+    });
+    actionsRow.append(importBtn, fileInput);
+  }
+  if (actionsRow.childElementCount > 0) {
+    panel.append(actionsRow);
+  }
 
       if (info?.syncState) {
         const syncTitle = el('div', 'schema-group-title');
@@ -568,6 +602,8 @@ export interface ReplInspectorRenderContext {
   readonly lastReplication: ReplReplicationInfo | null;
   readonly lastArrow: ReplArrowInspectorInfo | null;
   readonly onResetProfiler: () => void;
+  readonly onExportArrow?: () => void;
+  readonly onImportArrowFile?: (fileName: string, bytes: Uint8Array) => void;
 }
 
 export function renderReplInspector(ctx: ReplInspectorRenderContext): void {
@@ -585,7 +621,13 @@ export function renderReplInspector(ctx: ReplInspectorRenderContext): void {
       }
 
       if (ctx.activeTab === 'arrow') {
-        ctx.inspectorBody.append(renderArrowInspectorPanel(ctx.lastArrow));
+        ctx.inspectorBody.append(
+          renderArrowInspectorPanel(
+            ctx.lastArrow,
+            ctx.onExportArrow,
+            ctx.onImportArrowFile,
+          ),
+        );
         return;
       }
 

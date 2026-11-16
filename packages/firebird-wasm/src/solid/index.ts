@@ -42,10 +42,29 @@ import {
 } from '../frameworks/sync-store';
 import type { ColumnarQueryResult } from '../columnar';
 import type { LiveRowDelta, LiveRowKeySelector } from '../live-incremental';
+import {
+  createOptimisticMutationStore,
+  ReactiveTableStore,
+  type OptimisticMutationStore,
+  type OptimisticMutationStoreOptions,
+  type OptimisticStoreSnapshot,
+  type ReactiveTableDatabase,
+  type ReactiveTableState,
+  type ReactiveTableStoreOptions,
+} from '../optimistic-store';
+import type { TableExecutionHost, TableRepository } from '../table-api';
 import type { SqlFragment } from '../sql-tag';
 import type { QueryParams, Row } from '../types';
 
 export type { QueryableDatabase, QueryState } from '../frameworks/query-store';
+export type {
+  OptimisticMutationStore,
+  OptimisticMutationStoreOptions,
+  OptimisticStoreSnapshot,
+  ReactiveTableDatabase,
+  ReactiveTableState,
+  ReactiveTableStoreOptions,
+} from '../optimistic-store';
 export type {
   ColumnarQueryState,
   ColumnarQueryableDatabase,
@@ -427,6 +446,7 @@ export function createSyncStatus(
   };
 }
 
+
 /** SolidJS signal accessors returned by {@link createColumnarQuery} (`M20 Item 4`). */
 export interface SolidColumnarResult {
   result: Accessor<ColumnarQueryResult | undefined>;
@@ -487,6 +507,7 @@ export function createColumnarQuery(
   };
 }
 
+
 /** SolidJS signal accessors returned by {@link createLiveIncrementalQuery} (`M20 Item 4`). */
 export interface SolidIncrementalResult<T = Row> {
   rows: Accessor<readonly T[] | undefined>;
@@ -545,6 +566,135 @@ export function createLiveIncrementalQuery<T extends Row = Row>(
     loading: () => getSnap().loading,
     state: getSnap,
     refresh: () => store.refresh(),
+    dispose,
+  };
+}
+
+/** SolidJS signal result returned by {@link createOptimisticMutation} (`M22 Item 3`). */
+export interface SolidOptimisticMutationResult {
+  readonly store: OptimisticMutationStore;
+  state: Accessor<OptimisticStoreSnapshot>;
+  pendingCount: Accessor<number>;
+  flushing: Accessor<boolean>;
+  lastError: Accessor<Error | undefined>;
+  insert: OptimisticMutationStore['insert'];
+  update: OptimisticMutationStore['update'];
+  upsert: OptimisticMutationStore['upsert'];
+  delete: OptimisticMutationStore['delete'];
+  revert: OptimisticMutationStore['revert'];
+  revertAll: OptimisticMutationStore['revertAll'];
+  flush: OptimisticMutationStore['flush'];
+  table: OptimisticMutationStore['table'];
+  dispose(): void;
+}
+
+/** Create SolidJS signal accessors backed by {@link OptimisticMutationStore} (`M22 Item 3`). */
+export function createOptimisticMutation(
+  options: OptimisticMutationStoreOptions & {
+    db?: TableExecutionHost;
+    store?: OptimisticMutationStore;
+  } = {},
+): SolidOptimisticMutationResult {
+  const primitives = resolveSolidPrimitives();
+  const makeSignal = primitives.createSignal ?? createFallbackSignal;
+  const optStore =
+    options.store ??
+    createOptimisticMutationStore(
+      (options.db ?? useFirebird()) as unknown as TableExecutionHost,
+      options,
+    );
+  const [getSnap, setSnap] = makeSignal<OptimisticStoreSnapshot>(optStore.getSnapshot());
+  const unsub = optStore.subscribe(() => setSnap(optStore.getSnapshot()));
+
+  if (typeof primitives.onCleanup === 'function') {
+    try {
+      primitives.onCleanup(unsub);
+    } catch {
+      // Ignore outside reactive owner
+    }
+  }
+
+  return {
+    store: optStore,
+    state: getSnap,
+    pendingCount: () => getSnap().pendingCount,
+    flushing: () => getSnap().flushing,
+    lastError: () => getSnap().lastError,
+    insert: optStore.insert,
+    update: optStore.update,
+    upsert: optStore.upsert,
+    delete: optStore.delete,
+    revert: optStore.revert,
+    revertAll: optStore.revertAll,
+    flush: optStore.flush,
+    table: optStore.table,
+    dispose: unsub,
+  };
+}
+
+/** SolidJS signal result returned by {@link createTable} (`M22 Item 3`). */
+export interface SolidTableResult<T extends Row = Row, K = unknown> {
+  readonly repository: TableRepository<T, K>;
+  rows: Accessor<T[] | undefined>;
+  deltas: Accessor<readonly LiveRowDelta<T>[]>;
+  version: Accessor<number>;
+  loading: Accessor<boolean>;
+  error: Accessor<Error | undefined>;
+  pendingCount: Accessor<number>;
+  flushing: Accessor<boolean>;
+  state: Accessor<ReactiveTableState<T>>;
+  refresh(): Promise<void>;
+  insert(row: Partial<T> & Record<string, unknown>): Promise<T>;
+  update(key: K, patch: Partial<T> & Record<string, unknown>): Promise<{ affectedRows: number }>;
+  upsert(
+    row: Partial<T> & Record<string, unknown>,
+    matchingColumns?: ReadonlyArray<(keyof T & string) | string>,
+  ): Promise<T>;
+  remove(key: K): Promise<{ affectedRows: number }>;
+  dispose(): void;
+}
+
+/** Create a SolidJS reactive typed table handle (`M22 Item 3`). */
+export function createTable<T extends Row = Row, K = unknown>(
+  tableName: string,
+  options: ReactiveTableStoreOptions<T> & { db?: ReactiveTableDatabase } = {},
+): SolidTableResult<T, K> {
+  const primitives = resolveSolidPrimitives();
+  const makeSignal = primitives.createSignal ?? createFallbackSignal;
+  const db = (options.db ?? useFirebird()) as unknown as ReactiveTableDatabase;
+  const store = new ReactiveTableStore<T, K>(db, tableName, options);
+  const [getSnap, setSnap] = makeSignal<ReactiveTableState<T>>(store.getSnapshot());
+  const unsub = store.subscribe(() => setSnap(store.getSnapshot()));
+  store.start();
+  setSnap(store.getSnapshot());
+
+  const dispose = () => {
+    unsub();
+    store.stop();
+  };
+  if (typeof primitives.onCleanup === 'function') {
+    try {
+      primitives.onCleanup(dispose);
+    } catch {
+      // Ignore outside reactive owner
+    }
+  }
+
+  return {
+    repository: store.repository,
+    rows: () => getSnap().rows,
+    deltas: () => getSnap().deltas,
+    version: () => getSnap().version,
+    loading: () => getSnap().loading,
+    error: () => getSnap().error,
+    pendingCount: () => getSnap().pendingCount,
+    flushing: () => getSnap().flushing,
+    state: getSnap,
+    refresh: store.refresh,
+    insert: store.insert,
+    update: store.update,
+    upsert: store.upsert,
+    remove: store.remove,
     dispose,
   };
 }

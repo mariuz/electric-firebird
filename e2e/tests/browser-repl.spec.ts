@@ -257,6 +257,32 @@ test.describe('<firebird-repl>', () => {
     await expect(repl.locator('.inspector .inspector-arrow')).toContainText('int32 (INTEGER)');
     await expect(repl.locator('.inspector .inspector-arrow')).toContainText('float64 (DOUBLE)');
     await expect(repl.locator('.inspector .inspector-arrow')).toContainText('ONLINE (native) · LSN 18/18 · lag 0');
+    await expect(repl.locator('.inspector button.arrow-export-btn')).toBeVisible();
+    await expect(repl.locator('.inspector button.arrow-import-btn')).toBeVisible();
+
+    // Round-trip Arrow IPC V5 export & zero-copy import into a new table via repl.exportArrow() + repl.importArrow()
+    const roundTrip = await repl.evaluate(async (el: any) => {
+      const arrowBytes = await el.exportArrow('SELECT id, label, val FROM metrics ORDER BY id');
+      const importRes = await el.importArrow('METRICS_COPY', arrowBytes, {
+        createTable: true,
+        primaryKey: 'ID',
+      });
+      const entries = await el.run('SELECT id, label, val FROM METRICS_COPY ORDER BY id');
+      return {
+        exportedBytes: arrowBytes.byteLength,
+        rowsIngested: importRes.rowsIngested,
+        tableCreated: importRes.tableCreated,
+        copiedRows: entries[0].rows,
+      };
+    });
+
+    expect(roundTrip.exportedBytes).toBeGreaterThan(64);
+    expect(roundTrip.rowsIngested).toBe(2);
+    expect(roundTrip.tableCreated).toBe(true);
+    expect(roundTrip.copiedRows).toEqual([
+      [1, 'cpu', 42.5],
+      [2, 'mem', null],
+    ]);
   });
 
   test('takes a db property set before it was defined, and reports runs', async ({ page }) => {

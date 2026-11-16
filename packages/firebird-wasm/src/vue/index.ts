@@ -31,10 +31,27 @@ import {
 } from '../frameworks/sync-store';
 import type { ColumnarQueryResult } from '../columnar';
 import type { LiveRowDelta, LiveRowKeySelector } from '../live-incremental';
+import {
+  createOptimisticMutationStore,
+  ReactiveTableStore,
+  type OptimisticMutationStore,
+  type OptimisticMutationStoreOptions,
+  type PendingOptimisticMutation,
+  type ReactiveTableDatabase,
+  type ReactiveTableStoreOptions,
+} from '../optimistic-store';
+import type { TableExecutionHost, TableRepository } from '../table-api';
 import type { SqlFragment } from '../sql-tag';
 import type { QueryParams, Row } from '../types';
 
 export type { QueryableDatabase } from '../frameworks/query-store';
+export type {
+  OptimisticMutationStore,
+  OptimisticMutationStoreOptions,
+  PendingOptimisticMutation,
+  ReactiveTableDatabase,
+  ReactiveTableStoreOptions,
+} from '../optimistic-store';
 export type {
   ColumnarQueryableDatabase,
   IncrementalQueryableDatabase,
@@ -438,5 +455,147 @@ export function useLiveIncrementalQuery<T extends Row = Row>(
     error,
     loading,
     refresh: () => store?.refresh() ?? Promise.resolve(),
+  };
+}
+
+/** Vue refs returned by {@link useOptimisticMutation} (`M22 Item 3`). */
+export interface OptimisticMutationRefs {
+  readonly store: OptimisticMutationStore;
+  pendingCount: Ref<number>;
+  flushing: Ref<boolean>;
+  pending: ShallowRef<readonly PendingOptimisticMutation[]>;
+  confirmedCount: Ref<number>;
+  revertedCount: Ref<number>;
+  lastError: ShallowRef<Error | undefined>;
+  insert: OptimisticMutationStore['insert'];
+  update: OptimisticMutationStore['update'];
+  upsert: OptimisticMutationStore['upsert'];
+  delete: OptimisticMutationStore['delete'];
+  revert: OptimisticMutationStore['revert'];
+  revertAll: OptimisticMutationStore['revertAll'];
+  flush: OptimisticMutationStore['flush'];
+  table: OptimisticMutationStore['table'];
+}
+
+/** Composable wrapping {@link OptimisticMutationStore} as Vue refs (`M22 Item 3`). */
+export function useOptimisticMutation(
+  options: OptimisticMutationStoreOptions & {
+    db?: TableExecutionHost;
+    store?: OptimisticMutationStore;
+  } = {},
+): OptimisticMutationRefs {
+  const store =
+    options.store ??
+    createOptimisticMutationStore(
+      (options.db ?? useFirebird()) as unknown as TableExecutionHost,
+      options,
+    );
+  const init = store.getSnapshot();
+  const pendingCount = ref(init.pendingCount);
+  const flushing = ref(init.flushing);
+  const pending = shallowRef(init.pending);
+  const confirmedCount = ref(init.confirmedCount);
+  const revertedCount = ref(init.revertedCount);
+  const lastError = shallowRef<Error | undefined>(init.lastError);
+
+  const unsub = store.subscribe(() => {
+    const s = store.getSnapshot();
+    pendingCount.value = s.pendingCount;
+    flushing.value = s.flushing;
+    pending.value = s.pending;
+    confirmedCount.value = s.confirmedCount;
+    revertedCount.value = s.revertedCount;
+    lastError.value = s.lastError;
+  });
+
+  onScopeDispose(unsub);
+
+  return {
+    store,
+    pendingCount,
+    flushing,
+    pending,
+    confirmedCount,
+    revertedCount,
+    lastError,
+    insert: store.insert,
+    update: store.update,
+    upsert: store.upsert,
+    delete: store.delete,
+    revert: store.revert,
+    revertAll: store.revertAll,
+    flush: store.flush,
+    table: store.table,
+  };
+}
+
+/** Vue refs returned by {@link useTable} (`M22 Item 3`). */
+export interface TableRefs<T extends Row = Row, K = unknown> {
+  readonly repository: TableRepository<T, K>;
+  rows: ShallowRef<T[] | undefined>;
+  deltas: ShallowRef<readonly LiveRowDelta<T>[]>;
+  version: Ref<number>;
+  loading: Ref<boolean>;
+  error: ShallowRef<Error | undefined>;
+  pendingCount: Ref<number>;
+  flushing: Ref<boolean>;
+  refresh(): Promise<void>;
+  insert(row: Partial<T> & Record<string, unknown>): Promise<T>;
+  update(key: K, patch: Partial<T> & Record<string, unknown>): Promise<{ affectedRows: number }>;
+  upsert(
+    row: Partial<T> & Record<string, unknown>,
+    matchingColumns?: ReadonlyArray<(keyof T & string) | string>,
+  ): Promise<T>;
+  remove(key: K): Promise<{ affectedRows: number }>;
+}
+
+/** Reactive typed table composable for Vue (`M22 Item 3`). */
+export function useTable<T extends Row = Row, K = unknown>(
+  tableName: string,
+  options: ReactiveTableStoreOptions<T> & { db?: ReactiveTableDatabase } = {},
+): TableRefs<T, K> {
+  const db = (options.db ?? useFirebird()) as unknown as ReactiveTableDatabase;
+  const store = new ReactiveTableStore<T, K>(db, tableName, options);
+  const rows = shallowRef<T[] | undefined>(undefined);
+  const deltas = shallowRef<readonly LiveRowDelta<T>[]>([]);
+  const version = ref(0);
+  const loading = ref(true);
+  const error = shallowRef<Error | undefined>(undefined);
+  const pendingCount = ref(0);
+  const flushing = ref(false);
+
+  const sync = () => {
+    const s = store.getSnapshot();
+    rows.value = s.rows;
+    deltas.value = s.deltas;
+    version.value = s.version;
+    loading.value = s.loading;
+    error.value = s.error;
+    pendingCount.value = s.pendingCount;
+    flushing.value = s.flushing;
+  };
+  const unsub = store.subscribe(sync);
+  store.start();
+  sync();
+
+  onScopeDispose(() => {
+    unsub();
+    store.stop();
+  });
+
+  return {
+    repository: store.repository,
+    rows,
+    deltas,
+    version,
+    loading,
+    error,
+    pendingCount,
+    flushing,
+    refresh: store.refresh,
+    insert: store.insert,
+    update: store.update,
+    upsert: store.upsert,
+    remove: store.remove,
   };
 }

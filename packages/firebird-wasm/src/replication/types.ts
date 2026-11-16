@@ -425,6 +425,8 @@ export interface BootstrapReplicaOptions {
   tableDdl?: Readonly<Record<string, string>>;
   /** Whether to clear existing rows in published tables on `targetDb` before loading the logical snapshot. @default true */
   truncateExisting?: boolean;
+  /** Parallel table concurrency for multi-table logical snapshot export & seeding (`M22 Item 1`). @default 1 */
+  concurrency?: number;
 }
 
 /** Result returned by {@link bootstrapReplica}. */
@@ -621,6 +623,7 @@ export interface ReplicationPublication {
     compressGzip?: boolean;
     baseSnapshot?: Uint8Array;
     tableDdl?: Readonly<Record<string, string>>;
+    concurrency?: number;
   }): Promise<PublicationSnapshot>;
   /**
    * Record a single row DML mutation (`INSERT`, `UPDATE`, `DELETE`) in the
@@ -795,6 +798,12 @@ export interface CreateSubscriptionOptions {
    * - `'additive-only'`: allow additive DDL (`CREATE TABLE`, `ALTER TABLE ADD`, `CREATE INDEX`), skip already-applied additive DDL idempotently, and reject destructive DDL (`DROP TABLE`, `ALTER TABLE DROP`, `ALTER TABLE ALTER`).
    */
   ddlPolicy?: 'apply' | 'idempotent' | 'additive-only';
+  /**
+   * Optional inbound tenant isolation guard invoked before applying batches (`M22 Item 1`).
+   */
+  tenantGuard?: {
+    assertBatch(entries: readonly ReplicationLogEntry[], expectedTenantId?: string | number): void;
+  };
 }
 
 /**

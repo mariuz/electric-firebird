@@ -826,7 +826,10 @@ await poller.pollOnce(); // or poller.start(100)
 
 | Export | Description |
 |---|---|
-| `createHttpReplicationHandler(options)` | Web Fetch API `(Request) => Promise<Response>` handler serving `/changes`, `/ack`, `/heartbeat`, `/snapshot`, `/push`, and `/events` (SSE). |
+| `createHttpReplicationHandler(options)` | Web Fetch API `(Request) => Promise<Response>` handler serving `/changes`, `/ack`, `/heartbeat`, `/snapshot`, `/push`, and `/events` (SSE), with optional per-tenant `tenantColumn` / `sharedTables` outbound slice filtering and HTTP `403` `TenantIsolationError` push guards. |
+| `startCliReplicationServer(options)` | Zero-config `node:http` replication & Arrow IPC server (`npx firebird-wasm serve-sync`) exposing HTTP/SSE replication routes, `/health`, and `GET /arrow?sql=...` / `POST /arrow?table=...`. |
+| `createTenantReplicationSlice(options)` | Partitioned per-tenant replication slice (`WHERE <tenantColumn> = ?` + read-only `sharedTables`, parallel `concurrency` snapshot seeding, and inbound `TenantIsolationError` isolation guard). |
+| `createTenantIsolationGuard(config)` / `TenantIsolationError` | Validates inbound `ReplicationLogEntry[]` against a tenant slice (`TENANT_ISOLATION_VIOLATION`, HTTP `403`), rejecting cross-tenant mutations and writes to read-only `sharedTables`. |
 | `createHttpReplicationClient(options)` | Remote HTTP replication client with exponential backoff + jitter (`retry`), connection `state` / `onStateChange`, and `fetchSnapshotResumable({ chunkSize, checkpoint, onProgress })`. |
 | `createBroadcastChannelTransport(options?)` | Cross-tab / cross-worker replication transport backed by `BroadcastChannel`. |
 | `createWebSocketReplicationPeer(options)` | Duplex WebSocket replication peer streaming entries, pull requests, slot acks, and binary/gzipped `"FBCHANGELOG\0"` frames. |

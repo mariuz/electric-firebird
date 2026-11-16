@@ -177,6 +177,14 @@ export interface ReplDatabase {
   queryColumnar?(sql: string, params?: unknown[]): Promise<ColumnarQueryResult>;
   /** Optional Apache Arrow IPC V5 query execution (`M19 Item 2` / `M20 Item 4`). */
   queryArrow?(sql: string, params?: unknown[]): Promise<Uint8Array>;
+  /** Optional zero-copy Apache Arrow IPC V5 ingestion (`M22 Item 2` / `M22 Item 4`). */
+  loadArrowIpc?(
+    tableName: string,
+    source: ArrowIngestSource,
+    options?: LoadArrowIpcOptions,
+  ): Promise<ArrowIngestResult>;
+  execBatch?(sql: string, rows: unknown[][]): Promise<{ affectedRows: number } | void>;
+  execute?(sql: string, params?: unknown[]): Promise<{ affectedRows: number }>;
   /**
    * For a statement without rows: a transaction's `exec()` runs exactly one
    * statement and reports what it changed.  (`FirebirdBrowser.exec()` would
@@ -243,6 +251,14 @@ export interface FirebirdReplElement extends HTMLElement {
   replication(): Promise<ReplEntry | undefined>;
   /** Execute `sql` (default: editor text) as columnar vectors + Apache Arrow IPC stream and open the Sync & Arrow Inspector (`M20 Item 4`). */
   inspectArrow(sql?: string): Promise<ReplEntry | undefined>;
+  /** Export `sql` (default: editor text) as an Apache Arrow IPC V5 `Uint8Array` (`M22 Item 4`). */
+  exportArrow(sql?: string): Promise<Uint8Array>;
+  /** Import an Apache Arrow IPC V5 stream/buffer into `tableName` (`M22 Item 4`). */
+  importArrow(
+    tableName: string,
+    source: ArrowIngestSource,
+    options?: LoadArrowIpcOptions,
+  ): Promise<ArrowIngestResult>;
   /** Toggle (or switch to `tab` in) the interactive Schema Inspector, Migration Viewer, Profiler & Plan Explorer sidebar. */
   toggleInspector(tab?: ReplInspectorTab): Promise<void>;
   /** Refresh the interactive Schema Inspector, Migration Viewer, Profiler & Plan Explorer sidebar from the database. */
@@ -252,6 +268,14 @@ export interface FirebirdReplElement extends HTMLElement {
 }
 
 import { REPL_STYLE, el, asError, summary, table } from './repl-styles';
+import { encodeArrowIpc, rowsToColumnarResult } from '../columnar';
+import {
+  loadArrowIpcIntoDatabase,
+  type ArrowIngestHost,
+  type ArrowIngestResult,
+  type ArrowIngestSource,
+  type LoadArrowIpcOptions,
+} from '../arrow-ingest';
 import {
   fetchReplArrowInspector,
   fetchReplMigrations,
@@ -695,6 +719,29 @@ export function defineFirebirdRepl(
             this.db.resetMonitorStats();
             void this.refreshInspector();
           }
+        },
+        onExportArrow: () => {
+          void this.exportArrow().then((bytes) => {
+            if (typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function') {
+              const blob = new Blob(
+                [new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength) as unknown as BlobPart],
+                { type: 'application/vnd.apache.arrow.stream' },
+              );
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = url;
+              a.download = 'query.arrow';
+              a.click();
+              URL.revokeObjectURL(url);
+            }
+          });
+        },
+        onImportArrowFile: (fileName, bytes) => {
+          const base = fileName
+            .replace(/\.(arrow|ipc)$/i, '')
+            .replace(/[^A-Za-z0-9_]/g, '_')
+            .toUpperCase() || 'IMPORTED_ARROW';
+          void this.importArrow(base, bytes, { createTable: true });
         },
       });
     }
@@ -1185,6 +1232,104 @@ export function defineFirebirdRepl(
         }),
       );
       return entry;
+    }
+
+    async exportArrow(sql?: string): Promise<Uint8Array> {
+      if (!this.db) {
+        throw new Error('No database: set the element’s db property first');
+      }
+      const targetSql =
+        (sql ?? this.editor.value ?? '').trim() ||
+        'SELECT 1 AS SAMPLE_ID FROM RDB$DATABASE';
+      let bytes: Uint8Array;
+      if (typeof this.db.queryArrow === 'function') {
+        bytes = await this.db.queryArrow(targetSql);
+      } else {
+        const res = await this.db.query(targetSql, [], { rowMode: 'array' });
+        const rowsObj = res.rows.map((arr) => {
+          const r: Record<string, unknown> = {};
+          for (let i = 0; i < res.fields.length; i++) {
+            r[res.fields[i]!.name] = arr[i];
+          }
+          return r;
+        });
+        bytes = encodeArrowIpc(rowsToColumnarResult({ rows: rowsObj, fields: res.fields }));
+      }
+      await this.inspectArrow(targetSql);
+      this.dispatchEvent(
+        new CustomEvent('firebird-repl-arrow-export', {
+          detail: { sql: targetSql, bytes, byteLength: bytes.byteLength },
+          bubbles: true,
+          composed: true,
+        }),
+      );
+      return bytes;
+    }
+
+    async importArrow(
+      tableName: string,
+      source: ArrowIngestSource,
+      options: LoadArrowIpcOptions = {},
+    ): Promise<ArrowIngestResult> {
+      if (!this.db) {
+        throw new Error('No database: set the element’s db property first');
+      }
+      const started = performance.now();
+      const db = this.db;
+      let result: ArrowIngestResult;
+      if (typeof db.loadArrowIpc === 'function') {
+        result = await db.loadArrowIpc(tableName, source, options);
+      } else {
+        const fallbackHost: ArrowIngestHost = {
+          execute: async (s) => {
+            const r = await db.transaction((tx) => tx.exec(s));
+            return { affectedRows: r.affectedRows };
+          },
+          execBatch: async (s, rows) => {
+            if (typeof db.execBatch === 'function') {
+              return db.execBatch(s, rows);
+            }
+            let total = 0;
+            for (const row of rows) {
+              if (typeof db.execute === 'function') {
+                const er = await db.execute(s, row);
+                total += er.affectedRows;
+              }
+            }
+            return { affectedRows: total };
+          },
+          query: async <T extends Record<string, unknown>>(s: string, p?: unknown[]) => {
+            const arr = await db.query(s, p ?? [], { rowMode: 'array' });
+            const objs = arr.rows.map((rowArr) => {
+              const obj: Record<string, unknown> = {};
+              for (let i = 0; i < arr.fields.length; i++) {
+                obj[arr.fields[i]!.name] = rowArr[i];
+              }
+              return obj as T;
+            });
+            return { rows: objs };
+          },
+        };
+        result = await loadArrowIpcIntoDatabase(fallbackHost, tableName, source, options);
+      }
+      const entry: ReplEntry = {
+        sql: `IMPORT ARROW INTO "${result.tableName}"`,
+        line: 1,
+        ms: performance.now() - started,
+        affectedRows: result.rowsIngested,
+      };
+      this.show(entry);
+      if (this.isInspectorOpen) {
+        await this.refreshInspector();
+      }
+      this.dispatchEvent(
+        new CustomEvent('firebird-repl-arrow-import', {
+          detail: result,
+          bubbles: true,
+          composed: true,
+        }),
+      );
+      return result;
     }
 
     private onKey(event: KeyboardEvent): void {

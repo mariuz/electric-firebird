@@ -185,6 +185,7 @@ export async function bootstrapReplica(
       compressGzip: options.compressGzip,
       baseSnapshot: options.baseSnapshot,
       tableDdl: options.tableDdl,
+      concurrency: options.concurrency,
     }));
 
   const hasLocalPublication = Boolean(
@@ -265,84 +266,103 @@ export async function bootstrapReplica(
         (options.subscription as unknown as { _localPublication?: unknown })._localPublication,
       );
 
-      try {
-        for (const tbl of snapshot.tables) {
-          const tableUpper = normalizeTableName(tbl.table);
-          const ddl =
-            tbl.ddlSql ??
-            options.tableDdl?.[tableUpper] ??
-            options.tableDdl?.[tableUpper.toLowerCase()];
-          if (ddl) {
-            await ensureTableSafe(options.targetDb, ddl);
-          }
+      const seedConcurrency = Math.max(1, Math.floor(options.concurrency ?? 1));
+      const seedSingleTable = async (tbl: (typeof snapshot.tables)[number]) => {
+        const tableUpper = normalizeTableName(tbl.table);
+        const ddl =
+          tbl.ddlSql ??
+          options.tableDdl?.[tableUpper] ??
+          options.tableDdl?.[tableUpper.toLowerCase()];
+        if (ddl) {
+          await ensureTableSafe(options.targetDb, ddl);
+        }
 
-          if (truncateExisting) {
-            if (typeof runner.execBatch === 'function' && !hasLocalMirror) {
-              try {
-                await execStatement(runner, `DELETE FROM ${quoteIdent(tableUpper)}`);
-              } catch {
-                // Table may not exist yet or be empty
-              }
-            } else {
-              try {
-                const existing = await runner.query<Row>(
-                  `SELECT * FROM ${quoteIdent(tableUpper)}`,
+        if (truncateExisting) {
+          if (typeof runner.execBatch === 'function' && !hasLocalMirror) {
+            try {
+              await execStatement(runner, `DELETE FROM ${quoteIdent(tableUpper)}`);
+            } catch {
+              // Table may not exist yet or be empty
+            }
+          } else {
+            try {
+              const existing = await runner.query<Row>(
+                `SELECT * FROM ${quoteIdent(tableUpper)}`,
+              );
+              for (const r of existing.rows) {
+                const normR = normalizeRowKeysUpper(r);
+                const keyRec = extractKeyRecord(normR, tbl.primaryKey);
+                await applyRowMutationToTable(
+                  runner,
+                  tableUpper,
+                  tbl.primaryKey,
+                  'DELETE',
+                  keyRec,
+                  null,
                 );
-                for (const r of existing.rows) {
-                  const normR = normalizeRowKeysUpper(r);
-                  const keyRec = extractKeyRecord(normR, tbl.primaryKey);
-                  await applyRowMutationToTable(
-                    runner,
-                    tableUpper,
-                    tbl.primaryKey,
-                    'DELETE',
-                    keyRec,
-                    null,
-                  );
-                  syncLocalMirror(tableUpper, 'DELETE', keyRec, null);
-                }
-              } catch {
-                // Table may not exist yet or be empty
+                syncLocalMirror(tableUpper, 'DELETE', keyRec, null);
               }
+            } catch {
+              // Table may not exist yet or be empty
             }
           }
+        }
 
-          if (typeof runner.execBatch === 'function' && tbl.rows.length > 0) {
-            const batchItems = tbl.rows.map((row) => {
-              const normRow = normalizeRowKeysUpper(row);
-              const keyRec = extractKeyRecord(normRow, tbl.primaryKey);
-              bytesTransferred += JSON.stringify(normRow).length;
-              return { key: keyRec, rowValues: normRow };
-            });
-            await applyBatchedRowMutationsToTable(
+        if (typeof runner.execBatch === 'function' && tbl.rows.length > 0) {
+          const batchItems = tbl.rows.map((row) => {
+            const normRow = normalizeRowKeysUpper(row);
+            const keyRec = extractKeyRecord(normRow, tbl.primaryKey);
+            bytesTransferred += JSON.stringify(normRow).length;
+            return { key: keyRec, rowValues: normRow };
+          });
+          await applyBatchedRowMutationsToTable(
+            runner,
+            tableUpper,
+            tbl.primaryKey,
+            'INSERT',
+            batchItems,
+          );
+          if (hasLocalMirror) {
+            for (const item of batchItems) {
+              syncLocalMirror(tableUpper, 'INSERT', item.key, item.rowValues);
+            }
+          }
+          rowsCopied += batchItems.length;
+        } else {
+          for (const row of tbl.rows) {
+            const normRow = normalizeRowKeysUpper(row);
+            const keyRec = extractKeyRecord(normRow, tbl.primaryKey);
+            await applyRowMutationToTable(
               runner,
               tableUpper,
               tbl.primaryKey,
               'INSERT',
-              batchItems,
+              keyRec,
+              normRow,
             );
-            if (hasLocalMirror) {
-              for (const item of batchItems) {
-                syncLocalMirror(tableUpper, 'INSERT', item.key, item.rowValues);
+            syncLocalMirror(tableUpper, 'INSERT', keyRec, normRow);
+            rowsCopied++;
+            bytesTransferred += JSON.stringify(normRow).length;
+          }
+        }
+      };
+
+      try {
+        if (seedConcurrency > 1 && snapshot.tables.length > 1) {
+          let nextTblIdx = 0;
+          const workerCount = Math.min(seedConcurrency, snapshot.tables.length);
+          await Promise.all(
+            Array.from({ length: workerCount }, async () => {
+              for (;;) {
+                const idx = nextTblIdx++;
+                if (idx >= snapshot.tables.length) break;
+                await seedSingleTable(snapshot.tables[idx]!);
               }
-            }
-            rowsCopied += batchItems.length;
-          } else {
-            for (const row of tbl.rows) {
-              const normRow = normalizeRowKeysUpper(row);
-              const keyRec = extractKeyRecord(normRow, tbl.primaryKey);
-              await applyRowMutationToTable(
-                runner,
-                tableUpper,
-                tbl.primaryKey,
-                'INSERT',
-                keyRec,
-                normRow,
-              );
-              syncLocalMirror(tableUpper, 'INSERT', keyRec, normRow);
-              rowsCopied++;
-              bytesTransferred += JSON.stringify(normRow).length;
-            }
+            }),
+          );
+        } else {
+          for (const tbl of snapshot.tables) {
+            await seedSingleTable(tbl);
           }
         }
       } finally {
@@ -356,7 +376,10 @@ export async function bootstrapReplica(
       }
     };
 
-    if (typeof options.targetDb.transaction === 'function') {
+    if (
+      typeof options.targetDb.transaction === 'function' &&
+      Math.max(1, Math.floor(options.concurrency ?? 1)) <= 1
+    ) {
       await options.targetDb.transaction(applySnapshotTables);
     } else {
       await applySnapshotTables(options.targetDb);

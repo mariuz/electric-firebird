@@ -31,6 +31,12 @@ import {
   type ConnectionLifecycleState,
   type ConnectionStateChangeInfo,
 } from './webrtc-resilient';
+import {
+  TenantIsolationError,
+  readTenantField,
+  valuesMatchTenantId,
+  type TenantIsolationGuard,
+} from './tenant-slice';
 
 export * from './webrtc-resilient';
 
@@ -75,6 +81,21 @@ export interface HttpReplicationHandlerOptions {
   onChangelogSegment?: (
     segmentBytes: Uint8Array,
   ) => ApplyFbChangelogResult | Promise<ApplyFbChangelogResult>;
+  /**
+   * Optional multi-tenant isolation guard (`M22 Item 1`).
+   * Validates inbound `POST /push` mutations (returning HTTP `403 Forbidden` on
+   * cross-tenant or shared-table violations) and optionally filters outbound
+   * `/changes` and `/snapshot` rows when a tenant ID is resolved for the request.
+   */
+  tenantGuard?: TenantIsolationGuard;
+  /**
+   * Optional resolver extracting the authenticated tenant ID from an incoming
+   * HTTP `Request` (defaults to `x-tenant-id` header or `?tenantId=` query param
+   * or `tenantGuard.defaultTenantId`).
+   */
+  resolveTenantId?: (
+    request: Request,
+  ) => string | number | undefined | Promise<string | number | undefined>;
 }
 
 /** Options for {@link createHttpReplicationClient}. */
@@ -228,6 +249,11 @@ export function createHttpReplicationHandler(
 
     const url = new URL(request.url, 'http://localhost');
     const path = url.pathname.replace(/\/+$/, '');
+    const requestTenantId = options.resolveTenantId
+      ? await options.resolveTenantId(request)
+      : (request.headers.get('x-tenant-id') ??
+        url.searchParams.get('tenantId') ??
+        options.tenantGuard?.defaultTenantId);
 
     if (request.method === 'GET' && path.endsWith('/changelog')) {
       const sinceSequence = Number(url.searchParams.get('sinceSequence') ?? '0');
@@ -355,10 +381,14 @@ export function createHttpReplicationHandler(
       const sinceLsn = Number(url.searchParams.get('sinceLsn') ?? '0');
       const limitParam = url.searchParams.get('limit');
       const excludeOrigin = url.searchParams.get('excludeOrigin') ?? undefined;
-      const entries = await publication.fetchChangesSince(sinceLsn, {
+      const rawEntries = await publication.fetchChangesSince(sinceLsn, {
         ...(limitParam ? { limit: Number(limitParam) } : {}),
         ...(excludeOrigin ? { excludeOrigin } : {}),
       });
+      const entries =
+        options.tenantGuard && requestTenantId !== undefined
+          ? options.tenantGuard.filterOutboundEntries(rawEntries, requestTenantId)
+          : rawEntries;
       const currentLsn = await publication.currentLsn();
       return jsonResponse({
         name: publication.name,
@@ -421,7 +451,24 @@ export function createHttpReplicationHandler(
     }
 
     if (request.method === 'GET' && path.endsWith('/snapshot')) {
-      const snapshot = await publication.exportSnapshot({ mode: 'logical' });
+      const rawSnap = await publication.exportSnapshot({ mode: 'logical' });
+      const snapshot =
+        options.tenantGuard && requestTenantId !== undefined
+          ? {
+              ...rawSnap,
+              tables: rawSnap.tables.map((tbl) =>
+                options.tenantGuard!.sharedTables.has(tbl.table.toUpperCase())
+                  ? tbl
+                  : {
+                      ...tbl,
+                      rows: tbl.rows.filter((r) => {
+                        const tf = readTenantField(r, options.tenantGuard!.tenantColumn);
+                        return tf.present && valuesMatchTenantId(tf.value, requestTenantId);
+                      }),
+                    },
+              ),
+            }
+          : rawSnap;
       return jsonResponse({ snapshot });
     }
 
@@ -469,9 +516,42 @@ export function createHttpReplicationHandler(
     if (request.method === 'POST' && path.endsWith('/push')) {
       const body = (await request.json()) as { entries: ReplicationLogEntry[] };
       const entries = body.entries ?? [];
+      if (options.tenantGuard) {
+        try {
+          options.tenantGuard.assertBatch(entries, requestTenantId);
+        } catch (err) {
+          if (err instanceof TenantIsolationError) {
+            return jsonResponse(
+              {
+                error: err.message,
+                code: err.code,
+                table: err.table,
+                reason: err.reason,
+              },
+              403,
+            );
+          }
+          throw err;
+        }
+      }
       if (subscription) {
-        const result = await subscription.applyChanges(entries);
-        return jsonResponse({ result });
+        try {
+          const result = await subscription.applyChanges(entries);
+          return jsonResponse({ result });
+        } catch (err) {
+          if (err instanceof TenantIsolationError) {
+            return jsonResponse(
+              {
+                error: err.message,
+                code: err.code,
+                table: err.table,
+                reason: err.reason,
+              },
+              403,
+            );
+          }
+          throw err;
+        }
       }
       let appliedCount = 0;
       for (const entry of entries) {
@@ -1061,6 +1141,10 @@ export interface WebSocketReplicationPeerOptions {
     segment: Uint8Array,
     result?: ApplyFbChangelogResult,
   ) => void | Promise<void>;
+  /** Optional inbound tenant isolation guard enforced on incoming `repl_entries` frames (`M22 Item 1`). */
+  tenantGuard?: TenantIsolationGuard;
+  /** Optional error callback invoked when an inbound frame violates `tenantGuard` (`M22 Item 1`). */
+  onError?: (error: Error) => void;
 }
 
 /** Duplex WebSocket replication peer returned by {@link createWebSocketReplicationPeer}. */
@@ -1170,15 +1254,35 @@ export function createWebSocketReplicationPeer(
         }),
       );
     } else if (msg.type === 'repl_entries' && Array.isArray(msg.entries) && subscription) {
-      const res = await subscription.applyChanges(msg.entries);
-      socket.send(
-        JSON.stringify({
-          type: 'repl_ack',
-          slotName: subscription.slotName,
-          confirmedLsn: res.currentLsn,
-          nodeId: subscription.nodeId,
-        }),
-      );
+      try {
+        if (options.tenantGuard) {
+          options.tenantGuard.assertBatch(msg.entries);
+        }
+        const res = await subscription.applyChanges(msg.entries);
+        socket.send(
+          JSON.stringify({
+            type: 'repl_ack',
+            slotName: subscription.slotName,
+            confirmedLsn: res.currentLsn,
+            nodeId: subscription.nodeId,
+          }),
+        );
+      } catch (err) {
+        const errorObj = err instanceof Error ? err : new Error(String(err));
+        options.onError?.(errorObj);
+        if (err instanceof TenantIsolationError) {
+          socket.send(
+            JSON.stringify({
+              type: 'repl_error',
+              status: 403,
+              code: err.code,
+              table: err.table,
+              reason: err.reason,
+              error: err.message,
+            }),
+          );
+        }
+      }
     } else if (
       msg.type === 'repl_ack' &&
       publication &&

@@ -23,21 +23,12 @@
  */
 
 import { IndexedDBVFS } from './indexeddb-vfs';
-import type { IndexedDBVFSOptions } from './indexeddb-vfs';
-import type { PageEncryptionKey } from './page-crypto';
 import { DirectTransport, buildSweepResult } from './engine-transport';
 import type { EngineHandle, EngineTransport } from './engine-transport';
 import { WorkerTransport } from './worker-transport';
 import { splitStatements } from './sql-script';
 import {
-  compressGzipStream,
-  readDatabaseStreamChunks,
-  resolveStreamChunkSize,
-} from './data-stream';
-import {
-  extractReferencedTables,
   extractMutatedTables,
-  liveTableTriggerDDL,
   CrossTabLiveBridge,
 } from './live-tables';
 import {
@@ -47,30 +38,17 @@ import {
   type PageDiffOptions,
   type ApplyPageDiffOptions,
 } from './snapshots';
-import { ICU_LOCALE_DATA_PATH, isValidIcuDataPackage } from './icu-locales';
 import { introspect as introspectSchema, migrate as runMigrations } from './schema';
-import {
-  BLOB_INTERNAL_DATA,
-  type InternalBlobHandle,
-  buildBlobReadableStream,
-  buildBlobWritableStream,
-  createBlobHandle,
-  isBlobHandle,
-  resolveBlobColumnIndex,
-  resolveBlobSegmentSize,
-} from './blob-stream';
 import { buildCopyToStream } from './copy-stream';
 import { hasTransactionOptions } from './isolation';
 import { applyTypes, applySerializers } from './value-types';
-import type { TypeOptions } from './value-types';
 import { acquireDatabaseLock } from './db-lock';
 import { SharedEngineTransport } from './shared-transport';
 import type { DatabaseLock } from './db-lock';
 import { toStatement, resolveQueryCall, resolveBatchSize } from '../sql-tag';
-import type { SqlFragment, Statement } from '../sql-tag';
+import type { SqlFragment } from '../sql-tag';
 import {
   assertNotAborted,
-  createTimeoutError,
   DatabaseCoreSubsystems,
   type FirebirdDatabase,
   runWithCancellation,
@@ -100,9 +78,7 @@ import {
 } from '../pipeline';
 import {
   createArrowIpcReadableStream,
-  createColumnarStreamFromRowStream,
   resolveColumnarStreamArgs,
-  streamBinaryColumnarCursor,
   type ArrowStreamOptions,
   type ColumnarStreamOptions,
 } from '../columnar-stream';
@@ -112,8 +88,13 @@ import {
   type TableRepository,
 } from '../table-api';
 import {
-  createLiveColumnarQuery,
-  createLiveIncrementalQuery,
+  loadArrowIpcIntoDatabase,
+  type ArrowIngestResult,
+  type ArrowIngestSource,
+  type LoadArrowIpcOptions,
+} from '../arrow-ingest';
+import { decodeWireParamRows } from './wire-params';
+import {
   type IncrementalLiveSnapshot,
   type LiveColumnarOptions,
   type LiveColumnarQuery,
@@ -121,18 +102,11 @@ import {
   type LiveIncrementalQuery,
 } from '../live-incremental';
 import {
-  assertBatchParameterRows,
-  assertPreparedParamCount,
   assertUdrCallback,
-  decodePayloadColumnar,
   executeArrowFromColumnar,
-  executeColumnarViaArrayQuery,
   extractEffectiveQuerySchema,
   finalizeQueryResultWithSchema,
   resolveColumnarQueryCall,
-  resolvePreparedCallArgs,
-  runDriverApplyDiff,
-  runDriverExportDiff,
   scanUserTablesForSweep,
   type QueryArrowOptions,
 } from '../shared-driver-ops';
@@ -173,314 +147,55 @@ import type {
   RowMode,
   TransactionOptions,
 } from '../types';
-
-/** `QueryOptions` with the array mode pinned, for the overloads below. */
-type ArrayModeOptions = QueryOptions & { rowMode: 'array' };
-/** `QueryStreamOptions` with the array mode pinned, for the overloads below. */
-type ArrayStreamOptions = QueryStreamOptions & { rowMode: 'array' };
-
-// ---------------------------------------------------------------------------
-// Public types
-// ---------------------------------------------------------------------------
-
-/** A running subscription.  Returned by {@link FirebirdBrowser.listen}. */
-export interface EventSubscription {
-  /** Stop listening and release the subscription.  Safe to call twice. */
-  unsubscribe(): Promise<void>;
-}
-
-/** Options for {@link FirebirdBrowser.listen}. */
-export interface ListenOptions {
-  /**
-   * How often to ask the engine whether anything fired, in milliseconds.
-   *
-   * This is a poll because the engine's callback runs on an engine thread and
-   * re-arming has to happen off it — see `fb_events_poll`. The cost of a tick
-   * that finds nothing is one round trip to the Worker.
-   *
-   * @default 250
-   */
-  pollIntervalMs?: number;
-  /**
-   * Called when a poll or a handler throws.
-   *
-   * A subscription outlives the call that created it, so an error has nowhere
-   * else to go. Defaults to `console.error`; polling continues, because one
-   * failure does not mean the next will fail.
-   */
-  onError?: (error: Error) => void;
-}
-
-/** Options for {@link FirebirdBrowser.live}. */
-export interface LiveQueryOptions {
-  /**
-   * Event names to watch, as posted by `POST_EVENT`.
-   *
-   * When omitted (`undefined`), `live()` extracts the user tables referenced
-   * by the statement, installs an idempotent `AFTER INSERT OR UPDATE OR DELETE`
-   * `POST_EVENT` trigger (`FB_LIVE$<hash>`) on each table, and watches those
-   * events automatically.
-   *
-   * Pass an explicit non-empty array when watching custom application events
-   * posted by your own triggers or `db.notify()`. Passing an empty array `[]`
-   * throws a `RangeError`.
-   */
-  events?: readonly string[];
-  /** Parameters for the statement, as `query()` takes them. */
-  params?: QueryParams;
-  /**
-   * How often to ask the engine whether anything fired, in milliseconds.
-   *
-   * This is a poll because the engine's callback runs on an engine thread and
-   * re-arming has to happen off it — see `fb_events_poll`. The cost of a tick
-   * that finds nothing is one round trip to the Worker.
-   *
-   * @default 250
-   */
-  pollIntervalMs?: number;
-  /**
-   * Called when a refresh fails.
-   *
-   * A live query outlives the call that created it, so an error has nowhere
-   * else to go. Defaults to `console.error`; polling continues, because one
-   * failed refresh — a lock conflict, say — does not mean the next will fail.
-   */
-  onError?: (error: Error) => void;
-}
-
-/** A running live query.  Returned by {@link FirebirdBrowser.live}. */
-export interface LiveQuery<T> {
-  /** The most recent rows.  Replaced, not mutated, on each refresh. */
-  readonly rows: T[];
-  /** Re-run the statement now, without waiting for an event. */
-  refresh(): Promise<void>;
-  /** Stop watching and release the subscription.  Safe to call twice. */
-  unsubscribe(): Promise<void>;
-}
-
 import { FirebirdBrowserTransaction, type ExecResult } from './firebird-browser-tx';
 export { FirebirdBrowserTransaction, type ExecResult } from './firebird-browser-tx';
-
-export interface BranchOptions extends Partial<FirebirdBrowserOptions> {
-  /** Optional snapshot (or snapshot ID/label) to branch from. Defaults to taking a fresh snapshot of current state. */
-  fromSnapshot?: DatabaseSnapshot | string;
-}
-
-/** Options for creating a {@link FirebirdBrowser} instance. */
-export interface FirebirdBrowserOptions {
-  /** Options forwarded to the IndexedDB VFS layer. */
-  vfs?: IndexedDBVFSOptions;
-  /** Optional WebCrypto AES-GCM key (`CryptoKey` or 16/32-byte `Uint8Array` / `ArrayBuffer`) used to encrypt 8 KB database pages at rest. */
-  encryptionKey?: PageEncryptionKey;
-  /**
-   * Broadcast table-level `FB_LIVE$<table>` and `POST_EVENT` invalidations across
-   * same-origin browser tabs via `BroadcastChannel` (`true` by default for
-   * persistent databases; set `true` on `memory://` databases to share live
-   * invalidations across instances with the same name).
-   */
-  crossTabLive?: boolean;
-  /**
-   * URL or `ArrayBuffer` of the `firebird-embedded.wasm` binary.
-   * Passed through to the engine loader.
-   */
-  wasmBinary?: ArrayBuffer | string;
-  /**
-   * Custom `locateFile` callback for Emscripten.
-   * @see {@link import('../wasm-loader').WasmLoadOptions.locateFile}
-   */
-  locateFile?: (filename: string) => string;
-  /**
-   * Which build the engine loads in Node; see
-   * {@link import('../wasm-loader').WasmLoadOptions.threads}.  In a browser
-   * the page chooses by the glue script it loads ({@link wasmGlueFile}).
-   */
-  threads?: boolean | 'auto';
-  /**
-   * Worker running the engine.
-   *
-   * **Browsers need this with the threaded build.**  It uses pthreads, so
-   * Firebird blocks on mutexes while opening a database, and a browser main
-   * thread is not allowed to block — without a Worker the page deadlocks.
-   * Build the Worker script from `firebird-wasm/browser/worker-entry`.
-   *
-   * Omit it where blocking the calling thread is acceptable, such as Node or
-   * a test harness driving a stub engine, or with `firebird-embedded-st.js`,
-   * the build without threads, which never blocks and can run on the page
-   * thread (though a Worker still keeps long statements off it).
-   *
-   * With `multiTab: 'shared'` this must be a **factory**.  It is called only
-   * if this tab wins the election, so a follower never downloads and
-   * instantiates a 9 MB engine to sit idle beside the one already running.
-   */
-  worker?: Worker | (() => Worker);
-  /**
-   * Use a transport of your own.  Takes precedence over `worker`; mainly a
-   * seam for tests.
-   */
-  transport?: EngineTransport;
-  /**
-   * Persist to IndexedDB automatically after writes.
-   *
-   * Without this, a tab closed without `close()` loses everything written in
-   * that session — the common way to leave a page.  Enabled by default:
-   * silently losing committed data is a worse default than the cost of
-   * writing it.
-   *
-   * Set `false` to persist only on `close()` and explicit `persist()` calls.
-   *
-   * @default true
-   */
-  autoPersist?: boolean;
-  /**
-   * How long to wait after the last write before persisting, in
-   * milliseconds.  Bursts of statements coalesce into one persist.
-   *
-   * @default 500
-   */
-  autoPersistDebounceMs?: number;
-  /**
-   * Called when a background persist fails.
-   *
-   * Background persists cannot reject into caller code, and swallowing the
-   * error would hide data loss, so it is reported here.  Defaults to
-   * `console.error`.
-   */
-  onPersistError?: (error: Error) => void;
-  /**
-   * What to do when the same database is already open in another tab.
-   *
-   * Every tab keeps its own complete copy of the database and persists the
-   * whole image, so two writers do not interleave — the later persist discards
-   * the earlier tab's work entirely, with both tabs reporting success.
-   *
-   * - `'exclusive'` (default) takes a cross-tab lock and fails with
-   *   {@link DatabaseLockedError} if another tab will not release it in time.
-   * - `'shared'` elects one tab to run the engine and serves the others from
-   *   it, so every tab sees the same live database.  Needs `worker` to be a
-   *   factory rather than an instance — a follower must not build an engine it
-   *   will never use.
-   * - `'allow-unsafe'` skips the lock.  Only sound when at most one of the
-   *   tabs writes.
-   *
-   * @default 'exclusive'
-   */
-  multiTab?: 'exclusive' | 'shared' | 'allow-unsafe';
-  /**
-   * Run `query()` calls made outside `transaction()` that are a `SELECT` in
-   * one read-only transaction the engine keeps open, instead of starting and
-   * committing a transaction around each.
-   *
-   * Every statement still reads everything committed before it starts. It
-   * halves a cheap query (a primary-key `SELECT` from 44–45 to 20–22 µs in
-   * Node). Off by default because two things differ: a `SELECT` that writes (a
-   * selectable procedure that updates a table) is tried there first, fails,
-   * and is run again in its own transaction — once per SQL text, after which
-   * it goes there directly — so what it did outside transaction control before
-   * the failed write (a sequence, `RDB$SET_CONTEXT`) happens twice on that
-   * first call; and rows a `SELECT` leaves in an `ON COMMIT DELETE ROWS`
-   * temporary table stay until the shared transaction ends.
-   *
-   * @default false
-   */
-  sharedReads?: boolean;
-  /**
-   * How long to wait for another tab to release the database, in
-   * milliseconds.  `Infinity` waits indefinitely.
-   *
-   * @default 5000
-   */
-  lockTimeoutMs?: number;
-  /**
-   * Convert result values to richer JavaScript types.
-   *
-   * Off by default: every conversion trades something away, and values as
-   * returned today are correct, just awkward. See {@link TypeOptions} for what
-   * each one costs — `dates` in particular loses precision and has to choose a
-   * time zone Firebird did not store.
-   *
-   * @example
-   * ```ts
-   * new FirebirdBrowser('mydb', { worker, types: { bigint: true, binary: true } })
-   * ```
-   */
-  types?: TypeOptions;
-  /**
-   * Initial contents for the database, as the bytes {@link
-   * FirebirdBrowser.dumpDataDir} produced.
-   *
-   * Used **only when there is no database yet** — a stored one always wins.
-   * That is deliberate and is the difference between seeding and destroying:
-   * an application passes this on every load, so a seed that replaced what was
-   * there would reset the user's data to the snapshot on every page reload.
-   *
-   * To load a snapshot regardless of what is stored, open it as an ephemeral
-   * database: `new FirebirdBrowser('memory://', { loadDataDir: bytes })`.
-   */
-  loadDataDir?: Uint8Array;
-  /**
-   * Initial contents for the database as a stream of bytes produced by
-   * {@link FirebirdBrowser.dumpDataStream} (raw or gzip-compressed), or a
-   * factory returning one.
-   *
-   * Used **only when there is no database yet** — a stored one always wins.
-   */
-  loadDataStream?:
-    | ReadableStream<Uint8Array>
-    | AsyncIterable<Uint8Array>
-    | (() =>
-        | ReadableStream<Uint8Array>
-        | AsyncIterable<Uint8Array>
-        | Promise<ReadableStream<Uint8Array> | AsyncIterable<Uint8Array>>);
-  /**
-   * Optional lazy-loaded ICU `.dat` (or gzip-compressed `.dat.gz`) locale
-   * tailoring bundle (e.g., built via `wasm/tools/build-icu-data.sh --locales`
-   * or {@link buildIcuLocalePack}) for locale-specific collations such as
-   * `LOCALE=de_DE`, `es_ES`, `fr_FR`, `ja_JP`, registered via a second
-   * `udata_setCommonData()` slot without increasing the default WASM binary
-   * size.
-   */
-  icuLocaleData?:
-    | Uint8Array
-    | ArrayBuffer
-    | ArrayBufferLike
-    | (() => Uint8Array | ArrayBufferLike | Promise<Uint8Array | ArrayBufferLike>);
-}
-
-// ---------------------------------------------------------------------------
-// Shared helpers
-// ---------------------------------------------------------------------------
-
-/** Prefix marking a database that is never stored.  Matches PGlite's. */
-const MEMORY_PREFIX = 'memory://';
-
-/** Prefix marking a database whose pages live in OPFS rather than IndexedDB. */
-const OPFS_PREFIX = 'opfs://';
-
-/** Explicit prefix alias for an IndexedDB-backed database (`idb://mydb` === `'mydb'`). */
-const IDB_PREFIX = 'idb://';
-
-/**
- * Distinguishes ephemeral databases opened in one page.
- *
- * A counter rather than randomness: every instance in a tab shares one WASM
- * module and therefore one filesystem, so all this has to do is not repeat.
- */
-let ephemeralCounter = 0;
-
-/**
- * A filesystem name for `memory://` or `memory://label`.
- *
- * The label is kept for readability when looking at the engine's filesystem,
- * and made unique regardless: two `memory://scratch` databases are two
- * databases, not one shared by two owners. Nothing addresses this path from
- * outside, so uniqueness costs nothing and a collision would silently join two
- * callers who each believe they have their own.
- */
-function ephemeralFileName(dbName: string): string {
-  const label = dbName.slice(MEMORY_PREFIX.length).replace(/[^A-Za-z0-9_-]/g, '') || 'memory';
-  ephemeralCounter += 1;
-  return `${label}-${ephemeralCounter}`;
-}
+import {
+  ephemeralFileName,
+  IDB_PREFIX,
+  MEMORY_PREFIX,
+  OPFS_PREFIX,
+  type ArrayModeOptions,
+  type ArrayStreamOptions,
+  type BranchOptions,
+  type EventSubscription,
+  type FirebirdBrowserOptions,
+  type ListenOptions,
+  type LiveQuery,
+  type LiveQueryOptions,
+} from './firebird-browser-types';
+export type {
+  BranchOptions,
+  EventSubscription,
+  FirebirdBrowserOptions,
+  ListenOptions,
+  LiveQuery,
+  LiveQueryOptions,
+} from './firebird-browser-types';
+import {
+  createBrowserPreparedStatement,
+  executeBrowserQueryColumnar,
+  executeBrowserQueryColumnarStream,
+  listenBrowserEvents,
+  runBrowserLiveColumnar,
+  runBrowserLiveIncremental,
+  runBrowserLiveQuery,
+  streamBrowserQuery,
+  type BrowserStreamsHost,
+} from './firebird-browser-streams';
+import {
+  applyBrowserDiff,
+  applyBrowserIcuLocaleData,
+  captureBrowserSnapshot,
+  createBrowserBlobStream,
+  createBrowserDumpDataStream,
+  exportBrowserDiff,
+  openBrowserBlobStream,
+  openBrowserDatabaseFile,
+  restoreBrowserSnapshot,
+  runBrowserLoadDataStream,
+  setBrowserReplicaMode,
+  type BrowserStorageHost,
+} from './firebird-browser-storage';
 
 // ---------------------------------------------------------------------------
 // Implementation
@@ -675,22 +390,6 @@ export class FirebirdBrowser implements FirebirdDatabase {
   // ── Public API (mirrors FirebirdLite) ─────────────────────────────────
 
   /**
-   * Execute one or more statements that do not return rows.
-   *
-   * A script may contain several statements, which is what makes this usable
-   * for migrations.  Statement boundaries respect string literals, quoted
-   * identifiers, comments and `SET TERM`, so a stored procedure body full of
-   * semicolons survives intact.  Each statement runs in its own transaction,
-   * committed on success — a failure part-way leaves the statements before it
-   * committed, as it would in `isql`.
-   *
-   * Parameters may only be supplied for a single statement: there is no way to
-   * say which statement a value belongs to otherwise.  Use `query()` for
-   * parameterised statements that return rows.
-   *
-   * @returns one result per statement, in order.
-   */
-  /**
    * Cancel the currently running statement on this database attachment via
    * `IAttachment::cancelOperation(status, fb_cancel_raise)`.
    */
@@ -830,72 +529,17 @@ export class FirebirdBrowser implements FirebirdDatabase {
   async setReplicaMode(
     mode: 'none' | 'read_only' | 'read_write' | 0 | 1 | 2 = 'read_write',
   ): Promise<void> {
-    await this.ensureReady();
-    const modeCode: 0 | 1 | 2 =
-      mode === 0 || mode === 'none'
-        ? 0
-        : mode === 1 || mode === 'read_only'
-          ? 1
-          : 2;
-    const expectedContext =
-      modeCode === 0 ? null : modeCode === 1 ? 'READ-ONLY' : 'READ-WRITE';
-
-    for (const stmt of [...this.preparedStatements]) {
-      await stmt.close().catch(() => undefined);
-    }
-
-    if (typeof this.engine.setReplicaMode === 'function') {
-      try {
-        await this.engine.setReplicaMode(this.dbHandle, modeCode);
-      } catch {
-        // Fall through to ODS header page update if DPB/bridge call is unsupported
-      }
-    }
-
-    // Verify `RDB$GET_CONTEXT('SYSTEM', 'REPLICA_MODE')`; if the loaded WASM
-    // binary did not update `Ods::header_page::hdr_replica_mode` (offset 26)
-    // in-place, detach, patch byte 26 on disk/MEMFS/OPFS, and re-attach cleanly.
-    let currentMode: string | null = null;
-    try {
-      const ctxRes = await this.query<{ REPL_MODE: string | null }>(
-        "SELECT RDB$GET_CONTEXT('SYSTEM', 'REPLICA_MODE') AS REPL_MODE FROM RDB$DATABASE",
-      );
-      const raw = ctxRes.rows[0]?.REPL_MODE;
-      currentMode = raw === null || raw === undefined ? null : String(raw).trim().toUpperCase();
-    } catch {
-      currentMode = expectedContext;
-    }
-
-    if (currentMode !== expectedContext) {
-      if (this.dbHandle) {
-        await this.engine.detachDatabase(this.dbHandle);
-        this.dbHandle = 0;
-      }
-      try {
-        if (typeof this.engine.writeFileChunk === 'function') {
-          await this.engine.writeFileChunk(
-            this.dbPath,
-            new Uint8Array([modeCode]),
-            26,
-            false,
-          );
-        } else {
-          const rawBytes = await this.engine.readFile(this.dbPath);
-          if (rawBytes.byteLength >= 152) {
-            const copy = rawBytes.slice();
-            copy[26] = modeCode;
-            await this.engine.writeFile(this.dbPath, copy);
-          }
-        }
-      } finally {
-        this.dbHandle = await this.engine.attachDatabase(this.dbPath);
-        if (this.options.sharedReads) {
-          await this.engine.setSharedReads!(this.dbHandle, true);
-        }
-      }
-    }
-
-    this.markDirty();
+    return setBrowserReplicaMode(
+      this.storageHost,
+      async () => {
+        const ctxRes = await this.query<{ REPL_MODE: string | null }>(
+          "SELECT RDB$GET_CONTEXT('SYSTEM', 'REPLICA_MODE') AS REPL_MODE FROM RDB$DATABASE",
+        );
+        const raw = ctxRes.rows[0]?.REPL_MODE;
+        return raw === null || raw === undefined ? null : String(raw).trim().toUpperCase();
+      },
+      mode,
+    );
   }
 
   /**
@@ -1064,6 +708,61 @@ export class FirebirdBrowser implements FirebirdDatabase {
     options?: TableOptions<T>,
   ): TableRepository<T, K> {
     return createTableRepository<T, K>(this, tableName, options);
+  }
+
+  async execWireBatch(
+    sql: string,
+    wireRows: Uint8Array,
+    rowCount: number,
+  ): Promise<ExecResult> {
+    if (rowCount === 0) return { affectedRows: 0 };
+    await this.ensureReady();
+    if (!this.engine.acceptsWireParams && !(this.engine instanceof WorkerTransport)) {
+      return this.execBatch(sql, decodeWireParamRows(wireRows));
+    }
+    const startedAt = this.profiler.begin();
+    const ioBefore = await this.captureIoIfListening();
+    try {
+      const affectedRows = await this.engine.executeBatch(
+        this.dbHandle,
+        0,
+        sql,
+        wireRows,
+      );
+      const ioAfter = await this.captureIoIfListening();
+      this.profiler.end({
+        startedAt,
+        sql,
+        params: [],
+        kind: 'execBatch',
+        rowCount: affectedRows,
+        cacheHit: rowCount > 1,
+        ioBefore,
+        ioAfter,
+      });
+      this.markDirty();
+      this.liveBridge.broadcastTables(extractMutatedTables(sql));
+      return { affectedRows };
+    } catch (err) {
+      this.profiler.end({
+        startedAt,
+        sql,
+        params: [],
+        kind: 'execBatch',
+        cacheHit: rowCount > 1,
+        error: err,
+      });
+      throw err;
+    }
+  }
+
+  async loadArrowIpc(
+    tableName: string,
+    source: ArrowIngestSource,
+    options: LoadArrowIpcOptions = {},
+  ): Promise<ArrowIngestResult> {
+    await this.ensureReady();
+    return loadArrowIpcIntoDatabase(this, tableName, source, options);
   }
 
   /**
@@ -1255,86 +954,20 @@ export class FirebirdBrowser implements FirebirdDatabase {
     }
   }
 
-  /**
-   * Execute a `SELECT` query and return typed columnar buffers (`Int32Array`,
-   * `Float64Array`, `BigInt64Array`, UTF-8 offset buffers) directly from the
-   * WASM `"FBR\x01"` binary result payload without allocating per-row JS objects
-   * (`M19 Item 2`).
-   */
   async queryColumnar(
     sql: string | SqlFragment,
     paramsOrOptions: QueryParams | StatementExecutionOptions = [],
     maybeOptions: StatementExecutionOptions = {},
   ): Promise<ColumnarQueryResult> {
-    const { statement, options } = resolveColumnarQueryCall(
+    return executeBrowserQueryColumnar(
+      this.streamsHost,
+      (s, p, o) => this.query(s, p, { ...o, rowMode: 'array' }),
       sql,
       paramsOrOptions,
       maybeOptions,
     );
-    assertNotAborted(options.signal);
-    validateTimeoutMs(options.timeoutMs);
-    await this.ensureReady();
-
-    if (
-      typeof this.engine.queryBinary === 'function' &&
-      !this.udr.hasBridgeRoutines
-    ) {
-      const startedAt = this.profiler.begin();
-      const ioBefore = await this.captureIoIfListening();
-      try {
-        const payload = await runWithCancellation(
-          async () => {
-            await this.applyOneShotTimeout(options.timeoutMs);
-            return this.engine.queryBinary!(
-              this.dbHandle,
-              0,
-              statement.sql,
-              this.serialize(statement.params),
-              true,
-            );
-          },
-          options,
-          () => this.cancelOperation(),
-        );
-        const columnar = decodePayloadColumnar(payload, this.columnarShapeCache);
-        const ioAfter = await this.captureIoIfListening();
-        this.profiler.end({
-          startedAt,
-          sql: statement.sql,
-          params: statement.params,
-          kind: 'query',
-          rowCount: columnar.rowCount,
-          cacheHit: false,
-          ioBefore,
-          ioAfter,
-        });
-        return columnar;
-      } catch (err) {
-        this.profiler.end({
-          startedAt,
-          sql: statement.sql,
-          params: statement.params,
-          kind: 'query',
-          cacheHit: false,
-          error: err,
-        });
-        throw err;
-      }
-    }
-
-    return executeColumnarViaArrayQuery(() =>
-      this.query(statement.sql, statement.params, {
-        ...options,
-        rowMode: 'array',
-      }),
-    );
   }
 
-  /**
-   * Execute a `SELECT` query and return a standard **Apache Arrow IPC V5**
-   * stream (`Uint8Array`) ready for zero-copy ingestion into `apache-arrow`,
-   * DuckDB-WASM, Polars, Perspective, or WebGPU buffers (`M19 Item 2`).
-   */
   async queryArrow(
     sql: string | SqlFragment,
     paramsOrOptions: QueryParams | QueryArrowOptions = [],
@@ -1351,57 +984,19 @@ export class FirebirdBrowser implements FirebirdDatabase {
     );
   }
 
-  /**
-   * Stream typed `ColumnarQueryResult` chunks directly from WASM `"FBR\x01"` cursor
-   * batches in bounded `O(batchSize)` memory (`M21 Item 2`).
-   */
   queryColumnarStream(
     sql: string | SqlFragment,
     paramsOrOptions?: QueryParams | ColumnarStreamOptions,
     maybeOptions?: ColumnarStreamOptions,
   ): AsyncIterableIterator<ColumnarQueryResult> {
-    const { params, options } = resolveColumnarStreamArgs(paramsOrOptions, maybeOptions);
-    const statement = toStatement(sql, params ?? []);
-    const batchSize = Math.max(1, Math.floor(options?.batchSize ?? 1024));
-
-    if (
-      typeof this.engine.cursorOpen === 'function' &&
-      typeof this.engine.cursorFetchBinary === 'function' &&
-      typeof this.engine.cursorClose === 'function' &&
-      !this.udr.hasBridgeRoutines
-    ) {
-      return streamBinaryColumnarCursor({
-        ensureReady: () => this.ensureReady(),
-        openCursor: () =>
-          this.engine.cursorOpen!(
-            this.dbHandle,
-            0,
-            statement.sql,
-            this.serialize(statement.params),
-          ),
-        fetchBatch: async (h, sz) =>
-          decodePayloadColumnar(
-            await this.engine.cursorFetchBinary!(h, sz, true),
-            this.columnarShapeCache,
-          ),
-        closeCursor: (h) => this.engine.cursorClose!(h),
-        batchSize,
-        signal: options?.signal,
-      });
-    }
-
-    return createColumnarStreamFromRowStream(
-      (s, p, o) => this.queryStream<Row>(s, p ?? [], o),
+    return executeBrowserQueryColumnarStream(
+      this.streamsHost,
       sql,
       paramsOrOptions,
       maybeOptions,
     );
   }
 
-  /**
-   * Stream an **Apache Arrow IPC V5** byte stream (`Schema` + chunked `RecordBatch`es + `EOS`)
-   * in bounded `O(batchSize)` memory (`M21 Item 2`).
-   */
   queryArrowStream(
     sql: string | SqlFragment,
     paramsOrOptions?: QueryParams | ArrowStreamOptions,
@@ -1415,133 +1010,55 @@ export class FirebirdBrowser implements FirebirdDatabase {
     );
   }
 
-  private async queryPreparedHandle<T = Row>(
-    stmtHandle: EngineHandle,
-    params: QueryParams,
-    options: QueryOptions<T> = {},
-    sqlText = '<prepared>',
-  ): Promise<QueryResult<T>> {
-    assertNotAborted(options.signal);
-    validateTimeoutMs(options.timeoutMs);
-    await this.ensureReady();
-
-    const rowMode = options.rowMode ?? 'object';
-    const binaryBlobs = this.options.types?.binary === true;
-    const serialized = this.serialize(params);
-    const startedAt = this.profiler.begin();
-    const ioBefore = await this.captureIoIfListening();
-
-    if (!hasTransactionOptions(options)) {
-      try {
-        const raw = await runWithCancellation(
-          async () => {
-            await this.applyOneShotTimeout(options.timeoutMs);
-            return this.engine.queryStmt!<T>(
-              this.dbHandle,
-              0,
-              stmtHandle,
-              serialized,
-              rowMode,
-              binaryBlobs,
-            );
-          },
-          options,
-          () => this.cancelOperation(),
-        );
-        const typed = await finalizeQueryResultWithSchema(
-          applyTypes(raw, this.options.types, rowMode),
-          options.schema,
-          rowMode,
-        );
-        const ioAfter = await this.captureIoIfListening();
-        this.profiler.end({
-          startedAt,
-          sql: sqlText,
-          params,
-          kind: 'prepared',
-          rowCount: typed.rows.length,
-          cacheHit: true,
-          ioBefore,
-          ioAfter,
-        });
-        return typed;
-      } catch (err) {
-        this.profiler.end({
-          startedAt,
-          sql: sqlText,
-          params,
-          kind: 'prepared',
-          cacheHit: true,
-          error: err,
-        });
-        throw err;
-      }
-    }
-
-    const txHandle = await this.engine.startTransaction(this.dbHandle, options);
-    try {
-      const result = await runWithCancellation(
-        async () => {
-          await this.applyOneShotTimeout(options.timeoutMs);
-          return this.engine.queryStmt!<T>(
-            this.dbHandle,
-            txHandle,
-            stmtHandle,
-            serialized,
-            rowMode,
-            binaryBlobs,
-          );
-        },
-        options,
-        () => this.cancelOperation(),
-      );
-      await this.engine.commit(txHandle);
-      const typed = await finalizeQueryResultWithSchema(
-        applyTypes(result, this.options.types, rowMode),
-        options.schema,
-        rowMode,
-      );
-      const ioAfter = await this.captureIoIfListening();
-      this.profiler.end({
-        startedAt,
-        sql: sqlText,
-        params,
-        kind: 'prepared',
-        rowCount: typed.rows.length,
-        cacheHit: true,
-        ioBefore,
-        ioAfter,
-      });
-      return typed;
-    } catch (err) {
-      await this.engine.rollback(txHandle).catch(() => undefined);
-      this.profiler.end({
-        startedAt,
-        sql: sqlText,
-        params,
-        kind: 'prepared',
-        cacheHit: true,
-        error: err,
-      });
-      throw err;
-    }
+  private get streamsHost(): BrowserStreamsHost {
+    return {
+      ensureReady: () => this.ensureReady(),
+      isClosed: () => this.closed,
+      engine: this.engine,
+      getDbHandle: () => this.dbHandle,
+      types: this.options.types,
+      profiler: this.profiler,
+      liveBridge: this.liveBridge,
+      liveQueries: this.liveQueries,
+      liveTriggerPromises: this.liveTriggerPromises,
+      preparedStatements: this.preparedStatements,
+      columnarShapeCache: this.columnarShapeCache,
+      hasBridgeRoutines: () => this.udr.hasBridgeRoutines,
+      serialize: (p) => this.serialize(p),
+      applyOneShotTimeout: (t) => this.applyOneShotTimeout(t),
+      cancelOperation: () => this.cancelOperation(),
+      captureIoIfListening: () => this.captureIoIfListening(),
+      markDirty: () => this.markDirty(),
+      query: (s, p, o) => this.query(s, p, o),
+      queryColumnar: (s, p) => this.queryColumnar(s, p),
+      queryStream: (s, p, o) => this.queryStream(s, p, o),
+      execBatch: (s, r) => this.execBatch(s, r),
+    };
   }
 
-  /**
-   * Stream a SQL query's result set in batches of `batchSize` rows (default 500).
-   *
-   * Yields one `QueryResult<T>` batch per cursor fetch instead of materialising
-   * the entire result set into memory at once.  Breaking out of the `for await`
-   * loop early closes the cursor and finishes the transaction immediately.
-   *
-   * ```ts
-   * for await (const batch of db.queryStream('SELECT * FROM items', [], { batchSize: 100 })) {
-   *   for (const row of batch.rows) {
-   *     // process row
-   *   }
-   * }
-   * ```
-   */
+  private get storageHost(): BrowserStorageHost {
+    return {
+      ensureReady: () => this.ensureReady(),
+      isClosed: () => this.closed,
+      engine: this.engine,
+      getDbPath: () => this.dbPath,
+      sharedReads: this.options.sharedReads,
+      snapshotStore: this.snapshotStore,
+      preparedStatements: this.preparedStatements,
+      liveTriggerPromises: this.liveTriggerPromises,
+      liveQueries: this.liveQueries,
+      getDbHandle: () => this.dbHandle,
+      setDbHandle: (h) => {
+        this.dbHandle = h;
+      },
+      cancelScheduledPersist: () => this.cancelScheduledPersist(),
+      markDirty: () => this.markDirty(),
+      serialize: (p) => this.serialize(p),
+      describeQuery: (s) => this.describeQuery(s),
+      queryArray: (s, p) => this.query(s, p, { rowMode: 'array' }),
+    };
+  }
+
   queryStream(
     sql: SqlFragment,
     options: ArrayStreamOptions,
@@ -1577,279 +1094,18 @@ export class FirebirdBrowser implements FirebirdDatabase {
     );
     validateTimeoutMs(options.timeoutMs);
     const batchSize = resolveBatchSize(options.batchSize);
-    return this.streamQuery<T>(statement, options, batchSize);
+    return streamBrowserQuery<T>(this.streamsHost, statement, options, batchSize);
   }
 
-  private async *streamQuery<T>(
-    statement: Statement,
-    options: QueryStreamOptions,
-    batchSize: number,
-    stmtHandle: EngineHandle = 0,
-  ): AsyncIterableIterator<QueryResult<T>> {
-    assertNotAborted(options.signal);
-    const totalTimeoutMs = validateTimeoutMs(options.timeoutMs);
-    const deadline =
-      totalTimeoutMs && totalTimeoutMs > 0
-        ? Date.now() + totalTimeoutMs
-        : undefined;
-    const stepOptions = (): StatementExecutionOptions => ({
-      signal: options.signal,
-      timeoutMs:
-        deadline !== undefined ? Math.max(1, deadline - Date.now()) : undefined,
-    });
-
-    await this.ensureReady();
-
-    const rowMode = options.rowMode ?? 'object';
-    const binaryBlobs = this.options.types?.binary === true;
-    const serializedParams = this.serialize(statement.params);
-    const useStmtCursor =
-      stmtHandle > 0 && typeof this.engine.cursorOpenStmt === 'function';
-
-    if (
-      (!useStmtCursor && typeof this.engine.cursorOpen !== 'function') ||
-      typeof this.engine.cursorFetch !== 'function' ||
-      typeof this.engine.cursorClose !== 'function'
-    ) {
-      const full = (
-        stmtHandle > 0 && typeof this.engine.queryStmt === 'function'
-          ? await this.queryPreparedHandle<T>(
-              stmtHandle,
-              statement.params,
-              options as QueryOptions<T>,
-            )
-          : await this.query(
-              statement.sql,
-              statement.params,
-              options as QueryOptions<Row>,
-            )
-      ) as QueryResult<T>;
-      for (let i = 0; i < full.rows.length; i += batchSize) {
-        assertNotAborted(options.signal);
-        if (deadline !== undefined && Date.now() >= deadline) {
-          throw createTimeoutError(totalTimeoutMs!);
-        }
-        yield {
-          rows: full.rows.slice(i, i + batchSize),
-          fields: full.fields.map((f) => ({ ...f })),
-        };
-      }
-      return;
-    }
-
-    let txHandle: EngineHandle = 0;
-    let ownsTxHandle = false;
-    let cursorHandle: EngineHandle = 0;
-    let engineFailed = false;
-
-    try {
-      if (hasTransactionOptions(options)) {
-        txHandle = await this.engine.startTransaction(this.dbHandle, options);
-        ownsTxHandle = true;
-      }
-
-      try {
-        cursorHandle = await runWithCancellation(
-          async () => {
-            await this.applyOneShotTimeout(totalTimeoutMs);
-            return useStmtCursor
-              ? this.engine.cursorOpenStmt!(
-                  this.dbHandle,
-                  txHandle,
-                  stmtHandle,
-                  serializedParams,
-                )
-              : this.engine.cursorOpen!(
-                  this.dbHandle,
-                  txHandle,
-                  statement.sql,
-                  serializedParams,
-                );
-          },
-          stepOptions(),
-          () => this.cancelOperation(),
-        );
-      } catch (err) {
-        engineFailed = true;
-        throw err;
-      }
-
-      while (true) {
-        assertNotAborted(options.signal);
-        if (deadline !== undefined && Date.now() >= deadline) {
-          engineFailed = true;
-          throw createTimeoutError(totalTimeoutMs!);
-        }
-        let batch: QueryResult<T>;
-        try {
-          batch = await runWithCancellation(
-            () =>
-              this.engine.cursorFetch!<T>(
-                cursorHandle,
-                batchSize,
-                rowMode,
-                binaryBlobs,
-              ),
-            stepOptions(),
-            () => this.cancelOperation(),
-          );
-        } catch (err) {
-          engineFailed = true;
-          throw err;
-        }
-
-        if (batch.rows.length === 0) {
-          break;
-        }
-
-        yield applyTypes(batch, this.options.types, rowMode);
-      }
-
-      const toClose = cursorHandle;
-      cursorHandle = 0;
-      await this.engine.cursorClose(toClose);
-
-      if (ownsTxHandle && txHandle !== 0) {
-        const toCommit = txHandle;
-        txHandle = 0;
-        ownsTxHandle = false;
-        await this.engine.commit(toCommit);
-      }
-    } finally {
-      if (cursorHandle !== 0) {
-        await this.engine.cursorClose(cursorHandle).catch(() => undefined);
-      }
-      if (ownsTxHandle && txHandle !== 0) {
-        if (engineFailed) {
-          await this.engine.rollback(txHandle).catch(() => undefined);
-        } else {
-          await this.engine
-            .commit(txHandle)
-            .catch(() => this.engine.rollback(txHandle).catch(() => undefined));
-        }
-      }
-    }
-  }
-
-  /**
-   * Re-run a query whenever named events fire.
-   *
-   * ```ts
-   * // A trigger does the posting:
-   * //   CREATE TRIGGER items_ai FOR items AFTER INSERT
-   * //   AS BEGIN POST_EVENT 'items_changed'; END
-   *
-   * const live = await db.live(
-   *   'SELECT id, name FROM items ORDER BY id',
-   *   { events: ['items_changed'] },
-   *   (rows) => render(rows),
-   * );
-   * // …later
-   * await live.unsubscribe();
-   * ```
-   *
-   * `onChange` is called once immediately with the current rows, so it is the
-   * only place results need handling — there is no separate "initial value" to
-   * deal with differently.
-   *
-   * Firebird delivers events **after the posting transaction commits**, so a
-   * refresh only ever sees data that survived. That is worth more than
-   * immediacy: a live query that showed uncommitted rows would show rows that
-   * can vanish.
-   *
-   * The event names are the caller's to supply. Nothing in Firebird connects a
-   * posted event to the tables a statement reads, so inferring them would be
-   * guesswork dressed as convenience.
-   */
   async listen(
     names: string | string[],
     onEvent: (counts: Record<string, number>) => void,
     options: ListenOptions = {},
   ): Promise<EventSubscription> {
-    await this.ensureReady();
-
-    const watched = typeof names === 'string' ? [names] : names;
-    if (watched.length === 0) {
-      throw new RangeError('listen() needs at least one event name');
-    }
-
-    const pollIntervalMs = options.pollIntervalMs ?? 250;
-    const onError =
-      options.onError ??
-      ((error: Error) => console.error('[firebird-wasm] event listener failed', error));
-
-    const handle = await this.engine.eventsSubscribe(this.dbHandle, watched);
-
-    let stopped = false;
-    let timer: ReturnType<typeof setInterval> | null = null;
-    // One tick at a time: a handler slower than the interval would otherwise
-    // pile up, and a later poll could re-arm before an earlier handler had
-    // finished with what it delivered.
-    let running = false;
-
-    const tick = async (): Promise<void> => {
-      if (stopped || running) return;
-      running = true;
-      try {
-        const counts = await this.engine.eventsPoll(handle);
-        // Polling re-arms whether or not anything fired, so the empty case
-        // still has to reach the engine — it is not a wasted call.
-        const fired = Object.fromEntries(
-          Object.entries(counts).filter(([, count]) => count > 0),
-        );
-        if (Object.keys(fired).length > 0 && !stopped) {
-          this.liveBridge.broadcastEvents(fired);
-          onEvent(fired);
-        }
-      } catch (err) {
-        if (!stopped) onError(err instanceof Error ? err : new Error(String(err)));
-      } finally {
-        running = false;
-      }
-    };
-
-    const subscription: EventSubscription = {
-      unsubscribe: async () => {
-        if (stopped) return;
-        stopped = true;
-        unsubCrossTab();
-        if (timer !== null) clearInterval(timer);
-        this.liveQueries.delete(subscription);
-        // Best effort: the engine may already be gone if the database was
-        // closed first, and a subscription on a closed database is not
-        // something a caller can act on.
-        await this.engine.eventsCancel(handle).catch(() => undefined);
-      },
-    };
-
-    const unsubCrossTab = this.liveBridge.subscribe(watched, (fired) => {
-      if (!stopped) onEvent(fired);
-    });
-    timer = setInterval(() => void tick(), pollIntervalMs);
-    this.liveQueries.add(subscription);
-
-    return subscription;
+    return listenBrowserEvents(this.streamsHost, names, onEvent, options);
   }
 
-  /**
-   * Post an event, without writing a trigger to do it.
-   *
-   * ```ts
-   * await db.notify('items_changed');
-   * ```
-   *
-   * The event is delivered **after the transaction posting it commits**, which
-   * here is the statement's own auto-commit — so listeners hear about it only
-   * once it has actually happened.
-   *
-   * A trigger remains the better place for anything tied to data changing:
-   * `POST_EVENT` in an `AFTER INSERT` fires however the row arrived, including
-   * from another connection, while this fires only where it is called.
-   */
   async notify(name: string): Promise<void> {
-    // The name is bound, not interpolated: EXECUTE BLOCK's body is SQL text
-    // like any other, and a name reaching it unchecked would be an injection
-    // with a trigger's privileges.
     await this.query(
       'EXECUTE BLOCK (event_name VARCHAR(31) = ?) AS BEGIN POST_EVENT :event_name; END',
       [name],
@@ -1871,118 +1127,9 @@ export class FirebirdBrowser implements FirebirdDatabase {
     optionsOrOnChange: LiveQueryOptions | ((rows: T[], result: QueryResult<T>) => void),
     maybeOnChange?: (rows: T[], result: QueryResult<T>) => void,
   ): Promise<LiveQuery<T>> {
-    await this.ensureReady();
-
-    const options: LiveQueryOptions =
-      typeof optionsOrOnChange === 'function' ? {} : optionsOrOnChange;
-    const onChange =
-      typeof optionsOrOnChange === 'function' ? optionsOrOnChange : maybeOnChange!;
-
-    if (options.events !== undefined && options.events.length === 0) {
-      throw new RangeError(
-        'live() needs at least one event name to watch; without one it would ' +
-          'never refresh, which a plain query() already does better',
-      );
-    }
-
-    const statement = toStatement(sql, options.params ?? []);
-    const watchedEvents =
-      options.events !== undefined
-        ? [...options.events]
-        : await this.ensureLiveTableEvents(statement.sql);
-
-    const onError =
-      options.onError ??
-      ((error: Error) => console.error('[firebird-wasm] live query failed', error));
-
-    let rows: T[] = [];
-    let stopped = false;
-    // One refresh at a time: a statement slower than the interval would
-    // otherwise pile up, and the last to finish would win rather than the
-    // latest to start.  But an event that arrives *during* a refresh is not
-    // covered by it — that refresh may have read before the change committed —
-    // so it is remembered in `again` and earns exactly one more run.  Dropping
-    // it, as this once did, left the rows stale until some later event.
-    let refreshing = false;
-    let again = false;
-
-    const run = async (): Promise<void> => {
-      const result = await this.query<T>(statement.sql, statement.params);
-      rows = result.rows;
-      onChange(rows, result);
-    };
-
-    const drain = async (): Promise<void> => {
-      refreshing = true;
-      try {
-        while (again && !stopped) {
-          again = false;
-          try {
-            await run();
-          } catch (err) {
-            if (!stopped) onError(err instanceof Error ? err : new Error(String(err)));
-          }
-        }
-      } finally {
-        refreshing = false;
-      }
-    };
-
-    const requestRefresh = (): void => {
-      if (stopped) return;
-      again = true;
-      if (!refreshing) void drain();
-    };
-
-    // Subscribed before the first query, not after: a change committed between
-    // the two would otherwise be in neither — too late for the query, too early
-    // for the subscription.  This way it can only be in both, which costs one
-    // redundant refresh.
-    //
-    // Built on listen() rather than beside it: the subscription, the polling
-    // and the teardown are the same problem, and a second copy would be a
-    // second thing to keep correct.
-    const subscription = await this.listen(watchedEvents, requestRefresh, {
-      pollIntervalMs: options.pollIntervalMs,
-      onError,
-    });
-
-    // The first results before returning, so a caller that awaits live() has
-    // rendered once by the time it continues.  Marked as a refresh in progress
-    // so an event heard meanwhile queues behind it instead of racing it.
-    refreshing = true;
-    try {
-      await run();
-    } catch (err) {
-      stopped = true;
-      await subscription.unsubscribe();
-      throw err;
-    } finally {
-      refreshing = false;
-    }
-    if (again) void drain();
-
-    const live: LiveQuery<T> = {
-      get rows() {
-        return rows;
-      },
-      refresh: async () => {
-        if (!stopped) await run();
-      },
-      unsubscribe: async () => {
-        if (stopped) return;
-        stopped = true;
-        await subscription.unsubscribe();
-      },
-    };
-
-    return live;
+    return runBrowserLiveQuery<T>(this.streamsHost, sql, optionsOrOnChange, maybeOnChange);
   }
 
-  /**
-   * Subscribe to incremental `{ rows, deltas }` (`insert` / `update` / `delete`)
-   * updates with structural sharing for unchanged rows (`M20 Item 3`).
-   */
   async liveIncremental<T extends Row = Row>(
     sql: string | SqlFragment,
     optionsOrListener?:
@@ -1990,35 +1137,9 @@ export class FirebirdBrowser implements FirebirdDatabase {
       | ((snapshot: IncrementalLiveSnapshot<T>) => void),
     maybeListener?: (snapshot: IncrementalLiveSnapshot<T>) => void,
   ): Promise<LiveIncrementalQuery<T>> {
-    await this.ensureReady();
-    const opts: LiveIncrementalOptions<T> =
-      typeof optionsOrListener === 'function' ? {} : (optionsOrListener ?? {});
-    const listener =
-      typeof optionsOrListener === 'function' ? optionsOrListener : maybeListener;
-
-    return createLiveIncrementalQuery<T>(
-      {
-        query: (qSql, qParams, qOpts) => this.query<T>(qSql, qParams, qOpts),
-        queryColumnar: (qSql, qParams) => this.queryColumnar(qSql, qParams),
-        watchSqlEvents: async (sqlText, explicitEvents, onWakeup, watchOpts) => {
-          const watched =
-            explicitEvents !== undefined
-              ? [...explicitEvents]
-              : await this.ensureLiveTableEvents(sqlText);
-          const sub = await this.listen(watched, onWakeup, watchOpts);
-          return () => sub.unsubscribe();
-        },
-      },
-      sql,
-      opts,
-      listener,
-    );
+    return runBrowserLiveIncremental<T>(this.streamsHost, sql, optionsOrListener, maybeListener);
   }
 
-  /**
-   * Subscribe to reactive `ColumnarQueryResult` typed vectors without allocating
-   * per-row JS objects (`M20 Item 3`).
-   */
   async liveColumnar(
     sql: string | SqlFragment,
     optionsOrListener?:
@@ -2026,63 +1147,7 @@ export class FirebirdBrowser implements FirebirdDatabase {
       | ((result: ColumnarQueryResult, version: number) => void),
     maybeListener?: (result: ColumnarQueryResult, version: number) => void,
   ): Promise<LiveColumnarQuery> {
-    await this.ensureReady();
-    const opts: LiveColumnarOptions =
-      typeof optionsOrListener === 'function' ? {} : (optionsOrListener ?? {});
-    const listener =
-      typeof optionsOrListener === 'function' ? optionsOrListener : maybeListener;
-
-    return createLiveColumnarQuery(
-      {
-        queryColumnar: (qSql, qParams) => this.queryColumnar(qSql, qParams),
-        watchSqlEvents: async (sqlText, explicitEvents, onWakeup, watchOpts) => {
-          const watched =
-            explicitEvents !== undefined
-              ? [...explicitEvents]
-              : await this.ensureLiveTableEvents(sqlText);
-          const sub = await this.listen(watched, onWakeup, watchOpts);
-          return () => sub.unsubscribe();
-        },
-      },
-      sql,
-      opts,
-      listener,
-    );
-  }
-
-  /**
-   * Ensure an idempotent `AFTER INSERT OR UPDATE OR DELETE` `POST_EVENT`
-   * trigger exists on each user table referenced by `sqlText`, returning the
-   * event names to subscribe to.
-   */
-  private async ensureLiveTableEvents(sqlText: string): Promise<string[]> {
-    const tables = extractReferencedTables(sqlText);
-    if (tables.length === 0) {
-      throw new RangeError(
-        'live() could not find any user tables in the statement to watch automatically; ' +
-          'pass { events: [...] } explicitly',
-      );
-    }
-    const events: string[] = [];
-    for (const table of tables) {
-      let pending = this.liveTriggerPromises.get(table);
-      if (!pending) {
-        const { eventName, ddl } = liveTableTriggerDDL(table);
-        pending = this.engine
-          .execute(this.dbHandle, 0, ddl, [])
-          .then(() => {
-            this.markDirty();
-            return eventName;
-          })
-          .catch((err) => {
-            this.liveTriggerPromises.delete(table);
-            throw err;
-          });
-        this.liveTriggerPromises.set(table, pending);
-      }
-      events.push(await pending);
-    }
-    return events;
+    return runBrowserLiveColumnar(this.streamsHost, sql, optionsOrListener, maybeListener);
   }
 
   /**
@@ -2396,177 +1461,7 @@ export class FirebirdBrowser implements FirebirdDatabase {
    * ```
    */
   async prepare(sql: string | SqlFragment): Promise<PreparedStatement> {
-    await this.ensureReady();
-    const sqlText = toStatement(sql).sql;
-    const desc: QueryDescription & { handle?: EngineHandle } =
-      typeof this.engine.prepare === 'function'
-        ? await this.engine.prepare(this.dbHandle, 0, sqlText)
-        : await this.engine.describe(this.dbHandle, 0, sqlText);
-
-    const params = desc.params.map((p) => ({ ...p }));
-    const fields = desc.fields.map((f) => ({ ...f }));
-    const stmtHandle = desc.handle ?? 0;
-    let isClosed = false;
-    let currentTimeoutMs = 0;
-
-    const assertOpen = (): void => {
-      if (isClosed || this.closed) {
-        throw new Error('PreparedStatement has been closed');
-      }
-    };
-
-    const checkParamCount = (actual: number): void => {
-      assertPreparedParamCount(params.length, actual);
-    };
-
-    const isDbClosed = () => this.closed;
-
-    const stmt: PreparedStatement = {
-      sql: sqlText,
-      get params() {
-        return params.map((p) => ({ ...p }));
-      },
-      get fields() {
-        return fields.map((f) => ({ ...f }));
-      },
-      statementType: desc.statementType,
-      hasResultSet: desc.hasResultSet,
-      get closed() {
-        return isClosed || isDbClosed();
-      },
-      get timeoutMs() {
-        return currentTimeoutMs;
-      },
-      setTimeout: async (timeoutMs: number) => {
-        assertOpen();
-        const validated = validateTimeoutMs(timeoutMs) ?? 0;
-        currentTimeoutMs = validated;
-        if (stmtHandle > 0 && typeof this.engine.stmtSetTimeout === 'function') {
-          await this.engine.stmtSetTimeout(stmtHandle, validated);
-        }
-      },
-      query: (async <T = Row>(
-        paramsOrOptions: QueryParams | QueryOptions<T> = [],
-        maybeOptions: QueryOptions<T> = {},
-      ) => {
-        assertOpen();
-        const { callParams, callOptions } = resolvePreparedCallArgs<QueryOptions<T>>(
-          paramsOrOptions,
-          maybeOptions,
-          currentTimeoutMs,
-        );
-        checkParamCount(callParams.length);
-        if (stmtHandle > 0 && typeof this.engine.queryStmt === 'function') {
-          return this.queryPreparedHandle<T>(stmtHandle, callParams, callOptions, sqlText);
-        }
-        return this.query<T & Row>(sqlText, callParams, callOptions as QueryOptions<T & Row>);
-      }) as PreparedStatement['query'],
-      queryStream: ((
-        paramsOrOptions: QueryParams | QueryStreamOptions = [],
-        maybeOptions: QueryStreamOptions = {},
-      ) => {
-        assertOpen();
-        const { callParams, callOptions } = resolvePreparedCallArgs<QueryStreamOptions>(
-          paramsOrOptions,
-          maybeOptions,
-          currentTimeoutMs,
-        );
-        checkParamCount(callParams.length);
-        validateTimeoutMs(callOptions.timeoutMs);
-        const batchSize = resolveBatchSize(callOptions.batchSize);
-        const openStream = () =>
-          stmtHandle > 0
-            ? this.streamQuery(
-                { sql: sqlText, params: callParams },
-                callOptions,
-                batchSize,
-                stmtHandle,
-              )
-            : this.queryStream(sqlText, callParams, callOptions);
-        return (async function* () {
-          assertOpen();
-          yield* openStream();
-        })();
-      }) as PreparedStatement['queryStream'],
-      exec: async (
-        callParams: QueryParams = [],
-        execOptions: StatementExecutionOptions = {},
-      ) => {
-        assertOpen();
-        checkParamCount(callParams.length);
-        const effectiveOptions: StatementExecutionOptions =
-          execOptions.timeoutMs === undefined && currentTimeoutMs > 0
-            ? { ...execOptions, timeoutMs: currentTimeoutMs }
-            : execOptions;
-        assertNotAborted(effectiveOptions.signal);
-        validateTimeoutMs(effectiveOptions.timeoutMs);
-        await this.ensureReady();
-        const serialized = this.serialize(callParams);
-        const affectedRows = await runWithCancellation(
-          async () => {
-            await this.applyOneShotTimeout(effectiveOptions.timeoutMs);
-            return stmtHandle > 0 && typeof this.engine.executeStmt === 'function'
-              ? this.engine.executeStmt(
-                  this.dbHandle,
-                  0,
-                  stmtHandle,
-                  serialized,
-                )
-              : this.engine.execute(
-                  this.dbHandle,
-                  0,
-                  sqlText,
-                  serialized,
-                );
-          },
-          effectiveOptions,
-          () => this.cancelOperation(),
-        );
-        this.markDirty();
-        this.liveBridge.broadcastTables(extractMutatedTables(sqlText));
-        return { affectedRows };
-      },
-      execBatch: async (rows: QueryParams[]) => {
-        assertOpen();
-        assertBatchParameterRows(rows, params.length);
-        if (
-          stmtHandle > 0 &&
-          typeof this.engine.executeBatchStmt === 'function'
-        ) {
-          await this.ensureReady();
-          const affectedRows = await this.engine.executeBatchStmt(
-            this.dbHandle,
-            0,
-            stmtHandle,
-            rows.map((row) => this.serialize(row)),
-          );
-          if (rows.length > 0) {
-            this.markDirty();
-            this.liveBridge.broadcastTables(extractMutatedTables(sqlText));
-          }
-          return { affectedRows };
-        }
-        return this.execBatch(sqlText, rows);
-      },
-      close: async () => {
-        if (isClosed) return;
-        isClosed = true;
-        this.preparedStatements.delete(stmt);
-        if (
-          stmtHandle > 0 &&
-          !this.closed &&
-          typeof this.engine.stmtClose === 'function'
-        ) {
-          await this.engine.stmtClose(stmtHandle).catch(() => undefined);
-        }
-      },
-      [Symbol.asyncDispose]: async () => {
-        await stmt.close();
-      },
-    };
-
-    this.preparedStatements.add(stmt);
-    return stmt;
+    return createBrowserPreparedStatement(this.streamsHost, sql);
   }
 
   async transaction<T>(
@@ -2614,102 +1509,12 @@ export class FirebirdBrowser implements FirebirdDatabase {
     return result;
   }
 
-  /**
-   * Persist the in-memory database pages to IndexedDB.
-   * Call this periodically or before the page unloads to avoid data loss.
-   */
-  /**
-   * The database as bytes, ready to be stored, sent, or handed to
-   * {@link FirebirdBrowserOptions.loadDataDir}.
-   *
-   * ```ts
-   * const bytes = await db.dumpDataDir();
-   * const url = URL.createObjectURL(new Blob([bytes]));
-   * ```
-   *
-   * Read from the **live** database rather than from IndexedDB, which matters
-   * twice over: writes that have not been persisted yet are included, and an
-   * ephemeral `memory://` database has no stored copy to read at all. It is
-   * the same image `persist()` writes, taken the same way.
-   *
-   * A `Uint8Array` rather than a `Blob` — a `Blob` is one constructor away and
-   * exists only in a browser, while this class also runs in Node against a
-   * direct transport.
-   */
-  /**
-   * Create a segmented writable BLOB stream (`WritableStream<Uint8Array>`)
-   * backed by Firebird `IBlob::putSegment`.
-   *
-   * Once closed (via `pipeTo()`, `writer.close()`, or `finish()`), the stream
-   * or its `.handle` can be bound directly as a parameter in `exec()` or
-   * `query()`.
-   */
   async createBlobStream(
     options: BlobStreamOptions = {},
   ): Promise<BlobWritableStream> {
-    await this.ensureReady();
-    resolveBlobSegmentSize(options.segmentSize, true);
-
-    if (
-      typeof this.engine.blobCreate === 'function' &&
-      typeof this.engine.blobPutSegment === 'function' &&
-      typeof this.engine.blobClose === 'function'
-    ) {
-      const { blobHandle, blobId } = await this.engine.blobCreate(
-        this.dbHandle,
-        0,
-      );
-      return buildBlobWritableStream(
-        {
-          writeSegment: async (segment) => {
-            await this.engine.blobPutSegment!(blobHandle, segment);
-          },
-          close: async (totalBytes) => {
-            const finalId = await this.engine.blobClose!(blobHandle, false);
-            return createBlobHandle(
-              finalId.byteLength === 8 ? finalId : blobId,
-              totalBytes,
-            );
-          },
-          abort: async () => {
-            await this.engine
-              .blobClose!(blobHandle, true)
-              .catch(() => undefined);
-          },
-        },
-        options,
-      );
-    }
-
-    const chunks: Uint8Array[] = [];
-    return buildBlobWritableStream(
-      {
-        writeSegment: async (segment) => {
-          chunks.push(segment.slice());
-        },
-        close: async (totalBytes) => {
-          const stagedBytes = new Uint8Array(totalBytes);
-          let pos = 0;
-          for (const c of chunks) {
-            stagedBytes.set(c, pos);
-            pos += c.byteLength;
-          }
-          return createBlobHandle(new Uint8Array(8), totalBytes, {
-            stagedBytes,
-          });
-        },
-        abort: async () => {
-          chunks.length = 0;
-        },
-      },
-      options,
-    );
+    return createBrowserBlobStream(this.storageHost, options);
   }
 
-  /**
-   * Open a Firebird `BLOB` column (from a `SELECT` query or a {@link BlobHandle})
-   * as a segmented Web `ReadableStream<Uint8Array>` backed by `IBlob::getSegment`.
-   */
   async openBlobStream(
     handle: BlobHandle,
     options?: BlobStreamOptions,
@@ -2728,272 +1533,45 @@ export class FirebirdBrowser implements FirebirdDatabase {
     paramsOrOptions: QueryParams | BlobStreamOptions = [],
     maybeOptions: BlobStreamOptions = {},
   ): Promise<ReadableStream<Uint8Array>> {
-    await this.ensureReady();
-
-    if (isBlobHandle(sqlOrHandle)) {
-      const opts = Array.isArray(paramsOrOptions) ? maybeOptions : paramsOrOptions;
-      resolveBlobSegmentSize(opts.segmentSize, false);
-    const stagingId = (sqlOrHandle as InternalBlobHandle)[BLOB_INTERNAL_DATA]?.stagedBytes;
-      const staged = stagingId;
-      if (staged || typeof this.engine.blobOpenId !== 'function') {
-        const bytes = staged ?? new Uint8Array(0);
-        let offset = 0;
-        return buildBlobReadableStream(
-          {
-            readSegment: async (maxBytes) => {
-              if (offset >= bytes.byteLength) return null;
-              const end = Math.min(offset + maxBytes, bytes.byteLength);
-              const slice = bytes.slice(offset, end);
-              offset = end;
-              return slice;
-            },
-            close: async () => undefined,
-          },
-          opts,
-        );
-      }
-
-      const blobHandle = await this.engine.blobOpenId(
-        this.dbHandle,
-        0,
-        sqlOrHandle.blobId,
-      );
-      return buildBlobReadableStream(
-        {
-          readSegment: (maxBytes) =>
-            this.engine.blobGetSegment!(blobHandle, maxBytes),
-          close: async () => {
-            await this.engine.blobClose!(blobHandle, false);
-          },
-        },
-        opts,
-      );
-    }
-
-    const { statement, options } = resolveQueryCall<BlobStreamOptions>(
-      sqlOrHandle,
-      paramsOrOptions,
-      maybeOptions,
-    );
-    resolveBlobSegmentSize(options.segmentSize, false);
-
-    let colIndex = 0;
-    if (options.column !== undefined) {
-      const desc = await this.describeQuery(statement.sql);
-      colIndex = resolveBlobColumnIndex(
-        options.column,
-        desc.fields.map((f) => f.name),
-      );
-    }
-
-    if (
-      typeof this.engine.blobOpenQuery === 'function' &&
-      typeof this.engine.blobGetSegment === 'function' &&
-      typeof this.engine.blobClose === 'function'
-    ) {
-      const blobHandle = await this.engine.blobOpenQuery(
-        this.dbHandle,
-        0,
-        statement.sql,
-        this.serialize(statement.params),
-        colIndex,
-      );
-      return buildBlobReadableStream(
-        {
-          readSegment: (maxBytes) =>
-            this.engine.blobGetSegment!(blobHandle, maxBytes),
-          close: async () => {
-            await this.engine.blobClose!(blobHandle, false);
-          },
-        },
-        options,
-      );
-    }
-
-    const res = await this.query(statement.sql, statement.params, {
-      rowMode: 'array',
-    });
-    if (res.rows.length === 0) {
-      throw new Error('openBlobStream: query returned no rows');
-    }
-    const cell = res.rows[0]![colIndex];
-    if (cell === null || cell === undefined) {
-      throw new Error('openBlobStream: BLOB column value is NULL');
-    }
-    const bytes =
-      cell instanceof Uint8Array
-        ? cell
-        : typeof cell === 'string'
-          ? new TextEncoder().encode(cell)
-          : new Uint8Array(0);
-    let offset = 0;
-    return buildBlobReadableStream(
-      {
-        readSegment: async (maxBytes) => {
-          if (offset >= bytes.byteLength) return null;
-          const end = Math.min(offset + maxBytes, bytes.byteLength);
-          const slice = bytes.slice(offset, end);
-          offset = end;
-          return slice;
-        },
-        close: async () => undefined,
-      },
-      options,
-    );
+    return openBrowserBlobStream(this.storageHost, sqlOrHandle, paramsOrOptions, maybeOptions);
   }
 
-  /**
-   * Capture a lightweight copy-on-write point-in-time page snapshot of the
-   * database.
-   *
-   * Flushes all dirty pages by detaching and re-attaching the database handle,
-   * then stores an 8 KB page-deduplicated {@link DatabaseSnapshot} sharing
-   * unchanged pages with earlier snapshots.
-   */
   async snapshot(
     labelOrOptions?: string | SnapshotOptions,
   ): Promise<DatabaseSnapshot> {
-    if (this.closed) {
-      throw new Error('FirebirdBrowser instance has been closed');
-    }
-    await this.ensureReady();
-    if (this.dbHandle) {
-      await this.engine.detachDatabase(this.dbHandle);
-      this.dbHandle = 0;
-    }
-    try {
-      const image = await this.engine.readFile(this.dbPath);
-      return this.snapshotStore.createSnapshot(image, labelOrOptions);
-    } finally {
-      this.dbHandle = await this.engine.attachDatabase(this.dbPath);
-      if (this.options.sharedReads) {
-        await this.engine.setSharedReads!(this.dbHandle, true);
-      }
-    }
+    return captureBrowserSnapshot(this.storageHost, labelOrOptions);
   }
 
-  /**
-   * Restore the database instantaneously to a previously captured
-   * {@link DatabaseSnapshot} (by snapshot object, `id`, `label`, or raw `.fdb`
-   * bytes), rolling back any schema or data changes made since the snapshot.
-   */
   async restoreSnapshot(
     snapshotOrId: DatabaseSnapshot | string | Uint8Array,
   ): Promise<void> {
-    if (this.closed) {
-      throw new Error('FirebirdBrowser instance has been closed');
-    }
-    await this.ensureReady();
-    const bytes =
-      snapshotOrId instanceof Uint8Array
-        ? snapshotOrId
-        : this.snapshotStore.getSnapshot(snapshotOrId).toUint8Array();
-
-    this.cancelScheduledPersist();
-    for (const stmt of [...this.preparedStatements]) {
-      await stmt.close().catch(() => undefined);
-    }
-    this.liveTriggerPromises.clear();
-
-    if (this.dbHandle) {
-      await this.engine.detachDatabase(this.dbHandle);
-      this.dbHandle = 0;
-    }
-
-    await this.engine.writeFile(this.dbPath, bytes);
-    this.dbHandle = await this.engine.attachDatabase(this.dbPath);
-    if (this.options.sharedReads) {
-      await this.engine.setSharedReads!(this.dbHandle, true);
-    }
-    this.markDirty();
-
-    for (const live of [...this.liveQueries]) {
-      const refreshable = live as { refresh?: () => Promise<void> };
-      if (typeof refreshable.refresh === 'function') {
-        await refreshable.refresh().catch(() => undefined);
-      }
-    }
+    return restoreBrowserSnapshot(this.storageHost, snapshotOrId);
   }
 
-  /** List metadata for all copy-on-write snapshots captured on this database. */
   listSnapshots(): DatabaseSnapshotInfo[] {
     return this.snapshotStore.listSnapshots();
   }
 
-  /** Delete a stored copy-on-write snapshot by `id`, `label`, or reference. */
   deleteSnapshot(snapshotOrId: DatabaseSnapshot | string): boolean {
     return this.snapshotStore.deleteSnapshot(snapshotOrId);
   }
 
-  private async readDetachedImage(): Promise<Uint8Array> {
-    if (this.dbHandle) {
-      await this.engine.detachDatabase(this.dbHandle);
-      this.dbHandle = 0;
-    }
-    try {
-      return await this.engine.readFile(this.dbPath);
-    } finally {
-      this.dbHandle = await this.engine.attachDatabase(this.dbPath);
-      if (this.options.sharedReads) {
-        await this.engine.setSharedReads!(this.dbHandle, true);
-      }
-    }
-  }
-
-  /**
-   * Export a compact binary page diff (`FBDF\x01`) between `fromSnapshot` (or
-   * `null` for an initial full checkpoint) and `toSnapshot` (defaults to the
-   * current live database state).
-   */
   async exportDiff(
     fromSnapshot?: DatabaseSnapshot | string | Uint8Array | null,
     toSnapshot?: DatabaseSnapshot | string | Uint8Array,
     options?: PageDiffOptions,
   ): Promise<Uint8Array> {
-    if (this.closed) {
-      throw new Error('FirebirdBrowser instance has been closed');
-    }
-    await this.ensureReady();
-    return runDriverExportDiff(
-      this.snapshotStore,
-      () => this.readDetachedImage(),
-      fromSnapshot,
-      toSnapshot,
-      options,
-    );
+    return exportBrowserDiff(this.storageHost, fromSnapshot, toSnapshot, options);
   }
 
-  /**
-   * Apply a compact binary page diff (`FBDF\x01`) onto `baseSnapshot` (or the
-   * current live database image when `baseSnapshot` is omitted) and restore the
-   * database to the resulting state.
-   */
   async applyDiff(
     diffBytes: Uint8Array,
     baseSnapshot?: DatabaseSnapshot | string | Uint8Array | null,
     options: ApplyPageDiffOptions = {},
   ): Promise<Uint8Array> {
-    if (this.closed) {
-      throw new Error('FirebirdBrowser instance has been closed');
-    }
-    await this.ensureReady();
-    return runDriverApplyDiff(
-      this.snapshotStore,
-      () => this.readDetachedImage(),
-      (bytes) => this.restoreSnapshot(bytes),
-      diffBytes,
-      baseSnapshot,
-      options,
-    );
+    return applyBrowserDiff(this.storageHost, diffBytes, baseSnapshot, options);
   }
 
-  /**
-   * Create an isolated copy-on-write branch of this database as a new
-   * {@link FirebirdBrowser} instance seeded with a point-in-time snapshot.
-   *
-   * Ideal for running migration previews, speculative transactions, or isolated
-   * test cases without modifying the parent database.
-   */
   async branch(
     branchName?: string,
     options: BranchOptions = {},
@@ -3029,104 +1607,17 @@ export class FirebirdBrowser implements FirebirdDatabase {
     return this.engine.readFile(this.dbPath);
   }
 
-  /**
-   * Stream the live `.fdb` database file in fixed-size chunks
-   * (`ReadableStream<Uint8Array>`) without allocating a single contiguous
-   * `Uint8Array` of the entire database in memory.
-   *
-   * Pass `{ compression: 'gzip' }` to compress on the fly via
-   * `CompressionStream('gzip')`.
-   *
-   * ```ts
-   * const stream = db.dumpDataStream({ compression: 'gzip' });
-   * ```
-   */
   dumpDataStream(options: DataStreamOptions = {}): ReadableStream<Uint8Array> {
-    const chunkSize = resolveStreamChunkSize(options.chunkSize);
-    let offset = 0;
-    let totalSize: number | null = null;
-    let fallbackBytes: Uint8Array | null = null;
-
-    const raw = new ReadableStream<Uint8Array>({
-      pull: async (controller) => {
-        await this.ensureReady();
-        if (totalSize === null) {
-          if (
-            typeof this.engine.fileSize === 'function' &&
-            typeof this.engine.readFileChunk === 'function'
-          ) {
-            totalSize = await this.engine.fileSize(this.dbPath);
-          } else {
-            fallbackBytes = await this.engine.readFile(this.dbPath);
-            totalSize = fallbackBytes.byteLength;
-          }
-        }
-        if (offset >= totalSize) {
-          controller.close();
-          return;
-        }
-        const length = Math.min(chunkSize, totalSize - offset);
-        const chunk = fallbackBytes
-          ? fallbackBytes.slice(offset, offset + length)
-          : await this.engine.readFileChunk!(this.dbPath, offset, length);
-        if (chunk.byteLength === 0) {
-          controller.close();
-          return;
-        }
-        offset += chunk.byteLength;
-        controller.enqueue(chunk);
-        if (offset >= totalSize) {
-          controller.close();
-        }
-      },
-    });
-
-    return options.compression === 'gzip' ? compressGzipStream(raw) : raw;
+    return createBrowserDumpDataStream(this.storageHost, options);
   }
 
-  /**
-   * Replace the database with a raw or gzip-compressed `.fdb` byte stream
-   * produced by {@link dumpDataStream} without buffering the entire database
-   * in a single `Uint8Array`.
-   *
-   * ```ts
-   * await db.loadDataStream(stream);
-   * ```
-   */
   async loadDataStream(
     stream: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array>,
     options: DataStreamOptions = {},
   ): Promise<void> {
-    if (this.closed) {
-      throw new Error('FirebirdBrowser instance has been closed');
-    }
-    await this.ensureReady();
-    this.cancelScheduledPersist();
-
-    for (const stmt of [...this.preparedStatements]) {
-      await stmt.close().catch(() => undefined);
-    }
-    this.liveTriggerPromises.clear();
-
-    if (this.dbHandle) {
-      await this.engine.detachDatabase(this.dbHandle);
-      this.dbHandle = 0;
-    }
-
-    await this.writeStreamToDbPath(stream, options);
-
-    this.dbHandle = await this.engine.attachDatabase(this.dbPath);
-    if (this.options.sharedReads) {
-      await this.engine.setSharedReads!(this.dbHandle, true);
-    }
-    this.markDirty();
+    return runBrowserLoadDataStream(this.storageHost, stream, options);
   }
 
-  /**
-   * Bulk-import CSV or JSONLines (`'jsonl'` / `'ndjson'`) records from a
-   * `ReadableStream` or `AsyncIterable` into `tableName` in bounded-memory
-   * batches of `options.batchSize` (default 500) inside a single transaction.
-   */
   async copyFromStream(
     tableName: string,
     stream:
@@ -3142,11 +1633,6 @@ export class FirebirdBrowser implements FirebirdDatabase {
     );
   }
 
-  /**
-   * Stream a table or `SELECT` query as UTF-8 CSV or JSONLines (`'jsonl'` /
-   * `'ndjson'`) in bounded-memory cursor batches of `options.batchSize`
-   * (default 500).
-   */
   copyToStream(
     sql: SqlFragment,
     options?: CopyToOptions,
@@ -3168,48 +1654,6 @@ export class FirebirdBrowser implements FirebirdDatabase {
     return buildCopyToStream(this, tableOrQuery, paramsOrOptions, maybeOptions);
   }
 
-  private async writeStreamToDbPath(
-    stream: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array>,
-    options: DataStreamOptions = {},
-  ): Promise<void> {
-    let offset = 0;
-    let first = true;
-    if (typeof this.engine.writeFileChunk === 'function') {
-      for await (const chunk of readDatabaseStreamChunks(stream, options)) {
-        await this.engine.writeFileChunk(this.dbPath, chunk, offset, first);
-        first = false;
-        offset += chunk.byteLength;
-      }
-    } else {
-      const chunks: Uint8Array[] = [];
-      for await (const chunk of readDatabaseStreamChunks(stream, options)) {
-        chunks.push(chunk);
-        offset += chunk.byteLength;
-      }
-      if (offset > 0) {
-        const merged = new Uint8Array(offset);
-        let pos = 0;
-        for (const c of chunks) {
-          merged.set(c, pos);
-          pos += c.byteLength;
-        }
-        await this.engine.writeFile(this.dbPath, merged);
-      }
-    }
-    if (offset === 0) {
-      throw new RangeError(
-        'loadDataStream received an empty stream; pass a stream from dumpDataStream()',
-      );
-    }
-  }
-
-  /**
-   * Register an optional ICU `.dat` (or gzip-compressed `.dat.gz`) locale
-   * tailoring bundle at runtime via a second `udata_setCommonData()` slot so
-   * `CREATE COLLATION ... FOR UTF8 FROM UNICODE 'LOCALE=de_DE'` (`es_ES`,
-   * `fr_FR`, `ja_JP`, etc.) can be used without increasing the default WASM
-   * binary size.
-   */
   async loadIcuLocaleData(data: Uint8Array | ArrayBufferLike): Promise<void> {
     if (this.closed) {
       throw new Error('FirebirdBrowser instance has been closed');
@@ -3219,19 +1663,7 @@ export class FirebirdBrowser implements FirebirdDatabase {
   }
 
   private async applyIcuLocaleData(data: Uint8Array | ArrayBufferLike): Promise<void> {
-    const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
-    if (this.engine.loadIcuLocaleData) {
-      await this.engine.loadIcuLocaleData(bytes);
-      return;
-    }
-    if (!isValidIcuDataPackage(bytes)) {
-      throw new Error(
-        'Invalid ICU locale data package: expected an ICU CmnD (.dat) header (magic 0xda 0x27)',
-      );
-    }
-    await this.engine.mkdir('/firebird');
-    await this.engine.mkdir('/firebird/icu');
-    await this.engine.writeFile(ICU_LOCALE_DATA_PATH, bytes);
+    return applyBrowserIcuLocaleData(this.engine, data);
   }
 
   async persist(): Promise<void> {
@@ -3494,61 +1926,16 @@ export class FirebirdBrowser implements FirebirdDatabase {
     this.attachLifecycleListeners();
   }
 
-  /**
-   * Restore the stored image if this tab owns the engine, then attach.
-   *
-   * Separate from init() because it has to run again whenever the engine
-   * changes underneath us — in shared mode a leadership change replaces the
-   * engine, and every handle it issued dies with it.
-   *
-   * The restore is guarded by {@link mayPersist} for the same reason
-   * persistence is: a follower writing its IndexedDB snapshot into the
-   * filesystem would be overwriting the leader's *live* database with a
-   * possibly older image.
-   */
   private async openDatabase(): Promise<void> {
-    await this.engine.mkdir('/data');
-
-    if (this.mayPersist) {
-      const stored = await this.vfs.exportDatabase();
-      if (stored.byteLength > 0) {
-        await this.engine.writeFile(this.dbPath, stored);
-      }
-    }
-
-    // After the stored image, never before it: `loadDataDir` is what to start
-    // from when there is nothing, not what to overwrite with.
-    const seed = this.options.loadDataDir;
-    if (seed && !(await this.engine.exists(this.dbPath))) {
-      if (seed.byteLength === 0) {
-        throw new RangeError(
-          'loadDataDir is empty; pass the bytes from dumpDataDir() or omit it',
-        );
-      }
-      await this.engine.writeFile(this.dbPath, seed);
-    }
-
-    const seedStreamOpt = this.options.loadDataStream;
-    if (seedStreamOpt && !(await this.engine.exists(this.dbPath))) {
-      const seedStream =
-        typeof seedStreamOpt === 'function'
-          ? await seedStreamOpt()
-          : seedStreamOpt;
-      await this.writeStreamToDbPath(seedStream);
-    }
-
-    // Works unchanged for OPFS: that filesystem reports a file as existing
-    // only once it has bytes, so a database that has never been written is
-    // absent here rather than present and empty.
-    this.dbHandle = (await this.engine.exists(this.dbPath))
-      ? await this.engine.attachDatabase(this.dbPath)
-      : await this.engine.createDatabase(this.dbPath);
-
-    // On every open, so a tab re-attaching after a leadership change gets it
-    // again: the switch belongs to the handle, which the old engine took with it.
-    if (this.options.sharedReads) {
-      await this.engine.setSharedReads!(this.dbHandle, true);
-    }
+    this.dbHandle = await openBrowserDatabaseFile({
+      engine: this.engine,
+      dbPath: this.dbPath,
+      mayPersist: this.mayPersist,
+      exportStored: () => this.vfs.exportDatabase(),
+      loadDataDir: this.options.loadDataDir,
+      loadDataStream: this.options.loadDataStream,
+      sharedReads: this.options.sharedReads,
+    });
   }
 
   /**

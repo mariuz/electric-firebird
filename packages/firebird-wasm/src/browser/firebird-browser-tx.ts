@@ -53,6 +53,14 @@ import {
   type TableRepository,
 } from '../table-api';
 import {
+  loadArrowIpcIntoDatabase,
+  type ArrowIngestResult,
+  type ArrowIngestSource,
+  type LoadArrowIpcOptions,
+} from '../arrow-ingest';
+import { decodeWireParamRows } from './wire-params';
+import { WorkerTransport } from './worker-transport';
+import {
   assertBatchParameterRows,
   assertPreparedParamCount,
   decodePayloadColumnar,
@@ -398,6 +406,38 @@ export class FirebirdBrowserTransaction implements FirebirdTransactionClient {
       this.recordMutatedTables(sql);
     }
     return { affectedRows };
+  }
+
+  async execWireBatch(
+    sql: string,
+    wireRows: Uint8Array,
+    rowCount: number,
+  ): Promise<ExecResult> {
+    this.assertUsable();
+    if (rowCount === 0) return { affectedRows: 0 };
+    if (!this.engine.acceptsWireParams && !(this.engine instanceof WorkerTransport)) {
+      return this.execBatch(sql, decodeWireParamRows(wireRows));
+    }
+    const affectedRows = await this.engine.executeBatch(
+      this.dbHandle,
+      this.txHandle,
+      sql,
+      wireRows,
+    );
+    this.recordMutatedTables(sql);
+    return { affectedRows };
+  }
+
+  async loadArrowIpc(
+    tableName: string,
+    source: ArrowIngestSource,
+    options: Omit<LoadArrowIpcOptions, 'transaction'> = {},
+  ): Promise<ArrowIngestResult> {
+    this.assertUsable();
+    return loadArrowIpcIntoDatabase(this, tableName, source, {
+      ...options,
+      transaction: false,
+    });
   }
 
   /**

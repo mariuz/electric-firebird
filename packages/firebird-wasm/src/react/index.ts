@@ -43,10 +43,29 @@ import {
   type SyncStatusStoreOptions,
 } from '../frameworks/sync-store';
 import type { LiveRowKeySelector } from '../live-incremental';
+import {
+  createOptimisticMutationStore,
+  ReactiveTableStore,
+  type OptimisticMutationStore,
+  type OptimisticMutationStoreOptions,
+  type OptimisticStoreSnapshot,
+  type ReactiveTableDatabase,
+  type ReactiveTableState,
+  type ReactiveTableStoreOptions,
+} from '../optimistic-store';
+import type { TableExecutionHost, TableRepository } from '../table-api';
 import type { SqlFragment } from '../sql-tag';
 import type { QueryParams, Row } from '../types';
 
 export type { QueryableDatabase, QueryState } from '../frameworks/query-store';
+export type {
+  OptimisticMutationStore,
+  OptimisticMutationStoreOptions,
+  OptimisticStoreSnapshot,
+  ReactiveTableDatabase,
+  ReactiveTableState,
+  ReactiveTableStoreOptions,
+} from '../optimistic-store';
 export type {
   ColumnarQueryState,
   ColumnarQueryableDatabase,
@@ -178,6 +197,7 @@ function useStore<T extends Row>(
   return useMemo(() => ({ ...state, refresh: store.refresh }), [state, store]);
 }
 
+
 /** Return value of {@link useSyncStatus} (`M20 Item 4`). */
 export interface SyncStatusHookResult extends SyncStatusState {
   syncNow(): Promise<void>;
@@ -274,6 +294,7 @@ export function useColumnarQuery(
   return useMemo(() => ({ ...state, refresh: store.refresh }), [state, store]);
 }
 
+
 /** Options for {@link useLiveIncrementalQuery} (`M20 Item 4`). */
 export interface UseLiveIncrementalQueryOptions<T = Row> {
   db?: IncrementalQueryableDatabase;
@@ -332,4 +353,129 @@ export function useLiveIncrementalQuery<T extends Row = Row>(
   }, [store]);
   const state = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
   return useMemo(() => ({ ...state, refresh: store.refresh }), [state, store]);
+}
+
+/** Return value of {@link useOptimisticMutation} (`M22 Item 3`). */
+export interface OptimisticMutationHookResult extends OptimisticStoreSnapshot {
+  readonly store: OptimisticMutationStore;
+  insert: OptimisticMutationStore['insert'];
+  update: OptimisticMutationStore['update'];
+  upsert: OptimisticMutationStore['upsert'];
+  delete: OptimisticMutationStore['delete'];
+  revert: OptimisticMutationStore['revert'];
+  revertAll: OptimisticMutationStore['revertAll'];
+  flush: OptimisticMutationStore['flush'];
+  table: OptimisticMutationStore['table'];
+}
+
+/**
+ * Create or subscribe to an {@link OptimisticMutationStore} in React (`M22 Item 3`).
+ */
+export function useOptimisticMutation(
+  options: OptimisticMutationStoreOptions & {
+    db?: TableExecutionHost;
+    store?: OptimisticMutationStore;
+  } = {},
+): OptimisticMutationHookResult {
+  const provided = useContext(FirebirdContext);
+  const store = useMemo(() => {
+    if (options.store) return options.store;
+    const db = (options.db ?? provided) as TableExecutionHost | null;
+    if (!db) {
+      throw new Error(
+        'useOptimisticMutation() found no database: wrap in <FirebirdProvider db={…}>, or pass { db } / { store }',
+      );
+    }
+    return createOptimisticMutationStore(db, options);
+  }, [options.store, options.db, provided, options.syncHandle, options.autoFlush]);
+
+  const snap = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
+  return useMemo(
+    () => ({
+      ...snap,
+      store,
+      insert: store.insert,
+      update: store.update,
+      upsert: store.upsert,
+      delete: store.delete,
+      revert: store.revert,
+      revertAll: store.revertAll,
+      flush: store.flush,
+      table: store.table,
+    }),
+    [snap, store],
+  );
+}
+
+/** Options for {@link useTable} (`M22 Item 3`). */
+export interface UseTableOptions<T extends Row = Row> extends ReactiveTableStoreOptions<T> {
+  db?: ReactiveTableDatabase;
+}
+
+/** Return value of {@link useTable} (`M22 Item 3`). */
+export interface TableHookResult<T extends Row = Row, K = unknown> extends ReactiveTableState<T> {
+  readonly repository: TableRepository<T, K>;
+  refresh(): Promise<void>;
+  insert(row: Partial<T> & Record<string, unknown>): Promise<T>;
+  update(key: K, patch: Partial<T> & Record<string, unknown>): Promise<{ affectedRows: number }>;
+  upsert(
+    row: Partial<T> & Record<string, unknown>,
+    matchingColumns?: ReadonlyArray<(keyof T & string) | string>,
+  ): Promise<T>;
+  remove(key: K): Promise<{ affectedRows: number }>;
+}
+
+/**
+ * Reactive typed table hook combining `db.table<T>()`, incremental live rows, and
+ * optional optimistic local-first mutations (`M22 Item 3`).
+ */
+export function useTable<T extends Row = Row, K = unknown>(
+  tableName: string,
+  options: UseTableOptions<T> = {},
+): TableHookResult<T, K> {
+  const provided = useContext(FirebirdContext);
+  const db = (options.db ?? provided) as ReactiveTableDatabase | null;
+  if (!db) {
+    throw new Error(
+      'useTable() found no database: wrap in <FirebirdProvider db={…}>, or pass { db }',
+    );
+  }
+  const optsKey = JSON.stringify({
+    tableName,
+    pk: options.primaryKey ?? 'ID',
+    where: options.where,
+    orderBy: options.orderBy,
+    limit: options.limit,
+    columns: options.columns,
+    pollIntervalMs: options.pollIntervalMs,
+  });
+  const previous = useRef<ReactiveTableStore<T, K> | null>(null);
+  const store = useMemo(
+    () =>
+      new ReactiveTableStore<T, K>(
+        db,
+        tableName,
+        options,
+        previous.current?.getSnapshot().rows,
+      ),
+    [db, optsKey, options.optimisticStore],
+  );
+  useEffect(() => {
+    previous.current = store;
+    store.start();
+    return () => store.stop();
+  }, [store]);
+  const state = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
+  return useMemo(
+    () => ({
+      ...state,
+      repository: store.repository,
+      refresh: store.refresh,
+      insert: store.insert,
+      update: store.update,
+      upsert: store.upsert,
+      remove: store.remove,
+    }),
+    [state, store],
+  );
 }

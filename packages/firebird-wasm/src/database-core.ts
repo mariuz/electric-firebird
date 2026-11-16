@@ -53,6 +53,11 @@ import type {
 } from './columnar-stream';
 import type { TableOptions, TableRepository } from './table-api';
 import type {
+  ArrowIngestResult,
+  ArrowIngestSource,
+  LoadArrowIpcOptions,
+} from './arrow-ingest';
+import type {
   IncrementalLiveSnapshot,
   LiveColumnarOptions,
   LiveColumnarQuery,
@@ -294,6 +299,12 @@ export interface FirebirdTransactionClient {
     tableName: string,
     options?: TableOptions<T>,
   ): TableRepository<T, K>;
+  /** Zero-copy Apache Arrow IPC V5 ingestion into `tableName` (`M22 Item 2`). */
+  loadArrowIpc(
+    tableName: string,
+    source: ArrowIngestSource,
+    options?: Omit<LoadArrowIpcOptions, 'transaction'>,
+  ): Promise<ArrowIngestResult>;
   queryStream<T extends Row = Row>(
     sql: string | SqlFragment,
     paramsOrOptions?: QueryParams | QueryStreamOptions,
@@ -450,6 +461,12 @@ export interface FirebirdDatabase {
     tableName: string,
     options?: TableOptions<T>,
   ): TableRepository<T, K>;
+  /** Zero-copy Apache Arrow IPC V5 ingestion into `tableName` (`M22 Item 2`). */
+  loadArrowIpc(
+    tableName: string,
+    source: ArrowIngestSource,
+    options?: LoadArrowIpcOptions,
+  ): Promise<ArrowIngestResult>;
   /**
    * Subscribe to incremental `{ rows, deltas }` (`insert` / `update` / `delete`)
    * updates with structural sharing for unchanged rows (`M20 Item 3`).

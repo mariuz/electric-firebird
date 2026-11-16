@@ -12,9 +12,11 @@ import type {
   DatabaseInfo,
   SweepResult,
   FieldInfo,
+  QueryParams,
   RowMode,
 } from '../types';
 import { firebirdTypeName } from './field-types';
+import { extractReferencedTables } from './live-tables';
 import { statementKind } from '../statement-types';
 
 /**
@@ -403,4 +405,125 @@ export function attachBlobs<T>(
   }
 
   return result;
+}
+
+export async function fallbackExplainQuery(
+  describeFn: (sql: string) => Promise<QueryDescription>,
+  queryFn: <T extends Row = Row>(sql: string, params?: QueryParams) => Promise<QueryResult<T>>,
+  sql: string,
+  detailed: boolean,
+): Promise<string> {
+  const desc = await describeFn(sql);
+  if (
+    desc.statementType === 'DDL' ||
+    desc.statementType === 'START_TRANS' ||
+    desc.statementType === 'COMMIT' ||
+    desc.statementType === 'ROLLBACK' ||
+    desc.statementType === 'SAVEPOINT' ||
+    desc.statementType === 'SET_GENERATOR'
+  ) {
+    return '';
+  }
+
+  const userTables = extractReferencedTables(sql);
+  const tables = userTables.length > 0 ? userTables : ['RDB$DATABASE'];
+  const hasWhere = /\bWHERE\b/i.test(sql);
+  const indexByTable = new Map<string, string>();
+
+  if (hasWhere && userTables.length > 0) {
+    for (const table of userTables) {
+      try {
+        const res = await queryFn<{ IDX: string }>(
+          'SELECT FIRST 1 TRIM(RDB$INDEX_NAME) AS IDX FROM RDB$INDICES WHERE TRIM(RDB$RELATION_NAME) = ? ORDER BY RDB$INDEX_ID',
+          [table],
+        );
+        const idx = res.rows[0]?.IDX;
+        if (idx) indexByTable.set(table, idx);
+      } catch {
+        // Ignore catalog lookup errors in fallback mode.
+      }
+    }
+  }
+
+  if (detailed) {
+    const steps = tables.map((t) => {
+      const idx = indexByTable.get(t);
+      if (idx) {
+        return (
+          `    -> Filter\n` +
+          `        -> Table "${t}" Access By ID\n` +
+          `            -> Bitmap\n` +
+          `                -> Index "${idx}" Range Scan (full match)`
+        );
+      }
+      return `    -> Table "${t}" Full Scan`;
+    });
+    return `Select Expression\n${steps.join('\n')}`;
+  }
+
+  const parts = tables.map((t) => {
+    const idx = indexByTable.get(t);
+    return idx ? `${t} INDEX (${idx})` : `${t} NATURAL`;
+  });
+  return `PLAN (${parts.join(', ')})`;
+}
+
+export async function fallbackReadDatabaseInfo(
+  queryFn: <T extends Row = Row>(sql: string) => Promise<QueryResult<T>>,
+): Promise<DatabaseInfo> {
+  const dbRes = await queryFn<Record<string, unknown>>(
+    'SELECT MON$PAGE_SIZE, MON$PAGES, MON$ODS_MAJOR, MON$ODS_MINOR, ' +
+      'MON$OLDEST_TRANSACTION, MON$OLDEST_ACTIVE, MON$OLDEST_SNAPSHOT, ' +
+      'MON$NEXT_TRANSACTION, MON$PAGE_BUFFERS FROM MON$DATABASE',
+  );
+  const dbRow = dbRes.rows[0] ?? {};
+
+  let currentMemory = 0;
+  let maxMemory = 0;
+  try {
+    const memRes = await queryFn<Record<string, unknown>>(
+      'SELECT MON$MEMORY_USED, MON$MAX_MEMORY_USED FROM MON$MEMORY_USAGE WHERE MON$STAT_GROUP = 0',
+    );
+    const memRow = memRes.rows[0] ?? {};
+    currentMemory = Number(memRow['MON$MEMORY_USED'] ?? 0);
+    maxMemory = Number(memRow['MON$MAX_MEMORY_USED'] ?? 0);
+  } catch {
+    // Ignore if MON$MEMORY_USAGE is unavailable.
+  }
+
+  let reads = 0;
+  let writes = 0;
+  let fetches = 0;
+  let marks = 0;
+  try {
+    const ioRes = await queryFn<Record<string, unknown>>(
+      'SELECT MON$PAGE_READS, MON$PAGE_WRITES, MON$PAGE_FETCHES, MON$PAGE_MARKS ' +
+        'FROM MON$IO_STATS WHERE MON$STAT_GROUP = 0',
+    );
+    const ioRow = ioRes.rows[0] ?? {};
+    reads = Number(ioRow['MON$PAGE_READS'] ?? 0);
+    writes = Number(ioRow['MON$PAGE_WRITES'] ?? 0);
+    fetches = Number(ioRow['MON$PAGE_FETCHES'] ?? 0);
+    marks = Number(ioRow['MON$PAGE_MARKS'] ?? 0);
+  } catch {
+    // Ignore if MON$IO_STATS is unavailable.
+  }
+
+  return normalizeDatabaseInfo({
+    pageSize: Number(dbRow['MON$PAGE_SIZE'] ?? 0),
+    allocatedPages: Number(dbRow['MON$PAGES'] ?? 0),
+    odsVersion: Number(dbRow['MON$ODS_MAJOR'] ?? 0),
+    odsMinorVersion: Number(dbRow['MON$ODS_MINOR'] ?? 0),
+    oldestTransaction: Number(dbRow['MON$OLDEST_TRANSACTION'] ?? 0),
+    oldestActive: Number(dbRow['MON$OLDEST_ACTIVE'] ?? 0),
+    oldestSnapshot: Number(dbRow['MON$OLDEST_SNAPSHOT'] ?? 0),
+    nextTransaction: Number(dbRow['MON$NEXT_TRANSACTION'] ?? 0),
+    pageBuffers: Number(dbRow['MON$PAGE_BUFFERS'] ?? 0),
+    currentMemory,
+    maxMemory,
+    reads,
+    writes,
+    fetches,
+    marks,
+  });
 }

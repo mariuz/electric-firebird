@@ -3228,4 +3228,151 @@ test.describe('FirebirdBrowser', () => {
     expect(result.causalCatchUpSyncs).toBeGreaterThanOrEqual(1);
     expect(result.liveResults).toBe(0);
   });
+
+  test('M22: loadArrowIpc() FBP\\x02 ingestion, cached db.table() PreparedStatements, TenantIsolationGuard & OptimisticMutationStore', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      const db = new window.FB.FirebirdBrowser('memory://m22_browser');
+
+      // 1. Encode Arrow IPC V5 stream and ingest via db.loadArrowIpc() -> FBP\x02 batch
+      const col = window.FB.rowsToColumnarResult({
+        fields: [
+          { name: 'ID', typeName: 'INTEGER', nullable: false },
+          { name: 'TENANT_ID', typeName: 'VARYING', nullable: false },
+          { name: 'TITLE', typeName: 'VARYING', nullable: true },
+        ],
+        rows: [
+          { ID: 1, TENANT_ID: 'acme', TITLE: 'Alpha' },
+          { ID: 2, TENANT_ID: 'acme', TITLE: 'Beta' },
+          { ID: 3, TENANT_ID: 'acme', TITLE: 'Gamma' },
+        ],
+      });
+      const wireBuf = window.FB.encodeColumnarBatchToWireRows(col);
+      const arrowBytes = window.FB.encodeArrowIpc(col);
+      const ingestRes = await db.loadArrowIpc('TASKS', arrowBytes, { batchSize: 2 });
+
+      // 2. Bounded LRU PreparedStatement handle caching in db.table<T>()
+      const tbl = db.table('TASKS', { primaryKey: 'ID', cacheStatements: 2 });
+      window.__stub.resetCalls();
+      window.__stub.queryResult = {
+        columns: [
+          { name: 'ID', type: 496, scale: 0, subType: 0, length: 4, nullable: false },
+          { name: 'TITLE', type: 448, scale: 0, subType: 0, length: 64, nullable: true },
+        ],
+        rows: [[1, 'Alpha']],
+      };
+      const r1 = await tbl.get(1);
+      window.__stub.queryResult = {
+        columns: [
+          { name: 'ID', type: 496, scale: 0, subType: 0, length: 4, nullable: false },
+          { name: 'TITLE', type: 448, scale: 0, subType: 0, length: 64, nullable: true },
+        ],
+        rows: [[2, 'Beta']],
+      };
+      const r2 = await tbl.get(2);
+      const prepareCallCount = window.__stub.countCalls('_fb_prepare');
+      const cachedCount = tbl.cachedStatementCount;
+      await tbl.close();
+      const stmtCloseCallCount = window.__stub.countCalls('_fb_stmt_close');
+      const closedCount = tbl.cachedStatementCount;
+
+      // 3. TenantIsolationGuard rejects cross-tenant and shared-table mutations
+      const guard = window.FB.createTenantIsolationGuard({
+        tenantColumn: 'TENANT_ID',
+        tenantId: 'acme',
+        sharedTables: ['PLANS'],
+      });
+      let crossTenantBlocked = false;
+      let sharedTableBlocked = false;
+      try {
+        guard.assertEntry({
+          lsn: 1,
+          txid: 'tx1',
+          timestamp: Date.now(),
+          origin: 'peer',
+          table: 'TASKS',
+          operation: 'INSERT',
+          key: { ID: 9 },
+          after: { ID: 9, TENANT_ID: 'globex', TITLE: 'Spoof' },
+          before: null,
+        });
+      } catch (err) {
+        crossTenantBlocked = err instanceof window.FB.TenantIsolationError;
+      }
+      try {
+        guard.assertEntry({
+          lsn: 2,
+          txid: 'tx2',
+          timestamp: Date.now(),
+          origin: 'peer',
+          table: 'PLANS',
+          operation: 'UPDATE',
+          key: { ID: 'pro' },
+          after: { ID: 'pro' },
+          before: { ID: 'pro' },
+        });
+      } catch (err) {
+        sharedTableBlocked =
+          err instanceof window.FB.TenantIsolationError &&
+          err.reason === 'shared-table-read-only';
+      }
+
+      // 4. OptimisticMutationStore instant insert + rollback on remote rejection
+      const opt = window.FB.createOptimisticMutationStore(db, {
+        remoteSync: async () => {
+          throw new Error('HTTP 403 TenantIsolationError');
+        },
+      });
+      window.__stub.affectedRows = 1;
+      window.__stub.queryResult = {
+        columns: [
+          { name: 'ID', type: 496, scale: 0, subType: 0, length: 4, nullable: false },
+          { name: 'TITLE', type: 448, scale: 0, subType: 0, length: 64, nullable: true },
+        ],
+        rows: [[10, 'Optimistic Draft']],
+      };
+      await opt.insert('TASKS', { ID: 10, TITLE: 'Optimistic Draft' }, { primaryKey: 'ID' });
+      const pendingBeforeFlush = opt.getSnapshot().pendingCount;
+      const flushRes = await opt.flush();
+      const snapAfterFlush = opt.getSnapshot();
+
+      const stats = window.__stub.stats();
+      await db.close();
+
+      return {
+        isWireBatch: window.FB.isWireParamRowsBuffer(wireBuf),
+        rowsIngested: ingestRes.rowsIngested,
+        batchesExecuted: ingestRes.batchesExecuted,
+        r1Title: r1?.TITLE,
+        r2Title: r2?.TITLE,
+        prepareCallCount,
+        stmtCloseCallCount,
+        cachedCount,
+        closedCount,
+        crossTenantBlocked,
+        sharedTableBlocked,
+        pendingBeforeFlush,
+        revertedCount: flushRes.reverted,
+        pendingAfterFlush: snapAfterFlush.pendingCount,
+        liveResults: stats.liveResults,
+      };
+    });
+
+    expect(result.isWireBatch).toBe(true);
+    expect(result.rowsIngested).toBe(3);
+    expect(result.batchesExecuted).toBe(2);
+    expect(result.r1Title).toBe('Alpha');
+    expect(result.r2Title).toBe('Beta');
+    expect(result.prepareCallCount).toBe(1);
+    expect(result.stmtCloseCallCount).toBe(1);
+    expect(result.cachedCount).toBe(1);
+    expect(result.closedCount).toBe(0);
+    expect(result.crossTenantBlocked).toBe(true);
+    expect(result.sharedTableBlocked).toBe(true);
+    expect(result.pendingBeforeFlush).toBe(1);
+    expect(result.revertedCount).toBe(1);
+    expect(result.pendingAfterFlush).toBe(0);
+    expect(result.liveResults).toBe(0);
+  });
 });

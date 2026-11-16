@@ -3,7 +3,7 @@
  * (`db.table<T>(name, options?)` & `tx.table<T>(name, options?)`) (`M21 Item 3`).
  */
 
-import type { QueryParams, QueryResult, Row } from './types';
+import type { PreparedStatement, QueryParams, QueryResult, Row } from './types';
 import { isSqlFragment, toStatement, type SqlFragment } from './sql-tag';
 import {
   validateRowsWithSchema,
@@ -14,6 +14,13 @@ import type {
   LiveIncrementalOptions,
   LiveIncrementalQuery,
 } from './live-incremental';
+import {
+  loadArrowIpcIntoDatabase,
+  type ArrowIngestHost,
+  type ArrowIngestResult,
+  type ArrowIngestSource,
+  type LoadArrowIpcOptions,
+} from './arrow-ingest';
 
 const SAFE_IDENT_RE = /^[A-Za-z_][A-Za-z0-9_$]*$/;
 
@@ -64,6 +71,17 @@ export interface TableOptions<T = Row> {
   schema?: StandardSchemaV1<unknown, T>;
   /** Optional input validator applied before `insert` / `upsert` writes. */
   writeSchema?: StandardSchemaV1<unknown, Record<string, unknown>>;
+  /**
+   * Cache compiled `PreparedStatement` handles for hot CRUD templates (`get`,
+   * `exists`, `count`, `insert`, `upsert`, `update`, `delete`) in a bounded LRU
+   * cache when `host.prepare()` is available (`M22 Item 2`).
+   *
+   * Pass `true` (default, max `16` statements), `false` to disable, or a positive
+   * integer to configure the bounded LRU capacity.
+   *
+   * @default true
+   */
+  cacheStatements?: boolean | number;
 }
 
 /** Query options for `table.findMany()` / `table.findOne()` (`M21 Item 3`). */
@@ -100,6 +118,17 @@ export interface TableExecutionHost {
     sql: string,
     rows: QueryParams[],
   ): Promise<{ affectedRows: number } | void>;
+  execWireBatch?(
+    sql: string,
+    wireRows: Uint8Array,
+    rowCount: number,
+  ): Promise<{ affectedRows: number }>;
+  prepare?(sql: string | SqlFragment): Promise<PreparedStatement>;
+  loadArrowIpc?(
+    tableName: string,
+    source: ArrowIngestSource,
+    options?: LoadArrowIpcOptions,
+  ): Promise<ArrowIngestResult>;
   liveIncremental?<R extends Row = Row>(
     sql: string | SqlFragment,
     optionsOrListener?:
@@ -159,6 +188,23 @@ export interface TableRepository<T extends Row = Row, K = unknown> {
       Omit<LiveIncrementalOptions<T>, 'key' | 'params' | 'schema'>,
     listener?: (snapshot: IncrementalLiveSnapshot<T>) => void,
   ): Promise<LiveIncrementalQuery<T>>;
+  /** Zero-copy bulk insert from an Apache Arrow IPC V5 payload, `ColumnarQueryResult`, `ReadableStream`, or `AsyncIterable` (`M22 Item 2`). */
+  insertArrow(
+    source: ArrowIngestSource,
+    options?: Omit<LoadArrowIpcOptions, 'upsertMatching'>,
+  ): Promise<ArrowIngestResult>;
+  /** Zero-copy bulk upsert (`UPDATE OR INSERT ... MATCHING (...)`) from an Apache Arrow IPC V5 payload or stream (`M22 Item 2`). */
+  upsertArrow(
+    source: ArrowIngestSource,
+    matchingColumns?: ReadonlyArray<(keyof T & string) | string>,
+    options?: Omit<LoadArrowIpcOptions, 'upsertMatching'>,
+  ): Promise<ArrowIngestResult>;
+  /** Number of compiled `PreparedStatement` handles currently retained in this repository's LRU cache (`M22 Item 2`). */
+  readonly cachedStatementCount: number;
+  /** Close and evict all cached `PreparedStatement` handles held by this repository (`M22 Item 2`). */
+  close(): Promise<void>;
+  /** Async disposal (`await using users = db.table('USERS')`) (`M22 Item 2`). */
+  [Symbol.asyncDispose](): Promise<void>;
 }
 
 function getRowFieldCaseInsensitive(row: Record<string, unknown>, col: string): unknown {
@@ -387,13 +433,97 @@ export function createTableRepository<T extends Row = Row, K = unknown>(
     return { sql, params, orderItems };
   };
 
+  // Bounded LRU PreparedStatement handle cache (`M22 Item 2`)
+  const maxCachedStmts =
+    options.cacheStatements === false || typeof host.prepare !== 'function'
+      ? 0
+      : typeof options.cacheStatements === 'number'
+        ? Math.max(0, Math.floor(options.cacheStatements))
+        : 16;
+  const stmtCache = new Map<string, Promise<PreparedStatement>>();
+
+  const acquirePrepared = async (sqlText: string): Promise<PreparedStatement | null> => {
+    if (maxCachedStmts <= 0 || typeof host.prepare !== 'function') {
+      return null;
+    }
+    const existing = stmtCache.get(sqlText);
+    if (existing) {
+      stmtCache.delete(sqlText);
+      stmtCache.set(sqlText, existing);
+      const stmt = await existing;
+      if (!stmt.closed) {
+        return stmt;
+      }
+      stmtCache.delete(sqlText);
+    }
+    while (stmtCache.size >= maxCachedStmts) {
+      const oldestKey = stmtCache.keys().next().value;
+      if (oldestKey === undefined) break;
+      const evicted = stmtCache.get(oldestKey);
+      stmtCache.delete(oldestKey);
+      if (evicted) {
+        void evicted.then((s) => s.close()).catch(() => undefined);
+      }
+    }
+    const createdPromise = host.prepare(sqlText).catch((err) => {
+      stmtCache.delete(sqlText);
+      throw err;
+    });
+    stmtCache.set(sqlText, createdPromise);
+    return createdPromise;
+  };
+
+  const runCachedQuery = async (
+    sqlText: string,
+    params: QueryParams,
+  ): Promise<QueryResult<Row>> => {
+    const stmt = await acquirePrepared(sqlText);
+    if (stmt) {
+      return stmt.query<Row>(params);
+    }
+    return host.query<Row>(sqlText, params);
+  };
+
+  const runCachedExec = async (
+    sqlText: string,
+    params: QueryParams,
+  ): Promise<{ affectedRows: number }> => {
+    const stmt = await acquirePrepared(sqlText);
+    if (stmt) {
+      return stmt.exec(params);
+    }
+    return host.execute(sqlText, params);
+  };
+
+  const closeCachedStatements = async (): Promise<void> => {
+    const pending = [...stmtCache.values()];
+    stmtCache.clear();
+    await Promise.all(
+      pending.map((p) =>
+        p.then((s) => s.close().catch(() => undefined)).catch(() => undefined),
+      ),
+    );
+  };
+
   return {
     tableName: normalizeColName(tableName),
     primaryKey: pkCols,
 
+    get cachedStatementCount(): number {
+      return stmtCache.size;
+    },
+
+    async close(): Promise<void> {
+      await closeCachedStatements();
+    },
+
+    async [Symbol.asyncDispose](): Promise<void> {
+      await closeCachedStatements();
+    },
+
     async get(key: K): Promise<T | null> {
       const { clause, params } = compileKeyPredicate(pkCols, key);
-      const res = await host.query<Row>(
+      const res = await runCachedQuery(
         `SELECT * FROM ${quotedTable} ${clause} FETCH FIRST 1 ROWS ONLY`,
         params,
       );
@@ -436,10 +566,10 @@ export function createTableRepository<T extends Row = Row, K = unknown>(
 
     async count(where): Promise<number> {
       const { clause, params } = compileWhereClause(where);
-      const res = await host.query<Row>(
-        `SELECT COUNT(*) AS CNT FROM ${quotedTable}${clause ? ' ' + clause : ''}`,
-        params,
-      );
+      const sqlText = `SELECT COUNT(*) AS CNT FROM ${quotedTable}${clause ? ' ' + clause : ''}`;
+      const res = where
+        ? await host.query<Row>(sqlText, params)
+        : await runCachedQuery(sqlText, params);
       const first = res.rows[0];
       return Number(first?.CNT ?? first?.cnt ?? 0);
     },
@@ -456,10 +586,10 @@ export function createTableRepository<T extends Row = Row, K = unknown>(
       const { clause, params } = isFilterObj
         ? compileWhereClause(keyOrWhere as TableWhereFilter<T>)
         : compileKeyPredicate(pkCols, keyOrWhere);
-      const res = await host.query<Row>(
-        `SELECT 1 AS FOUND FROM ${quotedTable}${clause ? ' ' + clause : ''} FETCH FIRST 1 ROWS ONLY`,
-        params,
-      );
+      const sqlText = `SELECT 1 AS FOUND FROM ${quotedTable}${clause ? ' ' + clause : ''} FETCH FIRST 1 ROWS ONLY`;
+      const res = isFilterObj
+        ? await host.query<Row>(sqlText, params)
+        : await runCachedQuery(sqlText, params);
       return res.rows.length > 0;
     },
 
@@ -472,7 +602,7 @@ export function createTableRepository<T extends Row = Row, K = unknown>(
       const colsSql = entries.map(([c]) => quoteTableIdent(c)).join(', ');
       const placeholders = entries.map(() => '?').join(', ');
       const params = entries.map(([, v]) => v);
-      const res = await host.query<Row>(
+      const res = await runCachedQuery(
         `INSERT INTO ${quotedTable} (${colsSql}) VALUES (${placeholders}) RETURNING *`,
         params,
       );
@@ -516,7 +646,7 @@ export function createTableRepository<T extends Row = Row, K = unknown>(
       const colsSql = entries.map(([c]) => quoteTableIdent(c)).join(', ');
       const placeholders = entries.map(() => '?').join(', ');
       const params = entries.map(([, v]) => v);
-      const res = await host.query<Row>(
+      const res = await runCachedQuery(
         `UPDATE OR INSERT INTO ${quotedTable} (${colsSql}) VALUES (${placeholders}) MATCHING (${matchCols.join(', ')}) RETURNING *`,
         params,
       );
@@ -557,7 +687,7 @@ export function createTableRepository<T extends Row = Row, K = unknown>(
       const setSql = entries.map(([c]) => `${quoteTableIdent(c)} = ?`).join(', ');
       const setParams = entries.map(([, v]) => v);
       const keyPred = compileKeyPredicate(pkCols, key);
-      const res = await host.execute(
+      const res = await runCachedExec(
         `UPDATE ${quotedTable} SET ${setSql} ${keyPred.clause}`,
         [...setParams, ...keyPred.params],
       );
@@ -579,7 +709,7 @@ export function createTableRepository<T extends Row = Row, K = unknown>(
 
     async delete(key): Promise<{ affectedRows: number }> {
       const keyPred = compileKeyPredicate(pkCols, key);
-      const res = await host.execute(
+      const res = await runCachedExec(
         `DELETE FROM ${quotedTable} ${keyPred.clause}`,
         keyPred.params,
       );
@@ -593,6 +723,35 @@ export function createTableRepository<T extends Row = Row, K = unknown>(
         wherePred.params,
       );
       return { affectedRows: res.affectedRows };
+    },
+
+    async insertArrow(source, arrowOpts = {}): Promise<ArrowIngestResult> {
+      if (typeof host.loadArrowIpc === 'function') {
+        return host.loadArrowIpc(tableName, source, {
+          primaryKey: pkCols,
+          ...arrowOpts,
+        });
+      }
+      return loadArrowIpcIntoDatabase(host as unknown as ArrowIngestHost, tableName, source, {
+        primaryKey: pkCols,
+        ...arrowOpts,
+      });
+    },
+
+    async upsertArrow(source, matchingColumns, arrowOpts = {}): Promise<ArrowIngestResult> {
+      const match = (matchingColumns ?? pkCols).map((c) => String(c));
+      if (typeof host.loadArrowIpc === 'function') {
+        return host.loadArrowIpc(tableName, source, {
+          primaryKey: pkCols,
+          ...arrowOpts,
+          upsertMatching: match,
+        });
+      }
+      return loadArrowIpcIntoDatabase(host as unknown as ArrowIngestHost, tableName, source, {
+        primaryKey: pkCols,
+        ...arrowOpts,
+        upsertMatching: match,
+      });
     },
 
     async liveIncremental(liveOpts = {}, listener): Promise<LiveIncrementalQuery<T>> {

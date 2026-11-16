@@ -459,9 +459,22 @@
         const sql = UTF8ToString(sqlPtr);
         stub.calls.push({ fn: '_fb_prepare', args: [handle, txHandle, sql] });
         if (stub.describeReturnsNull) return 0;
+        const strippedSql = sql.replace(/'(?:''|[^'])*'/g, "''");
+        const placeholderCount = (strippedSql.match(/\?/g) ?? []).length;
+        const autoParams = Array.from({ length: placeholderCount }, () => ({
+          name: '',
+          type: 448,
+          subType: 0,
+          scale: 0,
+          length: 64,
+          nullable: true,
+        }));
         const described = {
           handle: 1,
-          params: stub.description.params ?? [],
+          params:
+            Array.isArray(stub.description.params) && stub.description.params.length > 0
+              ? stub.description.params
+              : autoParams,
           columns: stub.description.columns ?? [],
           statementType: stub.description.statementType ?? 1,
         };

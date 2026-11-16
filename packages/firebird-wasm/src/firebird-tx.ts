@@ -61,6 +61,12 @@ import {
   type TableRepository,
 } from './table-api';
 import {
+  loadArrowIpcIntoDatabase,
+  type ArrowIngestResult,
+  type ArrowIngestSource,
+  type LoadArrowIpcOptions,
+} from './arrow-ingest';
+import {
   assertPreparedParamCount,
   executeArrowFromColumnar,
   executeColumnarViaArrayQuery,
@@ -422,6 +428,18 @@ export class FirebirdTransaction implements FirebirdTransactionClient {
     const results = await executePipelineFallback(steps, this);
     assertNotAborted(options.signal);
     return results as PipelineResults<TOps>;
+  }
+
+  async loadArrowIpc(
+    tableName: string,
+    source: ArrowIngestSource,
+    options: Omit<LoadArrowIpcOptions, 'transaction'> = {},
+  ): Promise<ArrowIngestResult> {
+    this.assertUsable();
+    return loadArrowIpcIntoDatabase(this, tableName, source, {
+      ...options,
+      transaction: false,
+    });
   }
 
   /**

@@ -665,11 +665,37 @@ export async function createPublication(
         };
       }
 
-      const tableSnapshots: LogicalTableSnapshot[] = [];
-      for (const [tableUpper, cfg] of tablesMap.entries()) {
+      const entriesList = [...tablesMap.entries()];
+      const poolConcurrency = Math.max(1, Math.floor(snapOpts.concurrency ?? 1));
+      const tableSnapshots: LogicalTableSnapshot[] = new Array(entriesList.length);
+      let nextIdx = 0;
+
+      const exportSingleTable = async (
+        idx: number,
+        tableUpper: string,
+        cfg: NormalizedPublishedTableConfig,
+      ): Promise<void> => {
         let rows: Row[] = [];
         try {
-          const res = await db.query<Row>(`SELECT * FROM ${quoteIdent(tableUpper)}`);
+          const sqlClauseHint =
+            typeof cfg.where === 'string'
+              ? cfg.where
+              : typeof cfg.where === 'function' &&
+                  typeof (cfg.where as { sqlClause?: unknown }).sqlClause === 'string'
+                ? ((cfg.where as unknown as { sqlClause: string }).sqlClause)
+                : undefined;
+          let res: QueryResult<Row>;
+          if (sqlClauseHint && sqlClauseHint.trim().length > 0) {
+            try {
+              res = await db.query<Row>(
+                `SELECT * FROM ${quoteIdent(tableUpper)} WHERE ${sqlClauseHint}`,
+              );
+            } catch {
+              res = await db.query<Row>(`SELECT * FROM ${quoteIdent(tableUpper)}`);
+            }
+          } else {
+            res = await db.query<Row>(`SELECT * FROM ${quoteIdent(tableUpper)}`);
+          }
           rows = res.rows
             .map((r) => normalizeRowKeysUpper(r))
             .filter((r) => matchesRowFilter(r, cfg.where))
@@ -684,13 +710,25 @@ export async function createPublication(
           snapOpts.tableDdl?.[tableUpper] ??
           snapOpts.tableDdl?.[tableUpper.toLowerCase()] ??
           null;
-        tableSnapshots.push({
+        tableSnapshots[idx] = {
           table: tableUpper,
           primaryKey: cfg.primaryKey,
           ddlSql,
           rows,
-        });
-      }
+        };
+      };
+
+      const workerCount = Math.min(poolConcurrency, Math.max(1, entriesList.length));
+      await Promise.all(
+        Array.from({ length: workerCount }, async () => {
+          for (;;) {
+            const idx = nextIdx++;
+            if (idx >= entriesList.length) break;
+            const [tableUpper, cfg] = entriesList[idx]!;
+            await exportSingleTable(idx, tableUpper, cfg);
+          }
+        }),
+      );
 
       return {
         publication: pubName,
