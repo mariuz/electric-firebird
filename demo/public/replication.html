@@ -480,6 +480,10 @@
           <strong>13. Native <code>mode: 'native'</code> + WebRTC 16 KB P2P &amp; Standard Schema DLQ</strong>
           <span>Chunk <code>FBCHANGELOG\0</code> across 16 KB <code>'WRTC'</code> SCTP frames with CRC-32, validate rows via Standard Schema v1, and export Arrow IPC!</span>
         </button>
+        <button type="button" class="scenario-card" data-scenario="object-store-pitr-pipeline">
+          <strong>14. Binary <code>.fdb</code> Bootstrap + S3/R2 WAL PITR &amp; <code>db.pipeline()</code></strong>
+          <span>Clone via <code>bootstrapStrategy: 'binary-image'</code>, ship SigV4 WAL segments via <code>createObjectStoreReplicationTarget()</code>, restore PITR, and batch via <code>db.pipeline()</code>!</span>
+        </button>
       </section>
 
       <!-- Dual Database Nodes Grid -->

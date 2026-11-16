@@ -226,6 +226,39 @@ test.describe('<firebird-repl>', () => {
     await expect(repl.locator('.inspector .migration-item').nth(1)).toContainText('add_author_idx');
   });
 
+  test('inspects Arrow IPC vector layouts and live sync status with the Arrow button, repl.inspectArrow(), and repl.syncHandle', async ({ page }) => {
+    const repl = await openRepl(page, 'memory://repl-arrow-sync');
+    await runTyped(repl, [
+      'CREATE TABLE metrics (id INTEGER NOT NULL PRIMARY KEY, label VARCHAR(30), val DOUBLE PRECISION);',
+      "INSERT INTO metrics VALUES (1, 'cpu', 42.5);",
+      "INSERT INTO metrics VALUES (2, 'mem', NULL);",
+    ].join('\n'));
+    await expect(repl.locator('.entry')).toHaveCount(3);
+
+    await repl.evaluate((el: any) => {
+      el.syncHandle = {
+        mode: 'native',
+        stats: async () => ({
+          primaryLsn: 18,
+          replicaWatermark: 18,
+          lagEntries: 0,
+          conflictsResolved: 1,
+        }),
+      };
+    });
+
+    const editor = repl.locator('textarea');
+    await editor.fill('SELECT id, label, val FROM metrics ORDER BY id');
+    await repl.locator('button.arrow').click();
+
+    await expect(repl.locator('.inspector')).toBeVisible();
+    await expect(repl.locator('.inspector .inspector-arrow')).toContainText('Apache Arrow IPC V5 & Columnar Vectors');
+    await expect(repl.locator('.inspector .inspector-arrow')).toContainText('2 rows · 3 vectors');
+    await expect(repl.locator('.inspector .inspector-arrow')).toContainText('int32 (INTEGER)');
+    await expect(repl.locator('.inspector .inspector-arrow')).toContainText('float64 (DOUBLE)');
+    await expect(repl.locator('.inspector .inspector-arrow')).toContainText('ONLINE (native) · LSN 18/18 · lag 0');
+  });
+
   test('takes a db property set before it was defined, and reports runs', async ({ page }) => {
     await page.goto('/no-isolation/browser-harness-frameworks-st');
     await page.waitForFunction(() => Boolean((window as any).FB && (window as any).Frameworks));

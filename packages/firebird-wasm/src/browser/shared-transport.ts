@@ -48,6 +48,11 @@ import {
   encodeBinaryResultSet,
   isBinaryResultPayload,
 } from './binary-result';
+import type {
+  EnginePipelineStepRequest,
+  EnginePipelineStepResponse,
+  EnginePipelineWireOptions,
+} from '../pipeline';
 import { electLeader } from './leader-election';
 import type { LeaderElection } from './leader-election';
 
@@ -507,7 +512,14 @@ export class SharedEngineTransport implements EngineTransport {
         result: result ?? null,
       };
 
-      if (MUTATING.has(message.op)) {
+      if (
+        MUTATING.has(message.op) ||
+        (message.op === 'pipeline' &&
+          Array.isArray(message.args[2]) &&
+          (message.args[2] as EnginePipelineStepRequest[]).some(
+            (s) => s.op === 'execute' || s.op === 'executeBatch',
+          ))
+      ) {
         // The write happened here, but the caller that wanted it is in
         // another tab and will never mark this engine dirty.
         this.onServedMutation?.();
@@ -974,7 +986,7 @@ export class SharedEngineTransport implements EngineTransport {
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     stmtHandle: EngineHandle,
-    params: QueryParams = [],
+    params: QueryParams | Uint8Array = [],
   ): Promise<EngineHandle> {
     return this.call<EngineHandle>(
       'cursorOpenStmt',
@@ -982,6 +994,26 @@ export class SharedEngineTransport implements EngineTransport {
       txHandle,
       stmtHandle,
       params,
+    );
+  }
+
+  async pipeline(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    steps: readonly EnginePipelineStepRequest[],
+    options: EnginePipelineWireOptions = {},
+  ): Promise<EnginePipelineStepResponse[]> {
+    const raw = await this.call<EnginePipelineStepResponse[]>(
+      'pipeline',
+      dbHandle,
+      txHandle,
+      steps,
+      options,
+    );
+    return raw.map((item) =>
+      item.kind === 'binary'
+        ? { kind: 'binary', payload: this.normalizeBinaryPayload(item.payload) }
+        : item,
     );
   }
 

@@ -82,6 +82,14 @@
       "types": "./dist/replication/index.d.ts",
       "default": "./dist/replication/index.js"
     },
+    "./columnar": {
+      "types": "./dist/columnar.d.ts",
+      "default": "./dist/columnar.js"
+    },
+    "./schema": {
+      "types": "./dist/schema-validation.d.ts",
+      "default": "./dist/schema-validation.js"
+    },
     "./cli": {
       "types": "./dist/cli.d.ts",
       "default": "./dist/cli.js"

@@ -1553,7 +1553,7 @@ Reactive query and live-query hooks/stores across all four UI frameworks:
 
 ### `firebird-wasm/repl`
 
-- `defineFirebirdRepl`: Registers the `<firebird-repl>` custom element with interactive SQL execution (`SET TERM` PSQL support) and a 5-tab Inspector sidebar (`Schema`, `Migrations`, `Profiler`, `Plan` flamegraph/tree explorer, and `Replication` topology/DLQ inspector).
+- `defineFirebirdRepl`: Registers the `<firebird-repl>` custom element with interactive SQL execution (`SET TERM` PSQL support), `repl.inspectArrow(sql?)`, `repl.syncHandle`, and a 6-tab Inspector sidebar (`Schema`, `Migrations`, `Profiler`, `Plan` flamegraph/tree explorer, `Replication` topology/DLQ inspector, and `Arrow / Sync` columnar vector & live sync inspector).
 - `parseQueryPlan` & `computeTableIoBreakdown`: Parse Firebird `PLAN (...)` / detailed explain output into typed operator trees (`ParsedQueryPlan`) and per-table page I/O breakdowns.
 
 ### `firebird-wasm/electric` & `firebird-wasm/electric-server`
@@ -1611,3 +1611,26 @@ Zero-dependency developer CLI (`bin`: `firebird-wasm`, programmatic `runCli(argv
 - `npx firebird-wasm migrate <uri> --dir <dir> [--down] [--target <version>]`
 - `npx firebird-wasm dump <uri> --out <file> [--gzip]` & `restore <uri> --in <file> [--gzip]`
 - `npx firebird-wasm inspect-changelog <segment-file> [--json]`
+
+### `db.pipeline()` & `"FBP\x01"` / `"FBP\x02"` Binary Parameter Wire Frames
+
+Batch heterogeneous `execute`, `execBatch`, `query`, `queryColumnar`, and `queryArrow` steps in a single Worker round-trip (`{ transaction: true }` wraps the batch atomically), using compact binary parameter frames (`encodeWireParams` / `encodeWireParamRows`):
+
+```ts
+const [inserted, batched, rowsRes, colRes, arrowBytes] = await db.pipeline(
+  [
+    { kind: 'execute', sql: 'INSERT INTO metrics (id, val) VALUES (?, ?)', params: [1, 10.5] },
+    { kind: 'execBatch', sql: 'INSERT INTO metrics (id, val) VALUES (?, ?)', rows: [[2, 20.0], [3, 30.25]] },
+    { kind: 'query', sql: 'SELECT id, val FROM metrics ORDER BY id' },
+    { kind: 'queryColumnar', sql: 'SELECT id, val FROM metrics ORDER BY id' },
+    { kind: 'queryArrow', sql: 'SELECT id, val FROM metrics ORDER BY id' },
+  ],
+  { transaction: true },
+);
+```
+
+### `db.liveIncremental()` & `db.liveColumnar()` — Keyed Delta & Columnar Live Queries
+
+- `db.liveIncremental<T>(sql, params?, { key, table? })`: Emits `{ rows, deltas }` (`'insert' | 'update' | 'delete'`) with structural row-reference sharing (`prevRow === nextRow` for unchanged rows) and supports direct $O(k)$ replication log patching via `handle.applyChanges(entries)`.
+- `db.liveColumnar(sql, params?, options?)`: Reactive `ColumnarQueryResult` subscription backed by `"FBR\x01"` typed-array vectors.
+- Framework hooks in `firebird-wasm/react`, `/vue`, `/svelte`, and `/solid`: `useSyncStatus` / `createSyncStatus`, `useColumnarQuery` / `createColumnarQuery`, and `useLiveIncrementalQuery` / `createLiveIncrementalQuery`.

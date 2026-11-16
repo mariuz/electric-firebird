@@ -107,6 +107,19 @@ export interface SyncDatabasesOptions {
    */
   bootstrap?: boolean;
   /**
+   * Cold-start / catch-up bootstrap strategy (`M20 Item 1`):
+   * - `'logical'` (default): batched row-level `UPDATE OR INSERT` seeding
+   * - `'binary-image'`: raw/gzipped `.fdb` database image transfer (`10–20×` faster on large DBs)
+   * - `'page-diff'`: incremental `PAGE_DIFF_MAGIC` dirty-page transfer
+   *
+   * @default 'logical'
+   */
+  bootstrapStrategy?: 'logical' | 'binary-image' | 'page-diff';
+  /** Whether to gzip-compress `'binary-image'` snapshots during bootstrap (`M20 Item 1`). @default false */
+  bootstrapCompressGzip?: boolean;
+  /** Optional base `.fdb` image when `bootstrapStrategy === 'page-diff'` (`M20 Item 1`). */
+  baseSnapshot?: Uint8Array;
+  /**
    * Start live continuous background synchronization (`POST_EVENT` wakeup + interval poll).
    * @default true
    */
@@ -258,7 +271,12 @@ export async function syncDatabases(
   });
 
   if (doBootstrap) {
-    await replicator.bootstrap({ truncateExisting: direction === 'one-way' });
+    await replicator.bootstrap({
+      bootstrapStrategy: options.bootstrapStrategy,
+      compressGzip: options.bootstrapCompressGzip,
+      baseSnapshot: options.baseSnapshot,
+      truncateExisting: direction === 'one-way',
+    });
     if (direction === 'bidirectional') {
       await replicator.sync();
     }

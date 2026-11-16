@@ -29,20 +29,22 @@ See [Firebird server packages](https://firebirdsql.org/en/server-packages/) if y
 | `firebird-wasm` | Native driver → Firebird server or embedded (`FirebirdLite`) + shared helpers | Firebird client library |
 | `firebird-wasm/browser` | Firebird 5.0 LTS / 6.0 compiled to WebAssembly (`FirebirdBrowser`, `IndexedDBVFS`, `OPFSVFS`) | Browser or Node.js |
 | `firebird-wasm/browser/worker-entry` | Dedicated Web Worker entry point for the WASM engine | Browser Worker |
-| `firebird-wasm/react` | React `<FirebirdProvider>`, `useFirebird`, `useQuery`, `useLiveQuery` | React 18+ |
-| `firebird-wasm/vue` | Vue 3 `provideFirebird`, `useFirebird`, `useQuery`, `useLiveQuery` | Vue 3.3+ |
-| `firebird-wasm/svelte` | Svelte 5 `setFirebirdContext`, `getFirebirdContext`, `useFirebird`, `createQuery`, `createLiveQuery` | Svelte 4/5+ |
-| `firebird-wasm/solid` | SolidJS `setFirebirdContext`, `useFirebird`, `createQuery`, `createLiveQuery` | SolidJS 1.7+ |
+| `firebird-wasm/react` | React `<FirebirdProvider>`, `useFirebird`, `useQuery`, `useLiveQuery`, `useSyncStatus`, `useColumnarQuery`, `useLiveIncrementalQuery` | React 18+ |
+| `firebird-wasm/vue` | Vue 3 `provideFirebird`, `useFirebird`, `useQuery`, `useLiveQuery`, `useSyncStatus`, `useColumnarQuery`, `useLiveIncrementalQuery` | Vue 3.3+ |
+| `firebird-wasm/svelte` | Svelte 5 `setFirebirdContext`, `getFirebirdContext`, `useFirebird`, `createQuery`, `createLiveQuery`, `createSyncStatus`, `createColumnarQuery`, `createLiveIncrementalQuery` | Svelte 4/5+ |
+| `firebird-wasm/solid` | SolidJS `setFirebirdContext`, `useFirebird`, `createQuery`, `createLiveQuery`, `createSyncStatus`, `createColumnarQuery`, `createLiveIncrementalQuery` | SolidJS 1.7+ |
 | `firebird-wasm/tanstack` | TanStack Query (`createFirebirdQueryOptions`, `connectFirebirdQueryClient`) & TanStack DB (`createFirebirdCollection`) | `@tanstack/query-core` / `@tanstack/db` (optional) |
 | `firebird-wasm/rxdb` | RxDB storage adapter (`getRxStorageFirebird`) backed by Firebird SQL | RxDB 15+ (optional) |
-| `firebird-wasm/repl` | `<firebird-repl>` interactive SQL console + Schema, Migrations, Profiler, Plan & Replication inspector | Browser custom elements |
+| `firebird-wasm/repl` | `<firebird-repl>` interactive SQL console + Schema, Migrations, Profiler, Plan, Replication & Arrow/Sync inspector | Browser custom elements |
 | `firebird-wasm/electric` | ElectricSQL client sync (`syncShapeToTable`, `syncShapesToTables`, `syncShapes`, `createWriteQueue`) | `FirebirdBrowser` / `FirebirdLite` |
 | `firebird-wasm/electric-server` | Firebird-backed Electric shape feed & write ingestion (`createShapeServer`, `applyWrite`) | `FirebirdLite` / `FirebirdBrowser` |
 | `firebird-wasm/kysely` | Kysely dialect (`FirebirdDialect`, `createKysely`) & TypeScript schema codegen (`generateKyselyTypes`) | Kysely 0.27+ (optional) |
 | `firebird-wasm/drizzle` | Drizzle-style query builder (`drizzle`, `firebirdTable`) & schema codegen (`generateDrizzleSchema`) | Drizzle ORM 0.30+ (optional) |
 | `firebird-wasm/vector` | Float32/Int8 vector codec, persistent HNSW ANN index (`HnswIndex`, `createVectorIndex`), SQL UDRs, and `vectorSearch` | `FirebirdBrowser` / `FirebirdLite` |
 | `firebird-wasm/fts` | Okapi BM25 full-text search (`Bm25Index`, `createFtsIndex`), stemming/highlighting UDRs, and RRF `hybridSearch` | `FirebirdBrowser` / `FirebirdLite` |
-| `firebird-wasm/replication` | Logical, journal & native Firebird engine replication (`syncDatabases`, `db.syncWith`, WebRTC/WS/HTTP, CRDTs, mesh/hub, DLQ, PITR, `"FBCHANGELOG\0"`) | `FirebirdBrowser` / `FirebirdLite` |
+| `firebird-wasm/columnar` | Standalone zero-copy columnar vector decoder (`decodeBinaryResultColumnar`) & Apache Arrow IPC V5 codec (`encodeArrowIpc`, `decodeArrowIpc`) | Browser or Node.js |
+| `firebird-wasm/schema` | Standalone Standard Schema v1 row validator (`createRowSchema`, `validateRows`) & schema-aware SQL builder (`createTypedSql<DB>()`) | Browser or Node.js |
+| `firebird-wasm/replication` | Logical, journal, binary `.fdb` / page-diff bootstrap, S3/R2/HTTP WAL PITR (`createObjectStoreReplicationTarget`), WebRTC/WS/HTTP, CRDTs, mesh/hub, DLQ & `"FBCHANGELOG\0"` | `FirebirdBrowser` / `FirebirdLite` |
 | `firebird-wasm/cli` | `npx firebird-wasm` developer CLI (`query`, `repl`, `codegen --kysely\|--drizzle`, `migrate`, `dump`, `restore`, `inspect-changelog`) | Node.js 18+ |
 
 ## Quick start — Browser (WASM)
@@ -96,9 +98,10 @@ await db.close();
 
 ### Core API (`FirebirdBrowser` & `FirebirdLite`)
 
-- **Unified & columnar queries**: `openDatabase(uri, opts?)`, `db.execute(sql, params?)`, `db.exec(sql, params?)`, `db.execBatch(sql, rows)`, `db.query<T>(sql, params?, { schema? })`, `db.queryColumnar(sql, params?)`, `db.queryArrow(sql, params?, opts?)` (`encodeArrowIpc` / `decodeArrowIpc`), `db.queryStream<T>(sql, params?, opts?)`, `db.prepare(sql)`, `` sql`...` `` & `createTypedSql<DB>(db)`
+- **Unified, pipelined & columnar queries**: `openDatabase(uri, opts?)`, `db.execute(sql, params?)`, `db.exec(sql, params?)`, `db.execBatch(sql, rows)`, `db.pipeline(steps, { transaction? })` (`"FBP\x01"` / `"FBP\x02"` wire params), `db.query<T>(sql, params?, { schema? })`, `db.queryColumnar(sql, params?)`, `db.queryArrow(sql, params?, opts?)` (`encodeArrowIpc` / `decodeArrowIpc`), `db.queryStream<T>(sql, params?, opts?)`, `db.prepare(sql)`, `` sql`...` `` & `createTypedSql<DB>(db)`
 - **Standard Schema v1 & errors**: `Zod` / `Valibot` / `ArkType` / `createRowSchema` validation (`{ schema }`, `SchemaValidationError`), structured `FirebirdError` (`gdscode`, `sqlcode`, `sqlState`, `hint`), `[Symbol.asyncDispose]()` (`await using db = ...`)
-- **Replication & P2P sync**: `syncDatabases(primary, replica, { mode: 'native' | 'logical' | 'auto' })`, `db.syncWith(peerOrUrl)`, `createWebRtcReplicationPeer()` (16 KB SCTP chunking + CRC-32 + backpressure), `createResilientWebSocketPeer()`, `fetchSnapshotResumable()`, `flushDatabaseFbChangelogSegment()`
+- **Replication, S3/R2 WAL PITR & P2P sync**: `syncDatabases(primary, replica, { mode: 'native' | 'logical' | 'auto', bootstrapStrategy: 'binary-image' | 'page-diff' | 'logical' })`, `db.syncWith(peerOrUrl)`, `createObjectStoreReplicationTarget()` + `restoreDatabaseToPointInTime()` (AWS SigV4), `createWebRtcReplicationPeer()`, `createResilientWebSocketPeer()`, `fetchSnapshotResumable()`
+- **Reactive live queries**: `db.live()`, `db.liveIncremental(sql, params?, { key, table? })` (structural row-reference sharing + `applyChanges()`), `db.liveColumnar(sql, params?)`, `db.listen()`, `db.notify()`
 - **Transactions**: `db.transaction(fn, options?)`, `tx.savepoint(fn)`, `tx.rollback()`
 - **Schema & migrations**: `db.describeQuery(sql)`, `db.explain(sql, options?)`, `db.introspect()`, `db.migrate(migrations)`, `diffSchema()`, `generateMigration()`
 - **Bulk & BLOB streaming**: `db.copyFromStream()`, `db.copyToStream()`, `db.createBlobStream()`, `db.openBlobStream()`, `db.dumpDataDir()`, `db.dumpDataStream()`, `db.loadDataStream()`

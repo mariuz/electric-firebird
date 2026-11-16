@@ -2923,4 +2923,178 @@ test.describe('FirebirdBrowser', () => {
     expect(result.roundTripRow).toEqual({ ID: 1, LABEL: 'alpha' });
     expect(result.liveResults).toBe(0);
   });
+
+  test('M20: db.pipeline(), FBP\\x01 wire params, db.liveIncremental(), db.liveColumnar(), and S3/HTTP object-store WAL PITR', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      window.__stub.affectedRows = 1;
+      window.__stub.queryResult = {
+        columns: [
+          { name: 'ID', type: 496, subType: 0, scale: 0, length: 4, nullable: false },
+          { name: 'LABEL', type: 448, subType: 0, scale: 0, length: 32, nullable: false },
+        ],
+        rows: [
+          [1, 'alpha'],
+          [2, 'beta'],
+        ],
+      };
+
+      // 1. FBP\x01 / FBP\x02 binary wire parameter round-trip
+      const wireSingle = window.FB.encodeWireParams([42, 'hello', true, null, 9007199254740993n]);
+      const decodedSingle = window.FB.decodeWireParams(wireSingle);
+      const wireBatch = window.FB.encodeWireParamRows([
+        [1, 'one'],
+        [2, 'two'],
+      ]);
+      const decodedBatch = window.FB.decodeWireParamRows(wireBatch);
+
+      const db = new window.FB.FirebirdBrowser('memory://m20-e2e', { persist: false });
+
+      // 2. db.pipeline() batching execute + execBatch + query + queryColumnar + queryArrow
+      const pipeOut = await db.pipeline(
+        [
+          { kind: 'execute', sql: 'INSERT INTO ITEMS (ID, LABEL) VALUES (?, ?)', params: [1, 'alpha'] },
+          {
+            kind: 'execBatch',
+            sql: 'INSERT INTO ITEMS (ID, LABEL) VALUES (?, ?)',
+            rows: [
+              [2, 'beta'],
+              [3, 'gamma'],
+            ],
+          },
+          { kind: 'query', sql: 'SELECT ID, LABEL FROM ITEMS ORDER BY ID' },
+          { kind: 'queryColumnar', sql: 'SELECT ID, LABEL FROM ITEMS ORDER BY ID' },
+          { kind: 'queryArrow', sql: 'SELECT ID, LABEL FROM ITEMS ORDER BY ID' },
+        ],
+        { transaction: true },
+      );
+
+      const pipeRows = (pipeOut[2] as { rows: Array<Record<string, unknown>> }).rows;
+      const pipeCol = pipeOut[3] as { rowCount: number; getColumn(name: string): { data: Int32Array } | undefined };
+      const pipeArrow = pipeOut[4] as Uint8Array;
+      const decodedArrow = window.FB.decodeArrowIpc(pipeArrow);
+
+      // 3. db.liveIncremental() with structural row-reference sharing & O(k) applyChanges()
+      const incSnapshots: Array<{
+        rows: readonly Record<string, unknown>[];
+        deltas: Array<{ type: string; key: string }>;
+      }> = [];
+      const inc = await db.liveIncremental<Record<string, unknown>>(
+        'SELECT ID, LABEL FROM ITEMS ORDER BY ID',
+        { key: 'ID' },
+      );
+      const initialRow1Ref = inc.rows[0];
+      inc.subscribe((snap) => {
+        incSnapshots.push({
+          rows: snap.rows,
+          deltas: snap.deltas.map((d) => ({ type: d.type, key: String(d.key) })),
+        });
+      });
+      inc.applyChanges([
+        {
+          lsn: 10,
+          txid: 'tx-10',
+          origin: 'primary',
+          publication: 'pub',
+          table: 'ITEMS',
+          operation: 'UPDATE',
+          key: { ID: 2 },
+          after: { ID: 2, LABEL: 'beta-patched' },
+          before: { ID: 2, LABEL: 'beta' },
+          ddlSql: null,
+          timestamp: Date.now(),
+        },
+        {
+          lsn: 11,
+          txid: 'tx-10',
+          origin: 'primary',
+          publication: 'pub',
+          table: 'ITEMS',
+          operation: 'INSERT',
+          key: { ID: 3 },
+          after: { ID: 3, LABEL: 'gamma-patched' },
+          before: null,
+          ddlSql: null,
+          timestamp: Date.now(),
+        },
+      ]);
+      const row1Preserved = incSnapshots[0]!.rows[0] === initialRow1Ref;
+      await inc.unsubscribe();
+
+      // 4. db.liveColumnar()
+      const liveCol = await db.liveColumnar('SELECT ID, LABEL FROM ITEMS ORDER BY ID');
+      const colRowCount = liveCol.current.rowCount;
+      await liveCol.unsubscribe();
+
+      // 5. AWS SigV4 header signing + Memory Object-Store WAL structure check
+      const sigHeaders = await window.FB.signAwsSigV4Headers({
+        method: 'PUT',
+        url: 'https://s3.us-east-1.amazonaws.com/fb-replicas/wal/0001.fbdr',
+        accessKeyId: 'AKIAIOSFODNN7EXAMPLE',
+        secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+        region: 'us-east-1',
+        body: new Uint8Array([1, 2, 3, 4]),
+        now: new Date('2026-11-16T12:00:00Z'),
+      });
+      const memStore = window.FB.createMemoryObjectStoreAdapter();
+      await memStore.putObject('test/seg.bin', new Uint8Array([9, 8, 7]));
+      const memKeys = await memStore.listObjects!('test/');
+
+      const stats = window.__stub.stats();
+      await db.close();
+
+      return {
+        wireSingleMagic: Array.from(wireSingle.subarray(0, 4)),
+        decodedSingleOk:
+          decodedSingle[0] === 42 &&
+          decodedSingle[1] === 'hello' &&
+          decodedSingle[2] === true &&
+          decodedSingle[3] === null &&
+          decodedSingle[4] === 9007199254740993n,
+        decodedBatch,
+        pipeAffected1: pipeOut[0],
+        pipeAffectedBatch: pipeOut[1],
+        pipeRows,
+        pipeColIds: Array.from(pipeCol.getColumn('ID')!.data),
+        arrowRows: decodedArrow.rowCount,
+        row1Preserved,
+        incSecondRows: incSnapshots[0]!.rows,
+        incSecondDeltas: incSnapshots[0]!.deltas,
+        colRowCount,
+        authHeader: sigHeaders.Authorization,
+        memKeys,
+        liveResults: stats.liveResults,
+      };
+    });
+
+    expect(result.wireSingleMagic).toEqual([0x46, 0x42, 0x50, 0x01]);
+    expect(result.decodedSingleOk).toBe(true);
+    expect(result.decodedBatch).toEqual([
+      [1, 'one'],
+      [2, 'two'],
+    ]);
+    expect(result.pipeAffected1).toEqual({ affectedRows: 1 });
+    expect(result.pipeAffectedBatch).toEqual({ affectedRows: 2 });
+    expect(result.pipeRows).toEqual([
+      { ID: 1, LABEL: 'alpha' },
+      { ID: 2, LABEL: 'beta' },
+    ]);
+    expect(result.pipeColIds).toEqual([1, 2]);
+    expect(result.arrowRows).toBe(2);
+    expect(result.row1Preserved).toBe(true);
+    expect(result.incSecondRows).toEqual([
+      { ID: 1, LABEL: 'alpha' },
+      { ID: 2, LABEL: 'beta-patched' },
+      { ID: 3, LABEL: 'gamma-patched' },
+    ]);
+    expect(result.incSecondDeltas).toEqual([
+      { type: 'update', key: '2' },
+      { type: 'insert', key: '3' },
+    ]);
+    expect(result.colRowCount).toBe(2);
+    expect(result.authHeader).toContain('AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261116/us-east-1/s3/aws4_request');
+    expect(result.memKeys).toEqual(['test/seg.bin']);
+    expect(result.liveResults).toBe(0);
+  });
 });

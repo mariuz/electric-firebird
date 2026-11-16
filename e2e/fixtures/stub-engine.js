@@ -340,7 +340,9 @@
     let nextDbHandle = 1000;
     let nextTxHandle = 5000;
     let nextCursorHandle = 9000;
+    let nextEventSubHandle = 12000;
     const cursors = new Map(); // cursorHandle -> { columns, rows, offset }
+    const eventSubs = new Map(); // subHandle -> { names, pending }
     let initialised = false;
 
     /**
@@ -620,6 +622,32 @@
         });
         cursors.delete(cursorHandle);
         return stub.cursorCloseRc;
+      },
+
+      _fb_events_subscribe(handle, namesPtr) {
+        const csv = UTF8ToString(namesPtr);
+        const names = csv ? csv.split(',').filter(Boolean) : [];
+        stub.calls.push({ fn: '_fb_events_subscribe', args: [handle, names] });
+        const subHandle = nextEventSubHandle++;
+        eventSubs.set(subHandle, { names, pending: {} });
+        return subHandle;
+      },
+
+      _fb_events_poll(subHandle) {
+        stub.calls.push({ fn: '_fb_events_poll', args: [subHandle] });
+        const entry = eventSubs.get(subHandle);
+        const counts = entry ? { ...entry.pending } : {};
+        if (entry) entry.pending = {};
+        const json = JSON.stringify(counts);
+        const len = lengthBytesUTF8(json) + 1;
+        const ptr = malloc(len);
+        stringToUTF8(json, ptr, len);
+        return ptr;
+      },
+
+      _fb_events_cancel(subHandle) {
+        stub.calls.push({ fn: '_fb_events_cancel', args: [subHandle] });
+        eventSubs.delete(subHandle);
       },
 
       _fb_last_error() {

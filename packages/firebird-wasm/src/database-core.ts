@@ -40,6 +40,18 @@ import type {
 import type { SqlFragment } from './sql-tag';
 import type { ArrowIpcOptions, ColumnarQueryResult } from './columnar';
 import type { StandardSchemaV1, TypedSqlFragment } from './schema-validation';
+import type {
+  PipelineOperation,
+  PipelineOptions,
+  PipelineResults,
+} from './pipeline';
+import type {
+  IncrementalLiveSnapshot,
+  LiveColumnarOptions,
+  LiveColumnarQuery,
+  LiveIncrementalOptions,
+  LiveIncrementalQuery,
+} from './live-incremental';
 import { UdrManager } from './browser/udr';
 import {
   CowSnapshotStore,
@@ -248,6 +260,11 @@ export interface FirebirdTransactionClient {
     params?: QueryParams | (StatementExecutionOptions & ArrowIpcOptions),
     options?: StatementExecutionOptions & ArrowIpcOptions,
   ): Promise<Uint8Array>;
+  /** Execute a heterogeneous batch of queries and DML statements in one pipeline (`M20 Item 2`). */
+  pipeline<const TOps extends readonly PipelineOperation[]>(
+    ops: TOps,
+    options?: Omit<PipelineOptions, 'transaction'>,
+  ): Promise<PipelineResults<TOps>>;
   queryStream<T extends Row = Row>(
     sql: string | SqlFragment,
     paramsOrOptions?: QueryParams | QueryStreamOptions,
@@ -365,6 +382,36 @@ export interface FirebirdDatabase {
     sql: string,
     rows: QueryParams[],
   ): Promise<{ affectedRows: number } | void>;
+  /**
+   * Execute multiple heterogeneous `query` / `queryColumnar` / `queryArrow` /
+   * `execute` / `execBatch` steps in a single cross-worker round-trip (`M20 Item 2`).
+   */
+  pipeline<const TOps extends readonly PipelineOperation[]>(
+    ops: TOps,
+    options?: PipelineOptions,
+  ): Promise<PipelineResults<TOps>>;
+  /**
+   * Subscribe to incremental `{ rows, deltas }` (`insert` / `update` / `delete`)
+   * updates with structural sharing for unchanged rows (`M20 Item 3`).
+   */
+  liveIncremental<T extends Row = Row>(
+    sql: string | SqlFragment,
+    optionsOrListener?:
+      | LiveIncrementalOptions<T>
+      | ((snapshot: IncrementalLiveSnapshot<T>) => void),
+    maybeListener?: (snapshot: IncrementalLiveSnapshot<T>) => void,
+  ): Promise<LiveIncrementalQuery<T>>;
+  /**
+   * Subscribe to zero-per-row-object `ColumnarQueryResult` typed vectors that
+   * refresh automatically when referenced tables change (`M20 Item 3`).
+   */
+  liveColumnar(
+    sql: string | SqlFragment,
+    optionsOrListener?:
+      | LiveColumnarOptions
+      | ((result: ColumnarQueryResult, version: number) => void),
+    maybeListener?: (result: ColumnarQueryResult, version: number) => void,
+  ): Promise<LiveColumnarQuery>;
   prepare(sql: string | SqlFragment): Promise<PreparedStatement>;
   transaction<T>(
     fn: (tx: FirebirdTransactionClient) => Promise<T>,

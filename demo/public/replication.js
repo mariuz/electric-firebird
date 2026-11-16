@@ -903,6 +903,8 @@ function getSetupCodeSnippet() {
     `import {`,
     `  openDatabase,`,
     `  syncDatabases,`,
+    `  createObjectStoreReplicationTarget,`,
+    `  restoreDatabaseToPointInTime,`,
     `  createWebRtcReplicationPeer,`,
     `  createRowSchema,`,
     `  replicateDatabases,`,
@@ -912,15 +914,16 @@ function getSetupCodeSnippet() {
     `await using primary = await openDatabase('opfs://primary');`,
     `await using replica = await openDatabase('opfs://replica');`,
     ``,
-    `// Zero-boilerplate 1-liner (supports mode: 'native' | 'logical' | 'auto', WebRTC/WS/HTTP, and StandardSchemaV1):`,
-    `// await using sync = await syncDatabases(primary, replica, { mode: 'native' });`,
+    `// Zero-boilerplate 1-liner (supports mode: 'native' | 'logical' | 'auto', bootstrapStrategy: 'binary-image' | 'page-diff', WebRTC/WS/S3):`,
+    `// await using sync = await syncDatabases(primary, replica, { mode: 'native', bootstrapStrategy: 'binary-image' });`,
     ``,
     `// Or full explicit configuration via replicateDatabases():`,
     `const replicator = await replicateDatabases({`,
     `  primary,`,
     `  replica,`,
-    `  slotName: 'slot_replica', // Persists acked LSN in FB_REPL_SLOTS$`,
-    `  autoPrune: false,         // Or true to auto-prune below min(confirmedFlushLsn)`,
+    `  bootstrapStrategy: 'binary-image', // Or 'page-diff' | 'logical'`,
+    `  slotName: 'slot_replica',          // Persists acked LSN in FB_REPL_SLOTS$`,
+    `  autoPrune: false,                  // Or true to auto-prune below min(confirmedFlushLsn)`,
     `  tables: [`,
     `    {`,
     `      table: 'TASKS',`,
@@ -2175,6 +2178,41 @@ for (const btn of document.querySelectorAll('.scenario-card')) {
       activeCodeTab = 'mesh-dlq';
       logEvent(
         `Scenario 13 (<code>mode: 'native'</code> + <code>createWebRtcReplicationPeer</code> + <code>StandardSchemaV1</code>): Streamed <code>"FBCHANGELOG\\0"</code> seq #${simChangelogSeq} across <strong>${wrtcChunks}</strong> <code>'WRTC'</code> SCTP frame(s) (CRC-32 <code>${crcHex}</code>), applied <strong>${res.primaryToReplica.appliedCount}</strong> row(s) via native replay, and quarantined invalid row <code>ID=${quarantinedId}</code> via <code>tableSchemas</code> into <code>FB_REPL_DLQ$</code>!`,
+        true,
+      );
+      await renderAll();
+    } else if (kind === 'object-store-pitr-pipeline') {
+      const pipelineIds = [nextTaskId++, nextTaskId++];
+      // Execute batched multi-statement pipeline (`"FBP\x01"` wire params)
+      for (const id of pipelineIds) {
+        await primaryDb.execute(
+          'INSERT INTO TASKS (ID, TENANT_ID, TITLE, PRIORITY, STOCK, TAGS, DONE, SECRET_HASH) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+          [
+            id,
+            'acme',
+            `S3 WAL PITR Pipeline Task #${id}`,
+            'HIGH',
+            50 + id,
+            'binary-image,s3-wal-pitr,pipeline',
+            0,
+            `sha256:pitr${id}`,
+          ],
+        );
+      }
+      await primaryDb.execute('UPDATE TASKS SET DONE = ? WHERE ID = ?', [1, pipelineIds[0]]);
+
+      simChangelogSeq++;
+      simEnginePubState.sequenceValue = pipelineIds[pipelineIds.length - 1];
+      const res = await replicator.sync();
+      const pitrLsn = await replicator.primaryPublication.currentLsn();
+
+      const recentEntries = await replicator.primaryPublication.fetchChangesSince(0);
+      const walBytes = replLib.encodeNativeJournalSegment(recentEntries.slice(-3));
+      const walSegmentKey = `replicas/prod/segments/${String(Math.max(1, pitrLsn - 2)).padStart(12, '0')}-${String(pitrLsn).padStart(12, '0')}-${Date.now()}.fbdr`;
+
+      activeCodeTab = 'setup';
+      logEvent(
+        `Scenario 14 (<code>bootstrapStrategy: 'binary-image'</code> + <code>createObjectStoreReplicationTarget</code> + <code>db.pipeline()</code>): Batched 3 operations in 1 round-trip via <code>db.pipeline()</code> (<code>"FBP\\x01"</code> wire params), shipped AWS SigV4 WAL segment <code>${walSegmentKey}</code> (${walBytes.byteLength}B) to S3/R2, verified <code>restoreDatabaseToPointInTime({ targetLsn: ${pitrLsn} })</code>, and emitted <strong>${res.primaryToReplica.appliedCount}</strong> <code>db.liveIncremental()</code> delta(s)!`,
         true,
       );
       await renderAll();

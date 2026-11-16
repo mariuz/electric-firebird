@@ -7,9 +7,21 @@
  * starting an engine server.
  */
 
-import type { QueryParams } from '../types';
+import type { QueryParams, TransactionOptions } from '../types';
 import type { EngineTransport, BinaryResultPayload } from './engine-transport';
 import { encodeBinaryResultSet, isBinaryResultPayload } from './binary-result';
+import {
+  decodeWireParamRows,
+  decodeWireParams,
+  isWireParamRowsBuffer,
+  isWireParamsBuffer,
+} from './wire-params';
+import {
+  isEnginePipelineResponseArray,
+  type EnginePipelineStepRequest,
+  type EnginePipelineStepResponse,
+  type EnginePipelineWireOptions,
+} from '../pipeline';
 import type { EngineRequest, EngineResponse } from './worker-protocol';
 
 /**
@@ -74,6 +86,15 @@ function collectTransferables(result: unknown): Transferable[] {
       ? [result.binaryResult.buffer]
       : [];
   }
+  if (isEnginePipelineResponseArray(result)) {
+    const buffers = new Set<ArrayBuffer>();
+    for (const item of result) {
+      if (item.kind === 'binary' && isTransferableBuffer(item.payload.binaryResult.buffer)) {
+        buffers.add(item.payload.binaryResult.buffer);
+      }
+    }
+    return [...buffers];
+  }
   return collectBlobBuffers(result);
 }
 
@@ -125,13 +146,120 @@ export function serveEngine(
   scope.addEventListener('message', (event: MessageEvent<EngineRequest>) => {
     const { id, op, args } = event.data;
 
+    const unwrapParamsArg = (raw: unknown): QueryParams | Uint8Array => {
+      if (raw === undefined || raw === null) return [];
+      if (isWireParamsBuffer(raw)) {
+        return transport.acceptsWireParams ? raw : decodeWireParams(raw);
+      }
+      return raw as QueryParams;
+    };
+
+    const unwrapRowsArg = (raw: unknown): QueryParams[] | Uint8Array => {
+      if (raw === undefined || raw === null) return [];
+      if (isWireParamRowsBuffer(raw)) {
+        return transport.acceptsWireParams ? raw : decodeWireParamRows(raw);
+      }
+      return raw as QueryParams[];
+    };
+
     void (async () => {
       try {
+        if (op === 'pipeline') {
+          const dbHandle = args[0] as number;
+          const txHandle = args[1] as number;
+          const rawSteps = (args[2] as EnginePipelineStepRequest[]) ?? [];
+          const wireOpts = (args[3] as EnginePipelineWireOptions | undefined) ?? {};
+          const steps = transport.acceptsWireParams
+            ? rawSteps
+            : rawSteps.map((s): EnginePipelineStepRequest =>
+                s.op === 'executeBatch'
+                  ? { op: 'executeBatch', sql: s.sql, rows: unwrapRowsArg(s.rows) }
+                  : s.op === 'execute'
+                    ? { op: 'execute', sql: s.sql, params: unwrapParamsArg(s.params) }
+                    : {
+                        op: 'queryBinary',
+                        sql: s.sql,
+                        params: unwrapParamsArg(s.params),
+                        binaryBlobs: s.binaryBlobs,
+                      },
+              );
+
+          let rawOut: EnginePipelineStepResponse[];
+          if (typeof transport.pipeline === 'function') {
+            rawOut = await transport.pipeline(dbHandle, txHandle, steps, wireOpts);
+          } else {
+            let activeTx = txHandle;
+            const ownsTx = activeTx === 0 && Boolean(wireOpts.transaction);
+            if (ownsTx) {
+              const txOpts: TransactionOptions =
+                typeof wireOpts.transaction === 'object' && wireOpts.transaction !== null
+                  ? wireOpts.transaction
+                  : {};
+              activeTx = await transport.startTransaction(dbHandle, txOpts);
+            }
+            rawOut = new Array(steps.length);
+            try {
+              for (let i = 0; i < steps.length; i++) {
+                const s = steps[i]!;
+                if (s.op === 'execute') {
+                  rawOut[i] = {
+                    kind: 'affected',
+                    affectedRows: await transport.execute(dbHandle, activeTx, s.sql, s.params),
+                  };
+                } else if (s.op === 'executeBatch') {
+                  rawOut[i] = {
+                    kind: 'affected',
+                    affectedRows: await transport.executeBatch(dbHandle, activeTx, s.sql, s.rows),
+                  };
+                } else if (typeof transport.queryBinary === 'function') {
+                  rawOut[i] = {
+                    kind: 'binary',
+                    payload: await transport.queryBinary(
+                      dbHandle,
+                      activeTx,
+                      s.sql,
+                      s.params,
+                      s.binaryBlobs,
+                    ),
+                  };
+                } else {
+                  const decoded = await transport.query<unknown[]>(
+                    dbHandle,
+                    activeTx,
+                    s.sql,
+                    s.params,
+                    'array',
+                    s.binaryBlobs,
+                  );
+                  rawOut[i] = {
+                    kind: 'binary',
+                    payload: { binaryResult: encodeBinaryResultSet(decoded, { rowMode: 'array' }) },
+                  };
+                }
+              }
+              if (ownsTx) await transport.commit(activeTx);
+            } catch (err) {
+              if (ownsTx && activeTx !== 0) {
+                await transport.rollback(activeTx).catch(() => undefined);
+              }
+              throw err;
+            }
+          }
+
+          const prepared = rawOut.map((item) =>
+            item.kind === 'binary'
+              ? { kind: 'binary' as const, payload: prepareBinaryPayload(item.payload) }
+              : item,
+          );
+          reply({ id, ok: true, result: prepared });
+          return;
+        }
+
         if (op === 'query' || op === 'queryBinary') {
           const dbHandle = args[0] as number;
           const txHandle = args[1] as number;
           const sql = args[2] as string;
-          const params = (args[3] as QueryParams | undefined) ?? [];
+          const params = unwrapParamsArg(args[3]);
           const binaryBlobs = Boolean(op === 'query' ? args[5] : args[4]);
           if (typeof transport.queryBinary === 'function') {
             const payload = await transport.queryBinary(
@@ -166,7 +294,7 @@ export function serveEngine(
           const dbHandle = args[0] as number;
           const txHandle = args[1] as number;
           const stmtHandle = args[2] as number;
-          const params = (args[3] as QueryParams | undefined) ?? [];
+          const params = unwrapParamsArg(args[3]);
           const binaryBlobs = Boolean(op === 'queryStmt' ? args[5] : args[4]);
           if (typeof transport.queryStmtBinary === 'function') {
             const payload = await transport.queryStmtBinary(
@@ -234,7 +362,24 @@ export function serveEngine(
           throw new Error(`unknown engine operation: ${op}`);
         }
 
-        const result = (await fn.apply(transport, args)) ?? null;
+        let resolvedArgs = args;
+        if (!transport.acceptsWireParams) {
+          if (
+            op === 'execute' ||
+            op === 'cursorOpen' ||
+            op === 'executeStmt' ||
+            op === 'cursorOpenStmt' ||
+            op === 'blobOpenQuery'
+          ) {
+            resolvedArgs = [...args];
+            resolvedArgs[3] = unwrapParamsArg(args[3]);
+          } else if (op === 'executeBatch' || op === 'executeBatchStmt') {
+            resolvedArgs = [...args];
+            resolvedArgs[3] = unwrapRowsArg(args[3]);
+          }
+        }
+
+        const result = (await fn.apply(transport, resolvedArgs)) ?? null;
         reply({ id, ok: true, result: result as EngineResponse['result'] });
       } catch (err) {
         reply({

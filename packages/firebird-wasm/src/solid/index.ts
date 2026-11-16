@@ -28,10 +28,33 @@ import type {
   QueryState,
   QueryStoreOptions,
 } from '../frameworks/query-store';
+import {
+  ColumnarQueryStore,
+  IncrementalQueryStore,
+  SyncStatusStore,
+  type ColumnarQueryState,
+  type ColumnarQueryableDatabase,
+  type IncrementalQueryState,
+  type IncrementalQueryableDatabase,
+  type SyncHandleLike,
+  type SyncStatusState,
+  type SyncStatusStoreOptions,
+} from '../frameworks/sync-store';
+import type { ColumnarQueryResult } from '../columnar';
+import type { LiveRowDelta, LiveRowKeySelector } from '../live-incremental';
 import type { SqlFragment } from '../sql-tag';
 import type { QueryParams, Row } from '../types';
 
 export type { QueryableDatabase, QueryState } from '../frameworks/query-store';
+export type {
+  ColumnarQueryState,
+  ColumnarQueryableDatabase,
+  IncrementalQueryState,
+  IncrementalQueryableDatabase,
+  SyncHandleLike,
+  SyncStatusState,
+  SyncStatusStoreOptions,
+} from '../frameworks/sync-store';
 
 /** A SolidJS signal accessor `() => T`. */
 export type Accessor<T> = () => T;
@@ -343,6 +366,185 @@ function createSolidStoreInternal<T extends Row>(
         listeners.delete(listener);
       };
     },
+    dispose,
+  };
+}
+
+/** SolidJS signal accessors returned by {@link createSyncStatus} (`M20 Item 4`). */
+export interface SolidSyncStatusResult {
+  state: Accessor<SyncStatusState['state']>;
+  paused: Accessor<boolean>;
+  syncing: Accessor<boolean>;
+  lagEntries: Accessor<number>;
+  dlqCount: Accessor<number>;
+  error: Accessor<Error | undefined>;
+  snapshot: Accessor<SyncStatusState>;
+  syncNow(): Promise<void>;
+  pause(): void;
+  resume(): void;
+  refresh(): Promise<void>;
+  dispose(): void;
+}
+
+/** Track a `SyncHandle` as SolidJS signal accessors (`M20 Item 4`). */
+export function createSyncStatus(
+  handle: MaybeAccessor<SyncHandleLike | null | undefined>,
+  options: SyncStatusStoreOptions = {},
+): SolidSyncStatusResult {
+  const primitives = resolveSolidPrimitives();
+  const makeSignal = primitives.createSignal ?? createFallbackSignal;
+  const store = new SyncStatusStore(unwrapAccessor(handle), options);
+  const [getSnap, setSnap] = makeSignal<SyncStatusState>(store.getSnapshot());
+  const unsub = store.subscribe(() => setSnap(store.getSnapshot()));
+  store.start();
+
+  const dispose = () => {
+    unsub();
+    store.stop();
+  };
+
+  if (typeof primitives.onCleanup === 'function') {
+    try {
+      primitives.onCleanup(dispose);
+    } catch {
+      // Ignore outside reactive owner
+    }
+  }
+
+  return {
+    state: () => getSnap().state,
+    paused: () => getSnap().paused,
+    syncing: () => getSnap().syncing,
+    lagEntries: () => getSnap().lagEntries,
+    dlqCount: () => getSnap().dlqCount,
+    error: () => getSnap().error,
+    snapshot: getSnap,
+    syncNow: () => store.syncNow(),
+    pause: () => store.pause(),
+    resume: () => store.resume(),
+    refresh: () => store.refresh(),
+    dispose,
+  };
+}
+
+/** SolidJS signal accessors returned by {@link createColumnarQuery} (`M20 Item 4`). */
+export interface SolidColumnarResult {
+  result: Accessor<ColumnarQueryResult | undefined>;
+  version: Accessor<number>;
+  error: Accessor<Error | undefined>;
+  loading: Accessor<boolean>;
+  state: Accessor<ColumnarQueryState>;
+  refresh(): Promise<void>;
+  dispose(): void;
+}
+
+/** Run a one-shot or live columnar query exposed as SolidJS signal accessors (`M20 Item 4`). */
+export function createColumnarQuery(
+  query: MaybeAccessor<string | SqlFragment>,
+  options: {
+    db?: ColumnarQueryableDatabase;
+    events?: MaybeAccessor<readonly string[] | undefined>;
+    live?: boolean;
+    params?: MaybeAccessor<QueryParams | undefined>;
+    pollIntervalMs?: number;
+  } = {},
+): SolidColumnarResult {
+  const primitives = resolveSolidPrimitives();
+  const makeSignal = primitives.createSignal ?? createFallbackSignal;
+  const db = (options.db ?? useFirebird()) as ColumnarQueryableDatabase;
+  const stmt = resolveStatement(unwrapAccessor(query), unwrapAccessor(options.params));
+  const evs = options.events !== undefined ? unwrapAccessor(options.events) : undefined;
+  const store = new ColumnarQueryStore(db, stmt.sql, stmt.params, {
+    events: evs !== undefined ? [...evs] : undefined,
+    live: options.live,
+    pollIntervalMs: options.pollIntervalMs,
+  });
+  const [getSnap, setSnap] = makeSignal<ColumnarQueryState>(store.getSnapshot());
+  const unsub = store.subscribe(() => setSnap(store.getSnapshot()));
+  store.start();
+
+  const dispose = () => {
+    unsub();
+    store.stop();
+  };
+
+  if (typeof primitives.onCleanup === 'function') {
+    try {
+      primitives.onCleanup(dispose);
+    } catch {
+      // Ignore outside reactive owner
+    }
+  }
+
+  return {
+    result: () => getSnap().result,
+    version: () => getSnap().version,
+    error: () => getSnap().error,
+    loading: () => getSnap().loading,
+    state: getSnap,
+    refresh: () => store.refresh(),
+    dispose,
+  };
+}
+
+/** SolidJS signal accessors returned by {@link createLiveIncrementalQuery} (`M20 Item 4`). */
+export interface SolidIncrementalResult<T = Row> {
+  rows: Accessor<readonly T[] | undefined>;
+  deltas: Accessor<readonly LiveRowDelta<T>[]>;
+  version: Accessor<number>;
+  error: Accessor<Error | undefined>;
+  loading: Accessor<boolean>;
+  state: Accessor<IncrementalQueryState<T>>;
+  refresh(): Promise<void>;
+  dispose(): void;
+}
+
+/** Run an incremental `{ rows, deltas }` live query exposed as SolidJS signals (`M20 Item 4`). */
+export function createLiveIncrementalQuery<T extends Row = Row>(
+  query: MaybeAccessor<string | SqlFragment>,
+  options: {
+    db?: IncrementalQueryableDatabase;
+    key?: LiveRowKeySelector<T>;
+    events?: MaybeAccessor<readonly string[] | undefined>;
+    params?: MaybeAccessor<QueryParams | undefined>;
+    pollIntervalMs?: number;
+  } = {},
+): SolidIncrementalResult<T> {
+  const primitives = resolveSolidPrimitives();
+  const makeSignal = primitives.createSignal ?? createFallbackSignal;
+  const db = (options.db ?? useFirebird()) as IncrementalQueryableDatabase;
+  const stmt = resolveStatement(unwrapAccessor(query), unwrapAccessor(options.params));
+  const evs = options.events !== undefined ? unwrapAccessor(options.events) : undefined;
+  const store = new IncrementalQueryStore<T>(db, stmt.sql, stmt.params, {
+    key: options.key,
+    events: evs !== undefined ? [...evs] : undefined,
+    pollIntervalMs: options.pollIntervalMs,
+  });
+  const [getSnap, setSnap] = makeSignal<IncrementalQueryState<T>>(store.getSnapshot());
+  const unsub = store.subscribe(() => setSnap(store.getSnapshot()));
+  store.start();
+
+  const dispose = () => {
+    unsub();
+    store.stop();
+  };
+
+  if (typeof primitives.onCleanup === 'function') {
+    try {
+      primitives.onCleanup(dispose);
+    } catch {
+      // Ignore outside reactive owner
+    }
+  }
+
+  return {
+    rows: () => getSnap().rows,
+    deltas: () => getSnap().deltas,
+    version: () => getSnap().version,
+    error: () => getSnap().error,
+    loading: () => getSnap().loading,
+    state: getSnap,
+    refresh: () => store.refresh(),
     dispose,
   };
 }

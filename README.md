@@ -138,20 +138,22 @@ function Items() {
 | `firebird-wasm` | `openDatabase`, `FirebirdLite`, `FirebirdError` — Node.js native/embedded driver + shared schema, vector, and replication helpers |
 | `firebird-wasm/browser` | `openDatabase`, `FirebirdBrowser`, `FirebirdError`, `IndexedDBVFS`, `OPFSVFS`, snapshots/page diffs, and AES-256-GCM encryption helpers |
 | `firebird-wasm/browser/worker-entry` | Dedicated Web Worker entry point for the WASM engine |
-| `firebird-wasm/react` | React `<FirebirdProvider>`, `useFirebird`, `useQuery`, `useLiveQuery` |
-| `firebird-wasm/vue` | Vue 3 `provideFirebird`, `useFirebird`, `useQuery`, `useLiveQuery` |
-| `firebird-wasm/svelte` | Svelte 5 `setFirebirdContext`, `getFirebirdContext`, `useFirebird`, `createQuery`, `createLiveQuery` |
-| `firebird-wasm/solid` | SolidJS `setFirebirdContext`, `useFirebird`, `createQuery`, `createLiveQuery` |
+| `firebird-wasm/react` | React `<FirebirdProvider>`, `useFirebird`, `useQuery`, `useLiveQuery`, `useSyncStatus`, `useColumnarQuery`, `useLiveIncrementalQuery` |
+| `firebird-wasm/vue` | Vue 3 `provideFirebird`, `useFirebird`, `useQuery`, `useLiveQuery`, `useSyncStatus`, `useColumnarQuery`, `useLiveIncrementalQuery` |
+| `firebird-wasm/svelte` | Svelte 5 `setFirebirdContext`, `getFirebirdContext`, `useFirebird`, `createQuery`, `createLiveQuery`, `createSyncStatus`, `createColumnarQuery`, `createLiveIncrementalQuery` |
+| `firebird-wasm/solid` | SolidJS `setFirebirdContext`, `useFirebird`, `createQuery`, `createLiveQuery`, `createSyncStatus`, `createColumnarQuery`, `createLiveIncrementalQuery` |
 | `firebird-wasm/tanstack` | TanStack Query (`createFirebirdQueryOptions`, `connectFirebirdQueryClient`) & TanStack DB (`createFirebirdCollection`) adapters |
 | `firebird-wasm/rxdb` | RxDB storage adapter (`getRxStorageFirebird`) backed by Firebird SQL |
-| `firebird-wasm/repl` | `<firebird-repl>` custom element with Schema, Migrations, Profiler, Query Plan, and Replication inspector tabs |
+| `firebird-wasm/repl` | `<firebird-repl>` custom element with Schema, Migrations, Profiler, Query Plan, Replication, and Arrow / Sync inspector tabs |
 | `firebird-wasm/electric` | ElectricSQL Postgres shape sync (`syncShapeToTable`, `syncShapesToTables`, `syncShapes`, `createWriteQueue`) |
 | `firebird-wasm/electric-server` | Firebird-backed shape server & HTTP handler (`createShapeServer`, `applyWrite`) |
 | `firebird-wasm/kysely` | Kysely dialect (`FirebirdDialect`, `createKysely`) & TypeScript schema codegen (`generateKyselyTypes`) |
 | `firebird-wasm/drizzle` | Drizzle-style query builder (`drizzle`, `firebirdTable`) & schema codegen (`generateDrizzleSchema`) |
 | `firebird-wasm/vector` | Float32/Int8 vector codec, persistent HNSW ANN index (`HnswIndex`, `createVectorIndex`), SQL UDRs, and `vectorSearch` |
 | `firebird-wasm/fts` | Okapi BM25 full-text search (`Bm25Index`, `createFtsIndex`), stemming/highlighting SQL UDRs, and RRF `hybridSearch` |
-| `firebird-wasm/replication` | One-liner (`syncDatabases`, `db.syncWith`), logical/journal & native Firebird engine replication (`replicateDatabases`, CRDTs, mesh/hub, DLQ, PITR, `"FBCHANGELOG\0"` & `IReplicator`) |
+| `firebird-wasm/columnar` | Standalone zero-copy columnar vector decoder (`decodeBinaryResultColumnar`) & Apache Arrow IPC V5 codec (`encodeArrowIpc`, `decodeArrowIpc`) |
+| `firebird-wasm/schema` | Standalone Standard Schema v1 row validator (`createRowSchema`, `validateRows`) & schema-aware SQL builder (`createTypedSql<DB>()`) |
+| `firebird-wasm/replication` | One-liner (`syncDatabases`, `db.syncWith`), binary `.fdb` / page-diff bootstrap, S3/R2/HTTP object-store WAL shipping (`createObjectStoreReplicationTarget`, `restoreDatabaseToPointInTime`), CRDTs, mesh/hub, DLQ, PITR, `"FBCHANGELOG\0"` & `IReplicator` |
 
 See [docs/integration.md](./docs/integration.md), [docs/replication.md](./docs/replication.md), and [docs/api.md](./docs/api.md) for full details and usage examples.
 
@@ -324,6 +326,7 @@ The library provides two execution backends:
 - [x] Typed binary result wire format (`FBR\x01`), on-demand ICU locale collation packs (`loadIcuLocaleData`), and Firebird 5.0 LTS + 6.0 WASM build targets
 - [x] Unified isomorphic `openDatabase(uri)` + `FirebirdDatabase` (`db.execute()`, `Symbol.asyncDispose`), structured `FirebirdError` (`gdscode`/`sqlState`/`hint`), one-liner `syncDatabases()` / `db.syncWith()`, `IBatch` `UPDATE OR INSERT` catch-up, Worker-safe `db.setReplicaMode()` / `db.applyChangelog()`, and HTTP/WebSocket `"FBCHANGELOG\0"` gzip streaming
 - [x] End-to-end `mode: 'native'` sync preset & single-thread inline `"FBCHANGELOG\0"` emission, zero-copy `db.queryColumnar()` & Apache Arrow IPC (`db.queryArrow()`, `encodeArrowIpc`, `decodeArrowIpc`), WebRTC `RTCDataChannel` P2P sync (`createWebRtcReplicationPeer`) + resilient auto-reconnecting HTTP/WebSocket transports & resumable snapshots, Standard Schema v1 validation (`Zod`/`Valibot`/`ArkType` + `createTypedSql<DB>()`), and the `npx firebird-wasm` developer CLI (`query`, `repl`, `codegen`, `migrate`, `dump`, `restore`, `inspect-changelog`)
+- [x] Binary `.fdb` / page-diff replica bootstrap (`bootstrapStrategy: 'binary-image' | 'page-diff'`) + S3/R2/HTTP object-store WAL shipping (`createObjectStoreReplicationTarget`, `restoreDatabaseToPointInTime`, AWS SigV4), pipelined multi-statement execution (`db.pipeline()`) + `"FBP\x01"` / `"FBP\x02"` binary parameter wire frames, incremental & columnar live queries (`db.liveIncremental()`, `db.liveColumnar()`), reactive framework sync/columnar hooks (`useSyncStatus`, `useColumnarQuery`, `useLiveIncrementalQuery`), and standalone `firebird-wasm/columnar` & `firebird-wasm/schema` subpaths
 
 See [docs/roadmap.md](./docs/roadmap.md) for the full status audit, a
 feature-by-feature comparison with PGlite, and the staged plan.

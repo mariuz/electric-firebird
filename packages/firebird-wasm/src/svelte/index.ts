@@ -27,10 +27,33 @@ import type {
   QueryState,
   QueryStoreOptions,
 } from '../frameworks/query-store';
+import {
+  ColumnarQueryStore,
+  IncrementalQueryStore,
+  SyncStatusStore,
+  type ColumnarQueryState,
+  type ColumnarQueryableDatabase,
+  type IncrementalQueryState,
+  type IncrementalQueryableDatabase,
+  type SyncHandleLike,
+  type SyncStatusState,
+  type SyncStatusStoreOptions,
+} from '../frameworks/sync-store';
+import type { ColumnarQueryResult } from '../columnar';
+import type { LiveRowDelta, LiveRowKeySelector } from '../live-incremental';
 import type { SqlFragment } from '../sql-tag';
 import type { QueryParams, Row } from '../types';
 
 export type { QueryableDatabase, QueryState } from '../frameworks/query-store';
+export type {
+  ColumnarQueryState,
+  ColumnarQueryableDatabase,
+  IncrementalQueryState,
+  IncrementalQueryableDatabase,
+  SyncHandleLike,
+  SyncStatusState,
+  SyncStatusStoreOptions,
+} from '../frameworks/sync-store';
 
 /** A value or a Svelte 5 Rune getter function `() => T`. */
 export type MaybeGetter<T> = T | (() => T);
@@ -380,6 +403,288 @@ function createSvelteStoreInternal<T extends Row>(
     update(): void {
       ensureStore(autoStart || subscribers.size > 0);
     },
+    destroy,
+  };
+}
+
+/** Reactive Svelte store/Runes handle returned by {@link createSyncStatus} (`M20 Item 4`). */
+export interface SvelteSyncStatusStore {
+  readonly current: SyncStatusState;
+  readonly state: SyncStatusState['state'];
+  readonly paused: boolean;
+  readonly syncing: boolean;
+  readonly lagEntries: number;
+  readonly dlqCount: number;
+  readonly error: Error | undefined;
+  subscribe(run: (value: SyncStatusState) => void): () => void;
+  syncNow(): Promise<void>;
+  pause(): void;
+  resume(): void;
+  refresh(): Promise<void>;
+  destroy(): void;
+}
+
+/** Create a Svelte 5 Runes / `Readable` store tracking a `SyncHandle` (`M20 Item 4`). */
+export function createSyncStatus(
+  handle: MaybeGetter<SyncHandleLike | null | undefined>,
+  options: SyncStatusStoreOptions = {},
+): SvelteSyncStatusStore {
+  const primitives = resolveSveltePrimitives();
+  const initialHandle = unwrapGetter(handle);
+  const store = new SyncStatusStore(initialHandle, options);
+  const subscribers = new Set<(value: SyncStatusState) => void>();
+  let currentVal = store.getSnapshot();
+  const stateBox = primitives.createStateBox
+    ? primitives.createStateBox<SyncStatusState>(currentVal)
+    : {
+        get: () => currentVal,
+        set: (next: SyncStatusState) => {
+          currentVal = next;
+        },
+      };
+
+  const unsub = store.subscribe(() => {
+    const snap = store.getSnapshot();
+    stateBox.set(snap);
+    for (const run of [...subscribers]) run(snap);
+  });
+  store.start();
+
+  const destroy = () => {
+    unsub();
+    store.stop();
+    subscribers.clear();
+  };
+
+  if (typeof primitives.onDestroy === 'function') {
+    try {
+      primitives.onDestroy(destroy);
+    } catch {
+      // Ignore outside component context
+    }
+  }
+
+  return {
+    get current() {
+      return stateBox.get();
+    },
+    get state() {
+      return stateBox.get().state;
+    },
+    get paused() {
+      return stateBox.get().paused;
+    },
+    get syncing() {
+      return stateBox.get().syncing;
+    },
+    get lagEntries() {
+      return stateBox.get().lagEntries;
+    },
+    get dlqCount() {
+      return stateBox.get().dlqCount;
+    },
+    get error() {
+      return stateBox.get().error;
+    },
+    subscribe(run) {
+      subscribers.add(run);
+      run(stateBox.get());
+      return () => {
+        subscribers.delete(run);
+      };
+    },
+    syncNow: () => store.syncNow(),
+    pause: () => store.pause(),
+    resume: () => store.resume(),
+    refresh: () => store.refresh(),
+    destroy,
+  };
+}
+
+/** Reactive Svelte store/Runes handle returned by {@link createColumnarQuery} (`M20 Item 4`). */
+export interface SvelteColumnarStore {
+  readonly result: ColumnarQueryResult | undefined;
+  readonly version: number;
+  readonly error: Error | undefined;
+  readonly loading: boolean;
+  readonly current: ColumnarQueryState;
+  subscribe(run: (value: ColumnarQueryState) => void): () => void;
+  refresh(): Promise<void>;
+  destroy(): void;
+}
+
+/** Create a one-shot or live columnar query store for Svelte (`M20 Item 4`). */
+export function createColumnarQuery(
+  query: MaybeGetter<string | SqlFragment>,
+  options: {
+    db?: ColumnarQueryableDatabase;
+    events?: MaybeGetter<readonly string[] | undefined>;
+    live?: boolean;
+    params?: MaybeGetter<QueryParams | undefined>;
+    pollIntervalMs?: number;
+  } = {},
+): SvelteColumnarStore {
+  const primitives = resolveSveltePrimitives();
+  const db = (options.db ?? useFirebird()) as ColumnarQueryableDatabase;
+  const stmt = resolveStatement(unwrapGetter(query), unwrapGetter(options.params));
+  const evs = options.events !== undefined ? unwrapGetter(options.events) : undefined;
+  const store = new ColumnarQueryStore(db, stmt.sql, stmt.params, {
+    events: evs !== undefined ? [...evs] : undefined,
+    live: options.live,
+    pollIntervalMs: options.pollIntervalMs,
+  });
+  const subscribers = new Set<(value: ColumnarQueryState) => void>();
+  let currentVal = store.getSnapshot();
+  const stateBox = primitives.createStateBox
+    ? primitives.createStateBox<ColumnarQueryState>(currentVal)
+    : {
+        get: () => currentVal,
+        set: (next: ColumnarQueryState) => {
+          currentVal = next;
+        },
+      };
+
+  const unsub = store.subscribe(() => {
+    const snap = store.getSnapshot();
+    stateBox.set(snap);
+    for (const run of [...subscribers]) run(snap);
+  });
+  store.start();
+
+  const destroy = () => {
+    unsub();
+    store.stop();
+    subscribers.clear();
+  };
+
+  if (typeof primitives.onDestroy === 'function') {
+    try {
+      primitives.onDestroy(destroy);
+    } catch {
+      // Ignore outside component context
+    }
+  }
+
+  return {
+    get result() {
+      return stateBox.get().result;
+    },
+    get version() {
+      return stateBox.get().version;
+    },
+    get error() {
+      return stateBox.get().error;
+    },
+    get loading() {
+      return stateBox.get().loading;
+    },
+    get current() {
+      return stateBox.get();
+    },
+    subscribe(run) {
+      subscribers.add(run);
+      run(stateBox.get());
+      return () => {
+        subscribers.delete(run);
+      };
+    },
+    refresh: () => store.refresh(),
+    destroy,
+  };
+}
+
+/** Reactive Svelte store/Runes handle returned by {@link createLiveIncrementalQuery} (`M20 Item 4`). */
+export interface SvelteIncrementalStore<T = Row> {
+  readonly rows: readonly T[] | undefined;
+  readonly deltas: readonly LiveRowDelta<T>[];
+  readonly version: number;
+  readonly error: Error | undefined;
+  readonly loading: boolean;
+  readonly current: IncrementalQueryState<T>;
+  subscribe(run: (value: IncrementalQueryState<T>) => void): () => void;
+  refresh(): Promise<void>;
+  destroy(): void;
+}
+
+/** Create an incremental `{ rows, deltas }` live query store for Svelte (`M20 Item 4`). */
+export function createLiveIncrementalQuery<T extends Row = Row>(
+  query: MaybeGetter<string | SqlFragment>,
+  options: {
+    db?: IncrementalQueryableDatabase;
+    key?: LiveRowKeySelector<T>;
+    events?: MaybeGetter<readonly string[] | undefined>;
+    params?: MaybeGetter<QueryParams | undefined>;
+    pollIntervalMs?: number;
+  } = {},
+): SvelteIncrementalStore<T> {
+  const primitives = resolveSveltePrimitives();
+  const db = (options.db ?? useFirebird()) as IncrementalQueryableDatabase;
+  const stmt = resolveStatement(unwrapGetter(query), unwrapGetter(options.params));
+  const evs = options.events !== undefined ? unwrapGetter(options.events) : undefined;
+  const store = new IncrementalQueryStore<T>(db, stmt.sql, stmt.params, {
+    key: options.key,
+    events: evs !== undefined ? [...evs] : undefined,
+    pollIntervalMs: options.pollIntervalMs,
+  });
+  const subscribers = new Set<(value: IncrementalQueryState<T>) => void>();
+  let currentVal = store.getSnapshot();
+  const stateBox = primitives.createStateBox
+    ? primitives.createStateBox<IncrementalQueryState<T>>(currentVal)
+    : {
+        get: () => currentVal,
+        set: (next: IncrementalQueryState<T>) => {
+          currentVal = next;
+        },
+      };
+
+  const unsub = store.subscribe(() => {
+    const snap = store.getSnapshot();
+    stateBox.set(snap);
+    for (const run of [...subscribers]) run(snap);
+  });
+  store.start();
+
+  const destroy = () => {
+    unsub();
+    store.stop();
+    subscribers.clear();
+  };
+
+  if (typeof primitives.onDestroy === 'function') {
+    try {
+      primitives.onDestroy(destroy);
+    } catch {
+      // Ignore outside component context
+    }
+  }
+
+  return {
+    get rows() {
+      return stateBox.get().rows;
+    },
+    get deltas() {
+      return stateBox.get().deltas;
+    },
+    get version() {
+      return stateBox.get().version;
+    },
+    get error() {
+      return stateBox.get().error;
+    },
+    get loading() {
+      return stateBox.get().loading;
+    },
+    get current() {
+      return stateBox.get();
+    },
+    subscribe(run) {
+      subscribers.add(run);
+      run(stateBox.get());
+      return () => {
+        subscribers.delete(run);
+      };
+    },
+    refresh: () => store.refresh(),
     destroy,
   };
 }

@@ -31,6 +31,17 @@ import {
   encodeBinaryResultSet,
   isBinaryResultPayload,
 } from './binary-result';
+import {
+  encodeWireParamRows,
+  encodeWireParams,
+  isWireParamRowsBuffer,
+  isWireParamsBuffer,
+} from './wire-params';
+import type {
+  EnginePipelineStepRequest,
+  EnginePipelineStepResponse,
+  EnginePipelineWireOptions,
+} from '../pipeline';
 import type { EngineOp, EngineRequest, EngineResponse } from './worker-protocol';
 
 /** Options accepted by {@link WorkerTransport}. */
@@ -169,22 +180,49 @@ export class WorkerTransport implements EngineTransport {
     return this.call<void>('detachDatabase', dbHandle);
   }
 
+  private packParamsForTransfer(
+    params: QueryParams | Uint8Array | undefined,
+  ): { wire: QueryParams | Uint8Array; transfer: Transferable[] } {
+    if (!params) return { wire: [], transfer: [] };
+    if (isWireParamsBuffer(params)) {
+      const copy = params.slice();
+      return { wire: copy, transfer: [copy.buffer] };
+    }
+    if (params.length === 0) return { wire: [], transfer: [] };
+    const wire = encodeWireParams(params);
+    return { wire, transfer: [wire.buffer] };
+  }
+
+  private packRowsForTransfer(
+    rows: QueryParams[] | Uint8Array,
+  ): { wire: QueryParams[] | Uint8Array; transfer: Transferable[] } {
+    if (isWireParamRowsBuffer(rows)) {
+      const copy = rows.slice();
+      return { wire: copy, transfer: [copy.buffer] };
+    }
+    if (rows.length === 0) return { wire: [], transfer: [] };
+    const wire = encodeWireParamRows(rows);
+    return { wire, transfer: [wire.buffer] };
+  }
+
   execute(
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     sql: string,
-    params: QueryParams = [],
+    params: QueryParams | Uint8Array = [],
   ): Promise<number> {
-    return this.call<number>('execute', dbHandle, txHandle, sql, params);
+    const { wire, transfer } = this.packParamsForTransfer(params);
+    return this.callWithTransfer<number>(transfer, 'execute', dbHandle, txHandle, sql, wire);
   }
 
   executeBatch(
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     sql: string,
-    rows: QueryParams[],
+    rows: QueryParams[] | Uint8Array,
   ): Promise<number> {
-    return this.call<number>('executeBatch', dbHandle, txHandle, sql, rows);
+    const { wire, transfer } = this.packRowsForTransfer(rows);
+    return this.callWithTransfer<number>(transfer, 'executeBatch', dbHandle, txHandle, sql, wire);
   }
 
   private normalizeBinaryPayload(
@@ -211,18 +249,20 @@ export class WorkerTransport implements EngineTransport {
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     sql: string,
-    params: QueryParams = [],
+    params: QueryParams | Uint8Array = [],
     rowMode: RowMode = 'object',
     binaryBlobs = false,
   ): Promise<QueryResult<T>> {
     // The Worker transfers the raw "FBR\x01" binary result ArrayBuffer across
     // postMessage and this thread decodes rows directly into `rowMode`.
-    const raw = await this.call<BinaryResultPayload | QueryResult<T>>(
+    const { wire, transfer } = this.packParamsForTransfer(params);
+    const raw = await this.callWithTransfer<BinaryResultPayload | QueryResult<T>>(
+      transfer,
       'query',
       dbHandle,
       txHandle,
       sql,
-      params,
+      wire,
       rowMode,
       binaryBlobs,
     );
@@ -238,15 +278,17 @@ export class WorkerTransport implements EngineTransport {
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     sql: string,
-    params: QueryParams = [],
+    params: QueryParams | Uint8Array = [],
     binaryBlobs = false,
   ): Promise<BinaryResultPayload> {
-    const raw = await this.call<BinaryResultPayload | QueryResult<unknown[]>>(
+    const { wire, transfer } = this.packParamsForTransfer(params);
+    const raw = await this.callWithTransfer<BinaryResultPayload | QueryResult<unknown[]>>(
+      transfer,
       'queryBinary',
       dbHandle,
       txHandle,
       sql,
-      params,
+      wire,
       binaryBlobs,
     );
     return this.normalizeBinaryPayload(raw);
@@ -256,9 +298,17 @@ export class WorkerTransport implements EngineTransport {
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     sql: string,
-    params: QueryParams = [],
+    params: QueryParams | Uint8Array = [],
   ): Promise<EngineHandle> {
-    return this.call<EngineHandle>('cursorOpen', dbHandle, txHandle, sql, params);
+    const { wire, transfer } = this.packParamsForTransfer(params);
+    return this.callWithTransfer<EngineHandle>(
+      transfer,
+      'cursorOpen',
+      dbHandle,
+      txHandle,
+      sql,
+      wire,
+    );
   }
 
   async cursorFetch<T = Row>(
@@ -439,14 +489,16 @@ export class WorkerTransport implements EngineTransport {
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     stmtHandle: EngineHandle,
-    params: QueryParams = [],
+    params: QueryParams | Uint8Array = [],
   ): Promise<number> {
-    return this.call<number>(
+    const { wire, transfer } = this.packParamsForTransfer(params);
+    return this.callWithTransfer<number>(
+      transfer,
       'executeStmt',
       dbHandle,
       txHandle,
       stmtHandle,
-      params,
+      wire,
     );
   }
 
@@ -454,14 +506,16 @@ export class WorkerTransport implements EngineTransport {
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     stmtHandle: EngineHandle,
-    rows: QueryParams[],
+    rows: QueryParams[] | Uint8Array,
   ): Promise<number> {
-    return this.call<number>(
+    const { wire, transfer } = this.packRowsForTransfer(rows);
+    return this.callWithTransfer<number>(
+      transfer,
       'executeBatchStmt',
       dbHandle,
       txHandle,
       stmtHandle,
-      rows,
+      wire,
     );
   }
 
@@ -469,16 +523,18 @@ export class WorkerTransport implements EngineTransport {
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     stmtHandle: EngineHandle,
-    params: QueryParams = [],
+    params: QueryParams | Uint8Array = [],
     rowMode: RowMode = 'object',
     binaryBlobs = false,
   ): Promise<QueryResult<T>> {
-    const raw = await this.call<BinaryResultPayload | QueryResult<T>>(
+    const { wire, transfer } = this.packParamsForTransfer(params);
+    const raw = await this.callWithTransfer<BinaryResultPayload | QueryResult<T>>(
+      transfer,
       'queryStmt',
       dbHandle,
       txHandle,
       stmtHandle,
-      params,
+      wire,
       rowMode,
       binaryBlobs,
     );
@@ -494,15 +550,17 @@ export class WorkerTransport implements EngineTransport {
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     stmtHandle: EngineHandle,
-    params: QueryParams = [],
+    params: QueryParams | Uint8Array = [],
     binaryBlobs = false,
   ): Promise<BinaryResultPayload> {
-    const raw = await this.call<BinaryResultPayload | QueryResult<unknown[]>>(
+    const { wire, transfer } = this.packParamsForTransfer(params);
+    const raw = await this.callWithTransfer<BinaryResultPayload | QueryResult<unknown[]>>(
+      transfer,
       'queryStmtBinary',
       dbHandle,
       txHandle,
       stmtHandle,
-      params,
+      wire,
       binaryBlobs,
     );
     return this.normalizeBinaryPayload(raw);
@@ -512,14 +570,69 @@ export class WorkerTransport implements EngineTransport {
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     stmtHandle: EngineHandle,
-    params: QueryParams = [],
+    params: QueryParams | Uint8Array = [],
   ): Promise<EngineHandle> {
-    return this.call<EngineHandle>(
+    const { wire, transfer } = this.packParamsForTransfer(params);
+    return this.callWithTransfer<EngineHandle>(
+      transfer,
       'cursorOpenStmt',
       dbHandle,
       txHandle,
       stmtHandle,
-      params,
+      wire,
+    );
+  }
+
+  async pipeline(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    steps: readonly EnginePipelineStepRequest[],
+    options: EnginePipelineWireOptions = {},
+  ): Promise<EnginePipelineStepResponse[]> {
+    const transfer: Transferable[] = [];
+    const seen = new Set<ArrayBufferLike>();
+    const packedSteps: EnginePipelineStepRequest[] = steps.map((s) => {
+      if (s.op === 'executeBatch') {
+        const p = this.packRowsForTransfer(s.rows);
+        for (const t of p.transfer) {
+          const buf = t as ArrayBuffer;
+          if (!seen.has(buf)) {
+            seen.add(buf);
+            transfer.push(buf);
+          }
+        }
+        return { op: 'executeBatch', sql: s.sql, rows: p.wire };
+      }
+      const p = this.packParamsForTransfer(s.params);
+      for (const t of p.transfer) {
+        const buf = t as ArrayBuffer;
+        if (!seen.has(buf)) {
+          seen.add(buf);
+          transfer.push(buf);
+        }
+      }
+      return s.op === 'execute'
+        ? { op: 'execute', sql: s.sql, params: p.wire }
+        : {
+            op: 'queryBinary',
+            sql: s.sql,
+            params: p.wire,
+            binaryBlobs: s.binaryBlobs,
+          };
+    });
+
+    const raw = await this.callWithTransfer<EnginePipelineStepResponse[]>(
+      transfer,
+      'pipeline',
+      dbHandle,
+      txHandle,
+      packedSteps,
+      options,
+    );
+    return raw.map((item) =>
+      item.kind === 'binary'
+        ? { kind: 'binary', payload: this.normalizeBinaryPayload(item.payload) }
+        : item,
     );
   }
 

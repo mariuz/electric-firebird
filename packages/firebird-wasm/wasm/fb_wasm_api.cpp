@@ -2095,6 +2095,127 @@ bool parseParamsAt(const unsigned char* data, unsigned length, unsigned& pos,
 	return true;
 }
 
+/**
+ * Decode a compact `"FBP\x01"` / `"FBP\x02"` row (`M20 Item 2`).
+ */
+bool parseWireParamsAt(const unsigned char* data, unsigned length, unsigned& pos,
+	std::vector<ParamValue>& out)
+{
+	out.clear();
+	if (pos + 4 > length)
+		return false;
+
+	const unsigned count = readU32(data + pos);
+	pos += 4;
+	out.reserve(count);
+
+	for (unsigned i = 0; i < count; i++)
+	{
+		if (pos + 1 > length)
+			return false;
+
+		ParamValue value;
+		const unsigned char tag = data[pos++];
+		switch (tag)
+		{
+			case 0x00: // NULL
+				value.isNull = true;
+				break;
+			case 0x01: // BOOL_FALSE
+				value.text = "FALSE";
+				break;
+			case 0x02: // BOOL_TRUE
+				value.text = "TRUE";
+				break;
+			case 0x03: // INT32
+			{
+				if (pos + 4 > length) return false;
+				int32_t v32 = 0;
+				memcpy(&v32, data + pos, 4);
+				pos += 4;
+				value.binaryKind = 1;
+				value.i64 = static_cast<int64_t>(v32);
+				value.text = std::to_string(v32);
+				break;
+			}
+			case 0x04: // INT64_NUM
+			case 0x84: // INT64_BIGINT
+			{
+				if (pos + 8 > length) return false;
+				memcpy(&value.i64, data + pos, 8);
+				pos += 8;
+				value.binaryKind = 1;
+				value.text = std::to_string(value.i64);
+				break;
+			}
+			case 0x05: // FLOAT64
+			{
+				if (pos + 8 > length) return false;
+				memcpy(&value.dbl, data + pos, 8);
+				pos += 8;
+				value.binaryKind = 2;
+				char buf[64];
+				snprintf(buf, sizeof(buf), "%.17g", value.dbl);
+				value.text = buf;
+				break;
+			}
+			case 0x06: // DATE_UTC_MS
+			{
+				if (pos + 8 > length) return false;
+				double ms = 0.0;
+				memcpy(&ms, data + pos, 8);
+				pos += 8;
+				const int64_t totalMs = static_cast<int64_t>(ms);
+				time_t secs = static_cast<time_t>(totalMs / 1000);
+				int millis = static_cast<int>(totalMs % 1000);
+				if (millis < 0) { secs -= 1; millis += 1000; }
+				struct tm utcTm{};
+				gmtime_r(&secs, &utcTm);
+				char buf[64];
+				snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%03d",
+					utcTm.tm_year + 1900, utcTm.tm_mon + 1, utcTm.tm_mday,
+					utcTm.tm_hour, utcTm.tm_min, utcTm.tm_sec, millis);
+				value.text = buf;
+				break;
+			}
+			case 0x07: // UTF8
+			case 0x87: // BIGINT_TEXT
+			{
+				if (pos + 4 > length) return false;
+				const unsigned len = readU32(data + pos);
+				pos += 4;
+				if (pos + len > length) return false;
+				value.text.assign(reinterpret_cast<const char*>(data + pos), len);
+				pos += len;
+				break;
+			}
+			case 0x08: // BYTES
+			{
+				if (pos + 4 > length) return false;
+				const unsigned len = readU32(data + pos);
+				pos += 4;
+				if (pos + len > length) return false;
+				value.bytes = true;
+				value.text.assign(reinterpret_cast<const char*>(data + pos), len);
+				pos += len;
+				break;
+			}
+			case 0x09: // BLOB_ID
+			{
+				if (pos + 8 > length) return false;
+				value.isBlobId = true;
+				value.text.assign(reinterpret_cast<const char*>(data + pos), 8);
+				pos += 8;
+				break;
+			}
+			default:
+				return false;
+		}
+		out.push_back(std::move(value));
+	}
+	return true;
+}
+
 bool parseParams(const unsigned char* data, unsigned length,
 	std::vector<ParamValue>& out)
 {
@@ -2102,6 +2223,12 @@ bool parseParams(const unsigned char* data, unsigned length,
 
 	if (!data || length < 4)
 		return length == 0;   // no parameters at all is valid
+
+	if (length >= 8 && data[0] == 0x46 && data[1] == 0x42 && data[2] == 0x50 && data[3] == 0x01)
+	{
+		unsigned pos = 4;
+		return parseWireParamsAt(data, length, pos, out);
+	}
 
 	unsigned pos = 0;
 	return parseParamsAt(data, length, pos, out);

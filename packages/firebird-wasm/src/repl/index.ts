@@ -59,6 +59,12 @@ import {
   DEFAULT_REPL_WATERMARK_TABLE,
   type ReplicationStats,
 } from '../replication';
+import {
+  encodeArrowIpc,
+  rowsToColumnarResult,
+  type ColumnarQueryResult,
+} from '../columnar';
+import type { SyncHandleLike } from '../frameworks/sync-store';
 
 export {
   computeTableIoBreakdown,
@@ -70,13 +76,36 @@ export {
   type TableIoStats,
 };
 
-/** Active tab in the `<firebird-repl>` Schema Inspector, Migration Viewer, Profiler, Query Plan Explorer & Replication Inspector sidebar. */
+/** Active tab in the `<firebird-repl>` Schema Inspector, Migration Viewer, Profiler, Query Plan Explorer, Replication & Sync/Arrow Inspector sidebar. */
 export type ReplInspectorTab =
   | 'schema'
   | 'migrations'
   | 'profiler'
   | 'plan'
-  | 'replication';
+  | 'replication'
+  | 'arrow';
+
+/** Columnar vector & Apache Arrow IPC stream summary displayed in `<firebird-repl>` (`M20 Item 4`). */
+export interface ReplArrowInspectorInfo {
+  readonly sql: string;
+  readonly rowCount: number;
+  readonly arrowIpcBytes: number;
+  readonly vectors: ReadonlyArray<{
+    readonly name: string;
+    readonly kind: string;
+    readonly sqlType: string;
+    readonly nullCount: number;
+    readonly bufferBytes: number;
+  }>;
+  readonly syncState?: {
+    readonly state: string;
+    readonly mode: string;
+    readonly paused: boolean;
+    readonly lagEntries: number;
+    readonly replicaLsn: number;
+    readonly primaryLsn: number;
+  } | null;
+}
 
 /** Replication slot summary displayed in the `<firebird-repl>` Replication Inspector. */
 export interface ReplReplicationSlotInfo {
@@ -159,6 +188,10 @@ export interface ReplDatabase {
   monitorStats?(): Promise<MonitorStats>;
   /** Reset cumulative query telemetry counters. */
   resetMonitorStats?(): void;
+  /** Optional zero-copy columnar query execution (`M19 Item 2` / `M20 Item 4`). */
+  queryColumnar?(sql: string, params?: unknown[]): Promise<ColumnarQueryResult>;
+  /** Optional Apache Arrow IPC V5 query execution (`M19 Item 2` / `M20 Item 4`). */
+  queryArrow?(sql: string, params?: unknown[]): Promise<Uint8Array>;
   /**
    * For a statement without rows: a transaction's `exec()` runs exactly one
    * statement and reports what it changed.  (`FirebirdBrowser.exec()` would
@@ -187,6 +220,7 @@ export interface ReplEntry {
   migrations?: AppliedMigration[];
   stats?: MonitorStats;
   replication?: ReplReplicationInfo;
+  arrow?: ReplArrowInspectorInfo;
   error?: Error;
 }
 
@@ -196,6 +230,8 @@ export interface FirebirdReplElement extends HTMLElement {
   db: ReplDatabase | null;
   /** Optional `DatabaseReplicator` or `ReplicationSubscription` providing live `stats()` telemetry. */
   replicator?: { stats(): Promise<ReplicationStats> } | null;
+  /** Optional `SyncHandle` (`syncDatabases()` / `db.syncWith()`) inspected in the Sync & Arrow panel (`M20 Item 4`). */
+  syncHandle?: SyncHandleLike | null;
   /** The editor's text. */
   value: string;
   /** Whether the Schema Inspector & Migration Viewer sidebar is open. */
@@ -220,6 +256,8 @@ export interface FirebirdReplElement extends HTMLElement {
   profiler(): Promise<ReplEntry | undefined>;
   /** Inspect replication journal (`FB_REPL_JOURNAL$`), slots (`FB_REPL_SLOTS$`), watermarks (`FB_REPL_WATERMARKS$`), and live lag telemetry. */
   replication(): Promise<ReplEntry | undefined>;
+  /** Execute `sql` (default: editor text) as columnar vectors + Apache Arrow IPC stream and open the Sync & Arrow Inspector (`M20 Item 4`). */
+  inspectArrow(sql?: string): Promise<ReplEntry | undefined>;
   /** Toggle (or switch to `tab` in) the interactive Schema Inspector, Migration Viewer, Profiler & Plan Explorer sidebar. */
   toggleInspector(tab?: ReplInspectorTab): Promise<void>;
   /** Refresh the interactive Schema Inspector, Migration Viewer, Profiler & Plan Explorer sidebar from the database. */
@@ -372,6 +410,7 @@ export function defineFirebirdRepl(
   class FirebirdRepl extends HTMLElement implements FirebirdReplElement {
     private database: ReplDatabase | null = null;
     private replicatorHandle: { stats(): Promise<ReplicationStats> } | null = null;
+    private syncHandleRef: SyncHandleLike | null = null;
     private readonly output: HTMLDivElement;
     private readonly inspector: HTMLDivElement;
     private readonly inspectorBody: HTMLDivElement;
@@ -380,6 +419,7 @@ export function defineFirebirdRepl(
     private readonly tabProfilerBtn: HTMLButtonElement;
     private readonly tabPlanBtn: HTMLButtonElement;
     private readonly tabReplicationBtn: HTMLButtonElement;
+    private readonly tabArrowBtn: HTMLButtonElement;
     private readonly inspectorRefreshBtn: HTMLButtonElement;
     private readonly inspectorCloseBtn: HTMLButtonElement;
     private readonly editor: HTMLTextAreaElement;
@@ -391,6 +431,7 @@ export function defineFirebirdRepl(
     private readonly migrationsButton: HTMLButtonElement;
     private readonly profilerButton: HTMLButtonElement;
     private readonly replicationButton: HTMLButtonElement;
+    private readonly arrowButton: HTMLButtonElement;
     private readonly history: string[] = [];
     /** Position in `history` while walking it; `history.length` is the draft. */
     private cursor = 0;
@@ -403,6 +444,7 @@ export function defineFirebirdRepl(
     private lastStats: MonitorStats | null = null;
     private lastPlans: Array<{ sql: string; parsed: ParsedQueryPlan }> = [];
     private lastReplication: ReplReplicationInfo | null = null;
+    private lastArrow: ReplArrowInspectorInfo | null = null;
 
     constructor() {
       super();
@@ -449,12 +491,18 @@ export function defineFirebirdRepl(
       this.tabReplicationBtn.className = 'tab-replication';
       this.tabReplicationBtn.textContent = 'Replication';
 
+      this.tabArrowBtn = document.createElement('button');
+      this.tabArrowBtn.type = 'button';
+      this.tabArrowBtn.className = 'tab-arrow';
+      this.tabArrowBtn.textContent = 'Arrow / Sync';
+
       inspectorTabs.append(
         this.tabSchemaBtn,
         this.tabMigrationsBtn,
         this.tabProfilerBtn,
         this.tabPlanBtn,
         this.tabReplicationBtn,
+        this.tabArrowBtn,
       );
 
       const inspectorActions = el('div', 'inspector-actions');
@@ -507,6 +555,12 @@ export function defineFirebirdRepl(
       this.replicationButton.textContent = 'Replication';
       this.replicationButton.title = 'Inspect replication journal, slots, watermarks, and lag telemetry';
 
+      this.arrowButton = document.createElement('button');
+      this.arrowButton.type = 'button';
+      this.arrowButton.className = 'arrow';
+      this.arrowButton.textContent = 'Arrow';
+      this.arrowButton.title = 'Inspect typed columnar vectors, Apache Arrow IPC stream size, and SyncHandle telemetry';
+
       this.sweepButton = document.createElement('button');
       this.sweepButton.type = 'button';
       this.sweepButton.className = 'sweep';
@@ -535,6 +589,7 @@ export function defineFirebirdRepl(
         this.migrationsButton,
         this.profilerButton,
         this.replicationButton,
+        this.arrowButton,
         this.sweepButton,
         this.infoButton,
         this.explainButton,
@@ -552,6 +607,7 @@ export function defineFirebirdRepl(
       this.migrationsButton.addEventListener('click', () => void this.migrations());
       this.profilerButton.addEventListener('click', () => void this.profiler());
       this.replicationButton.addEventListener('click', () => void this.replication());
+      this.arrowButton.addEventListener('click', () => void this.inspectArrow());
       this.tabSchemaBtn.addEventListener('click', () => {
         this.inspectorTab = 'schema';
         void this.refreshInspector();
@@ -572,6 +628,10 @@ export function defineFirebirdRepl(
         this.inspectorTab = 'replication';
         void this.refreshInspector();
       });
+      this.tabArrowBtn.addEventListener('click', () => {
+        this.inspectorTab = 'arrow';
+        void this.refreshInspector();
+      });
       this.inspectorRefreshBtn.addEventListener(
         'click',
         () => void this.refreshInspector(),
@@ -584,7 +644,7 @@ export function defineFirebirdRepl(
       // A property set before the element was defined (React and Vue both
       // set properties as they render) sits on the instance and would hide
       // the accessor: take it over.
-      for (const name of ['db', 'replicator', 'value', 'inspectorOpen', 'inspectorTab'] as const) {
+      for (const name of ['db', 'replicator', 'syncHandle', 'value', 'inspectorOpen', 'inspectorTab'] as const) {
         if (Object.prototype.hasOwnProperty.call(this, name)) {
           const early = (this as Record<string, unknown>)[name];
           delete (this as Record<string, unknown>)[name];
@@ -607,6 +667,14 @@ export function defineFirebirdRepl(
 
     set replicator(rep: { stats(): Promise<ReplicationStats> } | null) {
       this.replicatorHandle = rep;
+    }
+
+    get syncHandle(): SyncHandleLike | null {
+      return this.syncHandleRef;
+    }
+
+    set syncHandle(handle: SyncHandleLike | null) {
+      this.syncHandleRef = handle;
     }
 
     get value(): string {
@@ -640,7 +708,9 @@ export function defineFirebirdRepl(
               ? 'plan'
               : tab === 'replication'
                 ? 'replication'
-                : 'schema';
+                : tab === 'arrow'
+                  ? 'arrow'
+                  : 'schema';
       this.updateActiveTabButtons();
       this.renderInspector();
     }
@@ -660,6 +730,7 @@ export function defineFirebirdRepl(
         'active',
         this.activeTab === 'replication',
       );
+      this.tabArrowBtn.classList.toggle('active', this.activeTab === 'arrow');
     }
 
     private setButtonsDisabled(disabled: boolean): void {
@@ -671,6 +742,7 @@ export function defineFirebirdRepl(
       this.migrationsButton.disabled = disabled;
       this.profilerButton.disabled = disabled;
       this.replicationButton.disabled = disabled;
+      this.arrowButton.disabled = disabled;
       this.inspectorRefreshBtn.disabled = disabled;
     }
 
@@ -712,6 +784,8 @@ export function defineFirebirdRepl(
           this.lastStats = await this.fetchStats();
         } else if (this.activeTab === 'replication') {
           this.lastReplication = await this.fetchReplication();
+        } else if (this.activeTab === 'arrow') {
+          this.lastArrow = await this.fetchArrowInspector(this.lastArrow?.sql);
         }
       } catch {
         // Keep previous state on transient failure.
@@ -1026,6 +1100,124 @@ export function defineFirebirdRepl(
       };
     }
 
+    private async fetchArrowInspector(
+      explicitSql?: string,
+    ): Promise<ReplArrowInspectorInfo> {
+      const db = this.db!;
+      const sqlCandidate = (explicitSql ?? this.editor.value ?? '').trim();
+      const targetSql =
+        sqlCandidate.length > 0
+          ? sqlCandidate
+          : 'SELECT 1 AS ID, CAST(\'firebird\' AS VARCHAR(32)) AS ENGINE FROM RDB$DATABASE';
+
+      let col: ColumnarQueryResult;
+      if (typeof db.queryColumnar === 'function') {
+        col = await db.queryColumnar(targetSql, []);
+      } else {
+        const res = await db.query(targetSql, [], { rowMode: 'array' });
+        const objRows = res.rows.map((r) =>
+          Object.fromEntries(res.fields.map((f, i) => [f.name, r[i]])),
+        );
+        col = rowsToColumnarResult({ fields: res.fields, rows: objRows });
+      }
+
+      const arrowBytes =
+        typeof db.queryArrow === 'function'
+          ? await db.queryArrow(targetSql, [])
+          : encodeArrowIpc(col);
+
+      let syncState: ReplArrowInspectorInfo['syncState'] = null;
+      if (this.syncHandleRef) {
+        try {
+          const st = await this.syncHandleRef.stats();
+          syncState = {
+            state: this.syncHandleRef.paused
+              ? 'paused'
+              : (this.syncHandleRef.connectionState ?? 'online'),
+            mode: this.syncHandleRef.mode ?? 'logical',
+            paused: this.syncHandleRef.paused,
+            lagEntries: st.lagEntries,
+            replicaLsn: st.replicaWatermark,
+            primaryLsn: st.primaryLsn,
+          };
+        } catch {
+          syncState = null;
+        }
+      }
+
+      const vectors = col.vectors.map((v, idx) => {
+        const f = col.fields[idx];
+        const dataBytes = v.data.byteLength;
+        const offsetBytes =
+          v.kind === 'utf8' || v.kind === 'bytes' ? v.offsets.byteLength : 0;
+        return {
+          name: f?.name ?? `COL_${idx}`,
+          kind: v.kind,
+          sqlType: f?.typeName ?? String(f?.type ?? ''),
+          nullCount: v.nullCount,
+          bufferBytes: dataBytes + offsetBytes + v.validity.byteLength,
+        };
+      });
+
+      return {
+        sql: targetSql,
+        rowCount: col.rowCount,
+        arrowIpcBytes: arrowBytes.byteLength,
+        vectors,
+        syncState,
+      };
+    }
+
+    private renderArrowInspectorPanel(): HTMLElement {
+      const panel = el('div', 'inspector-arrow');
+      const info = this.lastArrow;
+
+      if (info?.syncState) {
+        const syncTitle = el('div', 'schema-group-title');
+        syncTitle.textContent = 'SyncHandle Live Telemetry';
+        panel.append(syncTitle);
+        const syncSummary = el('p', 'inspector-summary');
+        syncSummary.textContent =
+          `${info.syncState.state.toUpperCase()} (${info.syncState.mode}) · ` +
+          `LSN ${info.syncState.replicaLsn}/${info.syncState.primaryLsn} · ` +
+          `lag ${info.syncState.lagEntries}`;
+        panel.append(syncSummary);
+      }
+
+      if (!info) {
+        const empty = el('p', 'inspector-empty');
+        empty.textContent =
+          'Click Arrow to inspect zero-copy columnar vectors & Apache Arrow IPC V5 buffers.';
+        panel.append(empty);
+        return panel;
+      }
+
+      const hdr = el('div', 'schema-group-title');
+      hdr.textContent = 'Apache Arrow IPC V5 & Columnar Vectors';
+      panel.append(hdr);
+
+      const summaryEl = el('p', 'inspector-summary');
+      summaryEl.textContent =
+        `${info.rowCount} ${info.rowCount === 1 ? 'row' : 'rows'} · ` +
+        `${info.vectors.length} ${info.vectors.length === 1 ? 'vector' : 'vectors'} · ` +
+        `Arrow IPC ${info.arrowIpcBytes} bytes`;
+      panel.append(summaryEl);
+
+      const list = el('ul', 'schema-list');
+      for (const vec of info.vectors) {
+        const li = el('li', 'schema-meta-item');
+        const name = el('span', 'col-name');
+        name.textContent = vec.name;
+        const badge = el('span', 'schema-badge');
+        badge.textContent =
+          `${vec.kind} (${vec.sqlType}) · ${vec.bufferBytes} B · nulls:${vec.nullCount}`;
+        li.append(name, badge);
+        list.append(li);
+      }
+      panel.append(list);
+      return panel;
+    }
+
     private renderPlanTreeNode(node: PlanTreeNode): HTMLElement {
       const details = el('details', 'plan-node');
       details.open = true;
@@ -1138,6 +1330,11 @@ export function defineFirebirdRepl(
 
       if (this.activeTab === 'plan') {
         this.inspectorBody.append(this.renderPlanExplorerPanel());
+        return;
+      }
+
+      if (this.activeTab === 'arrow') {
+        this.inspectorBody.append(this.renderArrowInspectorPanel());
         return;
       }
 
@@ -2107,6 +2304,50 @@ export function defineFirebirdRepl(
       return entry;
     }
 
+    async inspectArrow(sql?: string): Promise<ReplEntry | undefined> {
+      if (this.busy) return undefined;
+      const sqlLabel = (sql ?? this.editor.value ?? '').trim() || 'INSPECT ARROW';
+      if (!this.db) {
+        const entry: ReplEntry = {
+          sql: sqlLabel,
+          line: 1,
+          ms: 0,
+          error: new Error('No database: set the element’s db property first'),
+        };
+        this.show(entry);
+        return entry;
+      }
+
+      this.busy = true;
+      this.setButtonsDisabled(true);
+      const started = performance.now();
+      const entry: ReplEntry = { sql: sqlLabel, line: 1, ms: 0 };
+      try {
+        const info = await this.fetchArrowInspector(sql);
+        entry.arrow = info;
+        this.lastArrow = info;
+        this.activeTab = 'arrow';
+        this.updateActiveTabButtons();
+        this.inspectorOpen = true;
+        this.renderInspector();
+      } catch (err) {
+        entry.error = asError(err);
+      } finally {
+        entry.ms = performance.now() - started;
+        this.busy = false;
+        this.setButtonsDisabled(false);
+      }
+      this.show(entry);
+      this.dispatchEvent(
+        new CustomEvent('firebird-repl-arrow', {
+          detail: entry,
+          bubbles: true,
+          composed: true,
+        }),
+      );
+      return entry;
+    }
+
     private onKey(event: KeyboardEvent): void {
       if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
         event.preventDefault();
@@ -2339,6 +2580,26 @@ export function defineFirebirdRepl(
           }
           block.append(table([{ name: 'Metric' }, { name: 'Value' }], rows));
         }
+        if (entry.arrow !== undefined) {
+          const a = entry.arrow;
+          const rows: ArrayRow[] = [
+            ['Row count', a.rowCount],
+            ['Apache Arrow IPC stream (bytes)', a.arrowIpcBytes],
+            [
+              'Columnar vectors',
+              a.vectors
+                .map((v) => `${v.name}:${v.kind}(${v.bufferBytes}B, nulls=${v.nullCount})`)
+                .join(', '),
+            ],
+          ];
+          if (a.syncState) {
+            rows.push([
+              'SyncHandle status',
+              `${a.syncState.state} (${a.syncState.mode}) · LSN ${a.syncState.replicaLsn}/${a.syncState.primaryLsn} · lag ${a.syncState.lagEntries}`,
+            ]);
+          }
+          block.append(table([{ name: 'Metric' }, { name: 'Value' }], rows));
+        }
         const meta = el('p', 'meta');
         meta.textContent = `${summary(entry, fields.length > 0)} · ${entry.ms.toFixed(1)} ms`;
         block.append(meta);
@@ -2385,6 +2646,9 @@ function summary(entry: ReplEntry, returnsRows: boolean): string {
   if (entry.replication !== undefined) {
     const n = entry.replication.journalEntryCount;
     return `replication (${n} ${n === 1 ? 'entry' : 'entries'}, ${entry.replication.slots.length} ${entry.replication.slots.length === 1 ? 'slot' : 'slots'})`;
+  }
+  if (entry.arrow !== undefined) {
+    return `arrow (${entry.arrow.rowCount} ${entry.arrow.rowCount === 1 ? 'row' : 'rows'}, ${entry.arrow.arrowIpcBytes} B)`;
   }
   if (returnsRows) {
     const n = entry.rows?.length ?? 0;

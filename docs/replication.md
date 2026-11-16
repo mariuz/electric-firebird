@@ -796,7 +796,10 @@ await poller.pollOnce(); // or poller.start(100)
 
 | Export | Description |
 |---|---|
-| `bootstrapReplica(options)` | Seeds or re-seeds a replica from a logical or binary page-diff `PublicationSnapshot`. |
+| `bootstrapReplica(options)` | Seeds or re-seeds a replica from a `'logical'`, `'binary-image'` (`.fdb` byte stream + optional gzip), or `'page-diff'` (`exportDiff` / `applyDiff`) `PublicationSnapshot`. |
+| `createObjectStoreReplicationTarget(options)` | Continuous WAL / base-backup shipping target to S3, Cloudflare R2, or any HTTP object store (`shipBaseBackup()`, `shipPendingWal()`, `pullNewSegments()`, `restorePointInTime()`). |
+| `restoreDatabaseToPointInTime(db, store, options?)` | Restores a database to a target `targetLsn`, `targetTimestamp`, or `targetHlc` from an object-store base backup + WAL manifest. |
+| `createHttpObjectStoreAdapter(options)` / `signAwsSigV4Headers(options)` | Zero-dependency HTTP / S3 / R2 object-store adapter with WebCrypto `AWS4-HMAC-SHA256` request signing (`buildS3ObjectUrl`, `createMemoryObjectStoreAdapter`). |
 | `needsBootstrap(pub, sub)` | Checks whether a replica is uninitialized (`watermark === 0`) or behind `pub.minRetainedLsn()`. |
 | `discoverUserTables(db, exclude?)` | Lists all non-system user tables in the database via `introspect()`. |
 | `publishAllTables(db, options?)` | Whole-database publication (`tables: '*'`) discovering all user tables automatically. |

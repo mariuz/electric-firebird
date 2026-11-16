@@ -366,7 +366,10 @@ export interface LogicalTableSnapshot {
   readonly rows: readonly Row[];
 }
 
-/** Consistent snapshot of a publication at `watermarkLsn` (logical rows or binary page diff). */
+/** Replica cold-start / catch-up bootstrap strategy (`M20 Item 1`). */
+export type BootstrapStrategy = 'logical' | 'binary-image' | 'page-diff';
+
+/** Consistent snapshot of a publication at `watermarkLsn` (logical rows, raw/gzipped `.fdb` image, or binary page diff). */
 export interface PublicationSnapshot {
   /** Publication name. */
   readonly publication: string;
@@ -376,19 +379,32 @@ export interface PublicationSnapshot {
   readonly watermarkLsn: number;
   /** Epoch timestamp when the snapshot was exported. */
   readonly timestamp: number;
-  /** Snapshot payload format (`'logical'` or `'page-diff'`). */
-  readonly mode: 'logical' | 'page-diff';
+  /** Snapshot payload format (`'logical'`, `'binary-image'`, or `'page-diff'`). */
+  readonly mode: BootstrapStrategy;
   /** Table snapshots when `mode === 'logical'`. */
   readonly tables: readonly LogicalTableSnapshot[];
   /** Binary page-diff payload (`FBDF\x01`) when `mode === 'page-diff'`. */
   readonly pageDiffBytes?: Uint8Array | null;
+  /** Full raw or gzip-compressed `.fdb` database image when `mode === 'binary-image'` (`M20 Item 1`). */
+  readonly databaseImageBytes?: Uint8Array | null;
+  /** Whether `databaseImageBytes` is gzip-compressed (`M20 Item 1`). */
+  readonly imageGzipped?: boolean;
 }
 
 /** Options for {@link bootstrapReplica}. */
 export interface BootstrapReplicaOptions {
   /** Target replica database (`FirebirdBrowser` or `FirebirdLite`). */
   targetDb: ReplicableDatabase & {
-    applyDiff?(diffBytes: Uint8Array, options?: { pageSize?: number }): Promise<Uint8Array>;
+    applyDiff?(
+      diffBytes: Uint8Array,
+      baseSnapshot?: Uint8Array | null,
+      options?: { pageSize?: number },
+    ): Promise<Uint8Array>;
+    loadDataStream?(
+      stream: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array>,
+      options?: { compression?: 'gzip' | 'none' },
+    ): Promise<void>;
+    dumpDataDir?(): Promise<Uint8Array>;
   };
   /** Source publication to export snapshot from (ignored if `snapshot` is passed directly). */
   publication: Pick<ReplicationPublication, 'exportSnapshot'> &
@@ -397,8 +413,12 @@ export interface BootstrapReplicaOptions {
   subscription: ReplicationSubscription;
   /** Optional pre-exported `PublicationSnapshot`. */
   snapshot?: PublicationSnapshot;
-  /** Bootstrap mode (`'logical'` or `'page-diff'`). @default 'logical' */
-  mode?: 'logical' | 'page-diff';
+  /** Bootstrap strategy (`'logical'`, `'binary-image'`, or `'page-diff'`). @default 'logical' */
+  bootstrapStrategy?: BootstrapStrategy;
+  /** Alias for `bootstrapStrategy` (`'logical'`, `'binary-image'`, or `'page-diff'`). @default 'logical' */
+  mode?: BootstrapStrategy;
+  /** Whether to gzip-compress a `'binary-image'` snapshot during export. @default false */
+  compressGzip?: boolean;
   /** Base snapshot or raw `.fdb` image when `mode === 'page-diff'`. */
   baseSnapshot?: Uint8Array;
   /** Optional `CREATE TABLE` DDL statements keyed by table name for provisioning missing tables on `targetDb`. */
@@ -409,8 +429,8 @@ export interface BootstrapReplicaOptions {
 
 /** Result returned by {@link bootstrapReplica}. */
 export interface BootstrapReplicaResult {
-  /** Bootstrap mode used (`'logical'` or `'page-diff'`). */
-  readonly mode: 'logical' | 'page-diff';
+  /** Bootstrap mode used (`'logical'`, `'binary-image'`, or `'page-diff'`). */
+  readonly mode: BootstrapStrategy;
   /** Watermark LSN aligned on the replica subscription and primary slot. */
   readonly watermarkLsn: number;
   /** Number of published tables bootstrapped. */
@@ -591,11 +611,14 @@ export interface ReplicationPublication {
    */
   compactJournal(options?: CompactJournalOptions): Promise<JournalCompactionResult>;
   /**
-   * Export a consistent logical table dump or binary page-diff (`FBDF\x01`) snapshot
-   * tagged with the publication's current LSN watermark for replica bootstrapping.
+   * Export a consistent logical table dump, raw/gzipped `.fdb` image (`'binary-image'`),
+   * or binary page-diff (`'page-diff'`) snapshot tagged with the publication's
+   * current LSN watermark for replica bootstrapping.
    */
   exportSnapshot(options?: {
-    mode?: 'logical' | 'page-diff';
+    mode?: BootstrapStrategy;
+    bootstrapStrategy?: BootstrapStrategy;
+    compressGzip?: boolean;
     baseSnapshot?: Uint8Array;
     tableDdl?: Readonly<Record<string, string>>;
   }): Promise<PublicationSnapshot>;

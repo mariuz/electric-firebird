@@ -30,10 +30,32 @@ import {
 import type { ReactNode } from 'react';
 import { QueryStore, queryKey, resolveStatement } from '../frameworks/query-store';
 import type { QueryableDatabase, QueryState, QueryStoreOptions } from '../frameworks/query-store';
+import {
+  ColumnarQueryStore,
+  IncrementalQueryStore,
+  SyncStatusStore,
+  type ColumnarQueryState,
+  type ColumnarQueryableDatabase,
+  type IncrementalQueryState,
+  type IncrementalQueryableDatabase,
+  type SyncHandleLike,
+  type SyncStatusState,
+  type SyncStatusStoreOptions,
+} from '../frameworks/sync-store';
+import type { LiveRowKeySelector } from '../live-incremental';
 import type { SqlFragment } from '../sql-tag';
 import type { QueryParams, Row } from '../types';
 
 export type { QueryableDatabase, QueryState } from '../frameworks/query-store';
+export type {
+  ColumnarQueryState,
+  ColumnarQueryableDatabase,
+  IncrementalQueryState,
+  IncrementalQueryableDatabase,
+  SyncHandleLike,
+  SyncStatusState,
+  SyncStatusStoreOptions,
+} from '../frameworks/sync-store';
 
 const FirebirdContext = createContext<QueryableDatabase | null>(null);
 
@@ -152,6 +174,162 @@ function useStore<T extends Row>(
     return () => store.stop();
   }, [store]);
 
+  const state = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
+  return useMemo(() => ({ ...state, refresh: store.refresh }), [state, store]);
+}
+
+/** Return value of {@link useSyncStatus} (`M20 Item 4`). */
+export interface SyncStatusHookResult extends SyncStatusState {
+  syncNow(): Promise<void>;
+  pause(): void;
+  resume(): void;
+  refresh(): Promise<void>;
+}
+
+/**
+ * Subscribe a React component to a `SyncHandle` (`syncDatabases()` / `db.syncWith()`) (`M20 Item 4`).
+ */
+export function useSyncStatus(
+  handle: SyncHandleLike | null | undefined,
+  options: SyncStatusStoreOptions = {},
+): SyncStatusHookResult {
+  const pollIntervalMs = options.pollIntervalMs;
+  const store = useMemo(
+    () => new SyncStatusStore(handle, { pollIntervalMs }),
+    [handle, pollIntervalMs],
+  );
+  useEffect(() => {
+    store.start();
+    return () => store.stop();
+  }, [store]);
+  const state = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
+  return useMemo(
+    () => ({
+      ...state,
+      syncNow: store.syncNow,
+      pause: store.pause,
+      resume: store.resume,
+      refresh: store.refresh,
+    }),
+    [state, store],
+  );
+}
+
+/** Options for {@link useColumnarQuery} (`M20 Item 4`). */
+export interface UseColumnarQueryOptions {
+  db?: ColumnarQueryableDatabase;
+  events?: readonly string[];
+  live?: boolean;
+  params?: QueryParams;
+  pollIntervalMs?: number;
+}
+
+/** Return value of {@link useColumnarQuery} (`M20 Item 4`). */
+export interface ColumnarQueryHookResult extends ColumnarQueryState {
+  refresh(): Promise<void>;
+}
+
+/**
+ * Run a one-shot or live columnar query (`ColumnarQueryResult`) in React (`M20 Item 4`).
+ */
+export function useColumnarQuery(
+  query: string | SqlFragment,
+  options: UseColumnarQueryOptions = {},
+): ColumnarQueryHookResult {
+  const provided = useContext(FirebirdContext);
+  const db = (options.db ?? provided) as ColumnarQueryableDatabase | null;
+  if (db === null) {
+    throw new Error(
+      'useColumnarQuery() found no database: wrap the component in <FirebirdProvider db={…}>, or pass { db }',
+    );
+  }
+  const statement = resolveStatement(query, options.params);
+  const key = queryKey(statement.sql, statement.params, {
+    events: options.events,
+    live: options.live,
+    pollIntervalMs: options.pollIntervalMs,
+  });
+  const previous = useRef<ColumnarQueryStore | null>(null);
+  const store = useMemo(
+    () =>
+      new ColumnarQueryStore(
+        db,
+        statement.sql,
+        statement.params,
+        {
+          events: options.events,
+          live: options.live,
+          pollIntervalMs: options.pollIntervalMs,
+        },
+        previous.current?.getSnapshot().result,
+      ),
+    [db, key],
+  );
+  useEffect(() => {
+    previous.current = store;
+    store.start();
+    return () => store.stop();
+  }, [store]);
+  const state = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
+  return useMemo(() => ({ ...state, refresh: store.refresh }), [state, store]);
+}
+
+/** Options for {@link useLiveIncrementalQuery} (`M20 Item 4`). */
+export interface UseLiveIncrementalQueryOptions<T = Row> {
+  db?: IncrementalQueryableDatabase;
+  key?: LiveRowKeySelector<T>;
+  events?: readonly string[];
+  params?: QueryParams;
+  pollIntervalMs?: number;
+}
+
+/** Return value of {@link useLiveIncrementalQuery} (`M20 Item 4`). */
+export interface IncrementalQueryHookResult<T = Row> extends IncrementalQueryState<T> {
+  refresh(): Promise<void>;
+}
+
+/**
+ * Subscribe a React component to incremental `{ rows, deltas }` updates with
+ * structural sharing for unchanged rows (`M20 Item 4`).
+ */
+export function useLiveIncrementalQuery<T extends Row = Row>(
+  query: string | SqlFragment,
+  options: UseLiveIncrementalQueryOptions<T> = {},
+): IncrementalQueryHookResult<T> {
+  const provided = useContext(FirebirdContext);
+  const db = (options.db ?? provided) as IncrementalQueryableDatabase | null;
+  if (db === null) {
+    throw new Error(
+      'useLiveIncrementalQuery() found no database: wrap the component in <FirebirdProvider db={…}>, or pass { db }',
+    );
+  }
+  const statement = resolveStatement(query, options.params);
+  const keyStr = queryKey(statement.sql, statement.params, {
+    events: options.events,
+    live: true,
+    pollIntervalMs: options.pollIntervalMs,
+  });
+  const previous = useRef<IncrementalQueryStore<T> | null>(null);
+  const store = useMemo(
+    () =>
+      new IncrementalQueryStore<T>(
+        db,
+        statement.sql,
+        statement.params,
+        {
+          key: options.key,
+          events: options.events,
+          pollIntervalMs: options.pollIntervalMs,
+        },
+        previous.current?.getSnapshot().rows,
+      ),
+    [db, keyStr],
+  );
+  useEffect(() => {
+    previous.current = store;
+    store.start();
+    return () => store.stop();
+  }, [store]);
   const state = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
   return useMemo(() => ({ ...state, refresh: store.refresh }), [state, store]);
 }

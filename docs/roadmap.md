@@ -1728,6 +1728,47 @@ Next-horizon improvements across **Replication**, **Speed & Performance**, **Int
 
 ---
 
+### M20 — Binary/Page-Diff Bootstrap & Object-Store WAL PITR, Pipelined Queries & Binary Params (`"FBP\x01"`), Incremental/Columnar Live Queries, Reactive Sync Hooks & Core Monolith Decomposition
+
+- [x] **1. Binary `.fdb` / Page-Diff Replica Bootstrap & S3 / R2 / HTTP Object-Store WAL Shipping (`PITR`).**
+      Add `bootstrapStrategy: 'binary-image' | 'page-diff' | 'logical'` to
+      `bootstrapReplica()` and `syncDatabases()` for 10–20× faster cold seeding via
+      raw/gzipped `.fdb` images or `PAGE_DIFF_MAGIC` incremental page diffs before
+      switching to `"FBCHANGELOG\0"` / logical streaming, plus a zero-dependency
+      Object-Store WAL Archiver & Follower (`createObjectStoreReplicationTarget`,
+      `restoreDatabaseToPointInTime`) using Fetch + WebCrypto AWS SigV4 / presigned
+      URLs for S3, Cloudflare R2, MinIO, or HTTP buckets.
+- [x] **2. Pipelined Multi-Statement Execution (`db.pipeline()`) & Binary Parameter Wire Frame (`"FBP\x01"`).**
+      Introduce a compact `"FBP\x01"` binary parameter wire encoder/decoder (`Int32`,
+      `BigInt64`, `Float64`, `Boolean`, `UTF-8`, `Bytes`, `Null`) across
+      `DirectTransport`, `WorkerTransport`, `SharedEngineTransport`, and
+      `fb_wasm_api.cpp` to eliminate JSON parameter serialization, and add
+      `db.pipeline(ops, { transaction? })` to batch heterogeneous `query` /
+      `queryColumnar` / `queryArrow` / `execute` operations into a single cross-worker
+      round-trip with zero-copy `Transferable` buffers.
+- [x] **3. Incremental & Columnar Live Queries (`db.liveIncremental()` / `db.liveColumnar()`).**
+      Extend reactive queries on `FirebirdDatabase` (`FirebirdBrowser` & `FirebirdLite`)
+      with `db.liveIncremental(sql, params, { key })` emitting `{ rows, deltas }`
+      (`'insert' | 'update' | 'delete'` row patches without reallocating unchanged row
+      identities) and `db.liveColumnar(sql, params)` emitting typed `ColumnarQueryResult`
+      vectors for zero-per-row-object analytical views and grids.
+- [x] **4. Reactive Framework Sync Hooks (`react` / `vue` / `svelte` / `solid`), `<firebird-repl>` Sync/Arrow Inspector & `columnar` / `schema` Subpaths.**
+      Expose `SyncHandle` status (`'connecting' | 'online' | 'backoff' | 'offline'`,
+      LSN lag, DLQ count, `syncNow()`, `pause()`, `resume()`) and columnar queries across
+      `firebird-wasm/react`, `firebird-wasm/vue`, `firebird-wasm/svelte`, and
+      `firebird-wasm/solid`, add a Sync & Arrow Inspector panel to `<firebird-repl>`,
+      and publish standalone tree-shakeable `firebird-wasm/columnar` and
+      `firebird-wasm/schema` subpath exports.
+- [x] **5. Core Monolith Decomposition (`replication/core.ts`, `firebird.ts`, `firebird-browser.ts`).**
+      Decompose `src/replication/core.ts` into focused domain modules (`dlq-compaction.ts`,
+      `bootstrap.ts`, `publication.ts`, `subscription.ts`, `orchestration.ts`, `mesh.ts`,
+      `archive-retention.ts`, `object-store-wal.ts`) behind `src/replication/index.ts`,
+      and extract `node-native-bindings.ts`, `firebird-tx.ts`, `firebird-browser-tx.ts`,
+      `pipeline.ts`, and `live-incremental.ts` from `src/firebird.ts` and
+      `src/browser/firebird-browser.ts` while preserving 100% public API and export parity.
+
+---
+
 ## 5. Test coverage added alongside this review
 
 `src/browser/` was excluded from Jest and had no browser tests.  It now has 73

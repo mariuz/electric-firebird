@@ -218,4 +218,21 @@ test.describe('Replication Simulator v2 (replication.html)', () => {
     await expect(page.locator('#event-feed')).toContainText('createWebRtcReplicationPeer');
     await expect(page.locator('#event-feed')).toContainText('CRC-32');
   });
+
+  test('Scenario 14: Binary .fdb Bootstrap + S3/R2 WAL Shipping PITR & db.pipeline()', async ({
+    page,
+  }) => {
+    await openReplicationSim(page);
+
+    await page.locator('.scenario-card[data-scenario="object-store-pitr-pipeline"]').click();
+
+    await expect(page.locator('#primary-rows')).toContainText('S3 WAL PITR Pipeline Task #4');
+    await expect(page.locator('#replica-rows')).toContainText('S3 WAL PITR Pipeline Task #5');
+    await expect(page.locator('#code-inspector')).toContainText('createObjectStoreReplicationTarget');
+    await expect(page.locator('#code-inspector')).toContainText("bootstrapStrategy: 'binary-image'");
+    await expect(page.locator('#event-feed')).toContainText('Scenario 14');
+    await expect(page.locator('#event-feed')).toContainText('restoreDatabaseToPointInTime');
+    await expect(page.locator('#event-feed')).toContainText('db.pipeline()');
+    await expect(page.locator('#event-feed')).toContainText('db.liveIncremental()');
+  });
 });

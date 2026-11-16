@@ -34,6 +34,17 @@ import type {
 } from '../types';
 import { isolationCode } from './isolation';
 import { encodeParams, encodeParamRows } from './params';
+import {
+  isWireParamRowsBuffer,
+  isWireParamsBuffer,
+  wireParamRowsToCAbi,
+  wireParamsToCAbi,
+} from './wire-params';
+import type {
+  EnginePipelineStepRequest,
+  EnginePipelineStepResponse,
+  EnginePipelineWireOptions,
+} from '../pipeline';
 import { extractBlobHandle } from './blob-stream';
 import {
   decodeBinaryResultSet,
@@ -70,6 +81,8 @@ export type EngineHandle = number;
  * the C API.
  */
 export interface EngineTransport {
+  /** When `true`, `serveEngine` forwards `"FBP\x01"` / `"FBP\x02"` wire parameter buffers directly without decoding JS arrays (`M20 Item 2`). */
+  readonly acceptsWireParams?: boolean;
   /** Initialise the engine.  Safe to call more than once. */
   init(): Promise<void>;
   /**
@@ -89,7 +102,7 @@ export interface EngineTransport {
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     sql: string,
-    params?: QueryParams,
+    params?: QueryParams | Uint8Array,
   ): Promise<number>;
   /**
    * Execute one statement once per row of parameters, prepared once: a
@@ -100,13 +113,13 @@ export interface EngineTransport {
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     sql: string,
-    rows: QueryParams[],
+    rows: QueryParams[] | Uint8Array,
   ): Promise<number>;
   query<T = Row>(
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     sql: string,
-    params?: QueryParams,
+    params?: QueryParams | Uint8Array,
     rowMode?: RowMode,
     binaryBlobs?: boolean,
   ): Promise<QueryResult<T>>;
@@ -119,14 +132,14 @@ export interface EngineTransport {
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     sql: string,
-    params?: QueryParams,
+    params?: QueryParams | Uint8Array,
     binaryBlobs?: boolean,
   ): Promise<BinaryResultPayload>;
   cursorOpen?(
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     sql: string,
-    params?: QueryParams,
+    params?: QueryParams | Uint8Array,
   ): Promise<EngineHandle>;
   /**
    * Fetch up to `batchSize` rows from an open cursor.
@@ -219,21 +232,21 @@ export interface EngineTransport {
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     stmtHandle: EngineHandle,
-    params?: QueryParams,
+    params?: QueryParams | Uint8Array,
   ): Promise<number>;
   /** Execute a prepared statement handle once per row of parameters as a single batch. */
   executeBatchStmt?(
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     stmtHandle: EngineHandle,
-    rows: QueryParams[],
+    rows: QueryParams[] | Uint8Array,
   ): Promise<number>;
   /** Query a prepared statement handle by integer ID without marshalling SQL text. */
   queryStmt?<T = Row>(
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     stmtHandle: EngineHandle,
-    params?: QueryParams,
+    params?: QueryParams | Uint8Array,
     rowMode?: RowMode,
     binaryBlobs?: boolean,
   ): Promise<QueryResult<T>>;
@@ -242,7 +255,7 @@ export interface EngineTransport {
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     stmtHandle: EngineHandle,
-    params?: QueryParams,
+    params?: QueryParams | Uint8Array,
     binaryBlobs?: boolean,
   ): Promise<BinaryResultPayload>;
   /** Open a streaming cursor for a prepared statement handle by integer ID. */
@@ -250,7 +263,7 @@ export interface EngineTransport {
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     stmtHandle: EngineHandle,
-    params?: QueryParams,
+    params?: QueryParams | Uint8Array,
   ): Promise<EngineHandle>;
   explain?(
     dbHandle: EngineHandle,
@@ -258,6 +271,13 @@ export interface EngineTransport {
     sql: string,
     detailed?: boolean,
   ): Promise<string>;
+  /** Execute a heterogeneous multi-statement pipeline in a single transport round-trip (`M20 Item 2`). */
+  pipeline?(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    steps: readonly EnginePipelineStepRequest[],
+    options?: EnginePipelineWireOptions,
+  ): Promise<EnginePipelineStepResponse[]>;
   describe(
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
@@ -932,6 +952,8 @@ export class DirectTransport implements EngineTransport {
     return fields;
   };
 
+  readonly acceptsWireParams = true;
+
   constructor(private readonly options: DirectTransportOptions = {}) {}
 
   async init(): Promise<void> {
@@ -1013,10 +1035,28 @@ export class DirectTransport implements EngineTransport {
    * message it would not use.
    */
   private withParams<T>(
-    params: QueryParams,
+    params: QueryParams | Uint8Array,
     fn: (ptr: number, length: number) => T,
   ): T {
-    if (!params || params.length === 0) {
+    if (!params) {
+      return fn(0, 0);
+    }
+    if (isWireParamsBuffer(params)) {
+      const view = new DataView(params.buffer, params.byteOffset, params.byteLength);
+      if (view.getUint32(4, true) === 0) {
+        return fn(0, 0);
+      }
+      const mod = this.module;
+      const packed = wireParamsToCAbi(params);
+      const ptr = mod._malloc(packed.length);
+      try {
+        mod.HEAPU8.set(packed, ptr);
+        return fn(ptr, packed.length);
+      } finally {
+        mod._free(ptr);
+      }
+    }
+    if (params.length === 0) {
       return fn(0, 0);
     }
 
@@ -1036,12 +1076,12 @@ export class DirectTransport implements EngineTransport {
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     sql: string,
-    params: QueryParams = [],
+    params: QueryParams | Uint8Array = [],
   ): Promise<number> {
     const mod = this.module;
     const rc = this.withString(sql, (sqlPtr) =>
       this.withParams(params, (paramPtr, paramLen) =>
-        params.length === 0
+        paramLen === 0
           ? mod._fb_execute(dbHandle, txHandle, sqlPtr)
           : mod._fb_execute_params(dbHandle, txHandle, sqlPtr, paramPtr, paramLen),
       ),
@@ -1056,12 +1096,19 @@ export class DirectTransport implements EngineTransport {
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     sql: string,
-    rows: QueryParams[],
+    rows: QueryParams[] | Uint8Array,
   ): Promise<number> {
-    if (rows.length === 0) return 0;
     const mod = this.module;
-    const resolvedRows = rows.map((row) => this.resolveStagedBlobParams(row));
-    const packed = encodeParamRows(resolvedRows);
+    let packed: Uint8Array;
+    if (isWireParamRowsBuffer(rows)) {
+      const view = new DataView(rows.buffer, rows.byteOffset, rows.byteLength);
+      if (view.getUint32(4, true) === 0) return 0;
+      packed = wireParamRowsToCAbi(rows);
+    } else {
+      if (rows.length === 0) return 0;
+      const resolvedRows = rows.map((row) => this.resolveStagedBlobParams(row));
+      packed = encodeParamRows(resolvedRows);
+    }
     const ptr = mod._malloc(packed.length);
     let rc: number;
     try {
@@ -1082,7 +1129,7 @@ export class DirectTransport implements EngineTransport {
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     sql: string,
-    params: QueryParams = [],
+    params: QueryParams | Uint8Array = [],
     rowMode: RowMode = 'object',
     binaryBlobs = false,
   ): Promise<QueryResult<T>> {
@@ -1127,7 +1174,7 @@ export class DirectTransport implements EngineTransport {
         }
       }
       const resultPtr =
-        params.length === 0
+        paramLen === 0
           ? mod._fb_query(dbHandle, txHandle, sqlPtr, flags)
           : mod._fb_query_params(
               dbHandle,
@@ -1182,7 +1229,7 @@ export class DirectTransport implements EngineTransport {
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     sql: string,
-    params: QueryParams = [],
+    params: QueryParams | Uint8Array = [],
     binaryBlobs = false,
   ): Promise<BinaryResultPayload> {
     const mod = this.module;
@@ -1241,7 +1288,7 @@ export class DirectTransport implements EngineTransport {
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     sql: string,
-    params: QueryParams = [],
+    params: QueryParams | Uint8Array = [],
   ): Promise<EngineHandle> {
     const mod = this.module;
     if (typeof mod._fb_cursor_open !== 'function') {
@@ -1818,7 +1865,7 @@ export class DirectTransport implements EngineTransport {
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     stmtHandle: EngineHandle,
-    params: QueryParams = [],
+    params: QueryParams | Uint8Array = [],
   ): Promise<number> {
     const mod = this.module;
     const entry = this.preparedStatements.get(stmtHandle);
@@ -1859,9 +1906,8 @@ export class DirectTransport implements EngineTransport {
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     stmtHandle: EngineHandle,
-    rows: QueryParams[],
+    rows: QueryParams[] | Uint8Array,
   ): Promise<number> {
-    if (rows.length === 0) return 0;
     const mod = this.module;
     const entry = this.preparedStatements.get(stmtHandle);
     if (
@@ -1869,8 +1915,16 @@ export class DirectTransport implements EngineTransport {
       (!entry || entry.native)
     ) {
       const executeBatchStmtFn = mod._fb_execute_batch_stmt;
-      const resolvedRows = rows.map((row) => this.resolveStagedBlobParams(row));
-      const packed = encodeParamRows(resolvedRows);
+      let packed: Uint8Array;
+      if (isWireParamRowsBuffer(rows)) {
+        const view = new DataView(rows.buffer, rows.byteOffset, rows.byteLength);
+        if (view.getUint32(4, true) === 0) return 0;
+        packed = wireParamRowsToCAbi(rows);
+      } else {
+        if (rows.length === 0) return 0;
+        const resolvedRows = rows.map((row) => this.resolveStagedBlobParams(row));
+        packed = encodeParamRows(resolvedRows);
+      }
       const ptr = mod._malloc(packed.length);
       let rc: number;
       try {
@@ -1908,7 +1962,7 @@ export class DirectTransport implements EngineTransport {
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     stmtHandle: EngineHandle,
-    params: QueryParams = [],
+    params: QueryParams | Uint8Array = [],
     rowMode: RowMode = 'object',
     binaryBlobs = false,
   ): Promise<QueryResult<T>> {
@@ -2011,7 +2065,7 @@ export class DirectTransport implements EngineTransport {
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     stmtHandle: EngineHandle,
-    params: QueryParams = [],
+    params: QueryParams | Uint8Array = [],
     binaryBlobs = false,
   ): Promise<BinaryResultPayload> {
     const mod = this.module;
@@ -2075,7 +2129,7 @@ export class DirectTransport implements EngineTransport {
     dbHandle: EngineHandle,
     txHandle: EngineHandle,
     stmtHandle: EngineHandle,
-    params: QueryParams = [],
+    params: QueryParams | Uint8Array = [],
   ): Promise<EngineHandle> {
     const mod = this.module;
     const entry = this.preparedStatements.get(stmtHandle);
@@ -2462,6 +2516,66 @@ export class DirectTransport implements EngineTransport {
 
   async rollback(txHandle: EngineHandle): Promise<void> {
     this.module._fb_rollback(txHandle);
+  }
+
+  async pipeline(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    steps: readonly EnginePipelineStepRequest[],
+    options: EnginePipelineWireOptions = {},
+  ): Promise<EnginePipelineStepResponse[]> {
+    let activeTx = txHandle;
+    const ownsTx = activeTx === 0 && Boolean(options.transaction);
+    if (ownsTx) {
+      const txOpts =
+        typeof options.transaction === 'object' && options.transaction !== null
+          ? options.transaction
+          : {};
+      activeTx = await this.startTransaction(dbHandle, txOpts);
+    }
+
+    const out: EnginePipelineStepResponse[] = new Array(steps.length);
+    try {
+      for (let i = 0; i < steps.length; i++) {
+        const step = steps[i]!;
+        if (step.op === 'execute') {
+          const affectedRows = await this.execute(
+            dbHandle,
+            activeTx,
+            step.sql,
+            step.params,
+          );
+          out[i] = { kind: 'affected', affectedRows };
+        } else if (step.op === 'executeBatch') {
+          const affectedRows = await this.executeBatch(
+            dbHandle,
+            activeTx,
+            step.sql,
+            step.rows,
+          );
+          out[i] = { kind: 'affected', affectedRows };
+        } else {
+          const payload = await this.queryBinary(
+            dbHandle,
+            activeTx,
+            step.sql,
+            step.params,
+            step.binaryBlobs,
+          );
+          out[i] = { kind: 'binary', payload };
+        }
+      }
+
+      if (ownsTx) {
+        await this.commit(activeTx);
+      }
+      return out;
+    } catch (err) {
+      if (ownsTx && activeTx !== 0) {
+        await this.rollback(activeTx).catch(() => undefined);
+      }
+      throw err;
+    }
   }
 
   // ── Filesystem ─────────────────────────────────────────────────────────
