@@ -1,0 +1,1113 @@
+/**
+ * repl-inspectors.ts – Catalog/telemetry fetchers & Inspector DOM renderers
+ * for `<firebird-repl>` (`M21 Item 5`).
+ */
+
+import {
+  DEFAULT_MIGRATIONS_TABLE,
+  introspect as introspectCatalog,
+} from '../browser/schema';
+import { computeTableIoBreakdown, type ParsedQueryPlan, type PlanTreeNode } from './plan-tree';
+import type {
+  AppliedMigration,
+  IntrospectOptions,
+  MigrateOptions,
+  MonitorStats,
+  Row,
+  SchemaIntrospection,
+} from '../types';
+import {
+  DEFAULT_REPL_DLQ_TABLE,
+  DEFAULT_REPL_JOURNAL_TABLE,
+  DEFAULT_REPL_SLOTS_TABLE,
+  DEFAULT_REPL_WATERMARK_TABLE,
+  type ReplicationStats,
+} from '../replication';
+import {
+  encodeArrowIpc,
+  rowsToColumnarResult,
+  type ColumnarQueryResult,
+} from '../columnar';
+import type { SyncHandleLike } from '../frameworks/sync-store';
+import { el } from './repl-styles';
+import type {
+  ReplArrowInspectorInfo,
+  ReplDatabase,
+  ReplEnginePublicationInfo,
+  ReplInspectorTab,
+  ReplReplicationDlqEntrySummary,
+  ReplReplicationInfo,
+  ReplReplicationJournalEntrySummary,
+  ReplReplicationSlotInfo,
+  ReplReplicationWatermarkInfo,
+} from './index';
+
+export async function fetchReplSchema(db: ReplDatabase, options?: IntrospectOptions): Promise<SchemaIntrospection> {
+      if (typeof db.introspect === 'function') {
+        return db.introspect(options);
+      }
+      return introspectCatalog(
+        {
+          query: async <T = Row>(sqlText: string, params: unknown[] = []) => {
+            const res = await db.query(sqlText, params, { rowMode: 'array' });
+            const objRows = res.rows.map((cols) =>
+              Object.fromEntries(res.fields.map((f, idx) => [f.name, cols[idx]])),
+            ) as unknown as T[];
+            return { fields: res.fields, rows: objRows };
+          },
+          exec: async () => undefined,
+        },
+        options,
+      );
+    }
+
+export async function fetchReplMigrations(db: ReplDatabase, options: Pick<MigrateOptions, 'tableName'> = {}): Promise<AppliedMigration[]> {
+      const rawName = (options.tableName ?? DEFAULT_MIGRATIONS_TABLE).trim();
+      const rawUpper = rawName.toUpperCase();
+      const quoted = `"${rawUpper.replace(/"/g, '""')}"`;
+
+      const exists = await db.query(
+        'SELECT 1 AS X FROM RDB$RELATIONS WHERE TRIM(RDB$RELATION_NAME) = ?',
+        [rawUpper],
+        { rowMode: 'array' },
+      );
+      if (exists.rows.length === 0) {
+        return [];
+      }
+
+      const res = await db.query(
+        `SELECT VERSION, NAME, APPLIED_AT FROM ${quoted} ORDER BY SEQ ASC, VERSION ASC`,
+        [],
+        { rowMode: 'array' },
+      );
+      return res.rows.map((row) => ({
+        version: String(row[0] ?? '').trim(),
+        name:
+          row[1] !== null && row[1] !== undefined && String(row[1]).trim() !== ''
+            ? String(row[1]).trim()
+            : null,
+        appliedAt: String(row[2] ?? '').trim(),
+      }));
+    }
+
+export async function fetchReplStats(db: ReplDatabase): Promise<MonitorStats | null> {
+      if (typeof db.monitorStats === 'function') {
+        return db.monitorStats();
+      }
+      if (typeof db.databaseInfo === 'function') {
+        const info = await db.databaseInfo();
+        return {
+          totalQueries: 0,
+          totalExecs: 0,
+          totalErrors: 0,
+          totalDurationMs: 0,
+          avgDurationMs: 0,
+          maxDurationMs: 0,
+          slowestSql: null,
+          prepareCacheHits: 0,
+          prepareCacheMisses: 0,
+          prepareCacheHitRate: 0,
+          io: {
+            reads: info.reads,
+            writes: info.writes,
+            fetches: info.fetches,
+            marks: info.marks,
+            pageBuffers: info.pageBuffers,
+            currentMemory: info.currentMemory,
+            maxMemory: info.maxMemory,
+          },
+          transactions: {
+            oldestTransaction: info.oldestTransaction,
+            oldestActive: info.oldestActive,
+            oldestSnapshot: info.oldestSnapshot,
+            nextTransaction: info.nextTransaction,
+            transactionGap: info.transactionGap,
+          },
+          activeStatements: 0,
+          recentQueries: [],
+        };
+      }
+      return null;
+    }
+
+export async function fetchReplReplication(db: ReplDatabase, replicatorHandle: { stats(): Promise<ReplicationStats> } | null): Promise<ReplReplicationInfo> {
+      const relRes = await db.query(
+        `SELECT TRIM(RDB$RELATION_NAME) AS REL_NAME
+         FROM RDB$RELATIONS
+         WHERE TRIM(RDB$RELATION_NAME) IN (?, ?, ?, ?)`,
+        [
+          DEFAULT_REPL_JOURNAL_TABLE,
+          DEFAULT_REPL_SLOTS_TABLE,
+          DEFAULT_REPL_WATERMARK_TABLE,
+          DEFAULT_REPL_DLQ_TABLE,
+        ],
+        { rowMode: 'array' },
+      );
+      const existingTables = new Set(
+        relRes.rows.map((r) => String(r[0] ?? '').trim().toUpperCase()),
+      );
+
+      let journalEntryCount = 0;
+      let minJournalLsn = 0;
+      let maxJournalLsn = 0;
+      const recentEntries: ReplReplicationJournalEntrySummary[] = [];
+
+      if (existingTables.has(DEFAULT_REPL_JOURNAL_TABLE)) {
+        const jQuoted = `"${DEFAULT_REPL_JOURNAL_TABLE}"`;
+        const statsRes = await db.query(
+          `SELECT COUNT(*), COALESCE(MIN(LSN), 0), COALESCE(MAX(LSN), 0) FROM ${jQuoted}`,
+          [],
+          { rowMode: 'array' },
+        );
+        const sRow = statsRes.rows[0];
+        if (sRow) {
+          journalEntryCount = Number(sRow[0] ?? 0);
+          minJournalLsn = Number(sRow[1] ?? 0);
+          maxJournalLsn = Number(sRow[2] ?? 0);
+        }
+
+        const recentRes = await db.query(
+          `SELECT LSN, ORIGIN_NODE, TABLE_NAME, OP, PK_JSON, CREATED_AT
+           FROM ${jQuoted}
+           ORDER BY LSN DESC
+           ROWS 20`,
+          [],
+          { rowMode: 'array' },
+        );
+        for (const r of recentRes.rows) {
+          recentEntries.push({
+            lsn: Number(r[0] ?? 0),
+            originNode: String(r[1] ?? '').trim(),
+            tableName: String(r[2] ?? '').trim(),
+            op: String(r[3] ?? '').trim(),
+            pkJson: String(r[4] ?? '').trim(),
+            createdAt: String(r[5] ?? '').trim(),
+          });
+        }
+      }
+
+      const slots: ReplReplicationSlotInfo[] = [];
+      if (existingTables.has(DEFAULT_REPL_SLOTS_TABLE)) {
+        const sQuoted = `"${DEFAULT_REPL_SLOTS_TABLE}"`;
+        const slotRes = await db.query(
+          `SELECT SLOT_NAME, NODE_ID, CONFIRMED_FLUSH_LSN, UPDATED_AT
+           FROM ${sQuoted}
+           ORDER BY SLOT_NAME ASC`,
+          [],
+          { rowMode: 'array' },
+        );
+        for (const r of slotRes.rows) {
+          slots.push({
+            slotName: String(r[0] ?? '').trim(),
+            nodeId: String(r[1] ?? '').trim(),
+            confirmedFlushLsn: Number(r[2] ?? 0),
+            updatedAt: String(r[3] ?? '').trim(),
+          });
+        }
+      }
+
+      const watermarks: ReplReplicationWatermarkInfo[] = [];
+      if (existingTables.has(DEFAULT_REPL_WATERMARK_TABLE)) {
+        const wQuoted = `"${DEFAULT_REPL_WATERMARK_TABLE}"`;
+        const wmRes = await db.query(
+          `SELECT PEER_ID, LAST_LSN, UPDATED_AT
+           FROM ${wQuoted}
+           ORDER BY PEER_ID ASC`,
+          [],
+          { rowMode: 'array' },
+        );
+        for (const r of wmRes.rows) {
+          watermarks.push({
+            peerId: String(r[0] ?? '').trim(),
+            lastLsn: Number(r[1] ?? 0),
+            updatedAt: String(r[2] ?? '').trim(),
+          });
+        }
+      }
+
+      const dlqEntries: ReplReplicationDlqEntrySummary[] = [];
+      if (existingTables.has(DEFAULT_REPL_DLQ_TABLE)) {
+        const dQuoted = `"${DEFAULT_REPL_DLQ_TABLE}"`;
+        const dlqRes = await db.query(
+          `SELECT LSN, SUB_NAME, ERROR_MSG, RETRY_COUNT, QUARANTINED_AT
+           FROM ${dQuoted}
+           ORDER BY LSN ASC`,
+          [],
+          { rowMode: 'array' },
+        );
+        for (const r of dlqRes.rows) {
+          dlqEntries.push({
+            lsn: Number(r[0] ?? 0),
+            subName: String(r[1] ?? '').trim(),
+            errorMessage: String(r[2] ?? '').trim(),
+            retryCount: Number(r[3] ?? 0),
+            quarantinedAt: String(r[4] ?? '').trim(),
+          });
+        }
+      }
+
+      let enginePublication: ReplEnginePublicationInfo | null = null;
+      try {
+        const pubRes = await db.query(
+          `SELECT TRIM(RDB$PUBLICATION_NAME), RDB$ACTIVE_FLAG, RDB$AUTO_ENABLE
+           FROM RDB$PUBLICATIONS`,
+          [],
+          { rowMode: 'array' },
+        );
+        const pubRow = pubRes.rows[0];
+        if (pubRow) {
+          const pubName = String(pubRow[0] ?? 'RDB$DEFAULT').trim() || 'RDB$DEFAULT';
+          const active = Number(pubRow[1] ?? 0) === 1;
+          const autoEnable = Number(pubRow[2] ?? 0) === 1;
+
+          const publishedTables: string[] = [];
+          try {
+            const tblRes = await db.query(
+              `SELECT TRIM(RDB$TABLE_NAME)
+               FROM RDB$PUBLICATION_TABLES
+               ORDER BY RDB$TABLE_NAME`,
+              [],
+              { rowMode: 'array' },
+            );
+            for (const tr of tblRes.rows) {
+              const tName = String(tr[0] ?? '').trim().toUpperCase();
+              if (tName) publishedTables.push(tName);
+            }
+          } catch {
+            // Ignore if RDB$PUBLICATION_TABLES is unavailable
+          }
+
+          let replicaMode: string | null = null;
+          let replicationSequence: number | null = null;
+          try {
+            const ctxRes = await db.query(
+              `SELECT RDB$GET_CONTEXT('SYSTEM', 'REPLICA_MODE'),
+                      RDB$GET_CONTEXT('SYSTEM', 'REPLICATION_SEQUENCE')
+               FROM RDB$DATABASE`,
+              [],
+              { rowMode: 'array' },
+            );
+            const ctxRow = ctxRes.rows[0];
+            if (ctxRow) {
+              if (ctxRow[0] !== null && ctxRow[0] !== undefined) {
+                replicaMode = String(ctxRow[0]).trim();
+              }
+              if (ctxRow[1] !== null && ctxRow[1] !== undefined) {
+                const parsedSeq = Number(ctxRow[1]);
+                if (Number.isFinite(parsedSeq)) {
+                  replicationSequence = parsedSeq;
+                }
+              }
+            }
+          } catch {
+            // Ignore if SYSTEM context variables are unavailable
+          }
+
+          enginePublication = {
+            name: pubName,
+            active,
+            autoEnable,
+            publishedTables,
+            replicaMode,
+            replicationSequence,
+          };
+        }
+      } catch {
+        enginePublication = null;
+      }
+
+      let liveStats: ReplicationStats | null = null;
+      if (replicatorHandle && typeof replicatorHandle.stats === 'function') {
+        try {
+          liveStats = await replicatorHandle.stats();
+        } catch {
+          liveStats = null;
+        }
+      }
+
+      return {
+        journalTableExists: existingTables.has(DEFAULT_REPL_JOURNAL_TABLE),
+        journalEntryCount,
+        minJournalLsn,
+        maxJournalLsn,
+        slots,
+        watermarks,
+        recentEntries,
+        dlqTableExists: existingTables.has(DEFAULT_REPL_DLQ_TABLE),
+        dlqEntryCount: dlqEntries.length,
+        dlqEntries,
+        enginePublication,
+        liveStats,
+      };
+    }
+
+export async function fetchReplArrowInspector(db: ReplDatabase, editorValue: string, syncHandleRef: SyncHandleLike | null, explicitSql?: string): Promise<ReplArrowInspectorInfo> {
+  const sqlCandidate = (explicitSql ?? editorValue ?? '').trim();
+      const targetSql =
+        sqlCandidate.length > 0
+          ? sqlCandidate
+          : 'SELECT 1 AS ID, CAST(\'firebird\' AS VARCHAR(32)) AS ENGINE FROM RDB$DATABASE';
+
+      let col: ColumnarQueryResult;
+      if (typeof db.queryColumnar === 'function') {
+        col = await db.queryColumnar(targetSql, []);
+      } else {
+        const res = await db.query(targetSql, [], { rowMode: 'array' });
+        const objRows = res.rows.map((r) =>
+          Object.fromEntries(res.fields.map((f, i) => [f.name, r[i]])),
+        );
+        col = rowsToColumnarResult({ fields: res.fields, rows: objRows });
+      }
+
+      const arrowBytes =
+        typeof db.queryArrow === 'function'
+          ? await db.queryArrow(targetSql, [])
+          : encodeArrowIpc(col);
+
+      let syncState: ReplArrowInspectorInfo['syncState'] = null;
+      if (syncHandleRef) {
+        try {
+          const st = await syncHandleRef.stats();
+          syncState = {
+            state: syncHandleRef.paused
+              ? 'paused'
+              : (syncHandleRef.connectionState ?? 'online'),
+            mode: syncHandleRef.mode ?? 'logical',
+            paused: syncHandleRef.paused,
+            lagEntries: st.lagEntries,
+            replicaLsn: st.replicaWatermark,
+            primaryLsn: st.primaryLsn,
+          };
+        } catch {
+          syncState = null;
+        }
+      }
+
+      const vectors = col.vectors.map((v, idx) => {
+        const f = col.fields[idx];
+        const dataBytes = v.data.byteLength;
+        const offsetBytes =
+          v.kind === 'utf8' || v.kind === 'bytes' ? v.offsets.byteLength : 0;
+        return {
+          name: f?.name ?? `COL_${idx}`,
+          kind: v.kind,
+          sqlType: f?.typeName ?? String(f?.type ?? ''),
+          nullCount: v.nullCount,
+          bufferBytes: dataBytes + offsetBytes + v.validity.byteLength,
+        };
+      });
+
+      return {
+        sql: targetSql,
+        rowCount: col.rowCount,
+        arrowIpcBytes: arrowBytes.byteLength,
+        vectors,
+        syncState,
+      };
+    }
+
+export function renderArrowInspectorPanel(info: ReplArrowInspectorInfo | null): HTMLElement {
+  const panel = el('div', 'inspector-arrow');
+
+      if (info?.syncState) {
+        const syncTitle = el('div', 'schema-group-title');
+        syncTitle.textContent = 'SyncHandle Live Telemetry';
+        panel.append(syncTitle);
+        const syncSummary = el('p', 'inspector-summary');
+        syncSummary.textContent =
+          `${info.syncState.state.toUpperCase()} (${info.syncState.mode}) · ` +
+          `LSN ${info.syncState.replicaLsn}/${info.syncState.primaryLsn} · ` +
+          `lag ${info.syncState.lagEntries}`;
+        panel.append(syncSummary);
+      }
+
+      if (!info) {
+        const empty = el('p', 'inspector-empty');
+        empty.textContent =
+          'Click Arrow to inspect zero-copy columnar vectors & Apache Arrow IPC V5 buffers.';
+        panel.append(empty);
+        return panel;
+      }
+
+      const hdr = el('div', 'schema-group-title');
+      hdr.textContent = 'Apache Arrow IPC V5 & Columnar Vectors';
+      panel.append(hdr);
+
+      const summaryEl = el('p', 'inspector-summary');
+      summaryEl.textContent =
+        `${info.rowCount} ${info.rowCount === 1 ? 'row' : 'rows'} · ` +
+        `${info.vectors.length} ${info.vectors.length === 1 ? 'vector' : 'vectors'} · ` +
+        `Arrow IPC ${info.arrowIpcBytes} bytes`;
+      panel.append(summaryEl);
+
+      const list = el('ul', 'schema-list');
+      for (const vec of info.vectors) {
+        const li = el('li', 'schema-meta-item');
+        const name = el('span', 'col-name');
+        name.textContent = vec.name;
+        const badge = el('span', 'schema-badge');
+        badge.textContent =
+          `${vec.kind} (${vec.sqlType}) · ${vec.bufferBytes} B · nulls:${vec.nullCount}`;
+        li.append(name, badge);
+        list.append(li);
+      }
+      panel.append(list);
+      return panel;
+    }
+
+export function renderPlanTreeNode(node: PlanTreeNode): HTMLElement {
+      const details = el('details', 'plan-node');
+      details.open = true;
+
+      const summaryNode = el('summary', 'plan-node-header');
+      const labelSpan = el('span', 'plan-node-label');
+      labelSpan.textContent = node.label;
+      summaryNode.append(labelSpan);
+
+      if (node.accessMethod === 'NATURAL') {
+        const warnBadge = el('span', 'plan-badge-warn');
+        warnBadge.textContent = 'NATURAL SCAN';
+        summaryNode.append(warnBadge);
+      } else if (node.accessMethod && node.indexNames.length > 0) {
+        const idxBadge = el('span', 'plan-badge-index');
+        idxBadge.textContent = `${node.accessMethod}: ${node.indexNames.join(', ')}`;
+        summaryNode.append(idxBadge);
+      }
+
+      const pct = Math.round(node.weightFraction * 100);
+      const weightBadge = el('span', 'schema-badge plan-node-weight');
+      weightBadge.textContent = `${pct}% (w:${node.estimatedWeight})`;
+      summaryNode.append(weightBadge);
+
+      if (node.tableIo) {
+        const ioBadge = el('span', 'schema-badge plan-node-io');
+        ioBadge.textContent = `fetches:${node.tableIo.fetches} reads:${node.tableIo.reads}`;
+        summaryNode.append(ioBadge);
+      }
+
+      details.append(summaryNode);
+
+      if (node.warnings.length > 0) {
+        for (const w of node.warnings) {
+          const warnEl = el('p', 'inspector-summary plan-warning');
+          warnEl.textContent = `⚠ ${w}`;
+          details.append(warnEl);
+        }
+      }
+
+      for (const child of node.children) {
+        details.append(renderPlanTreeNode(child));
+      }
+
+      return details;
+    }
+
+export function renderPlanExplorerPanel(lastPlans: ReadonlyArray<{ sql: string; parsed: ParsedQueryPlan }>): HTMLElement {
+  const panel = el('div', 'inspector-plan');
+  if (lastPlans.length === 0) {
+        const empty = el('p', 'inspector-empty');
+        empty.textContent = 'No query plan explained yet. Click Explain to analyze a query.';
+        panel.append(empty);
+        return panel;
+      }
+
+      for (const item of lastPlans) {
+        const parsed = item.parsed;
+        const sqlHeader = el('div', 'schema-group-title');
+        sqlHeader.textContent = item.sql;
+        panel.append(sqlHeader);
+
+        const summaryEl = el('p', 'inspector-summary');
+        summaryEl.textContent =
+          `${parsed.format} plan · ${parsed.nodes.length} ${parsed.nodes.length === 1 ? 'node' : 'nodes'} · ` +
+          `${parsed.indexScanCount} index ${parsed.indexScanCount === 1 ? 'scan' : 'scans'} · ` +
+          `${parsed.naturalScanCount} natural ${parsed.naturalScanCount === 1 ? 'scan' : 'scans'}`;
+        panel.append(summaryEl);
+
+        // 1. Flamegraph visualization
+        const flameTitle = el('div', 'schema-sub-label');
+        flameTitle.textContent = 'Cost Flamegraph:';
+        panel.append(flameTitle);
+
+        const flameWrap = el('div', 'flamegraph');
+        for (const n of parsed.nodes) {
+          const pct = Math.max(8, Math.round(n.weightFraction * 100));
+          const bar = el(
+            'div',
+            `flame-bar${n.accessMethod === 'NATURAL' ? ' natural' : ''}`,
+          );
+          bar.setAttribute('style', `width: ${pct}%; margin-left: ${n.depth * 6}px`);
+          const nameSpan = el('span', 'flame-label');
+          nameSpan.textContent = n.label;
+          const pctSpan = el('span', 'schema-badge flame-pct');
+          pctSpan.textContent = `${Math.round(n.weightFraction * 100)}%`;
+          bar.append(nameSpan, pctSpan);
+          flameWrap.append(bar);
+        }
+        panel.append(flameWrap);
+
+        // 2. Interactive collapsible Plan Tree
+        const treeTitle = el('div', 'schema-sub-label');
+        treeTitle.textContent = 'Plan Tree:';
+        panel.append(treeTitle);
+        panel.append(renderPlanTreeNode(parsed.root));
+      }
+
+      return panel;
+    }
+
+export interface ReplInspectorRenderContext {
+  readonly db: ReplDatabase | null;
+  readonly inspectorBody: HTMLDivElement;
+  readonly editor: HTMLTextAreaElement;
+  readonly activeTab: ReplInspectorTab;
+  readonly lastSchema: SchemaIntrospection | null;
+  readonly lastMigrations: AppliedMigration[];
+  readonly lastStats: MonitorStats | null;
+  readonly lastPlans: ReadonlyArray<{ sql: string; parsed: ParsedQueryPlan }>;
+  readonly lastReplication: ReplReplicationInfo | null;
+  readonly lastArrow: ReplArrowInspectorInfo | null;
+  readonly onResetProfiler: () => void;
+}
+
+export function renderReplInspector(ctx: ReplInspectorRenderContext): void {
+  ctx.inspectorBody.replaceChildren();
+  if (!ctx.db) {
+        const empty = el('p', 'inspector-empty');
+        empty.textContent = 'No database connected.';
+        ctx.inspectorBody.append(empty);
+        return;
+      }
+
+      if (ctx.activeTab === 'plan') {
+        ctx.inspectorBody.append(renderPlanExplorerPanel(ctx.lastPlans));
+        return;
+      }
+
+      if (ctx.activeTab === 'arrow') {
+        ctx.inspectorBody.append(renderArrowInspectorPanel(ctx.lastArrow));
+        return;
+      }
+
+      if (ctx.activeTab === 'profiler') {
+        const panel = el('div', 'inspector-profiler');
+        const stats = ctx.lastStats;
+        if (!stats) {
+          const empty = el('p', 'inspector-empty');
+          empty.textContent = 'No profiler telemetry available.';
+          panel.append(empty);
+          ctx.inspectorBody.append(panel);
+          return;
+        }
+
+        const totalStmts = stats.totalQueries + stats.totalExecs;
+        const hitPct = (stats.prepareCacheHitRate * 100).toFixed(1);
+        const totalCache = stats.prepareCacheHits + stats.prepareCacheMisses;
+        const summaryEl = el('p', 'inspector-summary');
+        summaryEl.textContent =
+          `${totalStmts} ${totalStmts === 1 ? 'query' : 'queries'} · ` +
+          `avg ${stats.avgDurationMs.toFixed(1)} ms · ` +
+          `cache ${hitPct}% (${stats.prepareCacheHits}/${totalCache})`;
+        panel.append(summaryEl);
+
+        const ioDiv = el('div', 'schema-sub');
+        const ioLabel = el('span', 'schema-sub-label');
+        ioLabel.textContent = 'Engine & Page I/O:';
+        ioDiv.append(ioLabel);
+        const ioList = el('ul', 'schema-list profiler-metrics');
+        const metrics: Array<[string, string]> = [
+          ['Page reads / writes', `${stats.io.reads} / ${stats.io.writes}`],
+          ['Page fetches / marks', `${stats.io.fetches} / ${stats.io.marks}`],
+          [
+            'Transaction gap (OIT → Next)',
+            `${stats.transactions.transactionGap} (${stats.transactions.oldestTransaction} → ${stats.transactions.nextTransaction})`,
+          ],
+          [
+            'Memory (current / max)',
+            `${stats.io.currentMemory} / ${stats.io.maxMemory} bytes`,
+          ],
+        ];
+        for (const [label, value] of metrics) {
+          const li = el('li', 'schema-meta-item');
+          const k = el('span', 'col-name');
+          k.textContent = `${label}:`;
+          const v = el('span', 'col-type');
+          v.textContent = value;
+          li.append(k, v);
+          ioList.append(li);
+        }
+        ioDiv.append(ioList);
+        panel.append(ioDiv);
+
+        // Per-Table Page I/O Flamegraph Breakdown
+        const tableIoBreakdown = computeTableIoBreakdown(
+          stats,
+          ctx.lastSchema?.tables.map((t) => t.name) ?? [],
+        );
+        if (tableIoBreakdown.size > 0) {
+          const tblIoTitle = el('div', 'schema-group-title');
+          tblIoTitle.textContent = 'Per-Table Page I/O Flamegraph';
+          panel.append(tblIoTitle);
+
+          const flameWrap = el('div', 'flamegraph profiler-table-io');
+          const sortedTables = [...tableIoBreakdown.values()].sort(
+            (a, b) =>
+              b.fetches + b.reads - (a.fetches + a.reads) ||
+              b.totalDurationMs - a.totalDurationMs,
+          );
+          for (const tStat of sortedTables) {
+            const pct = Math.max(10, Math.round(tStat.ioShare * 100));
+            const bar = el('div', 'flame-bar table-io-bar');
+            bar.setAttribute('style', `width: ${pct}%`);
+            const nameSpan = el('span', 'col-name');
+            nameSpan.textContent = tStat.tableName;
+            const detailSpan = el('span', 'schema-badge');
+            detailSpan.textContent =
+              `fetches: ${tStat.fetches} · reads: ${tStat.reads} · ` +
+              `writes: ${tStat.writes} · ${tStat.totalDurationMs.toFixed(1)} ms`;
+            bar.append(nameSpan, detailSpan);
+            flameWrap.append(bar);
+          }
+          panel.append(flameWrap);
+        }
+
+        const recentTitle = el('div', 'schema-group-title');
+        recentTitle.textContent = `Recent Queries (${stats.recentQueries.length})`;
+        panel.append(recentTitle);
+
+        if (stats.recentQueries.length === 0) {
+          const empty = el('p', 'inspector-empty');
+          empty.textContent = 'No queries profiled yet.';
+          panel.append(empty);
+        } else {
+          const qList = el('ol', 'migrations-list profiler-queries');
+          for (const q of [...stats.recentQueries].reverse()) {
+            const li = el('li', 'migration-item profiler-query-item');
+            const dur = el('span', 'migration-version');
+            dur.textContent = `${q.durationMs.toFixed(2)} ms`;
+            const sqlSpan = el('span', 'migration-name');
+            sqlSpan.textContent = q.sql;
+            const badge = el('span', 'schema-badge');
+            const ioSummary = q.io
+              ? ` · fetches:${q.io.fetches} reads:${q.io.reads}`
+              : '';
+            badge.textContent = `${q.kind} · ${q.rowCount} rows${q.cacheHit ? ' · cached' : ''}${ioSummary}`;
+            li.append(dur, sqlSpan, badge);
+            qList.append(li);
+          }
+          panel.append(qList);
+        }
+
+        ctx.inspectorBody.append(panel);
+        return;
+      }
+
+      if (ctx.activeTab === 'migrations') {
+        const panel = el('div', 'inspector-migrations');
+        const list = ctx.lastMigrations;
+        const latest = list.length > 0 ? list[list.length - 1]!.version : 'none';
+        const summaryEl = el('p', 'inspector-summary');
+        summaryEl.textContent = `Current version: ${latest} · ${list.length} applied`;
+        panel.append(summaryEl);
+
+        if (list.length === 0) {
+          const empty = el('p', 'inspector-empty');
+          empty.textContent = 'No applied migrations in FB_MIGRATIONS$.';
+          panel.append(empty);
+        } else {
+          const ol = el('ol', 'migrations-list');
+          for (const m of list) {
+            const li = el('li', 'migration-item');
+            const ver = el('span', 'migration-version');
+            ver.textContent = m.version;
+            li.append(ver);
+            if (m.name) {
+              const nameEl = el('span', 'migration-name');
+              nameEl.textContent = m.name;
+              li.append(nameEl);
+            }
+            const dateEl = el('span', 'schema-badge migration-date');
+            dateEl.textContent = m.appliedAt;
+            li.append(dateEl);
+            ol.append(li);
+          }
+          panel.append(ol);
+        }
+        ctx.inspectorBody.append(panel);
+        return;
+      }
+
+      if (ctx.activeTab === 'replication') {
+        const panel = el('div', 'inspector-replication');
+        const repl = ctx.lastReplication;
+        if (!repl) {
+          const empty = el('p', 'inspector-empty');
+          empty.textContent = 'No replication state loaded yet.';
+          panel.append(empty);
+          ctx.inspectorBody.append(panel);
+          return;
+        }
+
+        const dlqList = repl.dlqEntries ?? [];
+        const summaryEl = el('p', 'inspector-summary');
+        summaryEl.textContent =
+          `Journal: ${repl.journalEntryCount} ${repl.journalEntryCount === 1 ? 'entry' : 'entries'} ` +
+          `(LSN ${repl.minJournalLsn} → ${repl.maxJournalLsn}) · ` +
+          `${repl.slots.length} ${repl.slots.length === 1 ? 'slot' : 'slots'} · ` +
+          `${repl.watermarks.length} ${repl.watermarks.length === 1 ? 'watermark' : 'watermarks'} · ` +
+          `${dlqList.length} DLQ`;
+        panel.append(summaryEl);
+
+        if (repl.enginePublication) {
+          const ep = repl.enginePublication;
+          const engDiv = el('div', 'schema-sub replication-engine-pub');
+          const engLabel = el('span', 'schema-sub-label');
+          engLabel.textContent = 'Native Engine Publication (RDB$PUBLICATIONS):';
+          engDiv.append(engLabel);
+          const engList = el('ul', 'schema-list replication-engine-metrics');
+          const engMetrics: Array<[string, string]> = [
+            [
+              'Publication',
+              `${ep.name} (${ep.active ? 'ACTIVE' : 'INACTIVE'}${ep.autoEnable ? ' · INCLUDE ALL' : ''})`,
+            ],
+            [
+              'Published tables',
+              ep.publishedTables.length > 0 ? ep.publishedTables.join(', ') : 'none',
+            ],
+            [
+              'Replica mode / sequence',
+              `${ep.replicaMode ?? 'NONE'} / seq ${ep.replicationSequence ?? 0}`,
+            ],
+          ];
+          for (const [label, value] of engMetrics) {
+            const li = el('li', 'schema-meta-item');
+            const k = el('span', 'col-name');
+            k.textContent = `${label}:`;
+            const v = el('span', 'col-type');
+            v.textContent = value;
+            li.append(k, v);
+            engList.append(li);
+          }
+          engDiv.append(engList);
+          panel.append(engDiv);
+        }
+
+        if (repl.liveStats) {
+          const st = repl.liveStats;
+          const liveDiv = el('div', 'schema-sub');
+          const liveLabel = el('span', 'schema-sub-label');
+          liveLabel.textContent = 'Live Replicator Telemetry:';
+          liveDiv.append(liveLabel);
+          const liveList = el('ul', 'schema-list replication-live-metrics');
+          const metrics: Array<[string, string]> = [
+            ['Status', st.status],
+            [
+              'LSN (primary / watermark)',
+              `${st.primaryLsn} / ${st.replicaWatermark}`,
+            ],
+            [
+              'Lag (entries / ms)',
+              `${st.lagEntries} entries / ${st.lagMs} ms`,
+            ],
+            [
+              'Changes (fetched / applied)',
+              `${st.totalFetched} / ${st.totalApplied} (${st.bytesTransferred} B)`,
+            ],
+            [
+              'Conflicts resolved',
+              String(st.totalConflicts),
+            ],
+          ];
+          for (const [label, value] of metrics) {
+            const li = el('li', 'schema-meta-item');
+            const k = el('span', 'col-name');
+            k.textContent = `${label}:`;
+            const v = el('span', 'col-type');
+            v.textContent = value;
+            li.append(k, v);
+            liveList.append(li);
+          }
+          liveDiv.append(liveList);
+          panel.append(liveDiv);
+        }
+
+        const slotsTitle = el('div', 'schema-group-title');
+        slotsTitle.textContent = `Replication Slots (${repl.slots.length})`;
+        panel.append(slotsTitle);
+        if (repl.slots.length === 0) {
+          const empty = el('p', 'inspector-empty');
+          empty.textContent = 'No replication slots registered in FB_REPL_SLOTS$.';
+          panel.append(empty);
+        } else {
+          const slotList = el('ul', 'schema-list replication-slots');
+          for (const s of repl.slots) {
+            const li = el('li', 'migration-item replication-slot-item');
+            const nameEl = el('span', 'migration-version');
+            nameEl.textContent = s.slotName;
+            const nodeEl = el('span', 'migration-name');
+            nodeEl.textContent = `node: ${s.nodeId}`;
+            const lag = Math.max(0, repl.maxJournalLsn - s.confirmedFlushLsn);
+            const badgeEl = el('span', 'schema-badge');
+            badgeEl.textContent = `ack LSN ${s.confirmedFlushLsn} · lag ${lag}`;
+            li.append(nameEl, nodeEl, badgeEl);
+            slotList.append(li);
+          }
+          panel.append(slotList);
+        }
+
+        const wmTitle = el('div', 'schema-group-title');
+        wmTitle.textContent = `Peer Watermarks (${repl.watermarks.length})`;
+        panel.append(wmTitle);
+        if (repl.watermarks.length === 0) {
+          const empty = el('p', 'inspector-empty');
+          empty.textContent = 'No peer watermarks recorded in FB_REPL_WATERMARKS$.';
+          panel.append(empty);
+        } else {
+          const wmList = el('ul', 'schema-list replication-watermarks');
+          for (const w of repl.watermarks) {
+            const li = el('li', 'migration-item replication-watermark-item');
+            const peerEl = el('span', 'migration-version');
+            peerEl.textContent = w.peerId;
+            const lsnEl = el('span', 'migration-name');
+            lsnEl.textContent = `last LSN ${w.lastLsn}`;
+            const dateEl = el('span', 'schema-badge');
+            dateEl.textContent = w.updatedAt;
+            li.append(peerEl, lsnEl, dateEl);
+            wmList.append(li);
+          }
+          panel.append(wmList);
+        }
+
+        const entriesTitle = el('div', 'schema-group-title');
+        entriesTitle.textContent = `Recent Journal Entries (${repl.recentEntries.length})`;
+        panel.append(entriesTitle);
+        if (repl.recentEntries.length === 0) {
+          const empty = el('p', 'inspector-empty');
+          empty.textContent = repl.journalTableExists
+            ? 'No journal entries in FB_REPL_JOURNAL$.'
+            : 'Replication journal table FB_REPL_JOURNAL$ is not initialized.';
+          panel.append(empty);
+        } else {
+          const jList = el('ol', 'migrations-list replication-entries');
+          for (const e of repl.recentEntries) {
+            const li = el('li', 'migration-item replication-entry-item');
+            const lsnSpan = el('span', 'migration-version');
+            lsnSpan.textContent = `#${e.lsn}`;
+            const descSpan = el('span', 'migration-name');
+            descSpan.textContent = `${e.op} ${e.tableName} ${e.pkJson}`;
+            const badge = el('span', 'schema-badge');
+            badge.textContent = `${e.originNode} · ${e.createdAt}`;
+            li.append(lsnSpan, descSpan, badge);
+            jList.append(li);
+          }
+          panel.append(jList);
+        }
+
+        const dlqTitle = el('div', 'schema-group-title');
+        dlqTitle.textContent = `Dead-Letter Queue (${dlqList.length})`;
+        panel.append(dlqTitle);
+        if (dlqList.length === 0) {
+          const empty = el('p', 'inspector-empty');
+          empty.textContent = 'No quarantined entries in FB_REPL_DLQ$.';
+          panel.append(empty);
+        } else {
+          const dList = el('ul', 'schema-list replication-dlq');
+          for (const d of dlqList) {
+            const li = el('li', 'migration-item replication-dlq-item');
+            const lsnSpan = el('span', 'migration-version');
+            lsnSpan.textContent = `#${d.lsn}`;
+            const errSpan = el('span', 'migration-name');
+            errSpan.textContent = `${d.subName}: ${d.errorMessage}`;
+            const badge = el('span', 'schema-badge');
+            badge.textContent = `retries ${d.retryCount}`;
+            li.append(lsnSpan, errSpan, badge);
+            dList.append(li);
+          }
+          panel.append(dList);
+        }
+
+        ctx.inspectorBody.append(panel);
+        return;
+      }
+
+      const panel = el('div', 'inspector-schema');
+      const schema = ctx.lastSchema;
+      if (!schema) {
+        const empty = el('p', 'inspector-empty');
+        empty.textContent = 'No schema loaded yet.';
+        panel.append(empty);
+        ctx.inspectorBody.append(panel);
+        return;
+      }
+
+      const summaryEl = el('p', 'inspector-summary');
+      summaryEl.textContent =
+        `${schema.tables.length} ${schema.tables.length === 1 ? 'table' : 'tables'} · ` +
+        `${schema.views.length} ${schema.views.length === 1 ? 'view' : 'views'} · ` +
+        `${schema.sequences.length} ${schema.sequences.length === 1 ? 'sequence' : 'sequences'} · ` +
+        `${schema.triggers.length} ${schema.triggers.length === 1 ? 'trigger' : 'triggers'}`;
+      panel.append(summaryEl);
+
+      if (
+        schema.tables.length === 0 &&
+        schema.views.length === 0 &&
+        schema.sequences.length === 0
+      ) {
+        const empty = el('p', 'inspector-empty');
+        empty.textContent = 'No user tables, views, or sequences.';
+        panel.append(empty);
+      }
+
+      if (schema.tables.length > 0) {
+        const groupTitle = el('div', 'schema-group-title');
+        groupTitle.textContent = 'Tables';
+        panel.append(groupTitle);
+
+        for (const tbl of schema.tables) {
+          const details = el('details', 'schema-table');
+          details.open = true;
+          const header = el('summary', 'schema-item-header');
+          const nameSpan = el('span', 'schema-table-name');
+          nameSpan.textContent = tbl.name;
+          const badge = el('span', 'schema-badge');
+          badge.textContent = `(${tbl.columns.length} cols)`;
+          const queryBtn = document.createElement('button');
+          queryBtn.type = 'button';
+          queryBtn.className = 'schema-query-btn';
+          queryBtn.textContent = 'SELECT';
+          queryBtn.title = `Populate SELECT * FROM ${tbl.name}`;
+          queryBtn.addEventListener('click', (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            const ident = /^[A-Z0-9_$]+$/.test(tbl.name)
+              ? tbl.name
+              : `"${tbl.name.replace(/"/g, '""')}"`;
+            ctx.editor.value = `SELECT * FROM ${ident};`;
+            ctx.editor.focus();
+          });
+          header.append(nameSpan, badge, queryBtn);
+          details.append(header);
+
+          const pkSet = new Set(tbl.primaryKey ?? []);
+          const colList = el('ul', 'schema-list schema-columns');
+          for (const col of tbl.columns) {
+            const li = el('li', 'schema-col');
+            const cName = el('span', 'col-name');
+            cName.textContent = col.name;
+            const cType = el('span', 'col-type');
+            cType.textContent = col.typeName;
+            li.append(cName, cType);
+            if (pkSet.has(col.name) || col.isPrimaryKey) {
+              const pkFlag = el('span', 'col-flag');
+              pkFlag.textContent = 'PK';
+              li.append(pkFlag);
+            }
+            if (!col.nullable) {
+              const nnFlag = el('span', 'schema-badge');
+              nnFlag.textContent = 'NOT NULL';
+              li.append(nnFlag);
+            }
+            if (col.isIdentity) {
+              const idFlag = el('span', 'col-flag');
+              idFlag.textContent = 'IDENTITY';
+              li.append(idFlag);
+            }
+            if (col.defaultSource) {
+              const defBadge = el('span', 'schema-badge');
+              defBadge.textContent = col.defaultSource;
+              li.append(defBadge);
+            }
+            colList.append(li);
+          }
+          details.append(colList);
+
+          if (tbl.foreignKeys.length > 0) {
+            const fkDiv = el('div', 'schema-sub');
+            const fkLabel = el('span', 'schema-sub-label');
+            fkLabel.textContent = 'Foreign Keys:';
+            fkDiv.append(fkLabel);
+            const fkList = el('ul', 'schema-list schema-fks');
+            for (const fk of tbl.foreignKeys) {
+              const li = el('li', 'schema-meta-item');
+              li.textContent = `${fk.name}: (${fk.columns.join(', ')}) → ${fk.referencedTableName}(${fk.referencedColumns.join(', ')})`;
+              fkList.append(li);
+            }
+            fkDiv.append(fkList);
+            details.append(fkDiv);
+          }
+
+          if (tbl.indexes.length > 0) {
+            const idxDiv = el('div', 'schema-sub');
+            const idxLabel = el('span', 'schema-sub-label');
+            idxLabel.textContent = 'Indexes:';
+            idxDiv.append(idxLabel);
+            const idxList = el('ul', 'schema-list schema-indexes');
+            for (const idx of tbl.indexes) {
+              const li = el('li', 'schema-meta-item');
+              const kind = idx.unique ? 'UNIQUE' : 'INDEX';
+              const dir = idx.descending ? ' DESC' : '';
+              li.textContent = `${idx.name} (${kind}${dir}): (${idx.columns.join(', ')})`;
+              idxList.append(li);
+            }
+            idxDiv.append(idxList);
+            details.append(idxDiv);
+          }
+
+          if (tbl.triggers.length > 0) {
+            const trgDiv = el('div', 'schema-sub');
+            const trgLabel = el('span', 'schema-sub-label');
+            trgLabel.textContent = 'Triggers:';
+            trgDiv.append(trgLabel);
+            const trgList = el('ul', 'schema-list schema-triggers');
+            for (const trg of tbl.triggers) {
+              const li = el('li', 'schema-meta-item');
+              li.textContent = `${trg.name} (${trg.timing} ${trg.events.join(' OR ')})`;
+              trgList.append(li);
+            }
+            trgDiv.append(trgList);
+            details.append(trgDiv);
+          }
+
+          panel.append(details);
+        }
+      }
+
+      if (schema.views.length > 0) {
+        const groupTitle = el('div', 'schema-group-title');
+        groupTitle.textContent = 'Views';
+        panel.append(groupTitle);
+
+        for (const vw of schema.views) {
+          const details = el('details', 'schema-view');
+          const header = el('summary', 'schema-item-header');
+          const nameSpan = el('span', 'schema-view-name');
+          nameSpan.textContent = vw.name;
+          const badge = el('span', 'schema-badge');
+          badge.textContent = `(${vw.columns.length} cols)`;
+          header.append(nameSpan, badge);
+          details.append(header);
+          if (vw.source) {
+            const src = el('pre', 'schema-view-source');
+            src.textContent = vw.source;
+            details.append(src);
+          }
+          panel.append(details);
+        }
+      }
+
+      if (schema.sequences.length > 0) {
+        const groupTitle = el('div', 'schema-group-title');
+        groupTitle.textContent = 'Sequences';
+        panel.append(groupTitle);
+        const seqList = el('ul', 'schema-list schema-sequences');
+        for (const seq of schema.sequences) {
+          const li = el('li', 'schema-meta-item');
+          li.textContent = seq.name;
+          seqList.append(li);
+        }
+        panel.append(seqList);
+      }
+
+      ctx.inspectorBody.append(panel);
+    }
+

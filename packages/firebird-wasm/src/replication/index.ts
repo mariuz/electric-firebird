@@ -13,3 +13,4 @@ export * from './transports';
 export * from './metrics';
 export * from './core';
 export * from './presets';
+export * from './router';

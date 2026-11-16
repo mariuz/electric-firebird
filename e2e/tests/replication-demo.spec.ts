@@ -235,4 +235,20 @@ test.describe('Replication Simulator v2 (replication.html)', () => {
     await expect(page.locator('#event-feed')).toContainText('db.pipeline()');
     await expect(page.locator('#event-feed')).toContainText('db.liveIncremental()');
   });
+
+  test('Scenario 15: Causal createReplicaRouter() + db.table() & queryArrowStream()', async ({
+    page,
+  }) => {
+    await openReplicationSim(page);
+
+    await page.locator('.scenario-card[data-scenario="replica-router-arrow-stream"]').click();
+
+    await expect(page.locator('#primary-rows')).toContainText('ReplicaRouter Table Task #4');
+    await expect(page.locator('#replica-rows')).toContainText('ReplicaRouter Table Task #5');
+    await expect(page.locator('#code-inspector')).toContainText('createReplicaRouter');
+    await expect(page.locator('#event-feed')).toContainText('Scenario 15');
+    await expect(page.locator('#event-feed')).toContainText('read-your-writes');
+    await expect(page.locator('#event-feed')).toContainText('queryArrowStream()');
+    await expect(page.locator('#event-feed')).toContainText('preparePipeline()');
+  });
 });

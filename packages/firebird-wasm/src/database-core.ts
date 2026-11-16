@@ -44,7 +44,14 @@ import type {
   PipelineOperation,
   PipelineOptions,
   PipelineResults,
+  PreparedPipeline,
+  PreparedPipelineStepTemplate,
 } from './pipeline';
+import type {
+  ColumnarStreamOptions,
+  ArrowStreamOptions,
+} from './columnar-stream';
+import type { TableOptions, TableRepository } from './table-api';
 import type {
   IncrementalLiveSnapshot,
   LiveColumnarOptions,
@@ -260,11 +267,33 @@ export interface FirebirdTransactionClient {
     params?: QueryParams | (StatementExecutionOptions & ArrowIpcOptions),
     options?: StatementExecutionOptions & ArrowIpcOptions,
   ): Promise<Uint8Array>;
+  /**
+   * Stream typed `ColumnarQueryResult` chunks in bounded `O(batchSize)` memory (`M21 Item 2`).
+   */
+  queryColumnarStream(
+    sql: string | SqlFragment,
+    paramsOrOptions?: QueryParams | ColumnarStreamOptions,
+    maybeOptions?: ColumnarStreamOptions,
+  ): AsyncIterableIterator<ColumnarQueryResult>;
+  /**
+   * Stream an **Apache Arrow IPC V5** byte stream (`Schema` + chunked `RecordBatch`es + `EOS`)
+   * in bounded `O(batchSize)` memory (`M21 Item 2`).
+   */
+  queryArrowStream(
+    sql: string | SqlFragment,
+    paramsOrOptions?: QueryParams | ArrowStreamOptions,
+    maybeOptions?: ArrowStreamOptions,
+  ): ReadableStream<Uint8Array>;
   /** Execute a heterogeneous batch of queries and DML statements in one pipeline (`M20 Item 2`). */
   pipeline<const TOps extends readonly PipelineOperation[]>(
     ops: TOps,
     options?: Omit<PipelineOptions, 'transaction'>,
   ): Promise<PipelineResults<TOps>>;
+  /** Fluent typed CRUD & upsert repository bound to this transaction (`M21 Item 3`). */
+  table<T extends Row = Row, K = unknown>(
+    tableName: string,
+    options?: TableOptions<T>,
+  ): TableRepository<T, K>;
   queryStream<T extends Row = Row>(
     sql: string | SqlFragment,
     paramsOrOptions?: QueryParams | QueryStreamOptions,
@@ -359,6 +388,23 @@ export interface FirebirdDatabase {
     params?: QueryParams | (StatementExecutionOptions & ArrowIpcOptions),
     options?: StatementExecutionOptions & ArrowIpcOptions,
   ): Promise<Uint8Array>;
+  /**
+   * Stream typed `ColumnarQueryResult` chunks in bounded `O(batchSize)` memory (`M21 Item 2`).
+   */
+  queryColumnarStream(
+    sql: string | SqlFragment,
+    paramsOrOptions?: QueryParams | ColumnarStreamOptions,
+    maybeOptions?: ColumnarStreamOptions,
+  ): AsyncIterableIterator<ColumnarQueryResult>;
+  /**
+   * Stream an **Apache Arrow IPC V5** byte stream (`Schema` + chunked `RecordBatch`es + `EOS`)
+   * in bounded `O(batchSize)` memory (`M21 Item 2`).
+   */
+  queryArrowStream(
+    sql: string | SqlFragment,
+    paramsOrOptions?: QueryParams | ArrowStreamOptions,
+    maybeOptions?: ArrowStreamOptions,
+  ): ReadableStream<Uint8Array>;
   queryStream<T extends Row = Row>(
     sql: string | SqlFragment,
     paramsOrOptions?: QueryParams | QueryStreamOptions,
@@ -390,6 +436,20 @@ export interface FirebirdDatabase {
     ops: TOps,
     options?: PipelineOptions,
   ): Promise<PipelineResults<TOps>>;
+  /**
+   * Pre-compile a multi-statement pipeline into reusable integer `stmtHandle`s
+   * executed purely with `"FBP\x01"` / `"FBP\x02"` binary parameter frames (`M21 Item 2`).
+   */
+  preparePipeline<const TTemplates extends readonly PreparedPipelineStepTemplate[]>(
+    templates: TTemplates,
+  ): Promise<PreparedPipeline<TTemplates>>;
+  /**
+   * Create a zero-boilerplate typed CRUD & upsert repository for `tableName` (`M21 Item 3`).
+   */
+  table<T extends Row = Row, K = unknown>(
+    tableName: string,
+    options?: TableOptions<T>,
+  ): TableRepository<T, K>;
   /**
    * Subscribe to incremental `{ rows, deltas }` (`insert` / `update` / `delete`)
    * updates with structural sharing for unchanged rows (`M20 Item 3`).

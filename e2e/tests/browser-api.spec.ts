@@ -3097,4 +3097,135 @@ test.describe('FirebirdBrowser', () => {
     expect(result.memKeys).toEqual(['test/seg.bin']);
     expect(result.liveResults).toBe(0);
   });
+
+  test('M21: createReplicaRouter(), queryColumnarStream(), queryArrowStream(), preparePipeline(), and db.table()', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      window.__stub.affectedRows = 1;
+      window.__stub.queryResult = {
+        columns: [
+          { name: 'ID', type: 496, subType: 0, scale: 0, length: 4, nullable: false },
+          { name: 'LABEL', type: 448, subType: 0, scale: 0, length: 32, nullable: false },
+        ],
+        rows: [
+          [1, 'alpha'],
+          [2, 'beta'],
+          [3, 'gamma'],
+          [4, 'delta'],
+          [5, 'epsilon'],
+        ],
+      };
+
+      const primary = new window.FB.FirebirdBrowser('memory://m21-primary', { persist: false });
+      const replica = new window.FB.FirebirdBrowser('memory://m21-replica', { persist: false });
+
+      // 1. Streaming Columnar & multi-batch Arrow IPC V5 cursor streams (`batchSize: 2` -> [2, 2, 1])
+      const colBatchSizes: number[] = [];
+      for await (const colBatch of primary.queryColumnarStream(
+        'SELECT ID, LABEL FROM ITEMS ORDER BY ID',
+        { batchSize: 2 },
+      )) {
+        colBatchSizes.push(colBatch.rowCount);
+      }
+
+      const arrowStreamBytes = await window.FB.collectArrowStreamBytes(
+        primary.queryArrowStream('SELECT ID, LABEL FROM ITEMS ORDER BY ID', {
+          batchSize: 2,
+          metadata: { source: 'm21-stream' },
+        }),
+      );
+      const arrowBatches = window.FB.decodeArrowIpcBatches(arrowStreamBytes);
+      const fullArrow = window.FB.decodeArrowIpc(arrowStreamBytes);
+
+      // 2. Prepared Pipeline (`db.preparePipeline()`)
+      const prep = await primary.preparePipeline([
+        { kind: 'execute', sql: 'INSERT INTO ITEMS (ID, LABEL) VALUES (?, ?)' },
+        { kind: 'queryColumnar', sql: 'SELECT ID, LABEL FROM ITEMS ORDER BY ID' },
+      ] as const);
+      const [prepExec, prepCol] = await prep.run([[10, 'ten'], []], { transaction: true });
+      await prep.close();
+
+      // 3. Typed Table Repository (`db.table()`)
+      const itemsTable = primary.table<{ ID: number; LABEL: string }, number>('ITEMS', {
+        primaryKey: 'ID',
+      });
+      const batchIns = await itemsTable.insertMany([
+        { ID: 6, LABEL: 'zeta' },
+        { ID: 7, LABEL: 'eta' },
+      ]);
+      const batchUps = await itemsTable.upsertMany([
+        { ID: 6, LABEL: 'zeta-v2' },
+        { ID: 8, LABEL: 'theta' },
+      ]);
+      const foundRows = await itemsTable.findMany({ where: { ID: [1, 2] }, orderBy: 'ID ASC' });
+
+      // 4. Read/Write Replica Router (`createReplicaRouter()`)
+      let syncedWatermark = 0;
+      const router = window.FB.createReplicaRouter({
+        primary,
+        replicas: [replica],
+        syncHandles: [
+          {
+            syncNow: async () => {
+              syncedWatermark = 1;
+            },
+            stats: async () => ({
+              primaryLsn: 1,
+              replicaWatermark: syncedWatermark,
+              lagEntries: syncedWatermark >= 1 ? 0 : 1,
+              lagMs: 0,
+            }),
+          },
+        ],
+        consistency: 'read-your-writes',
+      });
+
+      await router.execute('INSERT INTO ITEMS (ID, LABEL) VALUES (?, ?)', [9, 'iota']);
+      const routedRead = await router.query('SELECT ID, LABEL FROM ITEMS ORDER BY ID');
+      const rStats = router.routerStats();
+
+      const stats = window.__stub.stats();
+      await replica.close();
+      await primary.close();
+
+      return {
+        readOnlySelect: window.FB.isReadOnlySqlStatement('SELECT * FROM ITEMS'),
+        readOnlyReturning: window.FB.isReadOnlySqlStatement('INSERT INTO ITEMS VALUES (1) RETURNING ID'),
+        colBatchSizes,
+        arrowBatchSizes: arrowBatches.map((b) => b.rowCount),
+        fullArrowRows: fullArrow.rowCount,
+        fullArrowMeta: fullArrow.metadata,
+        prepExec,
+        prepColRows: prepCol.rowCount,
+        prepClosed: prep.closed,
+        batchIns,
+        batchUps,
+        foundCount: foundRows.length,
+        routedReadCount: routedRead.rows.length,
+        writesRoutedToPrimary: rStats.writesRoutedToPrimary,
+        readsRoutedToReplicas: rStats.readsRoutedToReplicas,
+        causalCatchUpSyncs: rStats.causalCatchUpSyncs,
+        liveResults: stats.liveResults,
+      };
+    });
+
+    expect(result.readOnlySelect).toBe(true);
+    expect(result.readOnlyReturning).toBe(false);
+    expect(result.colBatchSizes).toEqual([2, 2, 1]);
+    expect(result.arrowBatchSizes).toEqual([2, 2, 1]);
+    expect(result.fullArrowRows).toBe(5);
+    expect(result.fullArrowMeta).toEqual({ source: 'm21-stream' });
+    expect(result.prepExec).toEqual({ affectedRows: 1 });
+    expect(result.prepColRows).toBe(5);
+    expect(result.prepClosed).toBe(true);
+    expect(result.batchIns).toEqual({ affectedRows: 2 });
+    expect(result.batchUps).toEqual({ affectedRows: 2 });
+    expect(result.foundCount).toBe(5);
+    expect(result.routedReadCount).toBe(5);
+    expect(result.writesRoutedToPrimary).toBe(1);
+    expect(result.readsRoutedToReplicas).toBe(1);
+    expect(result.causalCatchUpSyncs).toBeGreaterThanOrEqual(1);
+    expect(result.liveResults).toBe(0);
+  });
 });

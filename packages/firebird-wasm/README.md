@@ -44,8 +44,8 @@ See [Firebird server packages](https://firebirdsql.org/en/server-packages/) if y
 | `firebird-wasm/fts` | Okapi BM25 full-text search (`Bm25Index`, `createFtsIndex`), stemming/highlighting UDRs, and RRF `hybridSearch` | `FirebirdBrowser` / `FirebirdLite` |
 | `firebird-wasm/columnar` | Standalone zero-copy columnar vector decoder (`decodeBinaryResultColumnar`) & Apache Arrow IPC V5 codec (`encodeArrowIpc`, `decodeArrowIpc`) | Browser or Node.js |
 | `firebird-wasm/schema` | Standalone Standard Schema v1 row validator (`createRowSchema`, `validateRows`) & schema-aware SQL builder (`createTypedSql<DB>()`) | Browser or Node.js |
-| `firebird-wasm/replication` | Logical, journal, binary `.fdb` / page-diff bootstrap, S3/R2/HTTP WAL PITR (`createObjectStoreReplicationTarget`), WebRTC/WS/HTTP, CRDTs, mesh/hub, DLQ & `"FBCHANGELOG\0"` | `FirebirdBrowser` / `FirebirdLite` |
-| `firebird-wasm/cli` | `npx firebird-wasm` developer CLI (`query`, `repl`, `codegen --kysely\|--drizzle`, `migrate`, `dump`, `restore`, `inspect-changelog`) | Node.js 18+ |
+| `firebird-wasm/replication` | Logical, journal, `createReplicaRouter` (causal `read-your-writes`), binary `.fdb` / page-diff bootstrap, S3/R2/HTTP WAL PITR (`createObjectStoreReplicationTarget`), WebRTC/WS/HTTP, CRDTs, mesh/hub, DLQ & `"FBCHANGELOG\0"` | `FirebirdBrowser` / `FirebirdLite` |
+| `firebird-wasm/cli` | `npx firebird-wasm` developer CLI (`query`, `repl`, `codegen --kysely\|--drizzle`, `migrate`, `dump`, `restore`, `inspect-changelog`, `sync`, `wal-ship`, `pitr-restore`, `bench`) | Node.js 18+ |
 
 ## Quick start — Browser (WASM)
 
@@ -98,9 +98,9 @@ await db.close();
 
 ### Core API (`FirebirdBrowser` & `FirebirdLite`)
 
-- **Unified, pipelined & columnar queries**: `openDatabase(uri, opts?)`, `db.execute(sql, params?)`, `db.exec(sql, params?)`, `db.execBatch(sql, rows)`, `db.pipeline(steps, { transaction? })` (`"FBP\x01"` / `"FBP\x02"` wire params), `db.query<T>(sql, params?, { schema? })`, `db.queryColumnar(sql, params?)`, `db.queryArrow(sql, params?, opts?)` (`encodeArrowIpc` / `decodeArrowIpc`), `db.queryStream<T>(sql, params?, opts?)`, `db.prepare(sql)`, `` sql`...` `` & `createTypedSql<DB>(db)`
+- **Unified, pipelined, streaming & table APIs**: `openDatabase(uri, opts?)`, `db.table<T>(name, { primaryKey?, schema? })` (`insert`, `insertMany`, `upsert`, `upsertMany`, `findMany`, keyset `findPage`), `db.pipeline()`, `db.preparePipeline()`, `db.queryColumnar()`, `db.queryColumnarStream()`, `db.queryArrow()`, `db.queryArrowStream()` (`decodeArrowIpcBatches`), `db.queryStream<T>()`, `db.prepare(sql)`, `` sql`...` `` & `createTypedSql<DB>(db)`
 - **Standard Schema v1 & errors**: `Zod` / `Valibot` / `ArkType` / `createRowSchema` validation (`{ schema }`, `SchemaValidationError`), structured `FirebirdError` (`gdscode`, `sqlcode`, `sqlState`, `hint`), `[Symbol.asyncDispose]()` (`await using db = ...`)
-- **Replication, S3/R2 WAL PITR & P2P sync**: `syncDatabases(primary, replica, { mode: 'native' | 'logical' | 'auto', bootstrapStrategy: 'binary-image' | 'page-diff' | 'logical' })`, `db.syncWith(peerOrUrl)`, `createObjectStoreReplicationTarget()` + `restoreDatabaseToPointInTime()` (AWS SigV4), `createWebRtcReplicationPeer()`, `createResilientWebSocketPeer()`, `fetchSnapshotResumable()`
+- **Replication, Read/Write Router, S3/R2 WAL PITR & P2P sync**: `createReplicaRouter({ primary, replicas, consistency: 'read-your-writes', failover })`, `syncDatabases()`, `db.syncWith()`, `createObjectStoreReplicationTarget({ checkpointEverySegments, autoPruneBeforeCheckpoint })` + `restoreDatabaseToPointInTime()` (AWS SigV4), `createWebRtcReplicationPeer()`, `createResilientWebSocketPeer()`
 - **Reactive live queries**: `db.live()`, `db.liveIncremental(sql, params?, { key, table? })` (structural row-reference sharing + `applyChanges()`), `db.liveColumnar(sql, params?)`, `db.listen()`, `db.notify()`
 - **Transactions**: `db.transaction(fn, options?)`, `tx.savepoint(fn)`, `tx.rollback()`
 - **Schema & migrations**: `db.describeQuery(sql)`, `db.explain(sql, options?)`, `db.introspect()`, `db.migrate(migrations)`, `diffSchema()`, `generateMigration()`

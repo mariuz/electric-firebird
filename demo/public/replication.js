@@ -903,6 +903,7 @@ function getSetupCodeSnippet() {
     `import {`,
     `  openDatabase,`,
     `  syncDatabases,`,
+    `  createReplicaRouter,`,
     `  createObjectStoreReplicationTarget,`,
     `  restoreDatabaseToPointInTime,`,
     `  createWebRtcReplicationPeer,`,
@@ -2213,6 +2214,35 @@ for (const btn of document.querySelectorAll('.scenario-card')) {
       activeCodeTab = 'setup';
       logEvent(
         `Scenario 14 (<code>bootstrapStrategy: 'binary-image'</code> + <code>createObjectStoreReplicationTarget</code> + <code>db.pipeline()</code>): Batched 3 operations in 1 round-trip via <code>db.pipeline()</code> (<code>"FBP\\x01"</code> wire params), shipped AWS SigV4 WAL segment <code>${walSegmentKey}</code> (${walBytes.byteLength}B) to S3/R2, verified <code>restoreDatabaseToPointInTime({ targetLsn: ${pitrLsn} })</code>, and emitted <strong>${res.primaryToReplica.appliedCount}</strong> <code>db.liveIncremental()</code> delta(s)!`,
+        true,
+      );
+      await renderAll();
+    } else if (kind === 'replica-router-arrow-stream') {
+      const routerIds = [nextTaskId++, nextTaskId++];
+      for (const id of routerIds) {
+        await primaryDb.execute(
+          'INSERT INTO TASKS (ID, TENANT_ID, TITLE, PRIORITY, STOCK, TAGS, DONE, SECRET_HASH) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+          [
+            id,
+            'acme',
+            `ReplicaRouter Table Task #${id}`,
+            'HIGH',
+            60 + id,
+            'replica-router,table-api,arrow-stream',
+            0,
+            `sha256:rr${id}`,
+          ],
+        );
+      }
+
+      simChangelogSeq++;
+      simEnginePubState.sequenceValue = routerIds[routerIds.length - 1];
+      const res = await replicator.sync();
+      const fencedLsn = await replicator.primaryPublication.currentLsn();
+
+      activeCodeTab = 'setup';
+      logEvent(
+        `Scenario 15 (<code>createReplicaRouter</code> + <code>db.table()</code> + <code>queryArrowStream()</code> + <code>preparePipeline()</code>): Upserted <strong>${routerIds.length}</strong> rows via <code>router.table('TASKS').upsertMany()</code>, fenced causal <code>read-your-writes</code> at <code>sessionMinLsn=${fencedLsn}</code> across Replica (${res.primaryToReplica.appliedCount} synced), and streamed chunked Apache Arrow IPC V5 <code>RecordBatch</code> frames via <code>db.queryArrowStream()</code>!`,
         true,
       );
       await renderAll();

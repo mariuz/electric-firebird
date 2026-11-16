@@ -49,6 +49,18 @@ import {
   type PipelineResults,
 } from './pipeline';
 import {
+  createArrowIpcReadableStream,
+  createColumnarStreamFromRowStream,
+  resolveColumnarStreamArgs,
+  type ArrowStreamOptions,
+  type ColumnarStreamOptions,
+} from './columnar-stream';
+import {
+  createTableRepository,
+  type TableOptions,
+  type TableRepository,
+} from './table-api';
+import {
   assertPreparedParamCount,
   executeArrowFromColumnar,
   executeColumnarViaArrayQuery,
@@ -622,6 +634,42 @@ export class FirebirdTransaction implements FirebirdTransactionClient {
       () => this.queryColumnar(statement.sql, statement.params, options),
       options,
     );
+  }
+
+  queryColumnarStream(
+    sql: string | SqlFragment,
+    paramsOrOptions?: QueryParams | ColumnarStreamOptions,
+    maybeOptions?: ColumnarStreamOptions,
+  ): AsyncIterableIterator<ColumnarQueryResult> {
+    this.assertUsable();
+    return createColumnarStreamFromRowStream(
+      (s, p, o) => this.queryStream<Row>(s, p ?? [], o),
+      sql,
+      paramsOrOptions,
+      maybeOptions,
+    );
+  }
+
+  queryArrowStream(
+    sql: string | SqlFragment,
+    paramsOrOptions?: QueryParams | ArrowStreamOptions,
+    maybeOptions?: ArrowStreamOptions,
+  ): ReadableStream<Uint8Array> {
+    this.assertUsable();
+    const { options } = resolveColumnarStreamArgs(paramsOrOptions, maybeOptions);
+    return createArrowIpcReadableStream(
+      () => this.queryColumnarStream(sql, paramsOrOptions, maybeOptions),
+      async () => (await this.describeQuery(sql)).fields,
+      options,
+    );
+  }
+
+  table<T extends Row = Row, K = unknown>(
+    tableName: string,
+    options?: TableOptions<T>,
+  ): TableRepository<T, K> {
+    this.assertUsable();
+    return createTableRepository<T, K>(this, tableName, options);
   }
 
   /**

@@ -484,6 +484,10 @@
           <strong>14. Binary <code>.fdb</code> Bootstrap + S3/R2 WAL PITR &amp; <code>db.pipeline()</code></strong>
           <span>Clone via <code>bootstrapStrategy: 'binary-image'</code>, ship SigV4 WAL segments via <code>createObjectStoreReplicationTarget()</code>, restore PITR, and batch via <code>db.pipeline()</code>!</span>
         </button>
+        <button type="button" class="scenario-card" data-scenario="replica-router-arrow-stream">
+          <strong>15. Causal <code>createReplicaRouter()</code> + <code>db.table()</code> &amp; <code>queryArrowStream()</code></strong>
+          <span>Route writes to Primary with causal <code>read-your-writes</code> fencing, upsert via <code>db.table()</code>, and stream Arrow IPC V5 batches!</span>
+        </button>
       </section>
 
       <!-- Dual Database Nodes Grid -->

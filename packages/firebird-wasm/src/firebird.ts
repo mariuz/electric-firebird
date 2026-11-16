@@ -77,12 +77,29 @@ import {
   liveTableEventName,
 } from './browser/live-tables';
 import {
+  buildPreparedEnginePipelineRequests,
   executePipelineFallback,
   normalizePipelineOperations,
   type PipelineOperation,
   type PipelineOptions,
   type PipelineResults,
+  type PreparedPipeline,
+  type PreparedPipelineResults,
+  type PreparedPipelineStepInputs,
+  type PreparedPipelineStepTemplate,
 } from './pipeline';
+import {
+  createArrowIpcReadableStream,
+  createColumnarStreamFromRowStream,
+  resolveColumnarStreamArgs,
+  type ArrowStreamOptions,
+  type ColumnarStreamOptions,
+} from './columnar-stream';
+import {
+  createTableRepository,
+  type TableOptions,
+  type TableRepository,
+} from './table-api';
 import {
   createLiveColumnarQuery,
   createLiveIncrementalQuery,
@@ -532,6 +549,66 @@ export class FirebirdLite implements FirebirdDatabase {
   }
 
   /**
+   * Pre-compile a multi-statement pipeline on `FirebirdLite` (`M21 Item 2`).
+   */
+  async preparePipeline<
+    const TTemplates extends readonly PreparedPipelineStepTemplate[],
+  >(templates: TTemplates): Promise<PreparedPipeline<TTemplates>> {
+    await this.ensureReady();
+    let isClosed = false;
+    const handle: PreparedPipeline<TTemplates> = {
+      length: templates.length,
+      get closed() {
+        return isClosed;
+      },
+      run: async (
+        inputs?: PreparedPipelineStepInputs<TTemplates>,
+        options: PipelineOptions = {},
+      ): Promise<PreparedPipelineResults<TTemplates>> => {
+        if (isClosed) {
+          throw new Error('PreparedPipeline has already been closed');
+        }
+        assertNotAborted(options.signal);
+        if (templates.length === 0) {
+          return [] as unknown as PreparedPipelineResults<TTemplates>;
+        }
+        const { steps } = buildPreparedEnginePipelineRequests(
+          templates,
+          [],
+          inputs as readonly unknown[] | undefined,
+          (p) => this.serialize(p),
+          false,
+        );
+        const results = options.transaction
+          ? await this.transaction(
+              (tx) => executePipelineFallback(steps, tx),
+              typeof options.transaction === 'object' ? options.transaction : {},
+            )
+          : await executePipelineFallback(steps, this);
+        assertNotAborted(options.signal);
+        return results as PreparedPipelineResults<TTemplates>;
+      },
+      close: async (): Promise<void> => {
+        isClosed = true;
+      },
+      [Symbol.asyncDispose]: async (): Promise<void> => {
+        await handle.close();
+      },
+    };
+    return handle;
+  }
+
+  /**
+   * Create a zero-boilerplate typed CRUD & upsert repository for `tableName` (`M21 Item 3`).
+   */
+  table<T extends Row = Row, K = unknown>(
+    tableName: string,
+    options?: TableOptions<T>,
+  ): TableRepository<T, K> {
+    return createTableRepository<T, K>(this, tableName, options);
+  }
+
+  /**
    * Execute a (parameterised) SQL statement and return the result rows.
    *
    * For SELECT queries the rows are returned as plain objects keyed by the
@@ -757,6 +834,32 @@ export class FirebirdLite implements FirebirdDatabase {
     );
     return executeArrowFromColumnar(
       () => this.queryColumnar(statement.sql, statement.params, options),
+      options,
+    );
+  }
+
+  queryColumnarStream(
+    sql: string | SqlFragment,
+    paramsOrOptions?: QueryParams | ColumnarStreamOptions,
+    maybeOptions?: ColumnarStreamOptions,
+  ): AsyncIterableIterator<ColumnarQueryResult> {
+    return createColumnarStreamFromRowStream(
+      (s, p, o) => this.queryStream<Row>(s, p ?? [], o),
+      sql,
+      paramsOrOptions,
+      maybeOptions,
+    );
+  }
+
+  queryArrowStream(
+    sql: string | SqlFragment,
+    paramsOrOptions?: QueryParams | ArrowStreamOptions,
+    maybeOptions?: ArrowStreamOptions,
+  ): ReadableStream<Uint8Array> {
+    const { options } = resolveColumnarStreamArgs(paramsOrOptions, maybeOptions);
+    return createArrowIpcReadableStream(
+      () => this.queryColumnarStream(sql, paramsOrOptions, maybeOptions),
+      async () => (await this.describeQuery(sql)).fields,
       options,
     );
   }

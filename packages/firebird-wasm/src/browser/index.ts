@@ -326,6 +326,8 @@ export {
   restoreDatabaseToPointInTime,
   syncDatabases,
   syncWithPeer,
+  isReadOnlySqlStatement,
+  createReplicaRouter,
 } from '../replication';
 export type {
   ReplicableDatabase,
@@ -464,16 +466,28 @@ export type {
   ObjectStorePitrTarget,
   RestoreDatabaseToPointInTimeOptions,
   RestoreDatabaseToPointInTimeResult,
+  PruneObjectStoreWalResult,
   SyncDatabasesOptions,
   SyncWithOptions,
   SyncHandle,
+  ReplicaConsistencyMode,
+  ReplicaSyncLink,
+  ReplicaFailoverEvent,
+  ReplicaRouterOptions,
+  ReplicaRouterStats,
+  ReplicaRouter,
 } from '../replication';
 export {
   isColumnValueValid,
   buildColumnarResult,
   decodeBinaryResultColumnar,
   rowsToColumnarResult,
+  encodeArrowIpcSchemaFrame,
+  encodeArrowIpcRecordBatchFrame,
+  encodeArrowIpcEosFrame,
   encodeArrowIpc,
+  concatColumnarResults,
+  decodeArrowIpcBatches,
   decodeArrowIpc,
 } from '../columnar';
 export type {
@@ -537,6 +551,7 @@ export {
   isRowReturningSql,
   normalizePipelineOperations,
   buildEnginePipelineRequests,
+  buildPreparedEnginePipelineRequests,
   decodeEnginePipelineResponses,
   executePipelineFallback,
 } from '../pipeline';
@@ -554,7 +569,34 @@ export type {
   EnginePipelineStepRequest,
   EnginePipelineWireOptions,
   EnginePipelineStepResponse,
+  PreparedPipelineStepTemplate,
+  PreparedPipelineStepInputs,
+  PreparedPipelineResults,
+  PreparedPipeline,
 } from '../pipeline';
+export {
+  resolveColumnarStreamArgs,
+  createColumnarStreamFromRowStream,
+  createArrowIpcReadableStream,
+  collectArrowStreamBytes,
+} from '../columnar-stream';
+export type {
+  ColumnarStreamOptions,
+  ArrowStreamOptions,
+} from '../columnar-stream';
+export {
+  quoteTableIdent,
+  createTableRepository,
+} from '../table-api';
+export type {
+  TableWhereFilter,
+  TableOrderBySpec,
+  TableOptions,
+  TableFindOptions,
+  TablePageResult,
+  TableExecutionHost,
+  TableRepository,
+} from '../table-api';
 export {
   shallowRowEqual,
   buildRowKeyExtractor,

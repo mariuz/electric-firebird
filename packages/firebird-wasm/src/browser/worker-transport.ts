@@ -601,7 +601,12 @@ export class WorkerTransport implements EngineTransport {
             transfer.push(buf);
           }
         }
-        return { op: 'executeBatch', sql: s.sql, rows: p.wire };
+        return {
+          op: 'executeBatch',
+          sql: s.sql,
+          ...(s.stmtHandle !== undefined ? { stmtHandle: s.stmtHandle } : {}),
+          rows: p.wire,
+        };
       }
       const p = this.packParamsForTransfer(s.params);
       for (const t of p.transfer) {
@@ -612,10 +617,16 @@ export class WorkerTransport implements EngineTransport {
         }
       }
       return s.op === 'execute'
-        ? { op: 'execute', sql: s.sql, params: p.wire }
+        ? {
+            op: 'execute',
+            sql: s.sql,
+            ...(s.stmtHandle !== undefined ? { stmtHandle: s.stmtHandle } : {}),
+            params: p.wire,
+          }
         : {
             op: 'queryBinary',
             sql: s.sql,
+            ...(s.stmtHandle !== undefined ? { stmtHandle: s.stmtHandle } : {}),
             params: p.wire,
             binaryBlobs: s.binaryBlobs,
           };

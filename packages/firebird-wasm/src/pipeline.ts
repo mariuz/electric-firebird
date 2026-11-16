@@ -144,16 +144,19 @@ export type EnginePipelineStepRequest =
   | {
       readonly op: 'execute';
       readonly sql: string;
+      readonly stmtHandle?: number;
       readonly params: Uint8Array | QueryParams;
     }
   | {
       readonly op: 'executeBatch';
       readonly sql: string;
+      readonly stmtHandle?: number;
       readonly rows: Uint8Array | QueryParams[];
     }
   | {
       readonly op: 'queryBinary';
       readonly sql: string;
+      readonly stmtHandle?: number;
       readonly params: Uint8Array | QueryParams;
       readonly binaryBlobs?: boolean;
     };
@@ -498,4 +501,280 @@ export async function executePipelineFallback(
     }
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// Prepared Pipeline (`db.preparePipeline()`) (`M21 Item 2`)
+// ---------------------------------------------------------------------------
+
+/** Step template accepted by `db.preparePipeline(templates)` (`M21 Item 2`). */
+export type PreparedPipelineStepTemplate =
+  | {
+      readonly kind?: 'query';
+      readonly sql: string;
+      readonly rowMode?: RowMode;
+      readonly binaryBlobs?: boolean;
+      readonly schema?: StandardSchemaV1<unknown, Row>;
+    }
+  | {
+      readonly kind: 'queryColumnar';
+      readonly sql: string;
+      readonly binaryBlobs?: boolean;
+    }
+  | {
+      readonly kind: 'queryArrow';
+      readonly sql: string;
+      readonly arrowOptions?: ArrowIpcOptions;
+      readonly binaryBlobs?: boolean;
+    }
+  | {
+      readonly kind: 'execute';
+      readonly sql: string;
+    }
+  | {
+      readonly kind: 'execBatch';
+      readonly sql: string;
+    };
+
+/** Per-step runtime arguments passed to `preparedPipeline.run(stepInputs)` (`M21 Item 2`). */
+export type PreparedPipelineStepInputs<
+  TTemplates extends readonly PreparedPipelineStepTemplate[],
+> = {
+  [K in keyof TTemplates]: TTemplates[K] extends { readonly kind: 'execBatch' }
+    ? QueryParams[] | Uint8Array
+    : QueryParams | Uint8Array | undefined;
+};
+
+/** Mapped tuple result type for `preparedPipeline.run(stepInputs)` (`M21 Item 2`). */
+export type PreparedPipelineResults<
+  TTemplates extends readonly PreparedPipelineStepTemplate[],
+> = {
+  [K in keyof TTemplates]: TTemplates[K] extends { readonly kind: 'queryColumnar' }
+    ? ColumnarQueryResult
+    : TTemplates[K] extends { readonly kind: 'queryArrow' }
+      ? Uint8Array
+      : TTemplates[K] extends { readonly kind: 'execute' } | { readonly kind: 'execBatch' }
+        ? PipelineExecuteStepResult
+        : TTemplates[K] extends { readonly schema: StandardSchemaV1<unknown, infer TRow> }
+          ? QueryResult<TRow>
+          : QueryResult<Row>;
+};
+
+/** Reusable pre-compiled multi-statement pipeline (`db.preparePipeline()`) (`M21 Item 2`). */
+export interface PreparedPipeline<
+  TTemplates extends readonly PreparedPipelineStepTemplate[] = readonly PreparedPipelineStepTemplate[],
+> {
+  /** Number of steps in this prepared pipeline. */
+  readonly length: number;
+  /** Whether `close()` has been called. */
+  readonly closed: boolean;
+  /**
+   * Execute all pre-compiled steps in a single round-trip using integer `stmtHandle`s
+   * and `"FBP\x01"` / `"FBP\x02"` binary parameter frames without re-parsing SQL.
+   */
+  run(
+    inputs?: PreparedPipelineStepInputs<TTemplates>,
+    options?: PipelineOptions,
+  ): Promise<PreparedPipelineResults<TTemplates>>;
+  /** Release all underlying prepared statement handles. */
+  close(): Promise<void>;
+  [Symbol.asyncDispose](): Promise<void>;
+}
+
+/** Build wire-level requests for a `PreparedPipeline` using pre-compiled `stmtHandles`. */
+export function buildPreparedEnginePipelineRequests(
+  templates: readonly PreparedPipelineStepTemplate[],
+  stmtHandles: readonly (number | undefined)[],
+  inputs: readonly unknown[] | undefined,
+  serializeParams?: (params: QueryParams) => QueryParams,
+  packWireBinary = true,
+): {
+  steps: NormalizedPipelineStep[];
+  requests: EnginePipelineStepRequest[];
+  transferables: Transferable[];
+} {
+  const ops: PipelineOperation[] = templates.map((tpl, i) => {
+    const arg = inputs?.[i];
+    if (tpl.kind === 'execBatch') {
+      return {
+        kind: 'execBatch',
+        sql: tpl.sql,
+        rows: (arg as QueryParams[] | Uint8Array | undefined) ?? [],
+      };
+    }
+    return {
+      ...tpl,
+      params: (arg as QueryParams | Uint8Array | undefined) ?? [],
+    } as PipelineOperation;
+  });
+
+  const steps = normalizePipelineOperations(ops, serializeParams);
+  const { requests, transferables } = buildEnginePipelineRequests(steps, packWireBinary);
+
+  const handleRequests = requests.map((req, idx) => {
+    const h = stmtHandles[idx];
+    if (h !== undefined && h > 0) {
+      return { ...req, sql: '', stmtHandle: h };
+    }
+    return req;
+  });
+
+  return { steps, requests: handleRequests, transferables };
+}
+
+/** Shared host adapter used by `FirebirdBrowser.pipeline()` and `FirebirdBrowser.preparePipeline()`. */
+export interface BrowserPipelineDriverHost {
+  readonly dbHandle: number;
+  readonly packWireParams: boolean;
+  readonly shapeCache: Map<number, readonly FieldInfo[]>;
+  serialize(params: QueryParams): QueryParams;
+  applyTypes<T>(result: QueryResult<T>, rowMode: RowMode): QueryResult<T>;
+  prepareHandle?(sql: string): Promise<number | undefined>;
+  closeHandle?(stmtHandle: number): Promise<void>;
+  runEnginePipeline?(
+    requests: readonly EnginePipelineStepRequest[],
+    options: EnginePipelineWireOptions,
+  ): Promise<EnginePipelineStepResponse[]>;
+  runFallback(
+    steps: readonly NormalizedPipelineStep[],
+    transaction?: boolean | TransactionOptions,
+  ): Promise<PipelineStepResult[]>;
+  onMutatedSql(sqlStatements: readonly string[]): void;
+  assertNotAborted(signal?: AbortSignal): void;
+}
+
+/** Execute `db.pipeline()` via `BrowserPipelineDriverHost`. */
+export async function executeBrowserPipeline<
+  const TOps extends readonly PipelineOperation[],
+>(
+  host: BrowserPipelineDriverHost,
+  ops: TOps,
+  options: PipelineOptions = {},
+): Promise<PipelineResults<TOps>> {
+  host.assertNotAborted(options.signal);
+  if (ops.length === 0) {
+    return [] as unknown as PipelineResults<TOps>;
+  }
+  const steps = normalizePipelineOperations(ops, (p) => host.serialize(p));
+
+  let results: unknown[];
+  if (typeof host.runEnginePipeline === 'function') {
+    const { requests } = buildEnginePipelineRequests(steps, host.packWireParams);
+    const responses = await host.runEnginePipeline(requests, {
+      transaction: options.transaction,
+    });
+    results = await decodeEnginePipelineResponses(
+      steps,
+      responses,
+      host.shapeCache,
+      (res, rm) => host.applyTypes(res, rm),
+    );
+  } else {
+    results = await host.runFallback(steps, options.transaction);
+  }
+
+  host.assertNotAborted(options.signal);
+  const mutatedSqls = steps
+    .filter((s) => s.clientKind === 'execute' || s.clientKind === 'execBatch')
+    .map((s) => s.sql);
+  if (mutatedSqls.length > 0) {
+    host.onMutatedSql(mutatedSqls);
+  }
+  return results as PipelineResults<TOps>;
+}
+
+/** Create a pre-compiled `PreparedPipeline` via `BrowserPipelineDriverHost`. */
+export async function createBrowserPreparedPipeline<
+  const TTemplates extends readonly PreparedPipelineStepTemplate[],
+>(
+  host: BrowserPipelineDriverHost,
+  templates: TTemplates,
+): Promise<PreparedPipeline<TTemplates>> {
+  const stmtHandles: Array<number | undefined> = new Array(templates.length);
+  const preparedHandlesToClose: number[] = [];
+
+  if (typeof host.prepareHandle === 'function') {
+    try {
+      for (let i = 0; i < templates.length; i++) {
+        const h = await host.prepareHandle(templates[i]!.sql);
+        if (typeof h === 'number' && h > 0) {
+          stmtHandles[i] = h;
+          preparedHandlesToClose.push(h);
+        }
+      }
+    } catch (err) {
+      if (typeof host.closeHandle === 'function') {
+        for (const h of preparedHandlesToClose) {
+          await host.closeHandle(h).catch(() => undefined);
+        }
+      }
+      throw err;
+    }
+  }
+
+  let isClosed = false;
+  const mutatedSqls = templates
+    .filter((t) => t.kind === 'execute' || t.kind === 'execBatch')
+    .map((t) => t.sql);
+
+  const handle: PreparedPipeline<TTemplates> = {
+    length: templates.length,
+    get closed() {
+      return isClosed;
+    },
+    run: async (
+      inputs?: PreparedPipelineStepInputs<TTemplates>,
+      options: PipelineOptions = {},
+    ): Promise<PreparedPipelineResults<TTemplates>> => {
+      if (isClosed) {
+        throw new Error('PreparedPipeline has already been closed');
+      }
+      host.assertNotAborted(options.signal);
+      if (templates.length === 0) {
+        return [] as unknown as PreparedPipelineResults<TTemplates>;
+      }
+      const { steps, requests } = buildPreparedEnginePipelineRequests(
+        templates,
+        stmtHandles,
+        inputs as readonly unknown[] | undefined,
+        (p) => host.serialize(p),
+        host.packWireParams,
+      );
+
+      let results: unknown[];
+      if (typeof host.runEnginePipeline === 'function') {
+        const responses = await host.runEnginePipeline(requests, {
+          transaction: options.transaction,
+        });
+        results = await decodeEnginePipelineResponses(
+          steps,
+          responses,
+          host.shapeCache,
+          (res, rm) => host.applyTypes(res, rm),
+        );
+      } else {
+        results = await host.runFallback(steps, options.transaction);
+      }
+
+      host.assertNotAborted(options.signal);
+      if (mutatedSqls.length > 0) {
+        host.onMutatedSql(mutatedSqls);
+      }
+      return results as PreparedPipelineResults<TTemplates>;
+    },
+    close: async (): Promise<void> => {
+      if (isClosed) return;
+      isClosed = true;
+      if (typeof host.closeHandle === 'function') {
+        for (const h of preparedHandlesToClose) {
+          await host.closeHandle(h).catch(() => undefined);
+        }
+      }
+    },
+    [Symbol.asyncDispose]: async (): Promise<void> => {
+      await handle.close();
+    },
+  };
+
+  return handle;
 }

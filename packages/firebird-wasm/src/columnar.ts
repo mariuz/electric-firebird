@@ -982,22 +982,24 @@ function buildArrowEmptyTypeTable(fb: MiniFlatBufferBuilder): number {
   return fb.endObject();
 }
 
-function buildArrowSchemaMessage(
-  columnar: ColumnarQueryResult,
+function buildArrowSchemaMessageFromFields(
+  fields: readonly FieldInfo[],
+  vectorKinds?: ReadonlyArray<ColumnVector['kind']>,
+  baseMetadata?: Readonly<Record<string, string>>,
   metadata?: Readonly<Record<string, string>>,
 ): Uint8Array {
   const fb = new MiniFlatBufferBuilder(1024);
   const fieldTableOffsets: number[] = [];
 
-  for (let i = 0; i < columnar.fields.length; i++) {
-    const field = columnar.fields[i]!;
-    const vec = columnar.vectors[i]!;
+  for (let i = 0; i < fields.length; i++) {
+    const field = fields[i]!;
+    const kind = vectorKinds?.[i] ?? inferVectorKindForField(field);
     const nameOff = fb.createString(field.name);
     const emptyChildrenOff = fb.createOffsetVector([]);
 
     let typeEnum = ARROW_TYPE_UTF8;
     let typeTableOff = 0;
-    switch (vec.kind) {
+    switch (kind) {
       case 'int32':
         typeEnum = ARROW_TYPE_INT;
         fb.startObject(2);
@@ -1042,7 +1044,7 @@ function buildArrowSchemaMessage(
   }
 
   const fieldsVecOff = fb.createOffsetVector(fieldTableOffsets);
-  const mergedMeta = { ...columnar.metadata, ...metadata };
+  const mergedMeta = { ...baseMetadata, ...metadata };
   const metaEntries = Object.entries(mergedMeta);
   let customMetaVecOff = 0;
   if (metaEntries.length > 0) {
@@ -1074,6 +1076,140 @@ function buildArrowSchemaMessage(
   const msgOff = fb.endObject();
 
   return fb.finish(msgOff);
+}
+
+function buildArrowSchemaMessage(
+  columnar: ColumnarQueryResult,
+  metadata?: Readonly<Record<string, string>>,
+): Uint8Array {
+  return buildArrowSchemaMessageFromFields(
+    columnar.fields,
+    columnar.vectors.map((v) => v.kind),
+    columnar.metadata,
+    metadata,
+  );
+}
+
+/**
+ * Encode only the framed Apache Arrow IPC V5 `Schema` message (`0xFFFFFFFF`
+ * continuation + aligned FlatBuffer `Schema`) for streaming IPC writers (`M21 Item 2`).
+ */
+export function encodeArrowIpcSchemaFrame(
+  source: ColumnarQueryResult | readonly FieldInfo[],
+  options?: ArrowIpcOptions,
+): Uint8Array {
+  const schemaMeta = Array.isArray(source)
+    ? buildArrowSchemaMessageFromFields(source, undefined, undefined, options?.metadata)
+    : buildArrowSchemaMessage(source as ColumnarQueryResult, options?.metadata);
+  const paddedLen = align8(schemaMeta.byteLength);
+  const out = new Uint8Array(8 + paddedLen);
+  const view = new DataView(out.buffer);
+  view.setUint32(0, ARROW_IPC_CONTINUATION, true);
+  view.setInt32(4, paddedLen, true);
+  out.set(schemaMeta, 8);
+  return out;
+}
+
+/**
+ * Encode a single framed Apache Arrow IPC V5 `RecordBatch` message (`0xFFFFFFFF`
+ * continuation + aligned FlatBuffer `RecordBatch` + 8-byte aligned body buffers) (`M21 Item 2`).
+ */
+export function encodeArrowIpcRecordBatchFrame(
+  columnar: ColumnarQueryResult,
+): Uint8Array {
+  const bodyChunks: Uint8Array[] = [];
+  const bufferDescriptors: Array<{ offset: bigint; length: bigint }> = [];
+  const fieldNodes: Array<{ length: bigint; nullCount: bigint }> = [];
+  let bodyOffset = 0;
+
+  const pushBodyBuffer = (raw: Uint8Array): void => {
+    const start = bodyOffset;
+    const len = raw.byteLength;
+    bufferDescriptors.push({ offset: BigInt(start), length: BigInt(len) });
+    const padded = align8(len);
+    bodyChunks.push(raw);
+    if (padded > len) {
+      bodyChunks.push(new Uint8Array(padded - len));
+    }
+    bodyOffset += padded;
+  };
+
+  for (const vec of columnar.vectors) {
+    fieldNodes.push({
+      length: BigInt(vec.length),
+      nullCount: BigInt(vec.nullCount),
+    });
+    pushBodyBuffer(vec.nullCount === 0 ? new Uint8Array(0) : vec.validity);
+    switch (vec.kind) {
+      case 'int32':
+      case 'float64':
+      case 'bigint64':
+      case 'bool':
+        pushBodyBuffer(asBytes(vec.data));
+        break;
+      case 'utf8':
+      case 'bytes':
+        pushBodyBuffer(asBytes(vec.offsets));
+        pushBodyBuffer(vec.data);
+        break;
+    }
+  }
+
+  const fb = new MiniFlatBufferBuilder(1024);
+  fb.prep(8, bufferDescriptors.length * 16);
+  for (let i = bufferDescriptors.length - 1; i >= 0; i--) {
+    const b = bufferDescriptors[i]!;
+    fb.writeI64(b.length);
+    fb.writeI64(b.offset);
+  }
+  fb.prep(4, 0);
+  fb.writeI32(bufferDescriptors.length);
+  const buffersVecOff = fb.offset();
+
+  fb.prep(8, fieldNodes.length * 16);
+  for (let i = fieldNodes.length - 1; i >= 0; i--) {
+    const n = fieldNodes[i]!;
+    fb.writeI64(n.nullCount);
+    fb.writeI64(n.length);
+  }
+  fb.prep(4, 0);
+  fb.writeI32(fieldNodes.length);
+  const nodesVecOff = fb.offset();
+
+  fb.startObject(3);
+  fb.addFieldI64(0, BigInt(columnar.rowCount), 0n);
+  fb.addFieldOffset(1, nodesVecOff);
+  fb.addFieldOffset(2, buffersVecOff);
+  const rbOff = fb.endObject();
+
+  fb.startObject(4);
+  fb.addFieldI16(0, ARROW_METADATA_VERSION_V5, 0);
+  fb.addFieldU8(1, ARROW_HEADER_RECORD_BATCH, 0);
+  fb.addFieldOffset(2, rbOff);
+  fb.addFieldI64(3, BigInt(bodyOffset), 0n);
+  const rbMsgOff = fb.endObject();
+
+  const rbMeta = fb.finish(rbMsgOff);
+  const paddedRbMetaLen = align8(rbMeta.byteLength);
+
+  const out = new Uint8Array(8 + paddedRbMetaLen + bodyOffset);
+  const outView = new DataView(out.buffer);
+  outView.setUint32(0, ARROW_IPC_CONTINUATION, true);
+  outView.setInt32(4, paddedRbMetaLen, true);
+  out.set(rbMeta, 8);
+  let p = 8 + paddedRbMetaLen;
+  for (const chunk of bodyChunks) {
+    if (chunk.byteLength > 0) {
+      out.set(chunk, p);
+      p += chunk.byteLength;
+    }
+  }
+  return out;
+}
+
+/** Encode the 8-byte Apache Arrow IPC V5 End-Of-Stream (`0xFFFFFFFF, 0x00000000`) marker (`M21 Item 2`). */
+export function encodeArrowIpcEosFrame(): Uint8Array {
+  return new Uint8Array([0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00]);
 }
 
 function asBytes(typed: ArrayBufferView): Uint8Array {
@@ -1287,10 +1423,125 @@ class MiniFlatBufferReader {
 }
 
 /**
- * Decode an **Apache Arrow IPC Stream** (`Uint8Array`) back into a typed
- * {@link ColumnarQueryResult} (`M19 Item 2`).
+ * Concatenate multiple {@link ColumnarQueryResult} batches with identical schemas
+ * into a single contiguous {@link ColumnarQueryResult} (`M21 Item 2`).
  */
-export function decodeArrowIpc(ipcBytes: Uint8Array): ColumnarQueryResult {
+export function concatColumnarResults(
+  batches: readonly ColumnarQueryResult[],
+  metadataOverride?: Readonly<Record<string, string>>,
+): ColumnarQueryResult {
+  if (batches.length === 0) {
+    return buildColumnarResult(0, [], [], metadataOverride);
+  }
+  if (batches.length === 1 && !metadataOverride) {
+    return batches[0]!;
+  }
+  const first = batches[0]!;
+  const fields = first.fields;
+  const totalRows = batches.reduce((acc, b) => acc + b.rowCount, 0);
+  const colCount = fields.length;
+  const mergedVectors: ColumnVector[] = new Array(colCount);
+
+  for (let c = 0; c < colCount; c++) {
+    const kind = first.vectors[c]!.kind;
+    const validity = allocateAllValidBitmap(totalRows);
+    let nullCount = 0;
+
+    let rowCursor = 0;
+    for (const b of batches) {
+      const vec = b.vectors[c]!;
+      if (vec.nullCount > 0) {
+        for (let r = 0; r < vec.length; r++) {
+          if (vec.isNull(r)) {
+            clearValidityBit(validity, rowCursor + r);
+            nullCount++;
+          }
+        }
+      }
+      rowCursor += vec.length;
+    }
+
+    if (kind === 'int32') {
+      const data = new Int32Array(totalRows);
+      let off = 0;
+      for (const b of batches) {
+        const v = b.vectors[c] as Int32ColumnVector;
+        data.set(v.data, off);
+        off += v.length;
+      }
+      mergedVectors[c] = makeInt32Vector(data, validity, nullCount);
+    } else if (kind === 'float64') {
+      const data = new Float64Array(totalRows);
+      let off = 0;
+      for (const b of batches) {
+        const v = b.vectors[c] as Float64ColumnVector;
+        data.set(v.data, off);
+        off += v.length;
+      }
+      mergedVectors[c] = makeFloat64Vector(data, validity, nullCount);
+    } else if (kind === 'bigint64') {
+      const data = new BigInt64Array(totalRows);
+      let off = 0;
+      for (const b of batches) {
+        const v = b.vectors[c] as BigInt64ColumnVector;
+        data.set(v.data, off);
+        off += v.length;
+      }
+      mergedVectors[c] = makeBigInt64Vector(data, validity, nullCount);
+    } else if (kind === 'bool') {
+      const data = new Uint8Array((totalRows + 7) >> 3);
+      let off = 0;
+      for (const b of batches) {
+        const v = b.vectors[c] as BoolColumnVector;
+        for (let r = 0; r < v.length; r++) {
+          if (v.get(r) === true) {
+            const idx = off + r;
+            data[idx >> 3]! |= 1 << (idx & 7);
+          }
+        }
+        off += v.length;
+      }
+      mergedVectors[c] = makeBoolVector(totalRows, data, validity, nullCount);
+    } else {
+      let totalByteLen = 0;
+      for (const b of batches) {
+        const v = b.vectors[c] as Utf8ColumnVector | BytesColumnVector;
+        totalByteLen += v.data.byteLength;
+      }
+      const offsets = new Int32Array(totalRows + 1);
+      const data = new Uint8Array(totalByteLen);
+      let rowOff = 0;
+      let byteOff = 0;
+      for (const b of batches) {
+        const v = b.vectors[c] as Utf8ColumnVector | BytesColumnVector;
+        for (let r = 0; r < v.length; r++) {
+          offsets[rowOff + r] = byteOff + v.offsets[r]!;
+        }
+        data.set(v.data, byteOff);
+        rowOff += v.length;
+        byteOff += v.data.byteLength;
+      }
+      offsets[totalRows] = byteOff;
+      mergedVectors[c] =
+        kind === 'utf8'
+          ? makeUtf8Vector(totalRows, offsets, data, validity, nullCount)
+          : makeBytesVector(totalRows, offsets, data, validity, nullCount);
+    }
+  }
+
+  return buildColumnarResult(
+    totalRows,
+    fields,
+    mergedVectors,
+    metadataOverride ?? first.metadata,
+  );
+}
+
+/**
+ * Decode an **Apache Arrow IPC Stream** (`Uint8Array`) into its constituent
+ * `RecordBatch` chunks as {@link ColumnarQueryResult} objects (`M21 Item 2`).
+ */
+export function decodeArrowIpcBatches(ipcBytes: Uint8Array): ColumnarQueryResult[] {
   const view = new DataView(ipcBytes.buffer, ipcBytes.byteOffset, ipcBytes.byteLength);
   let pos = 0;
 
@@ -1300,8 +1551,7 @@ export function decodeArrowIpc(ipcBytes: Uint8Array): ColumnarQueryResult {
   }
   const cols: ParsedArrowCol[] = [];
   const schemaMetadata: Record<string, string> = {};
-  let rowCount = 0;
-  let vectors: ColumnVector[] = [];
+  const batches: ColumnarQueryResult[] = [];
 
   while (pos + 4 <= ipcBytes.byteLength) {
     let metaSize = view.getInt32(pos, true);
@@ -1367,7 +1617,7 @@ export function decodeArrowIpc(ipcBytes: Uint8Array): ColumnarQueryResult {
         throw new Error('decodeArrowIpc: truncated Arrow IPC RecordBatch body');
       }
       const body = ipcBytes.subarray(pos, pos + bodyLength);
-      rowCount = Number(reader.readI64(headerTable, 0, 0n));
+      const batchRowCount = Number(reader.readI64(headerTable, 0, 0n));
       const nodesVec = reader.readStructVectorPos(headerTable, 1);
       const bufsVec = reader.readStructVectorPos(headerTable, 2);
 
@@ -1379,11 +1629,11 @@ export function decodeArrowIpc(ipcBytes: Uint8Array): ColumnarQueryResult {
       };
 
       let bufIdx = 0;
-      vectors = new Array(cols.length);
+      const vectors: ColumnVector[] = new Array(cols.length);
       for (let c = 0; c < cols.length; c++) {
         const col = cols[c]!;
         const len =
-          c < nodesVec.length ? Number(reader.i64At(nodesVec.start + c * 16)) : rowCount;
+          c < nodesVec.length ? Number(reader.i64At(nodesVec.start + c * 16)) : batchRowCount;
         const nullCount =
           c < nodesVec.length ? Number(reader.i64At(nodesVec.start + c * 16 + 8)) : 0;
 
@@ -1436,15 +1686,56 @@ export function decodeArrowIpc(ipcBytes: Uint8Array): ColumnarQueryResult {
           vectors[c] = makeBytesVector(len, offsets, dataBytes, validity, nullCount);
         }
       }
+
+      batches.push(
+        buildColumnarResult(
+          batchRowCount,
+          cols.map((c) => c.field),
+          vectors,
+          schemaMetadata,
+        ),
+      );
     }
 
     pos += bodyLength;
   }
 
-  return buildColumnarResult(
-    rowCount,
-    cols.map((c) => c.field),
-    vectors,
-    schemaMetadata,
-  );
+  if (batches.length === 0) {
+    const emptyVectors = cols.map((col) => {
+      const validity = new Uint8Array(0);
+      switch (col.kind) {
+        case 'int32':
+          return makeInt32Vector(new Int32Array(0), validity, 0);
+        case 'float64':
+          return makeFloat64Vector(new Float64Array(0), validity, 0);
+        case 'bigint64':
+          return makeBigInt64Vector(new BigInt64Array(0), validity, 0);
+        case 'bool':
+          return makeBoolVector(0, new Uint8Array(0), validity, 0);
+        case 'bytes':
+          return makeBytesVector(0, new Int32Array(1), new Uint8Array(0), validity, 0);
+        default:
+          return makeUtf8Vector(0, new Int32Array(1), new Uint8Array(0), validity, 0);
+      }
+    });
+    return [
+      buildColumnarResult(
+        0,
+        cols.map((c) => c.field),
+        emptyVectors,
+        schemaMetadata,
+      ),
+    ];
+  }
+
+  return batches;
+}
+
+/**
+ * Decode an **Apache Arrow IPC Stream** (`Uint8Array` with 1 or more `RecordBatch`
+ * frames) back into a typed {@link ColumnarQueryResult} (`M19 Item 2` / `M21 Item 2`).
+ */
+export function decodeArrowIpc(ipcBytes: Uint8Array): ColumnarQueryResult {
+  const batches = decodeArrowIpcBatches(ipcBytes);
+  return batches.length === 1 ? batches[0]! : concatColumnarResults(batches);
 }

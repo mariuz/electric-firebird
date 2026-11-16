@@ -449,8 +449,23 @@ export interface ObjectStoreReplicationTargetOptions {
   aad?: Uint8Array | string;
   /** Maximum journal entries per shipped WAL segment. @default 250 */
   maxEntriesPerSegment?: number;
+  /** Automatically create a new base checkpoint every N shipped WAL segments (`M21 Item 1`). */
+  checkpointEverySegments?: number;
+  /** Automatically prune superseded WAL segments with `endLsn <= checkpoint.lsn` when rotating checkpoints (`M21 Item 1`). @default false */
+  autoPruneBeforeCheckpoint?: boolean;
+  /** Minimum LSN floor to retain when pruning archived WAL segments (`M21 Item 1`). */
+  retainMinLsn?: number;
   /** Background shipping interval in milliseconds when `start()` is called. @default 1000 */
   pollIntervalMs?: number;
+}
+
+/** Result returned by {@link ObjectStoreReplicationTarget.pruneArchivedSegments} (`M21 Item 1`). */
+export interface PruneObjectStoreWalResult {
+  readonly cutoffLsn: number;
+  readonly deletedSegments: number;
+  readonly deletedCheckpoints: number;
+  readonly deletedKeys: readonly string[];
+  readonly remainingSegments: number;
 }
 
 /** Handle for a read-replica tailing an object-store WAL bucket (`M20 Item 1`). */
@@ -481,6 +496,15 @@ export interface ObjectStoreReplicationTarget {
   }): Promise<ObjectStoreCheckpointDescriptor>;
   /** Capture & upload all unshipped journal changes (`> manifest.latestLsn`) as WAL segment(s). */
   shipWalOnce(): Promise<readonly ObjectStoreWalSegmentDescriptor[]>;
+  /**
+   * Delete superseded WAL segments (and older checkpoints when `keepCheckpoints` is set)
+   * whose `endLsn <= beforeLsn` (default: latest checkpoint LSN, capped by `retainMinLsn`) (`M21 Item 1`).
+   */
+  pruneArchivedSegments(options?: {
+    beforeLsn?: number;
+    retainMinLsn?: number;
+    keepCheckpoints?: number;
+  }): Promise<PruneObjectStoreWalResult>;
   /** Tail this object-store WAL target into `replicaDb` with zero custom sync server. */
   followInto(
     replicaDb: ReplicableDatabase & {
@@ -710,7 +734,101 @@ export async function createObjectStoreReplicationTarget(
         segments: [...manifest.segments, ...uploaded],
       });
 
+      const rotateEvery = options.checkpointEverySegments;
+      if (rotateEvery !== undefined && rotateEvery > 0) {
+        const updatedManifest = await readManifest();
+        const lastCkptLsn =
+          updatedManifest.checkpoints.length > 0
+            ? updatedManifest.checkpoints[updatedManifest.checkpoints.length - 1]!.lsn
+            : 0;
+        const segmentsSinceLastCkpt = updatedManifest.segments.filter(
+          (s) => s.endLsn > lastCkptLsn,
+        ).length;
+        if (segmentsSinceLastCkpt >= rotateEvery) {
+          const ckpt = await target.createCheckpoint();
+          if (options.autoPruneBeforeCheckpoint) {
+            await target.pruneArchivedSegments({
+              beforeLsn: ckpt.lsn,
+              retainMinLsn: options.retainMinLsn,
+            });
+          }
+        }
+      }
+
       return uploaded;
+    },
+
+    async pruneArchivedSegments(pruneOpts = {}): Promise<PruneObjectStoreWalResult> {
+      const manifest = await readManifest();
+      const latestCkptLsn =
+        manifest.checkpoints.length > 0
+          ? manifest.checkpoints[manifest.checkpoints.length - 1]!.lsn
+          : 0;
+      const requestedCutoff = pruneOpts.beforeLsn ?? latestCkptLsn;
+      const retainFloor = pruneOpts.retainMinLsn ?? options.retainMinLsn;
+      const cutoffLsn =
+        retainFloor !== undefined
+          ? Math.min(requestedCutoff, retainFloor)
+          : requestedCutoff;
+
+      if (cutoffLsn <= 0) {
+        return {
+          cutoffLsn: 0,
+          deletedSegments: 0,
+          deletedCheckpoints: 0,
+          deletedKeys: [],
+          remainingSegments: manifest.segments.length,
+        };
+      }
+
+      const deletedKeys: string[] = [];
+      const keptSegments: ObjectStoreWalSegmentDescriptor[] = [];
+      for (const seg of manifest.segments) {
+        if (seg.endLsn <= cutoffLsn) {
+          if (typeof store.deleteObject === 'function') {
+            await store.deleteObject(seg.key);
+          }
+          deletedKeys.push(seg.key);
+        } else {
+          keptSegments.push(seg);
+        }
+      }
+
+      let keptCheckpoints = [...manifest.checkpoints];
+      let deletedCheckpoints = 0;
+      if (
+        pruneOpts.keepCheckpoints !== undefined &&
+        pruneOpts.keepCheckpoints >= 1 &&
+        keptCheckpoints.length > pruneOpts.keepCheckpoints
+      ) {
+        const dropCount = keptCheckpoints.length - pruneOpts.keepCheckpoints;
+        const dropped = keptCheckpoints.slice(0, dropCount);
+        keptCheckpoints = keptCheckpoints.slice(dropCount);
+        for (const ckpt of dropped) {
+          if (typeof store.deleteObject === 'function') {
+            await store.deleteObject(ckpt.key);
+          }
+          deletedKeys.push(ckpt.key);
+          deletedCheckpoints++;
+        }
+      }
+
+      if (deletedKeys.length > 0) {
+        await writeManifest({
+          ...manifest,
+          updatedAt: Date.now(),
+          checkpoints: keptCheckpoints,
+          segments: keptSegments,
+        });
+      }
+
+      return {
+        cutoffLsn,
+        deletedSegments: manifest.segments.length - keptSegments.length,
+        deletedCheckpoints,
+        deletedKeys,
+        remainingSegments: keptSegments.length,
+      };
     },
 
     async followInto(replicaDb, followOpts = {}): Promise<ObjectStoreReplicaFollower> {

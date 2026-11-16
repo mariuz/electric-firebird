@@ -773,11 +773,15 @@ describe('M19 Item 3: WebRTC DataChannel Sync & Resilient Auto-Reconnecting Tran
         // Also verify `peerA.syncWith(chanA)` / `createWebRtcReplicationPeer` pushes live incremental rows
         await peerA.exec(`INSERT INTO NOTES (ID, BODY) VALUES (51, 'Incremental-51')`);
         await rtcA.pushSince(0);
-        await new Promise((r) => setTimeout(r, 40));
-
-        const row51 = await peerB.query<{ BODY: string }>(
+        let row51 = await peerB.query<{ BODY: string }>(
           'SELECT BODY FROM NOTES WHERE ID = 51',
         );
+        for (let attempt = 0; attempt < 40 && row51.rows.length === 0; attempt++) {
+          await new Promise((r) => setTimeout(r, 20));
+          row51 = await peerB.query<{ BODY: string }>(
+            'SELECT BODY FROM NOTES WHERE ID = 51',
+          );
+        }
         expect(row51.rows).toEqual([{ BODY: 'Incremental-51' }]);
 
         // Stream a gzip-compressed `"FBCHANGELOG\0"` segment over WebRTC DataChannel
@@ -789,11 +793,16 @@ describe('M19 Item 3: WebRTC DataChannel Sync & Resilient Auto-Reconnecting Tran
         });
         expect(flushed.segment).not.toBeNull();
         await rtcA.sendChangelogSegment(flushed.segment!, { compress: true });
-        await new Promise((r) => setTimeout(r, 50));
 
-        const row52 = await peerB.query<{ BODY: string }>(
+        let row52 = await peerB.query<{ BODY: string }>(
           'SELECT BODY FROM NOTES WHERE ID = 52',
         );
+        for (let attempt = 0; attempt < 50 && row52.rows.length === 0; attempt++) {
+          await new Promise((r) => setTimeout(r, 20));
+          row52 = await peerB.query<{ BODY: string }>(
+            'SELECT BODY FROM NOTES WHERE ID = 52',
+          );
+        }
         expect(row52.rows).toEqual([{ BODY: 'Native-Segment-52' }]);
 
         rtcA.close();

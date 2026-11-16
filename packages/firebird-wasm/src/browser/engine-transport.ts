@@ -1,26 +1,10 @@
 /**
- * engine-transport.ts – the boundary between `FirebirdBrowser` and the engine.
- *
- * There are two ways to reach the compiled engine, and they differ enough to
- * be worth naming:
- *
- *   • {@link DirectTransport} calls the WASM exports in this thread.  Simple,
- *     and what Node uses.
- *   • {@link WorkerTransport} (see `worker-transport.ts`) forwards to a Web
- *     Worker.  Browsers *must* use it: the build uses pthreads, Firebird
- *     blocks on mutexes while opening a database, and a browser main thread is
- *     not allowed to block — calling the engine directly from a page deadlocks.
- *
- * Both sides of that split need the same operations, including filesystem
- * access: persistence copies the database between Emscripten's in-memory FS
- * and IndexedDB, and in the Worker case that filesystem lives in the Worker.
- *
- * Every method is async so the two are interchangeable, even though the direct
- * one never actually suspends.
+ * engine-transport.ts – DirectTransport implementation over the Firebird WASM C ABI.
+ * Types live in wasm-abi-types.ts; result/info decoders live in result-decoder.ts (`M21 Item 5`).
  */
 
 import type { FirebirdWasmModule } from '../wasm-loader';
-import { acquireFirebirdWasm, releaseFirebirdWasm, allocString, lastError } from '../wasm-loader';
+import { acquireFirebirdWasm, releaseFirebirdWasm, allocString } from '../wasm-loader';
 import type {
   Row,
   QueryResult,
@@ -50,12 +34,8 @@ import {
   decodeBinaryResultSet,
   encodeBinaryResultSet,
   BINARY_HEADER_HAS_SHAPE_ID,
+  type BinaryResultPayload,
 } from './binary-result';
-import type { BinaryResultPayload } from './binary-result';
-export { decodeBinaryResultSet, encodeBinaryResultSet };
-export type { BinaryResultPayload };
-import { firebirdTypeName } from './field-types';
-import { statementKind } from '../statement-types';
 import { extractReferencedTables } from './live-tables';
 import { applyIcuLocaleDataToModule } from './icu-locales';
 import {
@@ -63,821 +43,52 @@ import {
   openDatabaseHandle,
   opfsAvailable,
 } from './opfs-fs';
+import {
+  OPFS_MOUNT,
+  type EngineHandle,
+  type EngineTransport,
+  type DirectTransportOptions,
+} from './wasm-abi-types';
+import {
+  engineError,
+  toFields,
+  MAX_FIELD_LISTS,
+  rowBuilder,
+  decodeResultSet,
+  DATABASE_INFO_REQUEST_ITEMS,
+  parseDatabaseInfoBuffer,
+  normalizeDatabaseInfo,
+  decodeDatabaseInfo,
+  buildSweepResult,
+  decodeDescription,
+  BLOB_SIDE_CHANNEL,
+  SHAPE_IDS,
+  readBlobs,
+  attachBlobs,
+  type EncodedColumn,
+} from './result-decoder';
 
-/** Where an OPFS-backed database is mounted inside the engine's filesystem. */
-export const OPFS_MOUNT = '/opfs';
-
-// ---------------------------------------------------------------------------
-// Public types
-// ---------------------------------------------------------------------------
-
-/** Opaque engine handle (database or transaction). 0 means "none". */
-export type EngineHandle = number;
-
-/**
- * The operations `FirebirdBrowser` needs from the engine, wherever it runs.
- *
- * `txHandle` of 0 means "run this statement in its own transaction", matching
- * the C API.
- */
-export interface EngineTransport {
-  /** When `true`, `serveEngine` forwards `"FBP\x01"` / `"FBP\x02"` wire parameter buffers directly without decoding JS arrays (`M20 Item 2`). */
-  readonly acceptsWireParams?: boolean;
-  /** Initialise the engine.  Safe to call more than once. */
-  init(): Promise<void>;
-  /**
-   * Register an optional ICU `.dat` (or `.dat.gz`) locale tailoring bundle
-   * (e.g., for `LOCALE=de_DE`, `es_ES`, `fr_FR`, `ja_JP`) in a second
-   * `udata_setCommonData()` slot without increasing the default WASM binary
-   * size.
-   */
-  loadIcuLocaleData?(data: Uint8Array): Promise<void>;
-
-  createDatabase(path: string): Promise<EngineHandle>;
-  attachDatabase(path: string): Promise<EngineHandle>;
-  detachDatabase(dbHandle: EngineHandle): Promise<void>;
-
-  /** Returns the number of rows the statement affected. */
-  execute(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-    sql: string,
-    params?: QueryParams | Uint8Array,
-  ): Promise<number>;
-  /**
-   * Execute one statement once per row of parameters, prepared once: a
-   * batch.  With no transaction the rows are all or nothing.  Returns the
-   * rows affected over the batch.
-   */
-  executeBatch(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-    sql: string,
-    rows: QueryParams[] | Uint8Array,
-  ): Promise<number>;
-  query<T = Row>(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-    sql: string,
-    params?: QueryParams | Uint8Array,
-    rowMode?: RowMode,
-    binaryBlobs?: boolean,
-  ): Promise<QueryResult<T>>;
-  /**
-   * Open a streaming cursor for `sql` (with optional `params`).
-   * With `txHandle` of 0 the cursor runs in its own transaction, committed by
-   * {@link EngineTransport.cursorClose}.
-   */
-  queryBinary?(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-    sql: string,
-    params?: QueryParams | Uint8Array,
-    binaryBlobs?: boolean,
-  ): Promise<BinaryResultPayload>;
-  cursorOpen?(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-    sql: string,
-    params?: QueryParams | Uint8Array,
-  ): Promise<EngineHandle>;
-  /**
-   * Fetch up to `batchSize` rows from an open cursor.
-   * An empty `rows` array signals end-of-cursor.
-   */
-  cursorFetch?<T = Row>(
-    cursorHandle: EngineHandle,
-    batchSize: number,
-    rowMode?: RowMode,
-    binaryBlobs?: boolean,
-  ): Promise<QueryResult<T>>;
-  /** Close an open cursor and finish any transaction it started for itself. */
-  cursorFetchBinary?(
-    cursorHandle: EngineHandle,
-    batchSize: number,
-    binaryBlobs?: boolean,
-  ): Promise<BinaryResultPayload>;
-  cursorClose?(cursorHandle: EngineHandle): Promise<void>;
-  /** Create a new writable BLOB handle in `(dbHandle, txHandle)`. */
-  blobCreate?(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-  ): Promise<{ blobHandle: EngineHandle; blobId: Uint8Array }>;
-  /** Write a segment of bytes to an open writable BLOB handle. */
-  blobPutSegment?(blobHandle: EngineHandle, segment: Uint8Array): Promise<void>;
-  /** Open an existing BLOB by its 8-byte `ISC_QUAD` ID for segmented reading. */
-  blobOpenId?(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-    blobId: Uint8Array,
-  ): Promise<EngineHandle>;
-  /** Execute `sql` and open column `colIndex` of the first row as a readable BLOB handle. */
-  blobOpenQuery?(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-    sql: string,
-    params: QueryParams | undefined,
-    colIndex: number,
-  ): Promise<EngineHandle>;
-  /** Read up to `maxLength` bytes from an open readable BLOB handle (`null` at EOF). */
-  blobGetSegment?(
-    blobHandle: EngineHandle,
-    maxLength: number,
-  ): Promise<Uint8Array | null>;
-  /** Close (or cancel) an open BLOB handle and return its 8-byte `ISC_QUAD` ID. */
-  blobClose?(blobHandle: EngineHandle, cancel?: boolean): Promise<Uint8Array>;
-  /**
-   * Run this database's autocommit SELECTs in a read-only transaction it
-   * keeps open (`true`), or each in one of its own (`false`, the default).
-   * Optional, so a transport written before it still type-checks;
-   * `FirebirdBrowser` refuses `sharedReads` on one without it.
-   */
-  setSharedReads?(dbHandle: EngineHandle, on: boolean): Promise<void>;
-  /** Describe a statement's shape without executing it. */
-  /** Return the execution plan for `sql` (`IStatement::getPlan`) without executing it. */
-  /** Return database storage, ODS, memory pool, I/O, and OIT/OAT/OST transaction health diagnostics. */
-  databaseInfo?(dbHandle: EngineHandle): Promise<DatabaseInfo>;
-  /** Trigger an immediate garbage-collection sweep and return before/after diagnostics. */
-  sweep?(dbHandle: EngineHandle): Promise<SweepResult>;
-  /**
-   * Configure Firebird's native database replica mode (`0 | 'none'`,
-   * `1 | 'read_only'`, or `2 | 'read_write'`) on the database header page.
-   */
-  setReplicaMode?(
-    dbHandle: EngineHandle,
-    mode: 0 | 1 | 2 | 'none' | 'read_only' | 'read_write',
-  ): Promise<void>;
-  /**
-   * Apply a native Firebird `"FBCHANGELOG\0"` binary changelog segment to
-   * `dbHandle` via `IAttachment::createReplicator`, returning the number of
-   * changelog blocks processed.
-   */
-  replicateChangelog?(
-    dbHandle: EngineHandle,
-    data: Uint8Array,
-    transfer?: boolean,
-  ): Promise<number>;
-  prepare?(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-    sql: string,
-  ): Promise<QueryDescription & { handle?: EngineHandle }>;
-  stmtClose?(stmtHandle: EngineHandle): Promise<void>;
-  /** Set the statement execution timeout in milliseconds (`IStatement::setTimeout`). `0` disables the timeout. */
-  stmtSetTimeout?(stmtHandle: EngineHandle, timeoutMs: number): Promise<void>;
-  /** Cancel the currently running operation on `dbHandle` (`IAttachment::cancelOperation`). */
-  cancelOperation?(dbHandle: EngineHandle, option?: number): Promise<void>;
-  /** Execute a prepared statement handle by integer ID without marshalling SQL text. */
-  executeStmt?(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-    stmtHandle: EngineHandle,
-    params?: QueryParams | Uint8Array,
-  ): Promise<number>;
-  /** Execute a prepared statement handle once per row of parameters as a single batch. */
-  executeBatchStmt?(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-    stmtHandle: EngineHandle,
-    rows: QueryParams[] | Uint8Array,
-  ): Promise<number>;
-  /** Query a prepared statement handle by integer ID without marshalling SQL text. */
-  queryStmt?<T = Row>(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-    stmtHandle: EngineHandle,
-    params?: QueryParams | Uint8Array,
-    rowMode?: RowMode,
-    binaryBlobs?: boolean,
-  ): Promise<QueryResult<T>>;
-  /** Query a prepared statement handle and return a packed `FBR\x01` binary result buffer. */
-  queryStmtBinary?(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-    stmtHandle: EngineHandle,
-    params?: QueryParams | Uint8Array,
-    binaryBlobs?: boolean,
-  ): Promise<BinaryResultPayload>;
-  /** Open a streaming cursor for a prepared statement handle by integer ID. */
-  cursorOpenStmt?(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-    stmtHandle: EngineHandle,
-    params?: QueryParams | Uint8Array,
-  ): Promise<EngineHandle>;
-  explain?(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-    sql: string,
-    detailed?: boolean,
-  ): Promise<string>;
-  /** Execute a heterogeneous multi-statement pipeline in a single transport round-trip (`M20 Item 2`). */
-  pipeline?(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-    steps: readonly EnginePipelineStepRequest[],
-    options?: EnginePipelineWireOptions,
-  ): Promise<EnginePipelineStepResponse[]>;
-  describe(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-    sql: string,
-  ): Promise<QueryDescription>;
-
-  /**
-   * Begin a transaction.
-   *
-   * `options` is honoured, not accepted and dropped: the Node backend has
-   * always applied isolationLevel and readOnly, and a browser caller
-   * writing the same code deserves the same transaction.
-   */
-  startTransaction(
-    dbHandle: EngineHandle,
-    options?: TransactionOptions,
-  ): Promise<EngineHandle>;
-  commit(txHandle: EngineHandle): Promise<void>;
-  rollback(txHandle: EngineHandle): Promise<void>;
-
-  // ── Filesystem, for the IndexedDB persistence layer ────────────────────
-  mkdir(path: string): Promise<void>;
-  exists(path: string): Promise<boolean>;
-  readFile(path: string): Promise<Uint8Array>;
-  writeFile(path: string, data: Uint8Array, transfer?: boolean): Promise<void>;
-  /** Return the byte size of `path` (0 when absent) without reading its contents. */
-  fileSize?(path: string): Promise<number>;
-  /** Read at most `length` bytes from `path` starting at byte `offset`. */
-  readFileChunk?(path: string, offset: number, length: number): Promise<Uint8Array>;
-  /** Write `data` into `path` at byte `offset`, optionally truncating the file to 0 first. */
-  writeFileChunk?(
-    path: string,
-    data: Uint8Array,
-    offset: number,
-    truncate?: boolean,
-    transfer?: boolean,
-  ): Promise<void>;
-  /** Remove a file.  Used to discard an ephemeral database on close. */
-  unlink(path: string): Promise<void>;
-  /** Subscribe to named events; returns a subscription handle. */
-  eventsSubscribe(dbHandle: EngineHandle, names: string[]): Promise<number>;
-  /**
-   * Counts that have arrived since the last poll, keyed by event name.
-   *
-   * Empty when nothing fired, which is the common case. Polling re-arms the
-   * subscription, so it has to keep being called for delivery to continue.
-   */
-  eventsPoll(subscription: number): Promise<Record<string, number>>;
-  /** Cancel a subscription. */
-  eventsCancel(subscription: number): Promise<void>;
-  /**
-   * Mount an OPFS-backed filesystem holding one database, and return the path
-   * the engine should open.
-   *
-   * Runs wherever the engine runs: the sync access handle is opened on that
-   * side and never crosses a boundary, because it is neither cloneable nor
-   * transferable.
-   */
-  mountOpfs(dbName: string): Promise<string>;
-
-  /** Release anything the transport owns.  Does not detach databases. */
-  dispose(): Promise<void>;
-}
-
-/** Options accepted by {@link DirectTransport}. */
-export interface DirectTransportOptions {
-  wasmBinary?: ArrayBuffer | string;
-  locateFile?: (filename: string) => string;
-  /** Which build to load; see {@link import('../wasm-loader').WasmLoadOptions.threads}. */
-  threads?: boolean | 'auto';
-}
-
-// ---------------------------------------------------------------------------
-// Shared helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Build an Error carrying whatever the engine reported.
- *
- * The C API returns only a numeric code; the readable Firebird message lives
- * behind `_fb_last_error()` and is lost unless it is read immediately, before
- * another call overwrites it.
- */
-function engineError(
-  mod: FirebirdWasmModule,
-  context: string,
-  code?: number,
-): Error {
-  const detail = lastError(mod);
-  const suffix = code === undefined ? '' : ` (code ${code})`;
-  return new Error(detail ? `${context}${suffix}: ${detail}` : `${context}${suffix}`);
-}
-
-/** How the engine describes one column. */
-interface EncodedColumn {
-  name: string;
-  type: number;
-  subType: number;
-  scale: number;
-  length: number;
-  nullable: boolean;
-}
-
-// ---------------------------------------------------------------------------
-// Column descriptions
-// ---------------------------------------------------------------------------
-
-/**
- * Decoded field lists by the text of their columns' JSON.
- *
- * A kept statement describes the same columns on every call, in the same
- * bytes, so the description is parsed and turned into `FieldInfo`s once
- * (bench/call-cost.js measured the decode of ten columns' description at
- * about 7 µs a call). Bounded like `rowBuilders`, and for the same reason.
- */
-const fieldLists = new Map<string, readonly FieldInfo[]>();
-const MAX_FIELD_LISTS = 256;
-
-const COLUMNS_PREFIX = '{"columns":';
-const SHAPE_PREFIX = '{"shape":';
-const ROWS_KEY = ',"rows":';
-const ROWS_INFIX = '],"rows":';
-
-/**
- * Split the engine's `{"columns":[…],"rows":[…]}` into its two parts,
- * parsing the rows and taking the columns from the cache when it has them.
- *
- * The first `],"rows":` is the boundary: it cannot occur inside a column
- * name, where every `"` is escaped. Anything else is parsed whole.
- */
-function splitResultSet(
-  json: string,
-  shapes?: (id: number) => readonly FieldInfo[],
-): { columns: readonly FieldInfo[]; rows: unknown[][] } {
-  if (shapes && json.startsWith(SHAPE_PREFIX)) {
-    const comma = json.indexOf(',', SHAPE_PREFIX.length);
-    const id = Number(json.slice(SHAPE_PREFIX.length, comma));
-    const rows = JSON.parse(json.slice(comma + ROWS_KEY.length, -1)) as unknown[][];
-    return { columns: shapes(id), rows };
-  }
-
-  const split = json.startsWith(COLUMNS_PREFIX) && json.endsWith('}') ? json.indexOf(ROWS_INFIX) : -1;
-  if (split < 0) {
-    const parsed = JSON.parse(json) as { columns: EncodedColumn[]; rows: unknown[][] };
-    return { columns: toFields(parsed.columns), rows: parsed.rows };
-  }
-
-  const columnsText = json.slice(COLUMNS_PREFIX.length, split + 1);
-  let columns = fieldLists.get(columnsText);
-  if (!columns) {
-    columns = toFields(JSON.parse(columnsText) as EncodedColumn[]);
-    if (fieldLists.size >= MAX_FIELD_LISTS) fieldLists.clear();
-    fieldLists.set(columnsText, columns);
-  }
-  const rows = JSON.parse(json.slice(split + ROWS_INFIX.length, -1)) as unknown[][];
-  return { columns, rows };
-}
-
-function toFields(columns: EncodedColumn[]): FieldInfo[] {
-  return columns.map((c) => ({
-    name: c.name,
-    type: c.type,
-    typeName: firebirdTypeName(c.type, c.scale),
-    subType: c.subType,
-    scale: c.scale,
-    length: c.length,
-    nullable: c.nullable,
-  }));
-}
-
-// ---------------------------------------------------------------------------
-// Row construction
-// ---------------------------------------------------------------------------
-
-/**
- * Row builders, keyed by the column-name signature.
- *
- * Building one costs more than it saves on a single small result, so a query
- * run repeatedly — which is most of them — has to reuse the builder. Measured
- * on 5 columns: rebuilding per call turns 2.5 ms into 5.5 ms across 2000
- * one-row queries, while reusing turns it into 1.1 ms.
- */
-const rowBuilders = new Map<string, (cols: unknown[]) => Row>();
-
-/**
- * Cap on distinct shapes remembered.  Cleared wholesale rather than evicted
- * one at a time: this exists to stop unbounded growth in a process issuing
- * endlessly varied `SELECT` lists, not to be a good cache.
- */
-const MAX_ROW_BUILDERS = 64;
-
-/** Set once `new Function` is known to be unavailable — see {@link rowBuilder}. */
-let codeGenerationBlocked = false;
-
-/**
- * A column name as a JavaScript string literal.
- *
- * `JSON.stringify` handles quotes, backslashes and control characters. U+2028
- * and U+2029 are legal in string literals from ES2019 and are escaped anyway,
- * because the cost is nothing and the failure would be a syntax error at
- * runtime on an older engine.
- */
-function stringLiteral(name: string): string {
-  return JSON.stringify(name)
-    .replace(/\u2028/g, '\\u2028')
-    .replace(/\u2029/g, '\\u2029');
-}
-
-/**
- * Build a function that turns one row of values into an object.
- *
- * Generated with literal keys, which is the whole point: every row then shares
- * one hidden class, and the engine can compile the construction. The obvious
- * safe alternative — computed keys, `{[name]: c[0]}` — forces dictionary-mode
- * objects and measured *no faster than `Object.fromEntries`* (14.7 ms against
- * 15.2 ms on 10,000 rows), so it is not a trade worth making.
- *
- * Returns null when the caller must fall back:
- *
- * - A column named `__proto__`. As a literal key that sets the prototype
- *   instead of defining a property, so the value would be silently lost.
- *   `Object.fromEntries` defines it correctly, so the slow path is also the
- *   right path here. A quoted alias keeps its case, so
- *   `SELECT 1 AS "__proto__"` reaches this.
- * - A Content-Security-Policy without `unsafe-eval`, where `new Function`
- *   throws. Remembered, so it is attempted once rather than per query.
- */
-function rowBuilder(names: string[]): ((cols: unknown[]) => Row) | null {
-  if (codeGenerationBlocked || names.includes('__proto__')) {
-    return null;
-  }
-
-  // \u0000 cannot appear in a Firebird identifier, so it cannot make two
-  // different column lists collide.
-  const signature = names.join('\u0000');
-  const cached = rowBuilders.get(signature);
-  if (cached) return cached;
-
-  let built: (cols: unknown[]) => Row;
-  try {
-    built = new Function(
-      'c',
-      'return {' + names.map((n, i) => `${stringLiteral(n)}:c[${i}]`).join(',') + '}',
-    ) as (cols: unknown[]) => Row;
-  } catch {
-    // A strict CSP. Every later result set takes the fallback without
-    // re-testing, and nothing about the returned rows changes.
-    codeGenerationBlocked = true;
-    return null;
-  }
-
-  if (rowBuilders.size >= MAX_ROW_BUILDERS) {
-    rowBuilders.clear();
-  }
-  rowBuilders.set(signature, built);
-  return built;
-}
-
-/**
- * Decode the engine's JSON result set.
- *
- * `rowMode: 'array'` returns the parsed rows as they arrive — the engine
- * already sends each row as an array of values, so this is the one shape that
- * costs nothing to produce. Object mode is what the row builder above exists
- * for, and what the decode benchmark measures.
- */
-export function decodeResultSet<T = Row>(
-  json: string,
-  rowMode: RowMode = 'object',
-  shapes?: (id: number) => readonly FieldInfo[],
-): QueryResult<T> {
-  const { columns, rows: encodedRows } = splitResultSet(json, shapes);
-  // Copies: the cached list is shared by every call with these columns, and a
-  // caller is free to change the fields it was given.
-  const fields: FieldInfo[] = columns.map((f) => ({ ...f }));
-
-  if (rowMode === 'array') {
-    // Handed straight through: no builder, no per-row object, and nothing to
-    // collide when two columns share a name.
-    return { rows: encodedRows as T[], fields };
-  }
-
-  const names = fields.map((f) => f.name);
-  const build = rowBuilder(names);
-
-  const rows = (
-    build
-      ? encodedRows.map(build)
-      : encodedRows.map((cols) =>
-          Object.fromEntries(names.map((name, i) => [name, cols[i]])),
-        )
-  ) as T[];
-
-  return { rows, fields };
-}
-
-/** One field of a description, as the engine encodes it. */
-function decodeField(c: EncodedColumn): FieldInfo {
-  return {
-    name: c.name,
-    type: c.type,
-    typeName: firebirdTypeName(c.type, c.scale),
-    subType: c.subType,
-    scale: c.scale,
-    length: c.length,
-    nullable: c.nullable,
-  };
-}
-
-/** `isc_info_*` tags requested by `databaseInfo()` (`IAttachment::getInfo`). */
-export const DATABASE_INFO_REQUEST_ITEMS = new Uint8Array([
-  14, // isc_info_page_size
-  21, // isc_info_allocation
-  32, // isc_info_ods_version
-  33, // isc_info_ods_minor_version
-  104, // isc_info_oldest_transaction
-  105, // isc_info_oldest_active
-  106, // isc_info_oldest_snapshot
-  107, // isc_info_next_transaction
-  17, // isc_info_current_memory
-  18, // isc_info_max_memory
-  15, // isc_info_num_buffers
-  5, // isc_info_reads
-  6, // isc_info_writes
-  7, // isc_info_fetches
-  8, // isc_info_marks
-]);
-
-function readPortableInt(buffer: Uint8Array, offset: number, length: number): number {
-  let value = 0;
-  let multiplier = 1;
-  const n = Math.min(length, 8);
-  for (let i = 0; i < n; i++) {
-    value += (buffer[offset + i] ?? 0) * multiplier;
-    multiplier *= 256;
-  }
-  return value;
-}
-
-/**
- * Parse a Firebird `IAttachment::getInfo` clumplet response buffer into a
- * {@link DatabaseInfo} object.
- */
-export function parseDatabaseInfoBuffer(buffer: Uint8Array): DatabaseInfo {
-  let pageSize = 0;
-  let allocatedPages = 0;
-  let odsVersion = 0;
-  let odsMinorVersion = 0;
-  let oldestTransaction = 0;
-  let oldestActive = 0;
-  let oldestSnapshot = 0;
-  let nextTransaction = 0;
-  let currentMemory = 0;
-  let maxMemory = 0;
-  let pageBuffers = 0;
-  let reads = 0;
-  let writes = 0;
-  let fetches = 0;
-  let marks = 0;
-
-  let pos = 0;
-  while (pos < buffer.length) {
-    const tag = buffer[pos++]!;
-    if (tag === 0 || tag === 1 || tag === 2) break; // end / truncated
-    if (pos + 2 > buffer.length) break;
-    const len = buffer[pos]! | (buffer[pos + 1]! << 8);
-    pos += 2;
-    if (pos + len > buffer.length) break;
-    const val = readPortableInt(buffer, pos, len);
-    pos += len;
-
-    switch (tag) {
-      case 14: pageSize = val; break;
-      case 21: allocatedPages = val; break;
-      case 32: odsVersion = val; break;
-      case 33: odsMinorVersion = val; break;
-      case 104: oldestTransaction = val; break;
-      case 105: oldestActive = val; break;
-      case 106: oldestSnapshot = val; break;
-      case 107: nextTransaction = val; break;
-      case 17: currentMemory = val; break;
-      case 18: maxMemory = val; break;
-      case 15: pageBuffers = val; break;
-      case 5: reads = val; break;
-      case 6: writes = val; break;
-      case 7: fetches = val; break;
-      case 8: marks = val; break;
-      default: break;
-    }
-  }
-
-  return normalizeDatabaseInfo({
-    pageSize,
-    allocatedPages,
-    odsVersion,
-    odsMinorVersion,
-    oldestTransaction,
-    oldestActive,
-    oldestSnapshot,
-    nextTransaction,
-    currentMemory,
-    maxMemory,
-    pageBuffers,
-    reads,
-    writes,
-    fetches,
-    marks,
-  });
-}
-
-/** Fill in derived fields (`databaseSizeBytes`, `transactionGap`) on partial info. */
-export function normalizeDatabaseInfo(raw: Partial<DatabaseInfo>): DatabaseInfo {
-  const pageSize = Number(raw.pageSize ?? 0);
-  const allocatedPages = Number(raw.allocatedPages ?? 0);
-  const databaseSizeBytes = Number(raw.databaseSizeBytes ?? pageSize * allocatedPages);
-  const odsVersion = Number(raw.odsVersion ?? 0);
-  const odsMinorVersion = Number(raw.odsMinorVersion ?? 0);
-  const oldestTransaction = Number(raw.oldestTransaction ?? 0);
-  const rawOldestActive = Number(raw.oldestActive ?? 0);
-  const oldestActive = rawOldestActive > 0 ? rawOldestActive : oldestTransaction;
-  const rawOldestSnapshot = Number(raw.oldestSnapshot ?? 0);
-  const oldestSnapshot = rawOldestSnapshot > 0 ? rawOldestSnapshot : oldestActive;
-  const rawNextTransaction = Number(raw.nextTransaction ?? 0);
-  const nextTransaction = rawNextTransaction > 0 ? rawNextTransaction : oldestActive;
-  const transactionGap = Number(
-    raw.transactionGap ?? (nextTransaction >= oldestActive ? nextTransaction - oldestActive : 0),
-  );
-  const currentMemory = Number(raw.currentMemory ?? 0);
-  const maxMemory = Number(raw.maxMemory ?? 0);
-  const pageBuffers = Number(raw.pageBuffers ?? 0);
-  const reads = Number(raw.reads ?? 0);
-  const writes = Number(raw.writes ?? 0);
-  const fetches = Number(raw.fetches ?? 0);
-  const marks = Number(raw.marks ?? 0);
-  return {
-    pageSize,
-    allocatedPages,
-    databaseSizeBytes,
-    odsVersion,
-    odsMinorVersion,
-    oldestTransaction,
-    oldestActive,
-    oldestSnapshot,
-    nextTransaction,
-    transactionGap,
-    currentMemory,
-    maxMemory,
-    pageBuffers,
-    reads,
-    writes,
-    fetches,
-    marks,
-  };
-}
-
-/** Decode what `fb_database_info` reports about a database. */
-export function decodeDatabaseInfo(json: string): DatabaseInfo {
-  return normalizeDatabaseInfo(JSON.parse(json) as Partial<DatabaseInfo>);
-}
-
-/** Build a {@link SweepResult} comparing before/after {@link DatabaseInfo} snapshots. */
-export function buildSweepResult(
-  before: DatabaseInfo,
-  after: DatabaseInfo,
-  tablesScanned: number,
-  durationMs: number,
-): SweepResult {
-  const oitAdvanced = Math.max(0, after.oldestTransaction - before.oldestTransaction);
-  const gapReduced = Math.max(0, before.transactionGap - after.transactionGap);
-  return {
-    before,
-    after,
-    tablesScanned,
-    oitAdvanced,
-    gapReduced,
-    durationMs: Math.max(0, durationMs),
-  };
-}
-
-/** Decode what `fb_describe` reports about a statement. */
-export function decodeDescription(json: string): QueryDescription {
-  const parsed = JSON.parse(json) as {
-    params: EncodedColumn[];
-    columns: EncodedColumn[];
-    statementType: number;
-  };
-
-  const fields = parsed.columns.map(decodeField);
-
-  return {
-    // Parameters are positional in Firebird and carry no name, so the engine
-    // sends "" — they are described by type and position alone.
-    params: parsed.params.map(decodeField),
-    fields,
-    statementType: statementKind(parsed.statementType),
-    // Derived rather than reported separately: a statement yields rows exactly
-    // when it describes some.
-    hasResultSet: fields.length > 0,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Binary BLOB side channel
-// ---------------------------------------------------------------------------
-
-/** `flags` bit asking the engine to send binary BLOBs beside the JSON. */
-export const BLOB_SIDE_CHANNEL = 1;
-
-/**
- * `fb_query` flag bit: a kept statement's result may name its columns by id,
- * `{"shape":N,"rows":[...]}`, rather than describe them again. The ids are
- * the engine module's own and never reused, so the transport that loaded the
- * module keeps what each one means.
- */
-export const SHAPE_IDS = 2;
-
-/** The placeholder a side-channelled BLOB leaves in the JSON. */
-interface BlobRef {
-  $blob: number;
-}
-
-function isBlobRef(value: unknown): value is BlobRef {
-  return (
-    typeof value === 'object' &&
-    value !== null &&
-    typeof (value as BlobRef).$blob === 'number'
-  );
-}
-
-/**
- * Copy the side buffer out of the WASM heap into one JavaScript buffer.
- *
- * One copy, and it is not the "no copy" the plan hoped for. A `Uint8Array`
- * over `HEAPU8.buffer` is a view into memory the engine reuses on the next
- * query and that `ALLOW_MEMORY_GROWTH` can detach from underneath it, so
- * handing such a view to a caller would be handing them something that goes
- * wrong later and elsewhere. What the side channel actually removes is the
- * 33% base64 inflation, the JSON string for those bytes, and the `atob` plus
- * per-byte loop that decoded them — measured in the benchmark.
- *
- * The single buffer is deliberate: it is what a Worker can *transfer* rather
- * than clone, which is the other half of the win and impossible for a base64
- * string.
- */
-function readBlobs(mod: FirebirdWasmModule): Uint8Array[] | null {
-  const ptr = mod._fb_last_blobs();
-  const size = mod._fb_last_blobs_size();
-  if (ptr === 0 || size === 0) return null;
-
-  // Re-read HEAPU8 rather than closing over it: the query may have grown the
-  // heap, which replaces the buffer and detaches older views.
-  const heap = mod.HEAPU8;
-  const view = new DataView(heap.buffer, heap.byteOffset + ptr, size);
-
-  const count = view.getUint32(0, true);
-  const headerBytes = 4 * (1 + count);
-
-  const blobs: Uint8Array[] = new Array(count);
-  let offset = headerBytes;
-  for (let i = 0; i < count; i++) {
-    const length = view.getUint32(4 * (1 + i), true);
-    // slice() copies; subarray() would alias the heap.
-    blobs[i] = heap.slice(ptr + offset, ptr + offset + length);
-    offset += length;
-  }
-
-  return blobs;
-}
-
-/**
- * Replace every `{"$blob":N}` placeholder with its bytes.
- *
- * Walks the decoded rows rather than the JSON text: the values are already
- * parsed, and a placeholder is the only object a row can contain, so
- * recognising one is a type check rather than a search.
- */
-export function attachBlobs<T>(
-  result: QueryResult<T>,
-  blobs: Uint8Array[],
-  rowMode: RowMode,
-): QueryResult<T> {
-  for (const row of result.rows) {
-    if (rowMode === 'array') {
-      const values = row as unknown[];
-      for (let i = 0; i < values.length; i++) {
-        const value = values[i];
-        if (isBlobRef(value)) values[i] = blobs[value.$blob];
-      }
-      continue;
-    }
-
-    const target = row as Record<string, unknown>;
-    for (const key of Object.keys(target)) {
-      const value = target[key];
-      if (isBlobRef(value)) target[key] = blobs[value.$blob];
-    }
-  }
-
-  return result;
-}
+export {
+  OPFS_MOUNT,
+  decodeBinaryResultSet,
+  encodeBinaryResultSet,
+  decodeResultSet,
+  DATABASE_INFO_REQUEST_ITEMS,
+  parseDatabaseInfoBuffer,
+  normalizeDatabaseInfo,
+  decodeDatabaseInfo,
+  buildSweepResult,
+  decodeDescription,
+  BLOB_SIDE_CHANNEL,
+  SHAPE_IDS,
+  attachBlobs,
+};
+export type {
+  EngineHandle,
+  EngineTransport,
+  DirectTransportOptions,
+  BinaryResultPayload,
+};
 
 // ---------------------------------------------------------------------------
 // DirectTransport
@@ -2539,29 +1750,54 @@ export class DirectTransport implements EngineTransport {
       for (let i = 0; i < steps.length; i++) {
         const step = steps[i]!;
         if (step.op === 'execute') {
-          const affectedRows = await this.execute(
-            dbHandle,
-            activeTx,
-            step.sql,
-            step.params,
-          );
+          const affectedRows =
+            step.stmtHandle && step.stmtHandle > 0
+              ? await this.executeStmt(
+                  dbHandle,
+                  activeTx,
+                  step.stmtHandle,
+                  step.params,
+                )
+              : await this.execute(
+                  dbHandle,
+                  activeTx,
+                  step.sql,
+                  step.params,
+                );
           out[i] = { kind: 'affected', affectedRows };
         } else if (step.op === 'executeBatch') {
-          const affectedRows = await this.executeBatch(
-            dbHandle,
-            activeTx,
-            step.sql,
-            step.rows,
-          );
+          const affectedRows =
+            step.stmtHandle && step.stmtHandle > 0
+              ? await this.executeBatchStmt(
+                  dbHandle,
+                  activeTx,
+                  step.stmtHandle,
+                  step.rows,
+                )
+              : await this.executeBatch(
+                  dbHandle,
+                  activeTx,
+                  step.sql,
+                  step.rows,
+                );
           out[i] = { kind: 'affected', affectedRows };
         } else {
-          const payload = await this.queryBinary(
-            dbHandle,
-            activeTx,
-            step.sql,
-            step.params,
-            step.binaryBlobs,
-          );
+          const payload =
+            step.stmtHandle && step.stmtHandle > 0
+              ? await this.queryStmtBinary(
+                  dbHandle,
+                  activeTx,
+                  step.stmtHandle,
+                  step.params,
+                  step.binaryBlobs,
+                )
+              : await this.queryBinary(
+                  dbHandle,
+                  activeTx,
+                  step.sql,
+                  step.params,
+                  step.binaryBlobs,
+                );
           out[i] = { kind: 'binary', payload };
         }
       }

@@ -35,6 +35,17 @@ import {
   isFbChangelogSegment,
   parseFbChangelogSegment,
 } from './replication/native-changelog';
+import { syncDatabases } from './replication/presets';
+import {
+  createHttpObjectStoreAdapter,
+  createObjectStoreReplicationTarget,
+  restoreDatabaseToPointInTime,
+  type ObjectStoreAdapter,
+  type ObjectStorePitrTarget,
+} from './replication/object-store-wal';
+import type { BootstrapStrategy, ReplicableDatabase } from './replication/types';
+import { collectArrowStreamBytes } from './columnar-stream';
+import { decodeArrowIpc } from './columnar';
 
 /** Injectable I/O handles for programmatic and unit-tested CLI execution. */
 export interface CliIo {
@@ -81,6 +92,10 @@ Commands:
   dump <uri> --out <file>        Export database bytes to <file> [--gzip]
   restore <uri> --in <file>      Restore database bytes from <file> [--gzip]
   inspect-changelog <file>       Inspect a binary Firebird "FBCHANGELOG\\0" segment [--json]
+  sync <src> <dst>               Sync two databases (--mode auto|native|logical --bootstrap binary-image|page-diff|logical)
+  wal-ship <uri>                 Ship checkpoint/WAL segments to --dir <path> or --url <http-or-s3-url>
+  pitr-restore <uri>             Restore database from --dir <path> or --url <url> [--lsn <n> | --timestamp <iso>]
+  bench [uri]                    Benchmark IBatch, row query, columnar, Arrow IPC stream & preparePipeline [--rows <n>]
 
 Global Options:
   --backend <auto|wasm|native>   Engine backend override (default: auto)
@@ -470,6 +485,90 @@ interface ParsedFlags {
   flags: Map<string, string | boolean>;
 }
 
+/**
+ * Local filesystem {@link ObjectStoreAdapter} used by `firebird-wasm wal-ship --dir`
+ * and `firebird-wasm pitr-restore --dir` (`M21 Item 4`).
+ */
+export function createFsObjectStoreAdapter(rootDir: string): ObjectStoreAdapter {
+  const absRoot = path.resolve(rootDir);
+  const resolveSafe = (key: string): string => {
+    const rel = key.replace(/^\/+/, '').split('/').join(path.sep);
+    const full = path.resolve(absRoot, rel);
+    if (!full.startsWith(absRoot)) {
+      throw new Error(`Object key escapes root directory: ${key}`);
+    }
+    return full;
+  };
+  const walkFiles = (dir: string, baseRel = ''): string[] => {
+    if (!fs.existsSync(dir)) return [];
+    const out: string[] = [];
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const nextRel = baseRel ? `${baseRel}/${entry.name}` : entry.name;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        out.push(...walkFiles(full, nextRel));
+      } else if (entry.isFile()) {
+        out.push(nextRel);
+      }
+    }
+    return out;
+  };
+  return {
+    async putObject(key: string, body: Uint8Array): Promise<void> {
+      const full = resolveSafe(key);
+      fs.mkdirSync(path.dirname(full), { recursive: true });
+      fs.writeFileSync(full, body);
+    },
+    async getObject(key: string): Promise<Uint8Array | null> {
+      const full = resolveSafe(key);
+      if (!fs.existsSync(full)) return null;
+      const buf = fs.readFileSync(full);
+      return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+    },
+    async listObjects(prefix = ''): Promise<string[]> {
+      const norm = prefix.replace(/^\/+/, '');
+      return walkFiles(absRoot).filter((k) => k.startsWith(norm)).sort();
+    },
+    async deleteObject(key: string): Promise<void> {
+      const full = resolveSafe(key);
+      if (fs.existsSync(full)) {
+        fs.unlinkSync(full);
+      }
+    },
+  };
+}
+
+function resolveCliObjectStore(
+  flags: Map<string, string | boolean>,
+  cwd: string,
+): ObjectStoreAdapter | null {
+  const dirFlag = flags.get('dir');
+  if (typeof dirFlag === 'string' && dirFlag.trim().length > 0) {
+    return createFsObjectStoreAdapter(path.resolve(cwd, dirFlag));
+  }
+  const urlFlag = flags.get('url');
+  if (typeof urlFlag === 'string' && urlFlag.trim().length > 0) {
+    const accessKeyId = process.env.S3_ACCESS_KEY_ID ?? process.env.AWS_ACCESS_KEY_ID;
+    const secretAccessKey =
+      process.env.S3_SECRET_ACCESS_KEY ?? process.env.AWS_SECRET_ACCESS_KEY;
+    const bucket = process.env.S3_BUCKET;
+    if (accessKeyId && secretAccessKey && bucket) {
+      return createHttpObjectStoreAdapter({
+        s3: {
+          endpoint: urlFlag,
+          bucket,
+          region: process.env.S3_REGION ?? process.env.AWS_REGION ?? 'auto',
+          accessKeyId,
+          secretAccessKey,
+          sessionToken: process.env.AWS_SESSION_TOKEN,
+        },
+      });
+    }
+    return createHttpObjectStoreAdapter({ baseUrl: urlFlag });
+  }
+  return null;
+}
+
 function parseCliArgs(argv: readonly string[]): ParsedFlags {
   const positional: string[] = [];
   const flags = new Map<string, string | boolean>();
@@ -492,7 +591,18 @@ function parseCliArgs(argv: readonly string[]): ParsedFlags {
             key === 'dir' ||
             key === 'target' ||
             key === 'backend' ||
-            key === 'case')
+            key === 'case' ||
+            key === 'mode' ||
+            key === 'bootstrap' ||
+            key === 'direction' ||
+            key === 'interval' ||
+            key === 'url' ||
+            key === 'prefix' ||
+            key === 'key' ||
+            key === 'lsn' ||
+            key === 'timestamp' ||
+            key === 'hlc' ||
+            key === 'rows')
         ) {
           flags.set(key, next);
           i += 1;
@@ -878,6 +988,304 @@ export async function runCli(
         } finally {
           rl?.close();
           await managed.flushAndClose(dirty);
+        }
+        return 0;
+      }
+
+      case 'sync': {
+        const sourceUri = positional[1];
+        const targetUri = positional[2];
+        if (!sourceUri || !targetUri) {
+          err(
+            'Usage: firebird-wasm sync <source-uri> <target-uri> [--mode auto|native|logical] [--bootstrap logical|binary-image|page-diff] [--direction one-way|bidirectional] [--json]\n',
+          );
+          return 1;
+        }
+        const modeRaw = String(flags.get('mode') ?? 'auto').toLowerCase();
+        const mode: 'auto' | 'native' | 'logical' =
+          modeRaw === 'native' || modeRaw === 'logical' ? modeRaw : 'auto';
+        const bootRaw = String(flags.get('bootstrap') ?? 'logical').toLowerCase();
+        const bootstrapStrategy: BootstrapStrategy =
+          bootRaw === 'binary-image' || bootRaw === 'page-diff' ? bootRaw : 'logical';
+        const direction: 'one-way' | 'bidirectional' =
+          String(flags.get('direction') ?? 'one-way').toLowerCase() === 'bidirectional'
+            ? 'bidirectional'
+            : 'one-way';
+
+        const srcManaged = await openCliDatabase(sourceUri, {
+          cwd,
+          backend,
+          allowMissing: false,
+        });
+        const dstManaged = await openCliDatabase(targetUri, { cwd, backend });
+        try {
+          const handle = await syncDatabases(
+            srcManaged.db as unknown as ReplicableDatabase,
+            dstManaged.db as unknown as ReplicableDatabase,
+            {
+              mode,
+              bootstrapStrategy,
+              direction,
+              live: false,
+            },
+          );
+          try {
+            const cycle = await handle.syncNow();
+            const stats = await handle.stats();
+            const appliedCount =
+              'primaryToReplica' in cycle
+                ? cycle.primaryToReplica.appliedCount
+                : cycle.appliedCount;
+            const summary = {
+              mode: handle.mode,
+              bootstrapStrategy,
+              direction,
+              appliedCount,
+              primaryLsn: stats.primaryLsn,
+              replicaWatermark: stats.replicaWatermark,
+              lagEntries: stats.lagEntries,
+            };
+            if (flags.get('json') === true) {
+              out(`${JSON.stringify(summary, null, 2)}\n`);
+            } else {
+              out(
+                `Synced ${sourceUri} -> ${targetUri} (mode=${summary.mode}, bootstrap=${bootstrapStrategy}, applied=${summary.appliedCount}, LSN=${summary.replicaWatermark}/${summary.primaryLsn})\n`,
+              );
+            }
+          } finally {
+            await handle.stop();
+          }
+        } finally {
+          await dstManaged.flushAndClose(true);
+          await srcManaged.flushAndClose(true);
+        }
+        return 0;
+      }
+
+      case 'wal-ship': {
+        const sourceUri = positional[1];
+        const store = resolveCliObjectStore(flags, cwd);
+        if (!sourceUri || !store) {
+          err(
+            'Usage: firebird-wasm wal-ship <source-uri> (--dir <wal-dir> | --url <store-url>) [--prefix <pfx>] [--checkpoint] [--prune] [--key <passphrase>] [--json]\n',
+          );
+          return 1;
+        }
+        const prefix =
+          typeof flags.get('prefix') === 'string' ? String(flags.get('prefix')) : undefined;
+        const encryptionKey =
+          typeof flags.get('key') === 'string' ? String(flags.get('key')) : undefined;
+
+        const srcManaged = await openCliDatabase(sourceUri, {
+          cwd,
+          backend,
+          allowMissing: false,
+        });
+        try {
+          const target = await createObjectStoreReplicationTarget({
+            db: srcManaged.db as unknown as ReplicableDatabase,
+            store,
+            prefix,
+            encryptionKey,
+            installTriggers: true,
+          });
+          try {
+            let checkpointId: string | null = null;
+            const currentManifest = await target.getManifest();
+            if (flags.get('checkpoint') === true || currentManifest.checkpoints.length === 0) {
+              const ckpt = await target.createCheckpoint();
+              checkpointId = ckpt.id;
+            }
+            const shipped = await target.shipWalOnce();
+            const pruned =
+              flags.get('prune') === true
+                ? await target.pruneArchivedSegments()
+                : null;
+            const finalManifest = await target.getManifest();
+            const report = {
+              checkpointCreated: checkpointId,
+              segmentsShipped: shipped.length,
+              entriesShipped: shipped.reduce((acc, s) => acc + s.entryCount, 0),
+              prunedSegments: pruned?.deletedSegments ?? 0,
+              latestLsn: finalManifest.latestLsn,
+              totalCheckpoints: finalManifest.checkpoints.length,
+              totalSegments: finalManifest.segments.length,
+            };
+            if (flags.get('json') === true) {
+              out(`${JSON.stringify(report, null, 2)}\n`);
+            } else {
+              out(
+                `Shipped WAL for ${sourceUri}: checkpoint=${report.checkpointCreated ?? 'none'}, segments=${report.segmentsShipped}, latestLsn=${report.latestLsn}\n`,
+              );
+            }
+          } finally {
+            await target.stop();
+          }
+        } finally {
+          await srcManaged.flushAndClose(true);
+        }
+        return 0;
+      }
+
+      case 'pitr-restore': {
+        const targetUri = positional[1];
+        const store = resolveCliObjectStore(flags, cwd);
+        if (!targetUri || !store) {
+          err(
+            'Usage: firebird-wasm pitr-restore <target-uri> (--dir <wal-dir> | --url <store-url>) [--prefix <pfx>] [--lsn <n>] [--timestamp <iso-or-ms>] [--hlc <hlc>] [--key <passphrase>] [--json]\n',
+          );
+          return 1;
+        }
+        const prefix =
+          typeof flags.get('prefix') === 'string' ? String(flags.get('prefix')) : undefined;
+        const decryptionKey =
+          typeof flags.get('key') === 'string' ? String(flags.get('key')) : undefined;
+
+        const pitrTarget: ObjectStorePitrTarget = {};
+        let hasCutoff = false;
+        if (typeof flags.get('lsn') === 'string') {
+          pitrTarget.lsn = Number(flags.get('lsn'));
+          hasCutoff = true;
+        }
+        if (typeof flags.get('timestamp') === 'string') {
+          const rawTs = String(flags.get('timestamp'));
+          pitrTarget.timestamp = /^\d+$/.test(rawTs) ? Number(rawTs) : Date.parse(rawTs);
+          hasCutoff = true;
+        }
+        if (typeof flags.get('hlc') === 'string') {
+          pitrTarget.hlc = String(flags.get('hlc'));
+          hasCutoff = true;
+        }
+
+        const dstManaged = await openCliDatabase(targetUri, { cwd, backend });
+        try {
+          const res = await restoreDatabaseToPointInTime({
+            targetDb: dstManaged.db as unknown as ReplicableDatabase,
+            store,
+            prefix,
+            decryptionKey,
+            ...(hasCutoff ? { target: pitrTarget } : {}),
+          });
+          if (flags.get('json') === true) {
+            out(`${JSON.stringify(res, null, 2)}\n`);
+          } else {
+            out(
+              `Restored ${targetUri} to LSN ${res.restoredToLsn} (checkpoint=${res.checkpointUsed ?? 'none'}, segments=${res.segmentsReplayed}, entries=${res.entriesApplied})\n`,
+            );
+          }
+        } finally {
+          await dstManaged.flushAndClose(true);
+        }
+        return 0;
+      }
+
+      case 'bench': {
+        const uri = positional[1] ?? 'memory://cli_bench';
+        const rowCount = Math.max(
+          10,
+          Number(typeof flags.get('rows') === 'string' ? flags.get('rows') : 250) || 250,
+        );
+        const format =
+          flags.get('json') === true || String(flags.get('format') ?? '').toLowerCase() === 'json'
+            ? 'json'
+            : 'table';
+
+        const managed = await openCliDatabase(uri, { cwd, backend });
+        try {
+          await managed.db.execute(
+            'RECREATE TABLE FB_CLI_BENCH$ (ID INTEGER NOT NULL PRIMARY KEY, LABEL VARCHAR(64), SCORE DOUBLE PRECISION)',
+          );
+          const tbl = managed.db.table<{ ID: number; LABEL: string; SCORE: number }, number>(
+            'FB_CLI_BENCH$',
+            { primaryKey: 'ID' },
+          );
+
+          const batchInput = Array.from({ length: rowCount }, (_, i) => ({
+            ID: i + 1,
+            LABEL: `row_${i + 1}`,
+            SCORE: (i + 1) * 1.25,
+          }));
+
+          const tInsert0 = performance.now();
+          await tbl.insertMany(batchInput);
+          const insertMs = performance.now() - tInsert0;
+
+          const tRow0 = performance.now();
+          const rowRes = await managed.db.query('SELECT ID, LABEL, SCORE FROM FB_CLI_BENCH$ ORDER BY ID');
+          const rowQueryMs = performance.now() - tRow0;
+
+          const tCol0 = performance.now();
+          const colRes = await managed.db.queryColumnar('SELECT ID, LABEL, SCORE FROM FB_CLI_BENCH$ ORDER BY ID');
+          const colQueryMs = performance.now() - tCol0;
+
+          const tArrow0 = performance.now();
+          const arrowBytes = await collectArrowStreamBytes(
+            managed.db.queryArrowStream('SELECT ID, LABEL, SCORE FROM FB_CLI_BENCH$ ORDER BY ID', {
+              batchSize: Math.max(25, Math.ceil(rowCount / 4)),
+            }),
+          );
+          const decodedArrow = decodeArrowIpc(arrowBytes);
+          const arrowStreamMs = performance.now() - tArrow0;
+
+          const prepPipe = await managed.db.preparePipeline([
+            { kind: 'query', sql: 'SELECT ID, SCORE FROM FB_CLI_BENCH$ WHERE ID = ?' },
+            { kind: 'queryColumnar', sql: 'SELECT ID, SCORE FROM FB_CLI_BENCH$ WHERE ID <= ?' },
+          ] as const);
+          const tPipe0 = performance.now();
+          try {
+            await prepPipe.run([[1], [Math.min(20, rowCount)]]);
+          } finally {
+            await prepPipe.close();
+          }
+          const prepPipeMs = performance.now() - tPipe0;
+
+          await managed.db.execute('DROP TABLE FB_CLI_BENCH$');
+
+          const metrics = [
+            {
+              WORKLOAD: 'insertMany (IBatch)',
+              ROWS: rowCount,
+              MS: Number(insertMs.toFixed(2)),
+              ROWS_PER_SEC: Math.round((rowCount / Math.max(0.05, insertMs)) * 1000),
+            },
+            {
+              WORKLOAD: 'query (JS objects)',
+              ROWS: rowRes.rows.length,
+              MS: Number(rowQueryMs.toFixed(2)),
+              ROWS_PER_SEC: Math.round((rowRes.rows.length / Math.max(0.05, rowQueryMs)) * 1000),
+            },
+            {
+              WORKLOAD: 'queryColumnar (TypedArrays)',
+              ROWS: colRes.rowCount,
+              MS: Number(colQueryMs.toFixed(2)),
+              ROWS_PER_SEC: Math.round((colRes.rowCount / Math.max(0.05, colQueryMs)) * 1000),
+            },
+            {
+              WORKLOAD: 'queryArrowStream (IPC V5)',
+              ROWS: decodedArrow.rowCount,
+              MS: Number(arrowStreamMs.toFixed(2)),
+              ROWS_PER_SEC: Math.round((decodedArrow.rowCount / Math.max(0.05, arrowStreamMs)) * 1000),
+            },
+            {
+              WORKLOAD: 'preparePipeline (stmtHandle)',
+              ROWS: Math.min(20, rowCount) + 1,
+              MS: Number(prepPipeMs.toFixed(2)),
+              ROWS_PER_SEC: Math.round(((Math.min(20, rowCount) + 1) / Math.max(0.05, prepPipeMs)) * 1000),
+            },
+          ];
+
+          if (format === 'json') {
+            out(`${JSON.stringify({ uri, rows: rowCount, benchmarks: metrics }, null, 2)}\n`);
+          } else {
+            out(
+              formatCliTable(
+                [{ name: 'WORKLOAD' }, { name: 'ROWS' }, { name: 'MS' }, { name: 'ROWS_PER_SEC' }],
+                metrics,
+              ),
+            );
+          }
+        } finally {
+          await managed.flushAndClose(false);
         }
         return 0;
       }

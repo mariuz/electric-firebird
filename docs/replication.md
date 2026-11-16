@@ -797,7 +797,8 @@ await poller.pollOnce(); // or poller.start(100)
 | Export | Description |
 |---|---|
 | `bootstrapReplica(options)` | Seeds or re-seeds a replica from a `'logical'`, `'binary-image'` (`.fdb` byte stream + optional gzip), or `'page-diff'` (`exportDiff` / `applyDiff`) `PublicationSnapshot`. |
-| `createObjectStoreReplicationTarget(options)` | Continuous WAL / base-backup shipping target to S3, Cloudflare R2, or any HTTP object store (`shipBaseBackup()`, `shipPendingWal()`, `pullNewSegments()`, `restorePointInTime()`). |
+| `createReplicaRouter(options)` / `isReadOnlySqlStatement(sql)` | Read/write splitting `FirebirdDatabase` router routing writes to `primary` and load-balancing reads across `replicas` with causal `'read-your-writes'` `sessionMinLsn` fencing, `'bounded-staleness'`, and optional automatic failover promotion. |
+| `createObjectStoreReplicationTarget(options)` | Continuous WAL / base-backup shipping target to S3, Cloudflare R2, or HTTP object storage (`createCheckpoint()`, `shipWalOnce()`, `checkpointEverySegments`, `pruneArchivedSegments()`, `followInto()`). |
 | `restoreDatabaseToPointInTime(db, store, options?)` | Restores a database to a target `targetLsn`, `targetTimestamp`, or `targetHlc` from an object-store base backup + WAL manifest. |
 | `createHttpObjectStoreAdapter(options)` / `signAwsSigV4Headers(options)` | Zero-dependency HTTP / S3 / R2 object-store adapter with WebCrypto `AWS4-HMAC-SHA256` request signing (`buildS3ObjectUrl`, `createMemoryObjectStoreAdapter`). |
 | `needsBootstrap(pub, sub)` | Checks whether a replica is uninitialized (`watermark === 0`) or behind `pub.minRetainedLsn()`. |

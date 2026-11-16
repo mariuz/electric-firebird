@@ -88,14 +88,29 @@ import {
 import type { ColumnarQueryResult } from '../columnar';
 import type { TypedSqlFragment } from '../schema-validation';
 import {
-  buildEnginePipelineRequests,
-  decodeEnginePipelineResponses,
+  createBrowserPreparedPipeline,
+  executeBrowserPipeline,
   executePipelineFallback,
-  normalizePipelineOperations,
+  type BrowserPipelineDriverHost,
   type PipelineOperation,
   type PipelineOptions,
   type PipelineResults,
+  type PreparedPipeline,
+  type PreparedPipelineStepTemplate,
 } from '../pipeline';
+import {
+  createArrowIpcReadableStream,
+  createColumnarStreamFromRowStream,
+  resolveColumnarStreamArgs,
+  streamBinaryColumnarCursor,
+  type ArrowStreamOptions,
+  type ColumnarStreamOptions,
+} from '../columnar-stream';
+import {
+  createTableRepository,
+  type TableOptions,
+  type TableRepository,
+} from '../table-api';
 import {
   createLiveColumnarQuery,
   createLiveIncrementalQuery,
@@ -987,71 +1002,68 @@ export class FirebirdBrowser implements FirebirdDatabase {
     return { affectedRows };
   }
 
-  /**
-   * Execute multiple heterogeneous `query`, `queryColumnar`, `queryArrow`,
-   * `execute`, and `execBatch` operations in a single cross-worker round-trip
-   * (`M20 Item 2`).
-   */
+  private createPipelineDriverHost(): BrowserPipelineDriverHost {
+    return {
+      dbHandle: this.dbHandle,
+      packWireParams:
+        Boolean(this.engine.acceptsWireParams) || this.engine instanceof WorkerTransport,
+      shapeCache: this.columnarShapeCache,
+      serialize: (p) => this.serialize(p),
+      applyTypes: (res, rm) => applyTypes(res, this.options.types, rm),
+      prepareHandle:
+        typeof this.engine.prepare === 'function'
+          ? async (s) => (await this.engine.prepare!(this.dbHandle, 0, s)).handle
+          : undefined,
+      closeHandle:
+        typeof this.engine.stmtClose === 'function'
+          ? (h) => this.engine.stmtClose!(h)
+          : undefined,
+      runEnginePipeline:
+        typeof this.engine.pipeline === 'function'
+          ? (reqs, opts) => this.engine.pipeline!(this.dbHandle, 0, reqs, opts)
+          : undefined,
+      runFallback: (steps, txOpt) =>
+        txOpt
+          ? this.transaction(
+              (tx) => executePipelineFallback(steps, tx),
+              typeof txOpt === 'object' ? txOpt : {},
+            )
+          : executePipelineFallback(steps, this),
+      onMutatedSql: (sqls) => {
+        this.markDirty();
+        const mutated = new Set<string>();
+        for (const s of sqls) {
+          for (const tbl of extractMutatedTables(s)) mutated.add(tbl);
+        }
+        if (mutated.size > 0) this.liveBridge.broadcastTables([...mutated]);
+      },
+      assertNotAborted,
+    };
+  }
+
   async pipeline<const TOps extends readonly PipelineOperation[]>(
     ops: TOps,
     options: PipelineOptions = {},
   ): Promise<PipelineResults<TOps>> {
-    assertNotAborted(options.signal);
-    if (ops.length === 0) {
-      return [] as unknown as PipelineResults<TOps>;
-    }
     await this.ensureReady();
-    const steps = normalizePipelineOperations(ops, (p) => this.serialize(p));
+    return executeBrowserPipeline(this.createPipelineDriverHost(), ops, options);
+  }
 
-    let results: unknown[];
-    if (typeof this.engine.pipeline === 'function') {
-      const { requests } = buildEnginePipelineRequests(
-        steps,
-        Boolean(this.engine.acceptsWireParams) || this.engine instanceof WorkerTransport,
-      );
-      const responses = await this.engine.pipeline(
-        this.dbHandle,
-        0,
-        requests,
-        { transaction: options.transaction },
-      );
-      results = await decodeEnginePipelineResponses(
-        steps,
-        responses,
-        this.columnarShapeCache,
-        (res, rm) => applyTypes(res, this.options.types, rm),
-      );
-    } else if (options.transaction) {
-      const txOpts =
-        typeof options.transaction === 'object' ? options.transaction : {};
-      results = await this.transaction(
-        (tx) => executePipelineFallback(steps, tx),
-        txOpts,
-      );
-    } else {
-      results = await executePipelineFallback(steps, this);
-    }
+  async preparePipeline<
+    const TTemplates extends readonly PreparedPipelineStepTemplate[],
+  >(templates: TTemplates): Promise<PreparedPipeline<TTemplates>> {
+    await this.ensureReady();
+    return createBrowserPreparedPipeline(this.createPipelineDriverHost(), templates);
+  }
 
-    assertNotAborted(options.signal);
-
-    const mutated = new Set<string>();
-    let hasMutation = false;
-    for (const s of steps) {
-      if (s.clientKind === 'execute' || s.clientKind === 'execBatch') {
-        hasMutation = true;
-        for (const tbl of extractMutatedTables(s.sql)) {
-          mutated.add(tbl);
-        }
-      }
-    }
-    if (hasMutation) {
-      this.markDirty();
-      if (mutated.size > 0) {
-        this.liveBridge.broadcastTables([...mutated]);
-      }
-    }
-
-    return results as PipelineResults<TOps>;
+  /**
+   * Create a zero-boilerplate typed CRUD & upsert repository for `tableName` (`M21 Item 3`).
+   */
+  table<T extends Row = Row, K = unknown>(
+    tableName: string,
+    options?: TableOptions<T>,
+  ): TableRepository<T, K> {
+    return createTableRepository<T, K>(this, tableName, options);
   }
 
   /**
@@ -1335,6 +1347,70 @@ export class FirebirdBrowser implements FirebirdDatabase {
     );
     return executeArrowFromColumnar(
       () => this.queryColumnar(statement.sql, statement.params, options),
+      options,
+    );
+  }
+
+  /**
+   * Stream typed `ColumnarQueryResult` chunks directly from WASM `"FBR\x01"` cursor
+   * batches in bounded `O(batchSize)` memory (`M21 Item 2`).
+   */
+  queryColumnarStream(
+    sql: string | SqlFragment,
+    paramsOrOptions?: QueryParams | ColumnarStreamOptions,
+    maybeOptions?: ColumnarStreamOptions,
+  ): AsyncIterableIterator<ColumnarQueryResult> {
+    const { params, options } = resolveColumnarStreamArgs(paramsOrOptions, maybeOptions);
+    const statement = toStatement(sql, params ?? []);
+    const batchSize = Math.max(1, Math.floor(options?.batchSize ?? 1024));
+
+    if (
+      typeof this.engine.cursorOpen === 'function' &&
+      typeof this.engine.cursorFetchBinary === 'function' &&
+      typeof this.engine.cursorClose === 'function' &&
+      !this.udr.hasBridgeRoutines
+    ) {
+      return streamBinaryColumnarCursor({
+        ensureReady: () => this.ensureReady(),
+        openCursor: () =>
+          this.engine.cursorOpen!(
+            this.dbHandle,
+            0,
+            statement.sql,
+            this.serialize(statement.params),
+          ),
+        fetchBatch: async (h, sz) =>
+          decodePayloadColumnar(
+            await this.engine.cursorFetchBinary!(h, sz, true),
+            this.columnarShapeCache,
+          ),
+        closeCursor: (h) => this.engine.cursorClose!(h),
+        batchSize,
+        signal: options?.signal,
+      });
+    }
+
+    return createColumnarStreamFromRowStream(
+      (s, p, o) => this.queryStream<Row>(s, p ?? [], o),
+      sql,
+      paramsOrOptions,
+      maybeOptions,
+    );
+  }
+
+  /**
+   * Stream an **Apache Arrow IPC V5** byte stream (`Schema` + chunked `RecordBatch`es + `EOS`)
+   * in bounded `O(batchSize)` memory (`M21 Item 2`).
+   */
+  queryArrowStream(
+    sql: string | SqlFragment,
+    paramsOrOptions?: QueryParams | ArrowStreamOptions,
+    maybeOptions?: ArrowStreamOptions,
+  ): ReadableStream<Uint8Array> {
+    const { options } = resolveColumnarStreamArgs(paramsOrOptions, maybeOptions);
+    return createArrowIpcReadableStream(
+      () => this.queryColumnarStream(sql, paramsOrOptions, maybeOptions),
+      async () => (await this.describeQuery(sql)).fields,
       options,
     );
   }

@@ -1769,6 +1769,43 @@ Next-horizon improvements across **Replication**, **Speed & Performance**, **Int
 
 ---
 
+### M21 — Read/Write Replica Router & Causal Fencing, Streaming Columnar/Arrow Cursors & Prepared Pipelines, Typed `db.table<T>()` API, CLI Sync/WAL/Bench Commands & Transport/Changelog/REPL Decomposition
+
+- [x] **1. Read/Write Replica Router, Causal Read-Your-Writes Fencing & Object-Store Checkpoint Rotation (`createReplicaRouter`).**
+      Add `createReplicaRouter({ primary, replicas, consistency: 'read-your-writes' | 'bounded-staleness' | 'eventual', maxStalenessMs?, failover? })`
+      implementing `FirebirdDatabase` to route writes/DDL to `primary` and distribute reads
+      across healthy replicas with per-session causal `minLsn` fencing (automatic catch-up
+      or primary fallback) and optional replica failover promotion, plus automatic
+      checkpoint rotation (`checkpointEverySegments`) and superseded WAL pruning
+      (`pruneArchivedSegments`) in `createObjectStoreReplicationTarget`.
+- [x] **2. Streaming Columnar & Apache Arrow IPC Cursors (`db.queryColumnarStream()` / `db.queryArrowStream()`) & Prepared Pipelines (`db.preparePipeline()`).**
+      Add bounded-memory `db.queryColumnarStream(sql, params?, { batchSize? })`
+      (`AsyncIterable<ColumnarQueryResult>`) and `db.queryArrowStream(sql, params?, { batchSize? })`
+      (`ReadableStream<Uint8Array>` emitting an Arrow IPC V5 `Schema` header + chunked
+      `RecordBatch` frames + EOS marker, with multi-batch `decodeArrowIpc()` support), plus
+      `db.preparePipeline(templates)` pre-compiling reusable `stmtHandle` pipelines shipped
+      purely with `"FBP\x01"` / `"FBP\x02"` binary parameter frames.
+- [x] **3. Zero-Boilerplate Typed Table & Upsert API (`db.table<T>()`).**
+      Add `db.table<T>(name, { primaryKey?, schema? })` (and `tx.table<T>(...)`) across
+      `FirebirdBrowser`, `FirebirdLite`, and `ReplicaRouter` providing fluent typed
+      `get`, `findOne`, `findMany`, keyset-paginated `findPage`, `count`, `exists`,
+      `insert`, `insertMany` (`IBatch`), `upsert` / `upsertMany`
+      (`UPDATE OR INSERT ... MATCHING`), `update`, `updateWhere`, `delete`, `deleteWhere`,
+      `live`, and `liveIncremental` with Standard Schema v1 validation.
+- [x] **4. CLI Replication, Object-Store WAL & Benchmark Commands (`npx firebird-wasm sync | wal-ship | pitr-restore | bench`).**
+      Extend `firebird-wasm/cli` with `sync` (one-shot or `--watch` continuous sync with
+      `--mode` and `--bootstrap`), `wal-ship` & `pitr-restore` (supporting local directory
+      object stores as well as S3/R2/HTTP endpoints), and `bench` (reporting row, columnar,
+      Arrow IPC, `IBatch`, and `preparePipeline` throughput).
+- [x] **5. Transport, Native Changelog & REPL Monolith Decomposition.**
+      Split `src/browser/engine-transport.ts` (`wasm-abi-types.ts`, `result-decoder.ts`,
+      `engine-transport.ts`), `src/replication/native-changelog.ts` (`jrd-record-codec.ts`,
+      `changelog-parser.ts`, `changelog-encoder.ts`, `native-changelog.ts`), and
+      `src/repl/index.ts` (`repl-styles.ts`, `repl-inspectors.ts`, `repl/index.ts`) into
+      clean, single-responsibility modules with 100% export parity.
+
+---
+
 ## 5. Test coverage added alongside this review
 
 `src/browser/` was excluded from Jest and had no browser tests.  It now has 73

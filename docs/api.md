@@ -1611,6 +1611,10 @@ Zero-dependency developer CLI (`bin`: `firebird-wasm`, programmatic `runCli(argv
 - `npx firebird-wasm migrate <uri> --dir <dir> [--down] [--target <version>]`
 - `npx firebird-wasm dump <uri> --out <file> [--gzip]` & `restore <uri> --in <file> [--gzip]`
 - `npx firebird-wasm inspect-changelog <segment-file> [--json]`
+- `npx firebird-wasm sync <source-uri> <target-uri> [--mode auto|native|logical] [--bootstrap binary-image|page-diff|logical] [--json]`
+- `npx firebird-wasm wal-ship <source-uri> (--dir <dir> | --url <url>) [--checkpoint] [--prune] [--key <passphrase>]`
+- `npx firebird-wasm pitr-restore <target-uri> (--dir <dir> | --url <url>) [--lsn <n> | --timestamp <iso>] [--key <passphrase>]`
+- `npx firebird-wasm bench [uri] [--rows <n>] [--json]`
 
 ### `db.pipeline()` & `"FBP\x01"` / `"FBP\x02"` Binary Parameter Wire Frames
 
@@ -1634,3 +1638,15 @@ const [inserted, batched, rowsRes, colRes, arrowBytes] = await db.pipeline(
 - `db.liveIncremental<T>(sql, params?, { key, table? })`: Emits `{ rows, deltas }` (`'insert' | 'update' | 'delete'`) with structural row-reference sharing (`prevRow === nextRow` for unchanged rows) and supports direct $O(k)$ replication log patching via `handle.applyChanges(entries)`.
 - `db.liveColumnar(sql, params?, options?)`: Reactive `ColumnarQueryResult` subscription backed by `"FBR\x01"` typed-array vectors.
 - Framework hooks in `firebird-wasm/react`, `/vue`, `/svelte`, and `/solid`: `useSyncStatus` / `createSyncStatus`, `useColumnarQuery` / `createColumnarQuery`, and `useLiveIncrementalQuery` / `createLiveIncrementalQuery`.
+
+### `db.queryColumnarStream()`, `db.queryArrowStream()` & `db.preparePipeline()`
+
+- `db.queryColumnarStream(sql, params?, { batchSize? })`: Bounded-memory `AsyncIterable<ColumnarQueryResult>` decoding WASM `"FBR\x01"` cursor chunks directly into typed arrays.
+- `db.queryArrowStream(sql, params?, { batchSize?, metadata? })`: Web Streams `ReadableStream<Uint8Array>` emitting an Apache Arrow IPC V5 `Schema` message, chunked `RecordBatch` frames, and EOS marker (`decodeArrowIpcBatches` / `decodeArrowIpc`).
+- `db.preparePipeline(templates)`: Pre-compiles multi-statement `stmtHandle`s once so repeated `prep.run(stepInputs, { transaction? })` calls send zero SQL text across Worker boundaries.
+
+### `db.table<T>(name, { primaryKey?, schema? })` — Typed CRUD, Upsert & Keyset Pagination
+
+Zero-boilerplate repository on `FirebirdDatabase`, `FirebirdTransactionClient`, and `ReplicaRouter`:
+- `get(key)`, `findOne(opts?)`, `findMany(opts?)`, `findPage({ where, orderBy, limit, cursor })`, `count(where?)`, `exists(keyOrWhere)`
+- `insert(row)`, `insertMany(rows)` (`IBatch`), `upsert(row)` / `upsertMany(rows)` (`UPDATE OR INSERT ... MATCHING`), `update(key, patch)`, `updateWhere`, `delete`, `deleteWhere`, and `liveIncremental()`.
