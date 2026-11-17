@@ -268,4 +268,22 @@ test.describe('Replication Simulator v2 (replication.html)', () => {
     await expect(page.locator('#event-feed')).toContainText('TenantIsolationError');
     await expect(page.locator('#event-feed')).toContainText('403');
   });
+
+  test('Scenario 17: WebCrypto JWT Claims + bootstrapStrategy: "arrow-ipc" & Durable Outbox Rebase', async ({
+    page,
+  }) => {
+    await openReplicationSim(page);
+
+    await page.locator('.scenario-card[data-scenario="jwt-arrow-outbox"]').click();
+
+    await expect(page.locator('#primary-rows')).toContainText('JWT Arrow Outbox Task #4');
+    await expect(page.locator('#replica-rows')).toContainText('JWT Arrow Outbox Task #5');
+    await expect(page.locator('#code-inspector')).toContainText('signSyncJwt');
+    await expect(page.locator('#code-inspector')).toContainText('createJwtTenantAuthResolver');
+    await expect(page.locator('#event-feed')).toContainText('Scenario 17');
+    await expect(page.locator('#event-feed')).toContainText('JWT_ROLE_FORBIDDEN');
+    await expect(page.locator('#event-feed')).toContainText('FBARSNAP');
+    await expect(page.locator('#event-feed')).toContainText('FB_OPTIMISTIC_OUTBOX$');
+    await expect(page.locator('#event-feed')).toContainText('db.registerVirtualTable');
+  });
 });

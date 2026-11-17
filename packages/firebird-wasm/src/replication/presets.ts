@@ -10,6 +10,7 @@ import { ensureAsyncDisposeSymbol } from '../database-core';
 ensureAsyncDisposeSymbol();
 import type { StandardSchemaV1 } from '../schema-validation';
 import type {
+  BootstrapStrategy,
   CreateSubscriptionOptions,
   PublishedTableConfig,
   ReplicableDatabase,
@@ -114,7 +115,7 @@ export interface SyncDatabasesOptions {
    *
    * @default 'logical'
    */
-  bootstrapStrategy?: 'logical' | 'binary-image' | 'page-diff';
+  bootstrapStrategy?: BootstrapStrategy;
   /** Whether to gzip-compress `'binary-image'` snapshots during bootstrap (`M20 Item 1`). @default false */
   bootstrapCompressGzip?: boolean;
   /** Optional base `.fdb` image when `bootstrapStrategy === 'page-diff'` (`M20 Item 1`). */
@@ -261,7 +262,7 @@ export async function syncDatabases(
     direction,
     installTriggers,
     autoPrune: options.autoPrune,
-    autoBootstrap: doBootstrap,
+    autoBootstrap: doBootstrap && !options.bootstrapStrategy,
     onConflict: options.onConflict,
     onConflictResolved: options.onConflictResolved,
     indexHooks: options.indexHooks,

@@ -29,6 +29,7 @@ import {
   type ColumnarQueryResult,
 } from '../columnar';
 import type { SyncHandleLike } from '../frameworks/sync-store';
+import type { OptimisticMutationStore, OptimisticStoreSnapshot } from '../optimistic-store';
 import { el } from './repl-styles';
 import type {
   ReplArrowInspectorInfo,
@@ -590,6 +591,67 @@ export function renderPlanExplorerPanel(lastPlans: ReadonlyArray<{ sql: string; 
       return panel;
     }
 
+function renderOutboxInspectorPanel(
+  snap: OptimisticStoreSnapshot | null,
+  onFlush?: () => void,
+  onRevert?: (id: string) => void,
+  onRevertAll?: () => void,
+): HTMLElement {
+  const panel = el('div', 'inspector-outbox');
+  if (!snap) {
+    const empty = el('p', 'inspector-empty');
+    empty.textContent = 'No optimisticStore attached to <firebird-repl>.';
+    panel.append(empty);
+    return panel;
+  }
+
+  const summaryEl = el('p', 'inspector-summary');
+  summaryEl.textContent =
+    `${snap.pendingCount} pending · ${snap.confirmedCount} confirmed · ` +
+    `${snap.revertedCount} reverted · ${snap.rebasedCount} rebased`;
+  panel.append(summaryEl);
+
+  const actionsBar = el('div', 'schema-sub');
+  const flushBtn = document.createElement('button');
+  flushBtn.type = 'button';
+  flushBtn.className = 'schema-query-btn outbox-flush-btn';
+  flushBtn.textContent = snap.flushing ? 'Flushing…' : 'Flush Outbox';
+  flushBtn.disabled = snap.pendingCount === 0 || snap.flushing;
+  flushBtn.addEventListener('click', () => onFlush?.());
+
+  const revertAllBtn = document.createElement('button');
+  revertAllBtn.type = 'button';
+  revertAllBtn.className = 'schema-query-btn outbox-revert-all-btn';
+  revertAllBtn.textContent = 'Revert All';
+  revertAllBtn.disabled = snap.pendingCount === 0 || snap.flushing;
+  revertAllBtn.addEventListener('click', () => onRevertAll?.());
+  actionsBar.append(flushBtn, revertAllBtn);
+  panel.append(actionsBar);
+
+  if (snap.pending.length === 0) {
+    const clean = el('p', 'inspector-empty');
+    clean.textContent = 'Outbox is clean (0 pending optimistic mutations).';
+    panel.append(clean);
+    return panel;
+  }
+
+  const list = el('ul', 'schema-list outbox-list');
+  for (const item of snap.pending) {
+    const li = el('li', 'schema-meta-item outbox-item');
+    const txt = document.createElement('span');
+    txt.textContent = `${item.id} · ${item.operation} ${item.tableName} (${JSON.stringify(item.keyValue)}) [${item.status}] `;
+    const revBtn = document.createElement('button');
+    revBtn.type = 'button';
+    revBtn.className = 'schema-query-btn outbox-revert-btn';
+    revBtn.textContent = 'Revert';
+    revBtn.addEventListener('click', () => onRevert?.(item.id));
+    li.append(txt, revBtn);
+    list.append(li);
+  }
+  panel.append(list);
+  return panel;
+}
+
 export interface ReplInspectorRenderContext {
   readonly db: ReplDatabase | null;
   readonly inspectorBody: HTMLDivElement;
@@ -601,9 +663,13 @@ export interface ReplInspectorRenderContext {
   readonly lastPlans: ReadonlyArray<{ sql: string; parsed: ParsedQueryPlan }>;
   readonly lastReplication: ReplReplicationInfo | null;
   readonly lastArrow: ReplArrowInspectorInfo | null;
+  readonly optimisticStore?: OptimisticMutationStore | null;
   readonly onResetProfiler: () => void;
   readonly onExportArrow?: () => void;
   readonly onImportArrowFile?: (fileName: string, bytes: Uint8Array) => void;
+  readonly onFlushOutbox?: () => void;
+  readonly onRevertMutation?: (id: string) => void;
+  readonly onRevertAllOutbox?: () => void;
 }
 
 export function renderReplInspector(ctx: ReplInspectorRenderContext): void {
@@ -626,6 +692,18 @@ export function renderReplInspector(ctx: ReplInspectorRenderContext): void {
             ctx.lastArrow,
             ctx.onExportArrow,
             ctx.onImportArrowFile,
+          ),
+        );
+        return;
+      }
+
+      if (ctx.activeTab === 'outbox') {
+        ctx.inspectorBody.append(
+          renderOutboxInspectorPanel(
+            ctx.optimisticStore ? ctx.optimisticStore.getSnapshot() : null,
+            ctx.onFlushOutbox,
+            ctx.onRevertMutation,
+            ctx.onRevertAllOutbox,
           ),
         );
         return;

@@ -1,6 +1,7 @@
 /**
  * optimistic-store.ts – Optimistic Local-First Mutation Queue with Automatic
- * Pre-Image Capture, Inverse-Row Rollback & Reactive Table Store (`M22 Item 3`).
+ * Pre-Image Capture, Crash-Safe Durable Outbox (`FB_OPTIMISTIC_OUTBOX$`),
+ * Field-Level Offline Rebase & Reactive Table Store (`M22 Item 3` / `M23 Item 2`).
  */
 
 import type { QueryParams, QueryResult, Row } from './types';
@@ -17,15 +18,22 @@ import {
   type IncrementalQueryableDatabase,
 } from './frameworks/sync-store';
 import type { LiveRowDelta } from './live-incremental';
+import type { ReplicationLogEntry } from './replication/types';
+
+export const DEFAULT_OPTIMISTIC_OUTBOX_TABLE = 'FB_OPTIMISTIC_OUTBOX$';
 
 export type OptimisticOperation = 'INSERT' | 'UPDATE' | 'UPSERT' | 'DELETE';
+export type OptimisticConflictStrategy = 'revert' | 'rebase-fields';
 
 export interface PendingOptimisticMutation {
   readonly id: string;
+  readonly seqNo?: number;
   readonly tableName: string;
   readonly primaryKey: readonly string[];
   readonly operation: OptimisticOperation;
   readonly keyValue: unknown;
+  /** Explicit column subset modified by this mutation (`null` for `DELETE`). */
+  readonly patchColumns?: Record<string, unknown> | null;
   /** Row state before this optimistic mutation (`null` if row did not exist before). */
   readonly beforeRow: Row | null;
   /** Row state written optimistically (`null` for `DELETE`). */
@@ -38,9 +46,11 @@ export interface PendingOptimisticMutation {
 export interface OptimisticStoreSnapshot {
   readonly pendingCount: number;
   readonly flushing: boolean;
+  readonly hydrated: boolean;
   readonly pending: readonly PendingOptimisticMutation[];
   readonly confirmedCount: number;
   readonly revertedCount: number;
+  readonly rebasedCount: number;
   readonly lastError: Error | undefined;
 }
 
@@ -62,6 +72,17 @@ export interface OptimisticMutationStoreOptions {
    * @default false
    */
   autoFlush?: boolean;
+  /**
+   * Persist pending optimistic mutations and rollback pre-images in
+   * `FB_OPTIMISTIC_OUTBOX$` so pending state survives page reloads / restarts (`M23 Item 2`).
+   *
+   * @default false
+   */
+  persist?: boolean;
+  /** Custom outbox table name when `persist: true`. @default 'FB_OPTIMISTIC_OUTBOX$' */
+  outboxTable?: string;
+  /** Default conflict resolution strategy used by `rebase(remoteEntries)` (`M23 Item 2`). @default 'rebase-fields' */
+  conflictStrategy?: OptimisticConflictStrategy;
   /** Callback invoked whenever a mutation fails remote sync and is rolled back locally. */
   onMutationFailed?: (mutation: PendingOptimisticMutation, error: Error) => void;
 }
@@ -70,6 +91,11 @@ export interface OptimisticFlushResult {
   readonly confirmed: number;
   readonly reverted: number;
   readonly errors: readonly Error[];
+}
+
+export interface OptimisticRebaseResult {
+  readonly rebased: number;
+  readonly reverted: number;
 }
 
 export interface OptimisticTableActions<T extends Row = Row, K = unknown> {
@@ -90,6 +116,13 @@ export interface OptimisticTableActions<T extends Row = Row, K = unknown> {
 export interface OptimisticMutationStore {
   readonly subscribe: (listener: () => void) => () => void;
   readonly getSnapshot: () => OptimisticStoreSnapshot;
+  /** Hydrate any crash/reload-persisted pending mutations from `FB_OPTIMISTIC_OUTBOX$` (`M23 Item 2`). */
+  hydrate(): Promise<readonly PendingOptimisticMutation[]>;
+  /** Rebase pending optimistic mutations on top of incoming remote `ReplicationLogEntry[]` (`M23 Item 2`). */
+  rebase(
+    remoteEntries: readonly ReplicationLogEntry[],
+    options?: { strategy?: OptimisticConflictStrategy },
+  ): Promise<OptimisticRebaseResult>;
   insert<T extends Row = Row>(
     tableName: string,
     row: Partial<T> & Record<string, unknown>,
@@ -133,6 +166,16 @@ function normalizePkList(pk?: string | readonly string[]): string[] {
   return pk.length > 0 ? pk.map((c) => String(c).toUpperCase()) : ['ID'];
 }
 
+function normalizeUpperRecord(rec: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(rec)) {
+    if (v !== undefined) {
+      out[k.toUpperCase()] = v;
+    }
+  }
+  return out;
+}
+
 function getFieldCI(row: Record<string, unknown>, col: string): unknown {
   if (col in row) return row[col];
   const upper = col.toUpperCase();
@@ -156,28 +199,77 @@ function extractKeyFromRow(row: Record<string, unknown>, pkCols: readonly string
   return obj;
 }
 
+function canonicalizeRowKey(keyVal: unknown, pkCols: readonly string[]): string {
+  if (pkCols.length === 1) {
+    if (keyVal && typeof keyVal === 'object' && !Array.isArray(keyVal)) {
+      return JSON.stringify([String(getFieldCI(keyVal as Record<string, unknown>, pkCols[0]!))]);
+    }
+    return JSON.stringify([String(keyVal)]);
+  }
+  const rec =
+    keyVal && typeof keyVal === 'object' ? (keyVal as Record<string, unknown>) : {};
+  return JSON.stringify(pkCols.map((c) => String(getFieldCI(rec, c))));
+}
+
+function valuesEqualLoose(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true;
+  if (a === null || a === undefined || b === null || b === undefined) {
+    return (a ?? null) === (b ?? null);
+  }
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function safeJsonStringify(val: unknown): string | null {
+  if (val === null || val === undefined) return null;
+  return JSON.stringify(val, (_k, v) => (typeof v === 'bigint' ? v.toString() : v));
+}
+
+function safeJsonParse<T>(raw: unknown): T | null {
+  if (raw === null || raw === undefined || raw === '') return null;
+  if (typeof raw !== 'string') return raw as T;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Create an optimistic local-first mutation store backed by a Firebird database
- * (`FirebirdBrowser`, `FirebirdLite`, or `ReplicaRouter`) (`M22 Item 3`).
+ * (`FirebirdBrowser`, `FirebirdLite`, or `ReplicaRouter`) (`M22 Item 3` / `M23 Item 2`).
  */
 export function createOptimisticMutationStore(
   db: TableExecutionHost & { notify?(name: string): Promise<void> },
   options: OptimisticMutationStoreOptions = {},
 ): OptimisticMutationStore {
   const listeners = new Set<() => void>();
+  const persistEnabled = options.persist === true;
+  const outboxTable = (options.outboxTable ?? DEFAULT_OPTIMISTIC_OUTBOX_TABLE)
+    .trim()
+    .toUpperCase();
+  const quotedOutbox = quoteTableIdent(outboxTable);
+  const defaultConflictStrategy: OptimisticConflictStrategy =
+    options.conflictStrategy ?? 'rebase-fields';
+
   let nextSeq = 1;
   let pendingList: PendingOptimisticMutation[] = [];
   let flushing = false;
+  let hydrated = !persistEnabled;
+  let outboxDdlEnsured = false;
+  let hydratePromise: Promise<readonly PendingOptimisticMutation[]> | null = null;
   let confirmedCount = 0;
   let revertedCount = 0;
+  let rebasedCount = 0;
   let lastError: Error | undefined = undefined;
 
   let snapshot: OptimisticStoreSnapshot = {
     pendingCount: 0,
     flushing: false,
+    hydrated,
     pending: [],
     confirmedCount: 0,
     revertedCount: 0,
+    rebasedCount: 0,
     lastError: undefined,
   };
 
@@ -185,14 +277,90 @@ export function createOptimisticMutationStore(
     snapshot = {
       pendingCount: pendingList.length,
       flushing,
+      hydrated,
       pending: [...pendingList],
       confirmedCount,
       revertedCount,
+      rebasedCount,
       lastError,
     };
     for (const cb of [...listeners]) {
       cb();
     }
+  };
+
+  const ensureOutboxTable = async (): Promise<void> => {
+    if (!persistEnabled || outboxDdlEnsured) return;
+    try {
+      const check = await db.query<Row>(
+        `SELECT 1 AS OK FROM RDB$RELATIONS WHERE TRIM(RDB$RELATION_NAME) = ?`,
+        [outboxTable],
+      );
+      if (check.rows.length > 0) {
+        outboxDdlEnsured = true;
+        return;
+      }
+    } catch {
+      // Proceed to CREATE TABLE attempt
+    }
+    try {
+      await db.execute(
+        `CREATE TABLE ${quotedOutbox} (
+          "SEQ_NO" BIGINT NOT NULL PRIMARY KEY,
+          "MUTATION_ID" VARCHAR(96) NOT NULL,
+          "TABLE_NAME" VARCHAR(128) NOT NULL,
+          "OP_KIND" VARCHAR(16) NOT NULL,
+          "PK_COLS_JSON" BLOB SUB_TYPE TEXT,
+          "KEY_JSON" BLOB SUB_TYPE TEXT,
+          "PATCH_JSON" BLOB SUB_TYPE TEXT,
+          "BEFORE_JSON" BLOB SUB_TYPE TEXT,
+          "AFTER_JSON" BLOB SUB_TYPE TEXT,
+          "CREATED_AT" BIGINT NOT NULL
+        )`,
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!/already exists|unsuccessful metadata update/i.test(msg)) {
+        throw err;
+      }
+    }
+    outboxDdlEnsured = true;
+  };
+
+  const persistMutationRow = async (m: PendingOptimisticMutation): Promise<void> => {
+    if (!persistEnabled) return;
+    await ensureOutboxTable();
+    await db.execute(
+      `UPDATE OR INSERT INTO ${quotedOutbox} (
+        "SEQ_NO", "MUTATION_ID", "TABLE_NAME", "OP_KIND",
+        "PK_COLS_JSON", "KEY_JSON", "PATCH_JSON", "BEFORE_JSON", "AFTER_JSON", "CREATED_AT"
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) MATCHING ("SEQ_NO")`,
+      [
+        m.seqNo ?? nextSeq++,
+        m.id,
+        m.tableName,
+        m.operation,
+        JSON.stringify(m.primaryKey),
+        safeJsonStringify({ v: m.keyValue }),
+        safeJsonStringify(m.patchColumns ?? null),
+        safeJsonStringify(m.beforeRow),
+        safeJsonStringify(m.afterRow),
+        m.createdAt,
+      ],
+    );
+  };
+
+  const removePersistedMutations = async (ids: readonly string[]): Promise<void> => {
+    if (!persistEnabled || ids.length === 0) return;
+    await ensureOutboxTable();
+    for (const id of ids) {
+      await db.execute(`DELETE FROM ${quotedOutbox} WHERE "MUTATION_ID" = ?`, [id]);
+    }
+  };
+
+  const ensureHydrated = async (): Promise<void> => {
+    if (!persistEnabled || hydrated) return;
+    await store.hydrate();
   };
 
   const applyInverseMutation = async (m: PendingOptimisticMutation): Promise<void> => {
@@ -202,20 +370,12 @@ export function createOptimisticMutationStore(
     });
 
     if (m.beforeRow === null) {
-      // Row did not exist prior to INSERT / UPSERT -> DELETE it
       if (m.keyValue !== undefined && m.keyValue !== null) {
         await repo.delete(m.keyValue);
       }
       return;
     }
 
-    if (m.operation === 'DELETE') {
-      // Row was deleted -> re-insert its exact pre-mutation state
-      await repo.upsert(m.beforeRow as Record<string, unknown>, m.primaryKey);
-      return;
-    }
-
-    // Row existed before UPDATE / UPSERT -> restore all pre-mutation columns
     await repo.upsert(m.beforeRow as Record<string, unknown>, m.primaryKey);
   };
 
@@ -235,11 +395,189 @@ export function createOptimisticMutationStore(
 
     getSnapshot: () => snapshot,
 
+    async hydrate(): Promise<readonly PendingOptimisticMutation[]> {
+      if (!persistEnabled) {
+        hydrated = true;
+        return pendingList;
+      }
+      if (hydratePromise) {
+        return hydratePromise;
+      }
+      hydratePromise = (async () => {
+        await ensureOutboxTable();
+        const res = await db.query<Row>(
+          `SELECT "SEQ_NO", "MUTATION_ID", "TABLE_NAME", "OP_KIND", "PK_COLS_JSON", "KEY_JSON", "PATCH_JSON", "BEFORE_JSON", "AFTER_JSON", "CREATED_AT" FROM ${quotedOutbox} ORDER BY "SEQ_NO" ASC`,
+        );
+        const loaded: PendingOptimisticMutation[] = [];
+        let maxSeq = 0;
+        for (const r of res.rows) {
+          const seqNo = Number(getFieldCI(r, 'SEQ_NO') ?? 0);
+          if (seqNo > maxSeq) maxSeq = seqNo;
+          const id = String(getFieldCI(r, 'MUTATION_ID') ?? `opt_${seqNo}`);
+          const tableName = String(getFieldCI(r, 'TABLE_NAME') ?? '').toUpperCase();
+          const operation = String(
+            getFieldCI(r, 'OP_KIND') ?? 'UPDATE',
+          ).toUpperCase() as OptimisticOperation;
+          const pkCols = safeJsonParse<string[]>(getFieldCI(r, 'PK_COLS_JSON')) ?? ['ID'];
+          const keyWrap = safeJsonParse<{ v?: unknown }>(getFieldCI(r, 'KEY_JSON'));
+          const patchColumns = safeJsonParse<Record<string, unknown>>(
+            getFieldCI(r, 'PATCH_JSON'),
+          );
+          const beforeRow = safeJsonParse<Row>(getFieldCI(r, 'BEFORE_JSON'));
+          const afterRow = safeJsonParse<Row>(getFieldCI(r, 'AFTER_JSON'));
+          const createdAt = Number(getFieldCI(r, 'CREATED_AT') ?? Date.now());
+          loaded.push({
+            id,
+            seqNo,
+            tableName,
+            primaryKey: pkCols,
+            operation,
+            keyValue: keyWrap ? keyWrap.v : undefined,
+            patchColumns,
+            beforeRow,
+            afterRow,
+            createdAt,
+            status: 'pending',
+          });
+        }
+        nextSeq = Math.max(nextSeq, maxSeq + 1);
+        pendingList = loaded;
+        hydrated = true;
+        emit();
+        return pendingList;
+      })();
+
+      try {
+        return await hydratePromise;
+      } finally {
+        hydratePromise = null;
+      }
+    },
+
+    async rebase(
+      remoteEntries: readonly ReplicationLogEntry[],
+      rebaseOpts = {},
+    ): Promise<OptimisticRebaseResult> {
+      await ensureHydrated();
+      if (pendingList.length === 0 || remoteEntries.length === 0) {
+        return { rebased: 0, reverted: 0 };
+      }
+      const strategy = rebaseOpts.strategy ?? defaultConflictStrategy;
+      let rebased = 0;
+      let reverted = 0;
+
+      for (const entry of remoteEntries) {
+        if (entry.operation === 'DDL') continue;
+        const entryTable = entry.table.trim().toUpperCase();
+
+        const matchingIndices: number[] = [];
+        for (let i = 0; i < pendingList.length; i++) {
+          const m = pendingList[i]!;
+          if (m.tableName !== entryTable) continue;
+          const mKeyStr = canonicalizeRowKey(m.keyValue, m.primaryKey);
+          const eKeyStr = canonicalizeRowKey(entry.key, m.primaryKey);
+          if (mKeyStr === eKeyStr) {
+            matchingIndices.push(i);
+          }
+        }
+        if (matchingIndices.length === 0) continue;
+
+        if (strategy === 'revert' || entry.operation === 'DELETE' || !entry.after) {
+          const idsToRemove = matchingIndices.map((idx) => pendingList[idx]!.id);
+          const repo = createTableRepository<Row, unknown>(db, entryTable, {
+            primaryKey: pendingList[matchingIndices[0]!]!.primaryKey,
+            cacheStatements: false,
+          });
+          if (entry.operation === 'DELETE' || !entry.after) {
+            await repo.delete(pendingList[matchingIndices[0]!]!.keyValue);
+          } else {
+            await repo.upsert(
+              normalizeUpperRecord(entry.after as Record<string, unknown>),
+              pendingList[matchingIndices[0]!]!.primaryKey,
+            );
+          }
+          pendingList = pendingList.filter((m) => !idsToRemove.includes(m.id));
+          await removePersistedMutations(idsToRemove);
+          reverted += idsToRemove.length;
+          revertedCount += idsToRemove.length;
+          continue;
+        }
+
+        // Field-level rebase (`strategy === 'rebase-fields'`)
+        const remoteAfter = normalizeUpperRecord(entry.after as Record<string, unknown>);
+        const remoteBefore = entry.before
+          ? normalizeUpperRecord(entry.before as Record<string, unknown>)
+          : null;
+
+        const workingRow: Record<string, unknown> = { ...remoteAfter };
+        for (const idx of matchingIndices) {
+          const m = pendingList[idx]!;
+          if (m.operation === 'DELETE') {
+            // Remote updated a row we optimistically deleted -> update pre-image to remoteAfter
+            const updatedDelete: PendingOptimisticMutation = {
+              ...m,
+              beforeRow: { ...remoteAfter },
+            };
+            pendingList[idx] = updatedDelete;
+            await persistMutationRow(updatedDelete);
+            const repo = createTableRepository<Row, unknown>(db, entryTable, {
+              primaryKey: m.primaryKey,
+              cacheStatements: false,
+            });
+            await repo.delete(m.keyValue);
+            rebased += 1;
+            rebasedCount += 1;
+            continue;
+          }
+
+          const localPatch = m.patchColumns ?? normalizeUpperRecord((m.afterRow ?? {}) as Record<string, unknown>);
+          const pkSet = new Set(m.primaryKey.map((c) => c.toUpperCase()));
+          const survivingPatch: Record<string, unknown> = {};
+
+          for (const [col, localVal] of Object.entries(localPatch)) {
+            if (pkSet.has(col)) continue;
+            const remBeforeVal = remoteBefore ? getFieldCI(remoteBefore, col) : undefined;
+            const remAfterVal = getFieldCI(remoteAfter, col);
+            const remoteChangedCol =
+              remoteBefore !== null
+                ? !valuesEqualLoose(remBeforeVal, remAfterVal)
+                : false;
+            if (!remoteChangedCol) {
+              workingRow[col] = localVal;
+              survivingPatch[col] = localVal;
+            }
+          }
+
+          const updatedMut: PendingOptimisticMutation = {
+            ...m,
+            patchColumns: survivingPatch,
+            beforeRow: { ...remoteAfter },
+            afterRow: { ...workingRow },
+          };
+          pendingList[idx] = updatedMut;
+          await persistMutationRow(updatedMut);
+          rebased += 1;
+          rebasedCount += 1;
+        }
+
+        const pkCols = pendingList[matchingIndices[0]!]?.primaryKey ?? ['ID'];
+        const repo = createTableRepository<Row, unknown>(db, entryTable, {
+          primaryKey: pkCols,
+          cacheStatements: false,
+        });
+        await repo.upsert(workingRow, pkCols);
+      }
+
+      emit();
+      return { rebased, reverted };
+    },
+
     async insert<T extends Row = Row>(
       tableName: string,
       row: Partial<T> & Record<string, unknown>,
       opts: { primaryKey?: string | readonly string[] } = {},
     ): Promise<{ mutationId: string; row: T }> {
+      await ensureHydrated();
       const pkCols = normalizePkList(opts.primaryKey);
       const repo = createTableRepository<T, unknown>(db, tableName, {
         primaryKey: pkCols,
@@ -247,21 +585,23 @@ export function createOptimisticMutationStore(
       const inserted = await repo.insert(row);
       await repo.close();
       const keyVal = extractKeyFromRow(inserted as Record<string, unknown>, pkCols);
-      const mutationId = `opt_${nextSeq++}`;
-      pendingList = [
-        ...pendingList,
-        {
-          id: mutationId,
-          tableName: tableName.toUpperCase(),
-          primaryKey: pkCols,
-          operation: 'INSERT',
-          keyValue: keyVal,
-          beforeRow: null,
-          afterRow: inserted,
-          createdAt: Date.now(),
-          status: 'pending',
-        },
-      ];
+      const seqNo = nextSeq++;
+      const mutationId = `opt_${seqNo}`;
+      const entry: PendingOptimisticMutation = {
+        id: mutationId,
+        seqNo,
+        tableName: tableName.toUpperCase(),
+        primaryKey: pkCols,
+        operation: 'INSERT',
+        keyValue: keyVal,
+        patchColumns: normalizeUpperRecord(row),
+        beforeRow: null,
+        afterRow: inserted,
+        createdAt: Date.now(),
+        status: 'pending',
+      };
+      await persistMutationRow(entry);
+      pendingList = [...pendingList, entry];
       emit();
       maybeAutoFlush();
       return { mutationId, row: inserted };
@@ -273,6 +613,7 @@ export function createOptimisticMutationStore(
       patch: Partial<T> & Record<string, unknown>,
       opts: { primaryKey?: string | readonly string[] } = {},
     ): Promise<{ mutationId: string; affectedRows: number }> {
+      await ensureHydrated();
       const pkCols = normalizePkList(opts.primaryKey);
       const repo = createTableRepository<T, K>(db, tableName, {
         primaryKey: pkCols,
@@ -281,22 +622,24 @@ export function createOptimisticMutationStore(
       const res = await repo.update(key, patch);
       const afterRow = res.affectedRows > 0 ? await repo.get(key) : beforeRow;
       await repo.close();
-      const mutationId = `opt_${nextSeq++}`;
+      const seqNo = nextSeq++;
+      const mutationId = `opt_${seqNo}`;
       if (res.affectedRows > 0) {
-        pendingList = [
-          ...pendingList,
-          {
-            id: mutationId,
-            tableName: tableName.toUpperCase(),
-            primaryKey: pkCols,
-            operation: 'UPDATE',
-            keyValue: key,
-            beforeRow,
-            afterRow,
-            createdAt: Date.now(),
-            status: 'pending',
-          },
-        ];
+        const entry: PendingOptimisticMutation = {
+          id: mutationId,
+          seqNo,
+          tableName: tableName.toUpperCase(),
+          primaryKey: pkCols,
+          operation: 'UPDATE',
+          keyValue: key,
+          patchColumns: normalizeUpperRecord(patch),
+          beforeRow,
+          afterRow,
+          createdAt: Date.now(),
+          status: 'pending',
+        };
+        await persistMutationRow(entry);
+        pendingList = [...pendingList, entry];
         emit();
         maybeAutoFlush();
       }
@@ -311,6 +654,7 @@ export function createOptimisticMutationStore(
         matchingColumns?: readonly string[];
       } = {},
     ): Promise<{ mutationId: string; row: T }> {
+      await ensureHydrated();
       const pkCols = normalizePkList(opts.primaryKey);
       const repo = createTableRepository<T, unknown>(db, tableName, {
         primaryKey: pkCols,
@@ -323,21 +667,23 @@ export function createOptimisticMutationStore(
       const upserted = await repo.upsert(row, opts.matchingColumns);
       await repo.close();
       const finalKey = extractKeyFromRow(upserted as Record<string, unknown>, pkCols);
-      const mutationId = `opt_${nextSeq++}`;
-      pendingList = [
-        ...pendingList,
-        {
-          id: mutationId,
-          tableName: tableName.toUpperCase(),
-          primaryKey: pkCols,
-          operation: 'UPSERT',
-          keyValue: finalKey,
-          beforeRow,
-          afterRow: upserted,
-          createdAt: Date.now(),
-          status: 'pending',
-        },
-      ];
+      const seqNo = nextSeq++;
+      const mutationId = `opt_${seqNo}`;
+      const entry: PendingOptimisticMutation = {
+        id: mutationId,
+        seqNo,
+        tableName: tableName.toUpperCase(),
+        primaryKey: pkCols,
+        operation: 'UPSERT',
+        keyValue: finalKey,
+        patchColumns: normalizeUpperRecord(row),
+        beforeRow,
+        afterRow: upserted,
+        createdAt: Date.now(),
+        status: 'pending',
+      };
+      await persistMutationRow(entry);
+      pendingList = [...pendingList, entry];
       emit();
       maybeAutoFlush();
       return { mutationId, row: upserted };
@@ -348,6 +694,7 @@ export function createOptimisticMutationStore(
       key: K,
       opts: { primaryKey?: string | readonly string[] } = {},
     ): Promise<{ mutationId: string; affectedRows: number }> {
+      await ensureHydrated();
       const pkCols = normalizePkList(opts.primaryKey);
       const repo = createTableRepository<Row, K>(db, tableName, {
         primaryKey: pkCols,
@@ -355,22 +702,24 @@ export function createOptimisticMutationStore(
       const beforeRow = await repo.get(key);
       const res = await repo.delete(key);
       await repo.close();
-      const mutationId = `opt_${nextSeq++}`;
+      const seqNo = nextSeq++;
+      const mutationId = `opt_${seqNo}`;
       if (res.affectedRows > 0 && beforeRow) {
-        pendingList = [
-          ...pendingList,
-          {
-            id: mutationId,
-            tableName: tableName.toUpperCase(),
-            primaryKey: pkCols,
-            operation: 'DELETE',
-            keyValue: key,
-            beforeRow,
-            afterRow: null,
-            createdAt: Date.now(),
-            status: 'pending',
-          },
-        ];
+        const entry: PendingOptimisticMutation = {
+          id: mutationId,
+          seqNo,
+          tableName: tableName.toUpperCase(),
+          primaryKey: pkCols,
+          operation: 'DELETE',
+          keyValue: key,
+          patchColumns: null,
+          beforeRow,
+          afterRow: null,
+          createdAt: Date.now(),
+          status: 'pending',
+        };
+        await persistMutationRow(entry);
+        pendingList = [...pendingList, entry];
         emit();
         maybeAutoFlush();
       }
@@ -378,33 +727,36 @@ export function createOptimisticMutationStore(
     },
 
     async revert(mutationId: string): Promise<boolean> {
+      await ensureHydrated();
       const idx = pendingList.findIndex((m) => m.id === mutationId);
       if (idx < 0) return false;
       const target = pendingList[idx]!;
       pendingList = pendingList.filter((m) => m.id !== mutationId);
       await applyInverseMutation(target);
+      await removePersistedMutations([mutationId]);
       revertedCount += 1;
       emit();
       return true;
     },
 
     async revertAll(): Promise<number> {
+      await ensureHydrated();
       if (pendingList.length === 0) return 0;
       const toRevert = [...pendingList].reverse();
+      const ids = toRevert.map((m) => m.id);
       pendingList = [];
       for (const m of toRevert) {
         await applyInverseMutation(m);
         revertedCount += 1;
       }
+      await removePersistedMutations(ids);
       emit();
       return toRevert.length;
     },
 
     async flush(): Promise<OptimisticFlushResult> {
-      if (pendingList.length === 0) {
-        return { confirmed: 0, reverted: 0, errors: [] };
-      }
-      if (flushing) {
+      await ensureHydrated();
+      if (pendingList.length === 0 || flushing) {
         return { confirmed: 0, reverted: 0, errors: [] };
       }
 
@@ -424,6 +776,7 @@ export function createOptimisticMutationStore(
           await options.syncHandle.syncNow();
         }
         pendingList = pendingList.filter((m) => !batchIds.has(m.id));
+        await removePersistedMutations([...batchIds]);
         confirmedCount += batch.length;
         flushing = false;
         emit();
@@ -431,7 +784,6 @@ export function createOptimisticMutationStore(
       } catch (err) {
         const errorObj = err instanceof Error ? err : new Error(String(err));
         lastError = errorObj;
-        // Roll back the rejected optimistic batch in reverse chronological order!
         pendingList = pendingList.filter((m) => !batchIds.has(m.id));
         const reversed = [...batch].reverse();
         for (const m of reversed) {
@@ -446,6 +798,7 @@ export function createOptimisticMutationStore(
             errorObj,
           );
         }
+        await removePersistedMutations([...batchIds]);
         flushing = false;
         emit();
         return {

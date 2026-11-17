@@ -366,8 +366,8 @@ export interface LogicalTableSnapshot {
   readonly rows: readonly Row[];
 }
 
-/** Replica cold-start / catch-up bootstrap strategy (`M20 Item 1`). */
-export type BootstrapStrategy = 'logical' | 'binary-image' | 'page-diff';
+/** Replica cold-start / catch-up bootstrap strategy (`M20 Item 1` / `M23 Item 3`). */
+export type BootstrapStrategy = 'logical' | 'binary-image' | 'page-diff' | 'arrow-ipc';
 
 /** Consistent snapshot of a publication at `watermarkLsn` (logical rows, raw/gzipped `.fdb` image, or binary page diff). */
 export interface PublicationSnapshot {

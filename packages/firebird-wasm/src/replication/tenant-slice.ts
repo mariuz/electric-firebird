@@ -332,6 +332,8 @@ export interface CreateTenantReplicationSliceOptions {
   onConflict?: ReplicationConflictStrategy;
   /** Automatically sync schema & bootstrap initial snapshot onto `replica`. @default true */
   bootstrap?: boolean;
+  /** Snapshot wire strategy for initial slice bootstrap (`'logical'` or zero-copy `'arrow-ipc'`, `M23 Item 3`). @default 'logical' */
+  bootstrapStrategy?: 'logical' | 'arrow-ipc';
   /** Parallel table concurrency for multi-table snapshot export & seeding (`M22 Item 1`). @default 4 */
   concurrency?: number;
   /** Start background polling immediately. @default false */
@@ -599,6 +601,7 @@ export async function createTenantReplicationSlice(
         targetDb: options.replica,
         publication: primaryPub,
         subscription: replicaSub,
+        bootstrapStrategy: options.bootstrapStrategy ?? 'logical',
         concurrency,
       });
     }

@@ -124,6 +124,12 @@ table { border-collapse: collapse; }
 th, td { border: 1px solid var(--firebird-repl-border); padding: 0.1rem 0.5rem; text-align: left; vertical-align: top; white-space: pre; }
 th { font-weight: 600; }
 td.num { text-align: right; }
+td.editable-cell { cursor: pointer; }
+tr.fb-repl-row-optimistic td { background: rgba(245, 158, 11, 0.14); }
+.fb-repl-optimistic-badge {
+  display: inline-block; margin-left: 0.35rem; padding: 0 0.3rem; border-radius: 3px;
+  font-size: 10px; font-weight: 600; background: rgba(245, 158, 11, 0.25); color: #f59e0b;
+}
 .null { color: var(--firebird-repl-muted); font-style: italic; }
 .input { display: flex; border-top: 1px solid var(--firebird-repl-border); }
 textarea {
@@ -174,6 +180,9 @@ export function summary(entry: ReplEntry, returnsRows: boolean): string {
   if (entry.arrow !== undefined) {
     return `arrow (${entry.arrow.rowCount} ${entry.arrow.rowCount === 1 ? 'row' : 'rows'}, ${entry.arrow.arrowIpcBytes} B)`;
   }
+  if (entry.outbox !== undefined) {
+    return `outbox (${entry.outbox.pendingCount} pending, ${entry.outbox.confirmedCount} confirmed, ${entry.outbox.revertedCount} reverted)`;
+  }
   if (returnsRows) {
     const n = entry.rows?.length ?? 0;
     return `${n} ${n === 1 ? 'row' : 'rows'}`;
@@ -184,7 +193,21 @@ export function summary(entry: ReplEntry, returnsRows: boolean): string {
   return 'done';
 }
 
-export function table(fields: FieldInfo[], rows: ArrayRow[]): HTMLElement {
+export interface ReplTableRenderOptions {
+  readonly pkIndex?: number;
+  readonly pendingKeys?: ReadonlySet<string>;
+  readonly onEditCell?: (
+    keyValue: unknown,
+    columnName: string,
+    newValue: string,
+  ) => Promise<void> | void;
+}
+
+export function table(
+  fields: FieldInfo[],
+  rows: ArrayRow[],
+  options?: ReplTableRenderOptions,
+): HTMLElement {
   const wrap = el('div', 'table');
   const grid = document.createElement('table');
   const head = document.createElement('tr');
@@ -197,9 +220,62 @@ export function table(fields: FieldInfo[], rows: ArrayRow[]): HTMLElement {
   const thead = document.createElement('thead');
   thead.append(head);
   const tbody = document.createElement('tbody');
+  const pkIdx = options?.pkIndex ?? -1;
   for (const row of rows.slice(0, MAX_ROWS)) {
     const tr = document.createElement('tr');
-    row.forEach((value) => tr.append(cell(value)));
+    const rowKey = pkIdx >= 0 ? row[pkIdx] : undefined;
+    const isOptimistic =
+      rowKey !== undefined &&
+      rowKey !== null &&
+      Boolean(options?.pendingKeys?.has(String(rowKey)));
+    if (isOptimistic) {
+      tr.classList.add('fb-repl-row-optimistic');
+    }
+    row.forEach((value, colIdx) => {
+      const td = cell(value);
+      if (isOptimistic && colIdx === Math.max(0, pkIdx)) {
+        const badge = el('span', 'fb-repl-optimistic-badge');
+        badge.textContent = 'pending';
+        td.append(badge);
+      }
+      if (options?.onEditCell && pkIdx >= 0 && colIdx !== pkIdx) {
+        td.classList.add('editable-cell');
+        td.title = 'Double-click to edit cell';
+        td.addEventListener('dblclick', () => {
+          if (td.querySelector('input')) return;
+          const prevText = value === null || value === undefined ? '' : String(value);
+          const inp = document.createElement('input');
+          inp.type = 'text';
+          inp.value = prevText;
+          inp.className = 'fb-repl-inline-input';
+          inp.style.width = '100%';
+          td.replaceChildren(inp);
+          inp.focus();
+          let committed = false;
+          const finish = (save: boolean) => {
+            if (committed) return;
+            committed = true;
+            const nextVal = inp.value;
+            td.textContent = nextVal;
+            if (save && nextVal !== prevText) {
+              void options.onEditCell!(rowKey, fields[colIdx]!.name, nextVal);
+            }
+          };
+          inp.addEventListener('keydown', (ev) => {
+            if (ev.key === 'Enter') {
+              ev.preventDefault();
+              finish(true);
+            } else if (ev.key === 'Escape') {
+              ev.preventDefault();
+              td.textContent = prevText;
+              committed = true;
+            }
+          });
+          inp.addEventListener('blur', () => finish(true));
+        });
+      }
+      tr.append(td);
+    });
     tbody.append(tr);
   }
   grid.append(thead, tbody);

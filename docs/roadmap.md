@@ -1840,6 +1840,42 @@ Next-horizon improvements across **Replication**, **Speed & Performance**, **Int
 
 ---
 
+### M23 — WebCrypto JWT Tenant Claims & Role Auth, Crash-Safe Durable Optimistic Outbox & Rebase, Arrow IPC Snapshot Bootstrap, Declarative Virtual Tables (`db.registerVirtualTable()`) & Editable `<firebird-repl>` Outbox
+
+- [x] **1. WebCrypto JWT Tenant Claims & Role-Based Sync Auth (`verifySyncJwt`, `createJwtTenantAuthResolver`, `serve-sync --jwt-secret`).**
+      Add zero-dependency WebCrypto (`crypto.subtle` HMAC-SHA256 / ECDSA P-256 / Ed25519)
+      JWT signing & verification (`signSyncJwt`, `verifySyncJwt`, `SyncJwtError`,
+      `createJwtTenantAuthResolver`) integrated into `createHttpReplicationHandler`,
+      `createWebSocketReplicationPeer`, and `npx firebird-wasm serve-sync --jwt-secret <key> [--jwt-tenant-claim <claim>]`
+      to cryptographically enforce per-tenant slice isolation, `'reader' | 'writer' | 'admin'`
+      push permissions, and allowed table scopes from `Authorization: Bearer <jwt>`.
+- [x] **2. Crash-Safe Durable Optimistic Outbox (`FB_OPTIMISTIC_OUTBOX$`) & Offline Rebase.**
+      Add `{ persist: true, conflictStrategy?: 'revert' | 'rebase-fields' }` to
+      `createOptimisticMutationStore(db, ...)` persisting pending mutations and rollback
+      pre-images atomically in `FB_OPTIMISTIC_OUTBOX$`, hydrating queued mutations across
+      reloads/restarts (`hydrate()`), and rebasing non-overlapping column edits on top of
+      incoming remote `ReplicationLogEntry[]` updates (`rebase()`).
+- [x] **3. Zero-Copy Arrow IPC Filtered Replica Bootstrap (`bootstrapStrategy: 'arrow-ipc'` & `GET /snapshot?format=arrow`).**
+      Add `bootstrapStrategy: 'arrow-ipc'`, `exportArrowSnapshot()`, and
+      `applyArrowSnapshot()` streaming partitioned / tenant-filtered table snapshots from
+      `db.queryArrowStream()` over HTTP (`GET /snapshot?format=arrow` with optional gzip)
+      directly into `replica.loadArrowIpc()` (`"FBP\x02"` `IBatch`) with zero intermediate
+      JS row objects.
+- [x] **4. Declarative Virtual Tables & Remote `/arrow` Federation (`db.registerVirtualTable()`).**
+      Add `db.registerVirtualTable(name, provider, { primaryKey?, columns?, ttlMs? })` on
+      `FirebirdBrowser` and `FirebirdLite` to mount Apache Arrow IPC buffers/streams,
+      remote `serve-sync` `/arrow` endpoints, CSV/JSONL data, or async JS iterables as
+      SQL-queryable Firebird relations (`SELECT ... JOIN`) with automatic schema inference
+      and on-demand `refresh()`.
+- [x] **5. Editable `<firebird-repl>` Result Grid + Outbox Inspector, Simulator Scenario 17 & Core Module Split (`columnar.ts`, `node-native-bindings.ts`).**
+      Add opt-in inline cell editing, optimistic pending badges, and an `Outbox` inspector
+      in `<firebird-repl>`, add Simulator **Scenario 17** (`jwt-arrow-outbox`), and split
+      `src/columnar.ts` (`arrow-ipc-codec.ts`) and `src/node-native-bindings.ts`
+      (`node-native-batch.ts`) while keeping every non-test `.ts` source file strictly
+      under 2,000 lines.
+
+---
+
 ## 5. Test coverage added alongside this review
 
 `src/browser/` was excluded from Jest and had no browser tests.  It now has 73

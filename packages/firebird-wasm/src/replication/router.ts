@@ -685,6 +685,10 @@ export function createReplicaRouter(options: ReplicaRouterOptions): ReplicaRoute
       return activePrimary.table<T, K>(tableName, tableOptions);
     },
 
+    registerVirtualTable(name, provider, vtOpts) {
+      return runWrite((db) => db.registerVirtualTable(name, provider, vtOpts));
+    },
+
     liveIncremental<T extends Row = Row>(
       sql: string | SqlFragment,
       optionsOrListener?:

@@ -11,6 +11,13 @@ import { publishAllTables } from './replication/publication';
 import { createSubscription } from './replication/subscription';
 import { createHttpReplicationHandler } from './replication/transports';
 import { createTenantIsolationGuard, type TenantIsolationGuard } from './replication/tenant-slice';
+import {
+  SyncJwtError,
+  createJwtTenantAuthResolver,
+  type JwtTenantAuthContext,
+  type JwtTenantAuthOptions,
+  type JwtTenantAuthResolver,
+} from './replication/jwt-auth';
 import { encodeArrowIpc, rowsToColumnarResult } from './columnar';
 import { loadArrowIpcIntoDatabase, type ArrowIngestHost } from './arrow-ingest';
 
@@ -23,6 +30,12 @@ export interface StartCliReplicationServerOptions {
   host?: string;
   /** Optional Bearer token / `x-replication-key` required on requests. */
   apiKey?: string;
+  /** Optional HMAC-SHA256 JWT secret enabling cryptographic claim & role auth (`M23 Item 1`). */
+  jwtSecret?: string;
+  /** Claim name carrying the tenant ID when `jwtSecret` or `jwtAuth` is configured. @default 'tenant_id' */
+  jwtTenantClaim?: string;
+  /** Optional full WebCrypto JWT resolver or options (`M23 Item 1`). */
+  jwtAuth?: JwtTenantAuthResolver | JwtTenantAuthOptions;
   /** Optional tenant column name enabling inbound/outbound multi-tenant isolation (`M22 Item 1`). */
   tenantColumn?: string;
   /** Optional read-only shared reference tables when `tenantColumn` is configured. */
@@ -133,11 +146,23 @@ export async function startCliReplicationServer(
     tenantGuard,
   });
 
+  const jwtResolver: JwtTenantAuthResolver | undefined = options.jwtAuth
+    ? 'authenticateRequest' in options.jwtAuth
+      ? options.jwtAuth
+      : createJwtTenantAuthResolver(options.jwtAuth)
+    : options.jwtSecret
+      ? createJwtTenantAuthResolver({
+          secretOrPublicKey: options.jwtSecret,
+          tenantClaim: options.jwtTenantClaim,
+        })
+      : undefined;
+
   const fetchHandler = createHttpReplicationHandler({
     publication,
     subscription,
     apiKey: options.apiKey,
     tenantGuard,
+    jwtAuth: jwtResolver,
   });
 
   const server = http.createServer((req, res) => {
@@ -173,7 +198,22 @@ export async function startCliReplicationServer(
         }
 
         if (cleanPath === '/arrow') {
-          if (!checkApiKeyAuth(req, options.apiKey)) {
+          let arrowJwtCtx: JwtTenantAuthContext | undefined;
+          if (jwtResolver) {
+            const authHeader = String(req.headers['authorization'] ?? '');
+            const tok = /^Bearer\s+/i.test(authHeader)
+              ? authHeader.replace(/^Bearer\s+/i, '').trim()
+              : parsedUrl.searchParams.get('token');
+            try {
+              arrowJwtCtx = await jwtResolver.authenticateToken(tok);
+            } catch (err) {
+              if (err instanceof SyncJwtError) {
+                sendJson(res, err.status, { error: err.message, code: err.code }, enableCors);
+                return;
+              }
+              throw err;
+            }
+          } else if (!checkApiKeyAuth(req, options.apiKey)) {
             sendJson(res, 401, { error: 'Unauthorized request' }, enableCors);
             return;
           }
@@ -207,6 +247,17 @@ export async function startCliReplicationServer(
           }
 
           if (req.method === 'POST') {
+            if (jwtResolver && arrowJwtCtx) {
+              try {
+                jwtResolver.assertWriteAllowed(arrowJwtCtx);
+              } catch (err) {
+                if (err instanceof SyncJwtError) {
+                  sendJson(res, err.status, { error: err.message, code: err.code }, enableCors);
+                  return;
+                }
+                throw err;
+              }
+            }
             const tableName = (parsedUrl.searchParams.get('table') ?? '').trim();
             if (!tableName) {
               sendJson(
@@ -216,6 +267,17 @@ export async function startCliReplicationServer(
                 enableCors,
               );
               return;
+            }
+            if (jwtResolver && arrowJwtCtx) {
+              try {
+                jwtResolver.assertTableAllowed(arrowJwtCtx, tableName);
+              } catch (err) {
+                if (err instanceof SyncJwtError) {
+                  sendJson(res, err.status, { error: err.message, code: err.code }, enableCors);
+                  return;
+                }
+                throw err;
+              }
             }
             const createTable =
               parsedUrl.searchParams.get('createTable') === '1' ||

@@ -3375,4 +3375,158 @@ test.describe('FirebirdBrowser', () => {
     expect(result.pendingAfterFlush).toBe(0);
     expect(result.liveResults).toBe(0);
   });
+
+  test('M23: WebCrypto HS256/ES256 JWT Tenant Auth, FBARSNAP Arrow Snapshot Codec, Outbox Rebase & registerVirtualTable()', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      // 1. WebCrypto HS256 & ES256 JWT signing + verification + role/tenant enforcement
+      const secret = 'm23-super-secret-hmac-key';
+      const readerJwt = await window.FB.signSyncJwt(
+        { sub: 'u_reader', tenant_id: 'acme', role: 'reader', tables: ['TASKS'] },
+        secret,
+        { expiresInSec: 300 },
+      );
+      const writerJwt = await window.FB.signSyncJwt(
+        { sub: 'u_writer', tenant_id: 'acme', role: 'writer', tables: ['TASKS'] },
+        secret,
+        { expiresInSec: 300 },
+      );
+      const ecPair = await crypto.subtle.generateKey(
+        { name: 'ECDSA', namedCurve: 'P-256' },
+        true,
+        ['sign', 'verify'],
+      );
+      const esJwt = await window.FB.signSyncJwt(
+        { sub: 'u_ec', tenant_id: 'acme', role: 'admin' },
+        ecPair.privateKey,
+        { algorithm: 'ES256', expiresInSec: 300 },
+      );
+      const verifiedEs = await window.FB.verifySyncJwt(esJwt, ecPair.publicKey, {
+        algorithms: ['ES256'],
+      });
+
+      const resolver = window.FB.createJwtTenantAuthResolver({
+        secretOrPublicKey: secret,
+      });
+      const readerCtx = await resolver.authenticateToken(readerJwt);
+      const writerCtx = await resolver.authenticateToken(writerJwt);
+      let readerWriteBlocked = false;
+      let spoofedTenantBlocked = false;
+      try {
+        resolver.assertWriteAllowed(readerCtx);
+      } catch (err) {
+        readerWriteBlocked =
+          err instanceof window.FB.SyncJwtError && err.code === 'JWT_ROLE_FORBIDDEN';
+      }
+      try {
+        resolver.resolveEffectiveTenantId(writerCtx, 'globex');
+      } catch (err) {
+        spoofedTenantBlocked =
+          err instanceof window.FB.SyncJwtError && err.code === 'JWT_TENANT_FORBIDDEN';
+      }
+
+      // 2. Binary FBARSNAP Arrow Snapshot Bundle encode + gzip + decode round-trip
+      const col = window.FB.rowsToColumnarResult({
+        fields: [
+          { name: 'ID', typeName: 'INTEGER', nullable: false },
+          { name: 'TITLE', typeName: 'VARYING', nullable: false },
+        ],
+        rows: [
+          { ID: 1, TITLE: 'One' },
+          { ID: 2, TITLE: 'Two' },
+        ],
+      });
+      const bundle = await window.FB.encodeArrowSnapshotBundle(
+        {
+          publication: 'pub_m23',
+          origin: 'primary',
+          watermarkLsn: 42,
+          timestamp: 1700000000000,
+          tables: [
+            {
+              table: 'TASKS',
+              primaryKey: ['ID'],
+              ddlSql: 'CREATE TABLE "TASKS" ("ID" INTEGER NOT NULL PRIMARY KEY, "TITLE" VARCHAR(64))',
+              rowCount: 2,
+              arrowBytes: window.FB.encodeArrowIpc(col),
+            },
+          ],
+        },
+        { compressGzip: true },
+      );
+      const decodedSnap = await window.FB.decodeArrowSnapshotBundle(bundle);
+      const decodedTableRows = window.FB.decodeArrowIpc(decodedSnap.tables[0]!.arrowBytes).toRows();
+
+      // 3. db.registerVirtualTable() with CSV source + OptimisticMutationStore field rebase
+      const db = new window.FB.FirebirdBrowser('memory://m23_browser');
+      const vt = await db.registerVirtualTable(
+        'CSV_METRICS',
+        { format: 'csv', data: 'id,label\n1,cpu\n2,mem\n' },
+        { primaryKey: 'ID' },
+      );
+      const vtCount = vt.rowCount;
+      await vt.drop();
+
+      window.__stub.affectedRows = 1;
+      window.__stub.queryResult = {
+        columns: [
+          { name: 'ID', type: 496, scale: 0, subType: 0, length: 4, nullable: false },
+          { name: 'TITLE', type: 448, scale: 0, subType: 0, length: 64, nullable: true },
+          { name: 'PRIORITY', type: 448, scale: 0, subType: 0, length: 32, nullable: true },
+        ],
+        rows: [[1, 'Draft Local Title', 'LOW']],
+      };
+      const opt = window.FB.createOptimisticMutationStore(db);
+      await opt.update('TASKS', 1, { TITLE: 'Draft Local Title' }, { primaryKey: 'ID' });
+      const rebaseRes = await opt.rebase([
+        {
+          lsn: 11,
+          txid: 'tx_rem',
+          timestamp: Date.now(),
+          origin: 'primary',
+          publication: 'pub',
+          table: 'TASKS',
+          operation: 'UPDATE',
+          key: { ID: 1 },
+          before: { ID: 1, TITLE: 'Original', PRIORITY: 'LOW' },
+          after: { ID: 1, TITLE: 'Original', PRIORITY: 'CRITICAL' },
+          ddlSql: null,
+        },
+      ]);
+      const rebasedAfter = opt.getSnapshot().pending[0]?.afterRow;
+
+      const stats = window.__stub.stats();
+      await db.close();
+
+      return {
+        esRole: verifiedEs.role,
+        readerWriteBlocked,
+        spoofedTenantBlocked,
+        watermarkLsn: decodedSnap.watermarkLsn,
+        decodedTableRows,
+        vtCount,
+        rebasedCount: rebaseRes.rebased,
+        rebasedAfter,
+        liveResults: stats.liveResults,
+      };
+    });
+
+    expect(result.esRole).toBe('admin');
+    expect(result.readerWriteBlocked).toBe(true);
+    expect(result.spoofedTenantBlocked).toBe(true);
+    expect(result.watermarkLsn).toBe(42);
+    expect(result.decodedTableRows).toEqual([
+      { ID: 1, TITLE: 'One' },
+      { ID: 2, TITLE: 'Two' },
+    ]);
+    expect(result.vtCount).toBe(2);
+    expect(result.rebasedCount).toBe(1);
+    expect(result.rebasedAfter).toEqual({
+      ID: 1,
+      TITLE: 'Draft Local Title',
+      PRIORITY: 'CRITICAL',
+    });
+    expect(result.liveResults).toBe(0);
+  });
 });

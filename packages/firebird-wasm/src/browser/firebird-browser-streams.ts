@@ -906,3 +906,52 @@ export function executeBrowserQueryColumnarStream(
     maybeOptions,
   );
 }
+
+export async function executeBrowserWireBatch(
+  host: BrowserStreamsHost,
+  sql: string,
+  wireRows: Uint8Array,
+  rowCount: number,
+  fallbackDecode: (buf: Uint8Array) => QueryParams[],
+  isWorker: boolean,
+): Promise<{ affectedRows: number }> {
+  if (rowCount === 0) return { affectedRows: 0 };
+  await host.ensureReady();
+  if (!host.engine.acceptsWireParams && !isWorker) {
+    return host.execBatch(sql, fallbackDecode(wireRows));
+  }
+  const startedAt = host.profiler.begin();
+  const ioBefore = await host.captureIoIfListening();
+  try {
+    const affectedRows = await host.engine.executeBatch(
+      host.getDbHandle(),
+      0,
+      sql,
+      wireRows,
+    );
+    const ioAfter = await host.captureIoIfListening();
+    host.profiler.end({
+      startedAt,
+      sql,
+      params: [],
+      kind: 'execBatch',
+      rowCount: affectedRows,
+      cacheHit: rowCount > 1,
+      ioBefore,
+      ioAfter,
+    });
+    host.markDirty();
+    host.liveBridge.broadcastTables(extractMutatedTables(sql));
+    return { affectedRows };
+  } catch (err) {
+    host.profiler.end({
+      startedAt,
+      sql,
+      params: [],
+      kind: 'execBatch',
+      cacheHit: rowCount > 1,
+      error: err,
+    });
+    throw err;
+  }
+}

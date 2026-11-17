@@ -285,6 +285,45 @@ test.describe('<firebird-repl>', () => {
     ]);
   });
 
+  test('edits result cells optimistically, renders pending row badges, and inspects/reverts the Outbox', async ({
+    page,
+  }) => {
+    const repl = await openRepl(page, 'memory://repl-outbox');
+
+    await repl.evaluate(async (el: any) => {
+      const w = window as any;
+      await el.run(
+        "CREATE TABLE tasks (id INTEGER NOT NULL PRIMARY KEY, title VARCHAR(64)); INSERT INTO tasks VALUES (1, 'Initial Title');",
+      );
+      el.optimisticStore = w.FB.createOptimisticMutationStore(el.db, {
+        persist: true,
+      });
+      el.editableTable = { table: 'TASKS', primaryKey: 'ID' };
+    });
+
+    await repl.evaluate(async (el: any) => {
+      await el.editCell('TASKS', 1, 'TITLE', 'Optimistic Edited Title', 'ID');
+      await el.run('SELECT id, title FROM tasks ORDER BY id');
+    });
+
+    await expect(repl.locator('tr.fb-repl-row-optimistic')).toHaveCount(1);
+    await expect(repl.locator('.fb-repl-optimistic-badge')).toContainText('pending');
+    await expect(repl.locator('tr.fb-repl-row-optimistic')).toContainText('Optimistic Edited Title');
+
+    await repl.locator('button.outbox').click();
+    await expect(repl.locator('.inspector .inspector-outbox')).toContainText('1 pending');
+    await expect(repl.locator('.inspector .outbox-item')).toContainText('UPDATE TASKS');
+
+    await repl.locator('.inspector button.outbox-revert-all-btn').click();
+    await expect(repl.locator('.inspector .inspector-outbox')).toContainText('0 pending');
+
+    const afterRevert = await repl.evaluate(async (el: any) => {
+      const entries = await el.run('SELECT id, title FROM tasks ORDER BY id');
+      return entries[0].rows;
+    });
+    expect(afterRevert).toEqual([[1, 'Initial Title']]);
+  });
+
   test('takes a db property set before it was defined, and reports runs', async ({ page }) => {
     await page.goto('/no-isolation/browser-harness-frameworks-st');
     await page.waitForFunction(() => Boolean((window as any).FB && (window as any).Frameworks));

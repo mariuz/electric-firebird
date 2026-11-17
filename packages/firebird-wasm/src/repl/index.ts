@@ -50,6 +50,7 @@ import type {
 import type { ReplicationStats } from '../replication';
 import type { ColumnarQueryResult } from '../columnar';
 import type { SyncHandleLike } from '../frameworks/sync-store';
+import type { OptimisticMutationStore, OptimisticStoreSnapshot } from '../optimistic-store';
 
 export {
   computeTableIoBreakdown,
@@ -68,7 +69,13 @@ export type ReplInspectorTab =
   | 'profiler'
   | 'plan'
   | 'replication'
-  | 'arrow';
+  | 'arrow'
+  | 'outbox';
+
+export interface ReplEditableTableConfig {
+  readonly table: string;
+  readonly primaryKey?: string;
+}
 
 /** Columnar vector & Apache Arrow IPC stream summary displayed in `<firebird-repl>` (`M20 Item 4`). */
 export interface ReplArrowInspectorInfo {
@@ -214,6 +221,7 @@ export interface ReplEntry {
   stats?: MonitorStats;
   replication?: ReplReplicationInfo;
   arrow?: ReplArrowInspectorInfo;
+  outbox?: OptimisticStoreSnapshot;
   error?: Error;
 }
 
@@ -225,6 +233,10 @@ export interface FirebirdReplElement extends HTMLElement {
   replicator?: { stats(): Promise<ReplicationStats> } | null;
   /** Optional `SyncHandle` (`syncDatabases()` / `db.syncWith()`) inspected in the Sync & Arrow panel (`M20 Item 4`). */
   syncHandle?: SyncHandleLike | null;
+  /** Optional `OptimisticMutationStore` enabling optimistic cell edits, pending row badges, and the `Outbox` inspector (`M23 Item 5`). */
+  optimisticStore?: OptimisticMutationStore | null;
+  /** Optional target table config enabling inline double-click cell editing in result grids (`M23 Item 5`). */
+  editableTable?: ReplEditableTableConfig | null;
   /** The editor's text. */
   value: string;
   /** Whether the Schema Inspector & Migration Viewer sidebar is open. */
@@ -259,6 +271,16 @@ export interface FirebirdReplElement extends HTMLElement {
     source: ArrowIngestSource,
     options?: LoadArrowIpcOptions,
   ): Promise<ArrowIngestResult>;
+  /** Open the Optimistic Outbox inspector and log an outbox summary entry (`M23 Item 5`). */
+  inspectOutbox(): Promise<ReplEntry | undefined>;
+  /** Programmatically or interactively edit a single cell value via `optimisticStore` or `db.execute` (`M23 Item 5`). */
+  editCell(
+    tableName: string,
+    keyValue: unknown,
+    column: string,
+    newValue: unknown,
+    primaryKey?: string,
+  ): Promise<void>;
   /** Toggle (or switch to `tab` in) the interactive Schema Inspector, Migration Viewer, Profiler & Plan Explorer sidebar. */
   toggleInspector(tab?: ReplInspectorTab): Promise<void>;
   /** Refresh the interactive Schema Inspector, Migration Viewer, Profiler & Plan Explorer sidebar from the database. */
@@ -300,6 +322,9 @@ export function defineFirebirdRepl(
     private database: ReplDatabase | null = null;
     private replicatorHandle: { stats(): Promise<ReplicationStats> } | null = null;
     private syncHandleRef: SyncHandleLike | null = null;
+    private optStoreRef: OptimisticMutationStore | null = null;
+    private unsubOptStore: (() => void) | null = null;
+    private editableCfg: ReplEditableTableConfig | null = null;
     private readonly output: HTMLDivElement;
     private readonly inspector: HTMLDivElement;
     private readonly inspectorBody: HTMLDivElement;
@@ -309,6 +334,7 @@ export function defineFirebirdRepl(
     private readonly tabPlanBtn: HTMLButtonElement;
     private readonly tabReplicationBtn: HTMLButtonElement;
     private readonly tabArrowBtn: HTMLButtonElement;
+    private readonly tabOutboxBtn: HTMLButtonElement;
     private readonly inspectorRefreshBtn: HTMLButtonElement;
     private readonly inspectorCloseBtn: HTMLButtonElement;
     private readonly editor: HTMLTextAreaElement;
@@ -321,6 +347,7 @@ export function defineFirebirdRepl(
     private readonly profilerButton: HTMLButtonElement;
     private readonly replicationButton: HTMLButtonElement;
     private readonly arrowButton: HTMLButtonElement;
+    private readonly outboxButton: HTMLButtonElement;
     private readonly history: string[] = [];
     /** Position in `history` while walking it; `history.length` is the draft. */
     private cursor = 0;
@@ -385,6 +412,11 @@ export function defineFirebirdRepl(
       this.tabArrowBtn.className = 'tab-arrow';
       this.tabArrowBtn.textContent = 'Arrow / Sync';
 
+      this.tabOutboxBtn = document.createElement('button');
+      this.tabOutboxBtn.type = 'button';
+      this.tabOutboxBtn.className = 'tab-outbox';
+      this.tabOutboxBtn.textContent = 'Outbox';
+
       inspectorTabs.append(
         this.tabSchemaBtn,
         this.tabMigrationsBtn,
@@ -392,6 +424,7 @@ export function defineFirebirdRepl(
         this.tabPlanBtn,
         this.tabReplicationBtn,
         this.tabArrowBtn,
+        this.tabOutboxBtn,
       );
 
       const inspectorActions = el('div', 'inspector-actions');
@@ -450,6 +483,12 @@ export function defineFirebirdRepl(
       this.arrowButton.textContent = 'Arrow';
       this.arrowButton.title = 'Inspect typed columnar vectors, Apache Arrow IPC stream size, and SyncHandle telemetry';
 
+      this.outboxButton = document.createElement('button');
+      this.outboxButton.type = 'button';
+      this.outboxButton.className = 'outbox';
+      this.outboxButton.textContent = 'Outbox';
+      this.outboxButton.title = 'Inspect optimistic local-first mutation outbox (flush / revert)';
+
       this.sweepButton = document.createElement('button');
       this.sweepButton.type = 'button';
       this.sweepButton.className = 'sweep';
@@ -479,6 +518,7 @@ export function defineFirebirdRepl(
         this.profilerButton,
         this.replicationButton,
         this.arrowButton,
+        this.outboxButton,
         this.sweepButton,
         this.infoButton,
         this.explainButton,
@@ -497,6 +537,7 @@ export function defineFirebirdRepl(
       this.profilerButton.addEventListener('click', () => void this.profiler());
       this.replicationButton.addEventListener('click', () => void this.replication());
       this.arrowButton.addEventListener('click', () => void this.inspectArrow());
+      this.outboxButton.addEventListener('click', () => void this.inspectOutbox());
       this.tabSchemaBtn.addEventListener('click', () => {
         this.inspectorTab = 'schema';
         void this.refreshInspector();
@@ -521,6 +562,10 @@ export function defineFirebirdRepl(
         this.inspectorTab = 'arrow';
         void this.refreshInspector();
       });
+      this.tabOutboxBtn.addEventListener('click', () => {
+        this.inspectorTab = 'outbox';
+        void this.refreshInspector();
+      });
       this.inspectorRefreshBtn.addEventListener(
         'click',
         () => void this.refreshInspector(),
@@ -533,7 +578,7 @@ export function defineFirebirdRepl(
       // A property set before the element was defined (React and Vue both
       // set properties as they render) sits on the instance and would hide
       // the accessor: take it over.
-      for (const name of ['db', 'replicator', 'syncHandle', 'value', 'inspectorOpen', 'inspectorTab'] as const) {
+      for (const name of ['db', 'replicator', 'syncHandle', 'optimisticStore', 'editableTable', 'value', 'inspectorOpen', 'inspectorTab'] as const) {
         if (Object.prototype.hasOwnProperty.call(this, name)) {
           const early = (this as Record<string, unknown>)[name];
           delete (this as Record<string, unknown>)[name];
@@ -564,6 +609,31 @@ export function defineFirebirdRepl(
 
     set syncHandle(handle: SyncHandleLike | null) {
       this.syncHandleRef = handle;
+    }
+
+    get optimisticStore(): OptimisticMutationStore | null {
+      return this.optStoreRef;
+    }
+
+    set optimisticStore(store: OptimisticMutationStore | null) {
+      this.unsubOptStore?.();
+      this.unsubOptStore = null;
+      this.optStoreRef = store;
+      if (store) {
+        this.unsubOptStore = store.subscribe(() => {
+          if (this.isInspectorOpen && this.activeTab === 'outbox') {
+            this.renderInspector();
+          }
+        });
+      }
+    }
+
+    get editableTable(): ReplEditableTableConfig | null {
+      return this.editableCfg;
+    }
+
+    set editableTable(cfg: ReplEditableTableConfig | null) {
+      this.editableCfg = cfg;
     }
 
     get value(): string {
@@ -599,7 +669,9 @@ export function defineFirebirdRepl(
                 ? 'replication'
                 : tab === 'arrow'
                   ? 'arrow'
-                  : 'schema';
+                  : tab === 'outbox'
+                    ? 'outbox'
+                    : 'schema';
       this.updateActiveTabButtons();
       this.renderInspector();
     }
@@ -620,6 +692,7 @@ export function defineFirebirdRepl(
         this.activeTab === 'replication',
       );
       this.tabArrowBtn.classList.toggle('active', this.activeTab === 'arrow');
+      this.tabOutboxBtn.classList.toggle('active', this.activeTab === 'outbox');
     }
 
     private setButtonsDisabled(disabled: boolean): void {
@@ -632,6 +705,7 @@ export function defineFirebirdRepl(
       this.profilerButton.disabled = disabled;
       this.replicationButton.disabled = disabled;
       this.arrowButton.disabled = disabled;
+      this.outboxButton.disabled = disabled;
       this.inspectorRefreshBtn.disabled = disabled;
     }
 
@@ -714,10 +788,26 @@ export function defineFirebirdRepl(
         lastPlans: this.lastPlans,
         lastReplication: this.lastReplication,
         lastArrow: this.lastArrow,
+        optimisticStore: this.optStoreRef,
         onResetProfiler: () => {
           if (this.db && typeof this.db.resetMonitorStats === "function") {
             this.db.resetMonitorStats();
             void this.refreshInspector();
+          }
+        },
+        onFlushOutbox: () => {
+          if (this.optStoreRef) {
+            void this.optStoreRef.flush().then(() => this.refreshInspector());
+          }
+        },
+        onRevertMutation: (id) => {
+          if (this.optStoreRef) {
+            void this.optStoreRef.revert(id).then(() => this.refreshInspector());
+          }
+        },
+        onRevertAllOutbox: () => {
+          if (this.optStoreRef) {
+            void this.optStoreRef.revertAll().then(() => this.refreshInspector());
           }
         },
         onExportArrow: () => {
@@ -1332,6 +1422,81 @@ export function defineFirebirdRepl(
       return result;
     }
 
+    async inspectOutbox(): Promise<ReplEntry | undefined> {
+      if (!this.optStoreRef) {
+        this.inspectorTab = 'outbox';
+        this.inspectorOpen = true;
+        this.renderInspector();
+        return undefined;
+      }
+      const started = performance.now();
+      await this.optStoreRef.hydrate();
+      const snap = this.optStoreRef.getSnapshot();
+      this.inspectorTab = 'outbox';
+      this.inspectorOpen = true;
+      this.renderInspector();
+      const entry: ReplEntry = {
+        sql: 'INSPECT OUTBOX',
+        line: 1,
+        ms: performance.now() - started,
+        outbox: snap,
+      };
+      this.show(entry);
+      return entry;
+    }
+
+    async editCell(
+      tableName: string,
+      keyValue: unknown,
+      column: string,
+      newValue: unknown,
+      primaryKey = 'ID',
+    ): Promise<void> {
+      if (!this.db) {
+        throw new Error('No database: set the element’s db property first');
+      }
+      const tblUpper = tableName.trim().toUpperCase();
+      const colUpper = column.trim().toUpperCase();
+      const pkUpper = primaryKey.trim().toUpperCase();
+      const coerced: unknown =
+        typeof newValue === 'string' && /^-?\d+$/.test(newValue.trim())
+          ? Number(newValue.trim())
+          : typeof newValue === 'string' && /^-?\d+\.\d+$/.test(newValue.trim())
+            ? Number(newValue.trim())
+            : newValue;
+
+      if (this.optStoreRef) {
+        await this.optStoreRef.update(
+          tblUpper,
+          keyValue,
+          { [colUpper]: coerced },
+          { primaryKey: pkUpper },
+        );
+      } else if (typeof this.db.execute === 'function') {
+        await this.db.execute(
+          `UPDATE "${tblUpper.replace(/"/g, '""')}" SET "${colUpper.replace(/"/g, '""')}" = ? WHERE "${pkUpper.replace(/"/g, '""')}" = ?`,
+          [coerced, keyValue],
+        );
+      } else {
+        await this.db.query(
+          `UPDATE "${tblUpper.replace(/"/g, '""')}" SET "${colUpper.replace(/"/g, '""')}" = ? WHERE "${pkUpper.replace(/"/g, '""')}" = ?`,
+          [coerced, keyValue],
+          { rowMode: 'array' },
+        );
+      }
+
+      if (this.isInspectorOpen) {
+        await this.refreshInspector();
+      }
+      this.dispatchEvent(
+        new CustomEvent('firebird-repl-cell-edit', {
+          detail: { table: tblUpper, keyValue, column: colUpper, value: coerced },
+          bubbles: true,
+          composed: true,
+        }),
+      );
+    }
+
     private onKey(event: KeyboardEvent): void {
       if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
         event.preventDefault();
@@ -1380,7 +1545,31 @@ export function defineFirebirdRepl(
       } else {
         const fields = entry.fields ?? [];
         const rows = entry.rows ?? [];
-        if (fields.length > 0) block.append(table(fields, rows));
+        if (fields.length > 0) {
+          const editTarget = this.editableCfg;
+          const pkName = (editTarget?.primaryKey ?? 'ID').toUpperCase();
+          const pkIdx = fields.findIndex((f) => f.name.toUpperCase() === pkName);
+          const pendingKeys = new Set<string>();
+          if (this.optStoreRef) {
+            const snap = this.optStoreRef.getSnapshot();
+            for (const m of snap.pending) {
+              if (!editTarget || m.tableName === editTarget.table.toUpperCase()) {
+                pendingKeys.add(String(m.keyValue));
+              }
+            }
+          }
+          block.append(
+            table(fields, rows, {
+              pkIndex: pkIdx,
+              pendingKeys,
+              onEditCell:
+                editTarget && pkIdx >= 0
+                  ? (keyVal, colName, nextVal) =>
+                      this.editCell(editTarget.table, keyVal, colName, nextVal, pkName)
+                  : undefined,
+            }),
+          );
+        }
         if (entry.plan !== undefined) {
           const plan = el('pre', 'plan');
           plan.textContent = entry.plan || '(no plan)';
@@ -1583,6 +1772,24 @@ export function defineFirebirdRepl(
             ]);
           }
           block.append(table([{ name: 'Metric' }, { name: 'Value' }], rows));
+        }
+        if (entry.outbox !== undefined) {
+          const ob = entry.outbox;
+          block.append(
+            table(
+              [{ name: 'Metric' }, { name: 'Value' }],
+              [
+                ['Pending optimistic mutations', ob.pendingCount],
+                ['Confirmed / Reverted / Rebased', `${ob.confirmedCount} / ${ob.revertedCount} / ${ob.rebasedCount}`],
+                [
+                  'Queued IDs',
+                  ob.pending.length > 0
+                    ? ob.pending.map((m) => `${m.id} (${m.operation} ${m.tableName})`).join(', ')
+                    : 'none',
+                ],
+              ],
+            ),
+          );
         }
         const meta = el('p', 'meta');
         meta.textContent = `${summary(entry, fields.length > 0)} · ${entry.ms.toFixed(1)} ms`;

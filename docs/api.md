@@ -1611,10 +1611,10 @@ Zero-dependency developer CLI (`bin`: `firebird-wasm`, programmatic `runCli(argv
 - `npx firebird-wasm migrate <uri> --dir <dir> [--down] [--target <version>]`
 - `npx firebird-wasm dump <uri> --out <file> [--gzip]` & `restore <uri> --in <file> [--gzip]`
 - `npx firebird-wasm inspect-changelog <segment-file> [--json]`
-- `npx firebird-wasm sync <source-uri> <target-uri> [--mode auto|native|logical] [--bootstrap binary-image|page-diff|logical] [--json]`
+- `npx firebird-wasm sync <source-uri> <target-uri> [--mode auto|native|logical] [--bootstrap binary-image|page-diff|arrow-ipc|logical] [--json]`
 - `npx firebird-wasm wal-ship <source-uri> (--dir <dir> | --url <url>) [--checkpoint] [--prune] [--key <passphrase>]`
 - `npx firebird-wasm pitr-restore <target-uri> (--dir <dir> | --url <url>) [--lsn <n> | --timestamp <iso>] [--key <passphrase>]`
-- `npx firebird-wasm serve-sync [uri] [--port <port>] [--host <host>] [--api-key <token>] [--tenant-column <col>] [--shared-tables <a,b>] [--cors] [--duration-ms <ms>] [--json]`
+- `npx firebird-wasm serve-sync [uri] [--port <port>] [--host <host>] [--api-key <token>] [--jwt-secret <key>] [--jwt-tenant-claim <claim>] [--tenant-column <col>] [--shared-tables <a,b>] [--cors] [--duration-ms <ms>] [--json]`
 - `npx firebird-wasm bench [uri] [--rows <n>] [--json]`
 
 ### `db.pipeline()` & `"FBP\x01"` / `"FBP\x02"` Binary Parameter Wire Frames
@@ -1661,6 +1661,12 @@ Packs decoded Apache Arrow IPC V5 `RecordBatch` vectors (`Uint8Array`, `ArrayBuf
 
 ### `createOptimisticMutationStore(db, options?)` & Framework Table Hooks
 
-Local-first optimistic mutations with pre-image capture, manual `revert(id)` / `revertAll()`, `flush()`, and automatic inverse-row rollback on remote rejection (`syncHandle` or custom `remoteSync`):
+Local-first optimistic mutations with pre-image capture, crash-safe durable `FB_OPTIMISTIC_OUTBOX$` persistence (`{ persist: true }`, `await store.hydrate()`), field-level offline rebase (`await store.rebase(remoteEntries)`), manual `revert(id)` / `revertAll()`, `flush()`, and automatic inverse-row rollback on remote rejection (`syncHandle` or custom `remoteSync`):
 - `useTable<T>(db, tableName, options?)` / `useOptimisticMutation(store)` in `firebird-wasm/react` & `firebird-wasm/vue`
-- `createTable<T>(db, tableName, options?)` / `createOptimisticMutation(store)` in `firebird-wasm/svelte` & `firebird-wasm/solid`.
+- `createTable<T>(db, tableName, options?)` / `createOptimisticMutation(store)` in `firebird-wasm/svelte` & `firebird-wasm/solid`
+- `<firebird-repl>`: `repl.optimisticStore = store`, `repl.editableTable = { table, primaryKey }`, `await repl.inspectOutbox()`, `await repl.editCell(...)`, and toolbar `Outbox` inspector.
+
+### `db.registerVirtualTable(name, provider, options?)` — Declarative Virtual Tables & `/arrow` Federation
+
+Mounts Apache Arrow IPC V5 buffers/streams, remote `serve-sync` `GET /arrow?sql=...` or JSON/JSONL/CSV HTTP URLs, inline CSV/JSONL text, or async JS iterables as SQL-queryable Firebird relations (`SELECT ... JOIN`, `GROUP BY`, indexes, CTEs):
+- Returns `VirtualTableHandle` (`tableName`, `fields`, `rowCount`, `isStale()`, `ensureFresh()`, `refresh()`, `drop()`, `[Symbol.asyncDispose]()`).

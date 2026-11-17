@@ -724,15 +724,18 @@ export type {
   ArrowIngestHost,
 } from './arrow-ingest';
 export {
+  DEFAULT_OPTIMISTIC_OUTBOX_TABLE,
   createOptimisticMutationStore,
   ReactiveTableStore,
 } from './optimistic-store';
 export type {
   OptimisticOperation,
+  OptimisticConflictStrategy,
   PendingOptimisticMutation,
   OptimisticStoreSnapshot,
   OptimisticMutationStoreOptions,
   OptimisticFlushResult,
+  OptimisticRebaseResult,
   OptimisticTableActions,
   OptimisticMutationStore,
   ReactiveTableDatabase,
@@ -744,3 +747,46 @@ export type {
   StartCliReplicationServerOptions,
   CliReplicationServerHandle,
 } from './cli-sync-server';
+export {
+  SyncJwtError,
+  signSyncJwt,
+  verifySyncJwt,
+  extractBearerJwtFromRequest,
+  createJwtTenantAuthResolver,
+} from './replication/jwt-auth';
+export type {
+  SyncJwtAlgorithm,
+  SyncJwtRole,
+  SyncJwtErrorCode,
+  SyncJwtClaims,
+  SyncJwtKeyInput,
+  SignSyncJwtOptions,
+  VerifySyncJwtOptions,
+  JwtTenantAuthOptions,
+  JwtTenantAuthContext,
+  JwtTenantAuthResolver,
+} from './replication/jwt-auth';
+export {
+  exportArrowSnapshot,
+  encodeArrowSnapshotBundle,
+  decodeArrowSnapshotBundle,
+  applyArrowSnapshot,
+} from './replication/arrow-snapshot';
+export type {
+  ArrowTableSnapshot,
+  ArrowPublicationSnapshot,
+  ExportArrowSnapshotOptions,
+  ApplyArrowSnapshotOptions,
+} from './replication/arrow-snapshot';
+export { registerVirtualTableOnDatabase } from './virtual-table';
+export type {
+  VirtualTableColumnDef,
+  VirtualTableUrlSource,
+  VirtualTableTextSource,
+  VirtualTableResolvedData,
+  VirtualTableProvider,
+  VirtualTableOptions,
+  VirtualTableRefreshResult,
+  VirtualTableHandle,
+  VirtualTableDatabaseHost,
+} from './virtual-table';

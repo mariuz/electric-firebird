@@ -58,6 +58,11 @@ import type {
   LoadArrowIpcOptions,
 } from './arrow-ingest';
 import type {
+  VirtualTableHandle,
+  VirtualTableOptions,
+  VirtualTableProvider,
+} from './virtual-table';
+import type {
   IncrementalLiveSnapshot,
   LiveColumnarOptions,
   LiveColumnarQuery,
@@ -467,6 +472,12 @@ export interface FirebirdDatabase {
     source: ArrowIngestSource,
     options?: LoadArrowIpcOptions,
   ): Promise<ArrowIngestResult>;
+  /** Mount an Arrow IPC buffer/stream, remote `/arrow` URL, CSV/JSONL, or JS iterable as a queryable Firebird table (`M23 Item 4`). */
+  registerVirtualTable(
+    name: string,
+    provider: VirtualTableProvider,
+    options?: VirtualTableOptions,
+  ): Promise<VirtualTableHandle>;
   /**
    * Subscribe to incremental `{ rows, deltas }` (`insert` / `update` / `delete`)
    * updates with structural sharing for unchanged rows (`M20 Item 3`).

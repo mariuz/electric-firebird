@@ -260,7 +260,13 @@ export async function createSubscription(
   const applyChanges = async (
     entries: readonly ReplicationLogEntry[],
   ): Promise<SubscriptionPullResult> => {
-    if (options.tenantGuard && entries.length > 0) {
+    if (
+      options.tenantGuard &&
+      ('defaultTenantId' in options.tenantGuard
+        ? (options.tenantGuard as { defaultTenantId?: unknown }).defaultTenantId !== undefined
+        : true) &&
+      entries.length > 0
+    ) {
       options.tenantGuard.assertBatch(entries);
     }
     const previousLsn = await getWatermark();

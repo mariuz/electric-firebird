@@ -492,6 +492,10 @@
           <strong>16. Multi-Tenant <code>createTenantReplicationSlice()</code> + <code>db.loadArrowIpc()</code> &amp; Optimistic Rollback</strong>
           <span>Isolate <code>TENANT_ID = 'acme'</code> with HTTP <code>403</code> guard, bulk-ingest Arrow IPC V5 via <code>FBP\x02</code>, and revert rejected optimistic writes!</span>
         </button>
+        <button type="button" class="scenario-card" data-scenario="jwt-arrow-outbox">
+          <strong>17. WebCrypto JWT Claims + <code>bootstrapStrategy: 'arrow-ipc'</code> &amp; Durable Outbox Rebase</strong>
+          <span>Enforce <code>HS256</code> JWT tenant/role claims, stream <code>FBARSNAP</code> Arrow snapshots, mount <code>db.registerVirtualTable()</code>, and rebase <code>FB_OPTIMISTIC_OUTBOX$</code>!</span>
+        </button>
       </section>
 
       <!-- Dual Database Nodes Grid -->

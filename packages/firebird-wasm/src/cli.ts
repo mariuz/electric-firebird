@@ -613,6 +613,8 @@ function parseCliArgs(argv: readonly string[]): ParsedFlags {
             key === 'port' ||
             key === 'host' ||
             key === 'api-key' ||
+            key === 'jwt-secret' ||
+            key === 'jwt-tenant-claim' ||
             key === 'tenant-column' ||
             key === 'shared-tables' ||
             key === 'duration-ms')
@@ -1019,7 +1021,9 @@ export async function runCli(
           modeRaw === 'native' || modeRaw === 'logical' ? modeRaw : 'auto';
         const bootRaw = String(flags.get('bootstrap') ?? 'logical').toLowerCase();
         const bootstrapStrategy: BootstrapStrategy =
-          bootRaw === 'binary-image' || bootRaw === 'page-diff' ? bootRaw : 'logical';
+          bootRaw === 'binary-image' || bootRaw === 'page-diff' || bootRaw === 'arrow-ipc'
+            ? bootRaw
+            : 'logical';
         const direction: 'one-way' | 'bidirectional' =
           String(flags.get('direction') ?? 'one-way').toLowerCase() === 'bidirectional'
             ? 'bidirectional'
@@ -1224,11 +1228,21 @@ export async function runCli(
             : undefined;
 
         const managed = await openCliDatabase(uri, { cwd, backend });
+        const jwtSecret =
+          typeof flags.get('jwt-secret') === 'string'
+            ? String(flags.get('jwt-secret'))
+            : undefined;
+        const jwtTenantClaim =
+          typeof flags.get('jwt-tenant-claim') === 'string'
+            ? String(flags.get('jwt-tenant-claim'))
+            : undefined;
         const srv = await startCliReplicationServer({
           db: managed.db,
           port,
           host,
           apiKey,
+          jwtSecret,
+          jwtTenantClaim,
           tenantColumn,
           sharedTables,
           cors,

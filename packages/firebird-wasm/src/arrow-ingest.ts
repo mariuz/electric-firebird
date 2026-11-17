@@ -119,7 +119,7 @@ function isReadableStream(val: unknown): val is ReadableStream<Uint8Array> {
   );
 }
 
-function mapFieldToFirebirdSqlType(field: FieldInfo): string {
+function mapFieldToFirebirdSqlType(field: FieldInfo, isKeyColumn = false): string {
   const tn = (field.typeName ?? 'VARYING').toUpperCase();
   switch (tn) {
     case 'SMALLINT':
@@ -143,9 +143,15 @@ function mapFieldToFirebirdSqlType(field: FieldInfo): string {
     case 'TIMESTAMP':
       return 'TIMESTAMP';
     case 'BLOB':
+      if (isKeyColumn) return 'VARCHAR(255)';
       return field.subType === 1 ? 'BLOB SUB_TYPE TEXT' : 'BLOB SUB_TYPE BINARY';
     default: {
-      const len = field.length && field.length > 0 && field.length <= 8191 ? field.length : 1024;
+      const defaultLen = isKeyColumn ? 255 : 1024;
+      const maxLen = isKeyColumn ? 255 : 8191;
+      const len =
+        field.length && field.length > 0 && field.length <= maxLen
+          ? field.length
+          : defaultLen;
       return `VARCHAR(${len})`;
     }
   }
@@ -173,8 +179,8 @@ export function buildCreateTableDdlFromColumnar(
 
   const colDefs = fields.map((f) => {
     const colIdent = quoteTableIdent(f.name);
-    const sqlType = mapFieldToFirebirdSqlType(f);
     const isPk = pkSet.has(f.name.toUpperCase());
+    const sqlType = mapFieldToFirebirdSqlType(f, isPk);
     const notNull = isPk || f.nullable === false ? ' NOT NULL' : '';
     return `${colIdent} ${sqlType}${notNull}`;
   });

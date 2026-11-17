@@ -22,6 +22,11 @@ import {
   quoteIdent,
 } from './shared';
 import { applyPageDiff } from '../browser/snapshots';
+import {
+  applyArrowSnapshot,
+  exportArrowSnapshot,
+  type ArrowPublicationSnapshot,
+} from './arrow-snapshot';
 
 /** Drop any `FB_REPL_TRG*` capture triggers cloned onto a unidirectional replica `.fdb` image (`M20 Item 1`). */
 export async function dropAllClonedReplicationTriggers(
@@ -176,6 +181,28 @@ export async function bootstrapReplica(
   const mode =
     options.bootstrapStrategy ?? options.mode ?? options.snapshot?.mode ?? 'logical';
   const truncateExisting = options.truncateExisting ?? true;
+
+  if (mode === 'arrow-ipc' && !options.snapshot) {
+    const pubWithArrowFetch = options.publication as ReplicationPublication & {
+      fetchArrowSnapshot?: (opts?: { compressGzip?: boolean }) => Promise<ArrowPublicationSnapshot>;
+    };
+    const arrowSnap =
+      typeof pubWithArrowFetch.fetchArrowSnapshot === 'function'
+        ? await pubWithArrowFetch.fetchArrowSnapshot({
+            compressGzip: options.compressGzip,
+          })
+        : await exportArrowSnapshot(options.publication as ReplicationPublication, {
+            tableDdl: options.tableDdl,
+            concurrency: options.concurrency,
+          });
+    return applyArrowSnapshot(options.targetDb, arrowSnap, {
+      subscription: options.subscription,
+      publication: options.publication as ReplicationPublication,
+      truncateExisting,
+      concurrency: options.concurrency,
+      tableDdl: options.tableDdl,
+    });
+  }
 
   const snapshot =
     options.snapshot ??

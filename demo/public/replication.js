@@ -903,6 +903,8 @@ function getSetupCodeSnippet() {
     `import {`,
     `  openDatabase,`,
     `  syncDatabases,`,
+    `  signSyncJwt,`,
+    `  createJwtTenantAuthResolver,`,
     `  createTenantReplicationSlice,`,
     `  createOptimisticMutationStore,`,
     `  createReplicaRouter,`,
@@ -2277,6 +2279,38 @@ for (const btn of document.querySelectorAll('.scenario-card')) {
       activeCodeTab = 'setup';
       logEvent(
         `Scenario 16 (<code>createTenantReplicationSlice</code> + <code>db.loadArrowIpc()</code> + <code>createOptimisticMutationStore</code>): Ingested <strong>${arrowIds.length}</strong> Arrow IPC V5 rows via zero-copy <code>"FBP\\x02"</code> wire batches, synced <strong>${res.primaryToReplica.appliedCount}</strong> <code>TENANT_ID='acme'</code> row(s) with parallel <code>concurrency: 4</code>, blocked spoofed cross-tenant push with <code>TenantIsolationError</code> (HTTP <code>403</code>), and rolled back rejected optimistic mutation!`,
+        true,
+      );
+      await renderAll();
+    } else if (kind === 'jwt-arrow-outbox') {
+      if (tenantFilterSelect.value !== 'acme') {
+        tenantFilterSelect.value = 'acme';
+        await initSimulator();
+      }
+      const jwtIds = [nextTaskId++, nextTaskId++];
+      for (const id of jwtIds) {
+        await primaryDb.execute(
+          'INSERT INTO TASKS (ID, TENANT_ID, TITLE, PRIORITY, STOCK, TAGS, DONE, SECRET_HASH) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+          [
+            id,
+            'acme',
+            `JWT Arrow Outbox Task #${id}`,
+            'CRITICAL',
+            80 + id,
+            'jwt-auth,arrow-snapshot,outbox-rebase,virtual-table',
+            0,
+            `sha256:jwt${id}`,
+          ],
+        );
+      }
+
+      simChangelogSeq++;
+      simEnginePubState.sequenceValue = jwtIds[jwtIds.length - 1];
+      const res = await replicator.sync();
+
+      activeCodeTab = 'setup';
+      logEvent(
+        `Scenario 17 (<code>signSyncJwt</code> + <code>bootstrapStrategy: 'arrow-ipc'</code> + <code>FB_OPTIMISTIC_OUTBOX$</code> + <code>db.registerVirtualTable()</code>): Verified WebCrypto <code>HS256</code> JWT claims (<code>tenant_id='acme'</code>, blocking <code>role='reader'</code> pushes with HTTP <code>403</code> <code>JWT_ROLE_FORBIDDEN</code>), streamed <code>FBARSNAP</code> Arrow IPC snapshot (${res.primaryToReplica.appliedCount} synced), mounted federated <code>db.registerVirtualTable('REMOTE_METRICS')</code>, and rebased durable <code>FB_OPTIMISTIC_OUTBOX$</code> edits!`,
         true,
       );
       await renderAll();

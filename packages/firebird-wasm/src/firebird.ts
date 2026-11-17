@@ -102,6 +102,12 @@ import {
   type LoadArrowIpcOptions,
 } from './arrow-ingest';
 import {
+  registerVirtualTableOnDatabase,
+  type VirtualTableHandle,
+  type VirtualTableOptions,
+  type VirtualTableProvider,
+} from './virtual-table';
+import {
   createLiveColumnarQuery,
   createLiveIncrementalQuery,
   type IncrementalLiveSnapshot,
@@ -610,6 +616,15 @@ export class FirebirdLite implements FirebirdDatabase {
   ): Promise<ArrowIngestResult> {
     await this.ensureReady();
     return loadArrowIpcIntoDatabase(this, tableName, source, options);
+  }
+
+  async registerVirtualTable(
+    name: string,
+    provider: VirtualTableProvider,
+    options: VirtualTableOptions = {},
+  ): Promise<VirtualTableHandle> {
+    await this.ensureReady();
+    return registerVirtualTableOnDatabase(this, name, provider, options);
   }
 
   /**

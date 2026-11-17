@@ -37,6 +37,19 @@ import {
   valuesMatchTenantId,
   type TenantIsolationGuard,
 } from './tenant-slice';
+import {
+  SyncJwtError,
+  createJwtTenantAuthResolver,
+  type JwtTenantAuthContext,
+  type JwtTenantAuthOptions,
+  type JwtTenantAuthResolver,
+} from './jwt-auth';
+import {
+  decodeArrowSnapshotBundle,
+  encodeArrowSnapshotBundle,
+  exportArrowSnapshot,
+  type ArrowPublicationSnapshot,
+} from './arrow-snapshot';
 
 export * from './webrtc-resilient';
 
@@ -96,6 +109,13 @@ export interface HttpReplicationHandlerOptions {
   resolveTenantId?: (
     request: Request,
   ) => string | number | undefined | Promise<string | number | undefined>;
+  /**
+   * Optional WebCrypto JWT verifier / claim resolver (`M23 Item 1`).
+   * Enforces `Authorization: Bearer <jwt>` (or `?token=<jwt>` for SSE), binds
+   * `tenantId` from JWT claims, restricts `role: 'reader'` from `/push`, and
+   * scopes allowed `tables`.
+   */
+  jwtAuth?: JwtTenantAuthResolver | JwtTenantAuthOptions;
 }
 
 /** Options for {@link createHttpReplicationClient}. */
@@ -181,6 +201,8 @@ export interface HttpReplicationClient {
     options?: { nodeId?: string; ttlMs?: number },
   ): Promise<ReplicationSlot | null>;
   fetchSnapshot(): Promise<PublicationSnapshot>;
+  /** Fetch a binary multi-table Apache Arrow IPC V5 snapshot (`"FBARSNAP"`, `M23 Item 3`). */
+  fetchArrowSnapshot(options?: { compressGzip?: boolean }): Promise<ArrowPublicationSnapshot>;
   /** Fetch a `PublicationSnapshot` in resumable paginated chunks via `/snapshot/manifest` + `/snapshot/chunk` (`M19 Item 3`). */
   fetchSnapshotResumable(
     options?: FetchSnapshotResumableOptions,
@@ -238,8 +260,14 @@ export function createHttpReplicationHandler(
   const snapshotCache = new Map<string, PublicationSnapshot>();
   let snapshotCounter = 1;
 
+  const jwtResolver: JwtTenantAuthResolver | undefined = options.jwtAuth
+    ? 'authenticateRequest' in options.jwtAuth
+      ? options.jwtAuth
+      : createJwtTenantAuthResolver(options.jwtAuth)
+    : undefined;
+
   return async (request: Request): Promise<Response> => {
-    if (apiKey) {
+    if (apiKey && !jwtResolver) {
       const auth = request.headers.get('authorization') ?? '';
       const keyHeader = request.headers.get('x-replication-key') ?? '';
       if (auth !== `Bearer ${apiKey}` && keyHeader !== apiKey) {
@@ -249,11 +277,39 @@ export function createHttpReplicationHandler(
 
     const url = new URL(request.url, 'http://localhost');
     const path = url.pathname.replace(/\/+$/, '');
-    const requestTenantId = options.resolveTenantId
-      ? await options.resolveTenantId(request)
-      : (request.headers.get('x-tenant-id') ??
-        url.searchParams.get('tenantId') ??
-        options.tenantGuard?.defaultTenantId);
+    const explicitRequestedTenant =
+      request.headers.get('x-tenant-id') ?? url.searchParams.get('tenantId');
+
+    let jwtCtx: JwtTenantAuthContext | undefined;
+    if (jwtResolver) {
+      try {
+        jwtCtx = await jwtResolver.authenticateRequest(request);
+      } catch (err) {
+        if (err instanceof SyncJwtError) {
+          return jsonResponse({ error: err.message, code: err.code }, err.status);
+        }
+        throw err;
+      }
+    }
+
+    let requestTenantId: string | number | undefined;
+    try {
+      if (jwtResolver && jwtCtx) {
+        requestTenantId = jwtResolver.resolveEffectiveTenantId(
+          jwtCtx,
+          explicitRequestedTenant,
+        );
+      } else if (options.resolveTenantId) {
+        requestTenantId = await options.resolveTenantId(request);
+      } else {
+        requestTenantId = explicitRequestedTenant ?? options.tenantGuard?.defaultTenantId;
+      }
+    } catch (err) {
+      if (err instanceof SyncJwtError) {
+        return jsonResponse({ error: err.message, code: err.code }, err.status);
+      }
+      throw err;
+    }
 
     if (request.method === 'GET' && path.endsWith('/changelog')) {
       const sinceSequence = Number(url.searchParams.get('sinceSequence') ?? '0');
@@ -326,6 +382,16 @@ export function createHttpReplicationHandler(
     }
 
     if (request.method === 'POST' && path.endsWith('/changelog')) {
+      if (jwtResolver && jwtCtx) {
+        try {
+          jwtResolver.assertWriteAllowed(jwtCtx);
+        } catch (err) {
+          if (err instanceof SyncJwtError) {
+            return jsonResponse({ error: err.message, code: err.code }, err.status);
+          }
+          throw err;
+        }
+      }
       const contentType = (request.headers.get('content-type') ?? '').toLowerCase();
       const incomingBytes: Uint8Array[] = [];
 
@@ -385,10 +451,14 @@ export function createHttpReplicationHandler(
         ...(limitParam ? { limit: Number(limitParam) } : {}),
         ...(excludeOrigin ? { excludeOrigin } : {}),
       });
-      const entries =
+      const tenantFiltered =
         options.tenantGuard && requestTenantId !== undefined
           ? options.tenantGuard.filterOutboundEntries(rawEntries, requestTenantId)
           : rawEntries;
+      const entries =
+        jwtResolver && jwtCtx
+          ? jwtResolver.filterEntriesForContext(tenantFiltered, jwtCtx)
+          : tenantFiltered;
       const currentLsn = await publication.currentLsn();
       return jsonResponse({
         name: publication.name,
@@ -451,8 +521,41 @@ export function createHttpReplicationHandler(
     }
 
     if (request.method === 'GET' && path.endsWith('/snapshot')) {
+      const accept = (request.headers.get('accept') ?? '').toLowerCase();
+      const formatParam = (url.searchParams.get('format') ?? '').toLowerCase();
+      const wantArrow =
+        formatParam === 'arrow' ||
+        formatParam === 'arrow-ipc' ||
+        accept.includes('application/vnd.apache.arrow.stream') ||
+        accept.includes('application/x-firebird-arrow-snapshot');
+
+      if (wantArrow) {
+        const wantGzip =
+          url.searchParams.get('compress') === '1' ||
+          url.searchParams.get('compress') === 'true' ||
+          url.searchParams.get('compress') === 'gzip' ||
+          url.searchParams.get('gzip') === '1';
+        const arrowSnap = await exportArrowSnapshot(publication, {
+          tenantColumn: options.tenantGuard?.tenantColumn,
+          tenantId: requestTenantId,
+          sharedTables: options.tenantGuard ? [...options.tenantGuard.sharedTables] : undefined,
+          allowedTables: jwtCtx?.allowedTables ?? null,
+        });
+        const bundle = await encodeArrowSnapshotBundle(arrowSnap, {
+          compressGzip: wantGzip,
+        });
+        return new Response(new Uint8Array(bundle), {
+          status: 200,
+          headers: {
+            'content-type': 'application/x-firebird-arrow-snapshot',
+            'x-fb-snapshot-lsn': String(arrowSnap.watermarkLsn),
+            ...(wantGzip ? { 'x-fb-snapshot-encoding': 'gzip' } : {}),
+          },
+        });
+      }
+
       const rawSnap = await publication.exportSnapshot({ mode: 'logical' });
-      const snapshot =
+      const tenantSnap =
         options.tenantGuard && requestTenantId !== undefined
           ? {
               ...rawSnap,
@@ -469,6 +572,15 @@ export function createHttpReplicationHandler(
               ),
             }
           : rawSnap;
+      const snapshot =
+        jwtCtx?.allowedTables
+          ? {
+              ...tenantSnap,
+              tables: tenantSnap.tables.filter((t) =>
+                jwtCtx.allowedTables!.has(t.table.toUpperCase()),
+              ),
+            }
+          : tenantSnap;
       return jsonResponse({ snapshot });
     }
 
@@ -516,6 +628,17 @@ export function createHttpReplicationHandler(
     if (request.method === 'POST' && path.endsWith('/push')) {
       const body = (await request.json()) as { entries: ReplicationLogEntry[] };
       const entries = body.entries ?? [];
+      if (jwtResolver && jwtCtx) {
+        try {
+          jwtResolver.assertWriteAllowed(jwtCtx);
+          jwtResolver.assertBatchTablesAllowed(jwtCtx, entries);
+        } catch (err) {
+          if (err instanceof SyncJwtError) {
+            return jsonResponse({ error: err.message, code: err.code }, err.status);
+          }
+          throw err;
+        }
+      }
       if (options.tenantGuard) {
         try {
           options.tenantGuard.assertBatch(entries, requestTenantId);
@@ -727,6 +850,26 @@ export function createHttpReplicationClient(
       }
       const data = (await res.json()) as { snapshot: PublicationSnapshot };
       return data.snapshot;
+    },
+
+    async fetchArrowSnapshot(arrowOpts = {}) {
+      const params = new URLSearchParams({ format: 'arrow' });
+      if (arrowOpts.compressGzip) {
+        params.set('compress', 'gzip');
+      }
+      const res = await fetchFn(`${baseUrl}/snapshot?${params.toString()}`, {
+        method: 'GET',
+        headers: buildHeaders({
+          accept: 'application/x-firebird-arrow-snapshot, application/vnd.apache.arrow.stream',
+        }),
+      });
+      if (!res.ok) {
+        throw new Error(
+          `HTTP replication fetchArrowSnapshot failed with status ${res.status}`,
+        );
+      }
+      const raw = new Uint8Array(await res.arrayBuffer());
+      return decodeArrowSnapshotBundle(raw);
     },
 
     async fetchSnapshotResumable(resumableOpts = {}) {
@@ -1143,7 +1286,11 @@ export interface WebSocketReplicationPeerOptions {
   ) => void | Promise<void>;
   /** Optional inbound tenant isolation guard enforced on incoming `repl_entries` frames (`M22 Item 1`). */
   tenantGuard?: TenantIsolationGuard;
-  /** Optional error callback invoked when an inbound frame violates `tenantGuard` (`M22 Item 1`). */
+  /** Optional WebCrypto JWT verifier / claim resolver enforced on incoming WebSocket frames (`M23 Item 1`). */
+  jwtAuth?: JwtTenantAuthResolver | JwtTenantAuthOptions;
+  /** Optional Bearer JWT token attached to outbound `repl_pull_request` / `repl_entries` frames (`M23 Item 1`). */
+  authToken?: string;
+  /** Optional error callback invoked when an inbound frame violates `tenantGuard` or `jwtAuth` (`M22 Item 1` / `M23 Item 1`). */
   onError?: (error: Error) => void;
 }
 
@@ -1179,6 +1326,25 @@ export function createWebSocketReplicationPeer(
   } = options;
 
   let lastPushedLsn = 0;
+  let sessionJwtCtx: JwtTenantAuthContext | undefined;
+
+  const wsJwtResolver: JwtTenantAuthResolver | undefined = options.jwtAuth
+    ? 'authenticateToken' in options.jwtAuth
+      ? options.jwtAuth
+      : createJwtTenantAuthResolver(options.jwtAuth)
+    : undefined;
+
+  const sendWsJwtError = (err: SyncJwtError): void => {
+    options.onError?.(err);
+    socket.send(
+      JSON.stringify({
+        type: 'repl_error',
+        status: err.status,
+        code: err.code,
+        error: err.message,
+      }),
+    );
+  };
 
   const handleBinaryChangelog = async (bytes: Uint8Array): Promise<boolean> => {
     let candidate = bytes;
@@ -1230,6 +1396,7 @@ export function createWebSocketReplicationPeer(
 
     let msg: {
       type?: string;
+      token?: string;
       sinceLsn?: number;
       excludeOrigin?: string;
       entries?: ReplicationLogEntry[];
@@ -1243,10 +1410,50 @@ export function createWebSocketReplicationPeer(
       return;
     }
 
+    if (msg.type === 'repl_auth') {
+      if (wsJwtResolver) {
+        try {
+          sessionJwtCtx = await wsJwtResolver.authenticateToken(msg.token);
+          socket.send(
+            JSON.stringify({
+              type: 'repl_auth_ok',
+              role: sessionJwtCtx.role,
+              tenantId: sessionJwtCtx.tenantId ?? null,
+            }),
+          );
+        } catch (err) {
+          if (err instanceof SyncJwtError) sendWsJwtError(err);
+        }
+      }
+      return;
+    }
+
+    let activeJwtCtx = sessionJwtCtx;
+    if (wsJwtResolver && (!activeJwtCtx || msg.token)) {
+      try {
+        activeJwtCtx = await wsJwtResolver.authenticateToken(msg.token);
+        sessionJwtCtx = activeJwtCtx;
+      } catch (err) {
+        if (err instanceof SyncJwtError) {
+          sendWsJwtError(err);
+          return;
+        }
+        throw err;
+      }
+    }
+
     if (msg.type === 'repl_pull_request' && publication) {
-      const entries = await publication.fetchChangesSince(msg.sinceLsn ?? 0, {
+      const rawEntries = await publication.fetchChangesSince(msg.sinceLsn ?? 0, {
         excludeOrigin: msg.excludeOrigin,
       });
+      const tenantEntries =
+        options.tenantGuard && activeJwtCtx?.tenantId !== undefined
+          ? options.tenantGuard.filterOutboundEntries(rawEntries, activeJwtCtx.tenantId)
+          : rawEntries;
+      const entries =
+        wsJwtResolver && activeJwtCtx
+          ? wsJwtResolver.filterEntriesForContext(tenantEntries, activeJwtCtx)
+          : tenantEntries;
       socket.send(
         JSON.stringify({
           type: 'repl_entries',
@@ -1255,8 +1462,12 @@ export function createWebSocketReplicationPeer(
       );
     } else if (msg.type === 'repl_entries' && Array.isArray(msg.entries) && subscription) {
       try {
+        if (wsJwtResolver && activeJwtCtx) {
+          wsJwtResolver.assertWriteAllowed(activeJwtCtx);
+          wsJwtResolver.assertBatchTablesAllowed(activeJwtCtx, msg.entries);
+        }
         if (options.tenantGuard) {
-          options.tenantGuard.assertBatch(msg.entries);
+          options.tenantGuard.assertBatch(msg.entries, activeJwtCtx?.tenantId);
         }
         const res = await subscription.applyChanges(msg.entries);
         socket.send(
@@ -1269,18 +1480,22 @@ export function createWebSocketReplicationPeer(
         );
       } catch (err) {
         const errorObj = err instanceof Error ? err : new Error(String(err));
-        options.onError?.(errorObj);
-        if (err instanceof TenantIsolationError) {
-          socket.send(
-            JSON.stringify({
-              type: 'repl_error',
-              status: 403,
-              code: err.code,
-              table: err.table,
-              reason: err.reason,
-              error: err.message,
-            }),
-          );
+        if (err instanceof SyncJwtError) {
+          sendWsJwtError(err);
+        } else {
+          options.onError?.(errorObj);
+          if (err instanceof TenantIsolationError) {
+            socket.send(
+              JSON.stringify({
+                type: 'repl_error',
+                status: 403,
+                code: err.code,
+                table: err.table,
+                reason: err.reason,
+                error: err.message,
+              }),
+            );
+          }
         }
       }
     } else if (
@@ -1320,6 +1535,7 @@ export function createWebSocketReplicationPeer(
           JSON.stringify({
             type: 'repl_entries',
             entries,
+            ...(options.authToken ? { token: options.authToken } : {}),
           }),
         );
       }
@@ -1333,6 +1549,7 @@ export function createWebSocketReplicationPeer(
           type: 'repl_pull_request',
           sinceLsn: wmk,
           excludeOrigin: subscription?.nodeId,
+          ...(options.authToken ? { token: options.authToken } : {}),
         }),
       );
     },

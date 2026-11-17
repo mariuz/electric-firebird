@@ -93,6 +93,12 @@ import {
   type ArrowIngestSource,
   type LoadArrowIpcOptions,
 } from '../arrow-ingest';
+import {
+  registerVirtualTableOnDatabase,
+  type VirtualTableHandle,
+  type VirtualTableOptions,
+  type VirtualTableProvider,
+} from '../virtual-table';
 import { decodeWireParamRows } from './wire-params';
 import {
   type IncrementalLiveSnapshot,
@@ -175,6 +181,7 @@ import {
   createBrowserPreparedStatement,
   executeBrowserQueryColumnar,
   executeBrowserQueryColumnarStream,
+  executeBrowserWireBatch,
   listenBrowserEvents,
   runBrowserLiveColumnar,
   runBrowserLiveIncremental,
@@ -715,45 +722,14 @@ export class FirebirdBrowser implements FirebirdDatabase {
     wireRows: Uint8Array,
     rowCount: number,
   ): Promise<ExecResult> {
-    if (rowCount === 0) return { affectedRows: 0 };
-    await this.ensureReady();
-    if (!this.engine.acceptsWireParams && !(this.engine instanceof WorkerTransport)) {
-      return this.execBatch(sql, decodeWireParamRows(wireRows));
-    }
-    const startedAt = this.profiler.begin();
-    const ioBefore = await this.captureIoIfListening();
-    try {
-      const affectedRows = await this.engine.executeBatch(
-        this.dbHandle,
-        0,
-        sql,
-        wireRows,
-      );
-      const ioAfter = await this.captureIoIfListening();
-      this.profiler.end({
-        startedAt,
-        sql,
-        params: [],
-        kind: 'execBatch',
-        rowCount: affectedRows,
-        cacheHit: rowCount > 1,
-        ioBefore,
-        ioAfter,
-      });
-      this.markDirty();
-      this.liveBridge.broadcastTables(extractMutatedTables(sql));
-      return { affectedRows };
-    } catch (err) {
-      this.profiler.end({
-        startedAt,
-        sql,
-        params: [],
-        kind: 'execBatch',
-        cacheHit: rowCount > 1,
-        error: err,
-      });
-      throw err;
-    }
+    return executeBrowserWireBatch(
+      this.streamsHost,
+      sql,
+      wireRows,
+      rowCount,
+      decodeWireParamRows,
+      this.engine instanceof WorkerTransport,
+    );
   }
 
   async loadArrowIpc(
@@ -763,6 +739,15 @@ export class FirebirdBrowser implements FirebirdDatabase {
   ): Promise<ArrowIngestResult> {
     await this.ensureReady();
     return loadArrowIpcIntoDatabase(this, tableName, source, options);
+  }
+
+  async registerVirtualTable(
+    name: string,
+    provider: VirtualTableProvider,
+    options: VirtualTableOptions = {},
+  ): Promise<VirtualTableHandle> {
+    await this.ensureReady();
+    return registerVirtualTableOnDatabase(this, name, provider, options);
   }
 
   /**
