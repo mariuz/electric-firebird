@@ -1670,3 +1670,18 @@ Local-first optimistic mutations with pre-image capture, crash-safe durable `FB_
 
 Mounts Apache Arrow IPC V5 buffers/streams, remote `serve-sync` `GET /arrow?sql=...` or JSON/JSONL/CSV HTTP URLs, inline CSV/JSONL text, or async JS iterables as SQL-queryable Firebird relations (`SELECT ... JOIN`, `GROUP BY`, indexes, CTEs):
 - Returns `VirtualTableHandle` (`tableName`, `fields`, `rowCount`, `isStale()`, `ensureFresh()`, `refresh()`, `drop()`, `[Symbol.asyncDispose]()`).
+
+### `db.createMaterializedView(name, selectSql, options?)` & `db.listMaterializedViews()`
+
+Creates persistent, indexed Firebird materialized views tracked in `"FB_MATVIEWS$"` across `FirebirdBrowser`, `FirebirdLite`, and `ReplicaRouter`:
+- Options: `{ primaryKey?, indexes?, refreshStrategy?: 'manual' | 'on-commit' | 'interval', watchTables?, intervalMs?, replaceExisting? }`
+- Supports both `'full'` (`DELETE` + zero-copy Arrow / `IBatch` re-populate) and keyed `'diff'` refresh (`await mv.refresh({ mode: 'diff' | 'full' })` returning `{ mode, rowCount, inserted, updated, deleted, durationMs }`), `mv.query()`, `mv.liveIncremental()`, `mv.dispose()`, and `mv.drop()`.
+
+### Streaming CSV / NDJSON <-> Apache Arrow IPC V5 Converters & CLI `export-arrow` / `import-arrow`
+
+- Bounded-memory Web Streams transcoders (`batchSize` chunking without buffering full datasets in RAM): `ndjsonToArrowStream(src, opts?)`, `csvToArrowStream(src, opts?)`, `arrowToNdjsonStream(src, opts?)`, `arrowToCsvStream(src, opts?)`.
+- CLI: `npx firebird-wasm export-arrow <uri> "<sql>" --out <file.arrow> [--gzip] [--json]` and `npx firebird-wasm import-arrow <uri> <table> --in <file.arrow> [--gzip] [--create-table] [--pk <col>] [--upsert] [--json]`.
+
+### `createUndoRedoManager(db, options?)` & Framework Hooks (`useUndoRedo` / `createUndoRedo`)
+
+Local-first per-user Undo / Redo stack with grouped action checkpoints (`await manager.run(label, fn)`), selective inverse row `undo()` / `redo()` (leaving concurrent background replication rows untouched), cross-tab `BroadcastChannel` synchronization (`broadcastChannel` on both `OptimisticMutationStore` and `UndoRedoManager`), `<firebird-repl>` `Undo` / `Redo` toolbar buttons (`repl.undoRedoManager = manager`), and reactive framework bindings (`useUndoRedo` in React/Vue; `createUndoRedo` in Svelte/Solid).

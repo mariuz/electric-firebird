@@ -30,6 +30,12 @@ import {
 } from '../columnar';
 import type { SyncHandleLike } from '../frameworks/sync-store';
 import type { OptimisticMutationStore, OptimisticStoreSnapshot } from '../optimistic-store';
+import type { UndoRedoSnapshot } from '../undo-redo';
+import {
+  DEFAULT_MATVIEWS_TABLE,
+  type MaterializedViewInfo,
+  type MaterializedViewRefreshStrategy,
+} from '../materialized-view';
 import { el } from './repl-styles';
 import type {
   ReplArrowInspectorInfo,
@@ -593,14 +599,38 @@ export function renderPlanExplorerPanel(lastPlans: ReadonlyArray<{ sql: string; 
 
 function renderOutboxInspectorPanel(
   snap: OptimisticStoreSnapshot | null,
+  undoSnap: UndoRedoSnapshot | null,
   onFlush?: () => void,
   onRevert?: (id: string) => void,
   onRevertAll?: () => void,
+  onUndo?: () => void,
+  onRedo?: () => void,
 ): HTMLElement {
   const panel = el('div', 'inspector-outbox');
+  if (undoSnap) {
+    const undoRow = el('div', 'schema-sub');
+    const undoBtn = document.createElement('button');
+    undoBtn.type = 'button';
+    undoBtn.className = 'schema-query-btn outbox-undo-btn';
+    undoBtn.textContent = `Undo (${undoSnap.undoCount})`;
+    undoBtn.disabled = !undoSnap.canUndo;
+    undoBtn.addEventListener('click', () => onUndo?.());
+
+    const redoBtn = document.createElement('button');
+    redoBtn.type = 'button';
+    redoBtn.className = 'schema-query-btn outbox-redo-btn';
+    redoBtn.textContent = `Redo (${undoSnap.redoCount})`;
+    redoBtn.disabled = !undoSnap.canRedo;
+    redoBtn.addEventListener('click', () => onRedo?.());
+    undoRow.append(undoBtn, redoBtn);
+    panel.append(undoRow);
+  }
+
   if (!snap) {
     const empty = el('p', 'inspector-empty');
-    empty.textContent = 'No optimisticStore attached to <firebird-repl>.';
+    empty.textContent = undoSnap
+      ? `Undo stack: ${undoSnap.undoCount} · Redo stack: ${undoSnap.redoCount}`
+      : 'No optimisticStore attached to <firebird-repl>.';
     panel.append(empty);
     return panel;
   }
@@ -652,24 +682,68 @@ function renderOutboxInspectorPanel(
   return panel;
 }
 
+export async function fetchReplMaterializedViews(
+  db: ReplDatabase,
+): Promise<MaterializedViewInfo[]> {
+  if (typeof db.listMaterializedViews === 'function') {
+    return db.listMaterializedViews();
+  }
+  try {
+    const rel = await db.query(
+      `SELECT 1 FROM RDB$RELATIONS WHERE TRIM(RDB$RELATION_NAME) = ?`,
+      [DEFAULT_MATVIEWS_TABLE],
+      { rowMode: 'array' },
+    );
+    if (rel.rows.length === 0) return [];
+    const res = await db.query(
+      `SELECT "VIEW_NAME", "SELECT_SQL", "PRIMARY_KEY_JSON", "INDEXES_JSON", ` +
+        `"REFRESH_STRATEGY", "WATCH_TABLES_JSON", "INTERVAL_MS", "ROW_COUNT", ` +
+        `"LAST_REFRESHED_AT", "LAST_DURATION_MS" ` +
+        `FROM "${DEFAULT_MATVIEWS_TABLE}" ORDER BY "VIEW_NAME"`,
+      [],
+      { rowMode: 'array' },
+    );
+    return res.rows.map((r) => ({
+      name: String(r[0] ?? '').trim(),
+      selectSql: String(r[1] ?? ''),
+      primaryKey: JSON.parse(String(r[2] ?? '[]')) as string[],
+      indexes: JSON.parse(String(r[3] ?? '[]')) as string[][],
+      refreshStrategy: (String(r[4] ?? 'manual').trim() ||
+        'manual') as MaterializedViewRefreshStrategy,
+      watchTables: JSON.parse(String(r[5] ?? '[]')) as string[],
+      intervalMs: r[6] === null || r[6] === undefined ? null : Number(r[6]),
+      rowCount: Number(r[7] ?? 0),
+      lastRefreshedAt: Number(r[8] ?? 0),
+      lastDurationMs: Number(r[9] ?? 0),
+    }));
+  } catch {
+    return [];
+  }
+}
+
 export interface ReplInspectorRenderContext {
   readonly db: ReplDatabase | null;
   readonly inspectorBody: HTMLDivElement;
   readonly editor: HTMLTextAreaElement;
   readonly activeTab: ReplInspectorTab;
   readonly lastSchema: SchemaIntrospection | null;
+  readonly lastMatViews?: readonly MaterializedViewInfo[];
   readonly lastMigrations: AppliedMigration[];
   readonly lastStats: MonitorStats | null;
   readonly lastPlans: ReadonlyArray<{ sql: string; parsed: ParsedQueryPlan }>;
   readonly lastReplication: ReplReplicationInfo | null;
   readonly lastArrow: ReplArrowInspectorInfo | null;
   readonly optimisticStore?: OptimisticMutationStore | null;
+  readonly undoRedoSnapshot?: UndoRedoSnapshot | null;
   readonly onResetProfiler: () => void;
   readonly onExportArrow?: () => void;
   readonly onImportArrowFile?: (fileName: string, bytes: Uint8Array) => void;
   readonly onFlushOutbox?: () => void;
   readonly onRevertMutation?: (id: string) => void;
   readonly onRevertAllOutbox?: () => void;
+  readonly onUndo?: () => void;
+  readonly onRedo?: () => void;
+  readonly onRefreshMaterializedView?: (name: string) => void;
 }
 
 export function renderReplInspector(ctx: ReplInspectorRenderContext): void {
@@ -701,9 +775,12 @@ export function renderReplInspector(ctx: ReplInspectorRenderContext): void {
         ctx.inspectorBody.append(
           renderOutboxInspectorPanel(
             ctx.optimisticStore ? ctx.optimisticStore.getSnapshot() : null,
+            ctx.undoRedoSnapshot ?? null,
             ctx.onFlushOutbox,
             ctx.onRevertMutation,
             ctx.onRevertAllOutbox,
+            ctx.onUndo,
+            ctx.onRedo,
           ),
         );
         return;
@@ -1211,6 +1288,38 @@ export function renderReplInspector(ctx: ReplInspectorRenderContext): void {
             src.textContent = vw.source;
             details.append(src);
           }
+          panel.append(details);
+        }
+      }
+
+      if (ctx.lastMatViews && ctx.lastMatViews.length > 0) {
+        const mvTitle = el('div', 'schema-group-title');
+        mvTitle.textContent = 'Materialized Views';
+        panel.append(mvTitle);
+
+        for (const mv of ctx.lastMatViews) {
+          const details = el('details', 'schema-view schema-matview');
+          const header = el('summary', 'schema-item-header');
+          const nameSpan = el('span', 'schema-view-name');
+          nameSpan.textContent = mv.name;
+          const badge = el('span', 'schema-badge');
+          badge.textContent = `${mv.rowCount} rows · ${mv.refreshStrategy}`;
+
+          const refreshMvBtn = document.createElement('button');
+          refreshMvBtn.type = 'button';
+          refreshMvBtn.className = 'schema-query-btn matview-refresh-btn';
+          refreshMvBtn.textContent = 'Refresh MV';
+          refreshMvBtn.addEventListener('click', (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            ctx.onRefreshMaterializedView?.(mv.name);
+          });
+
+          header.append(nameSpan, badge, refreshMvBtn);
+          details.append(header);
+          const src = el('pre', 'schema-view-source');
+          src.textContent = mv.selectSql;
+          details.append(src);
           panel.append(details);
         }
       }

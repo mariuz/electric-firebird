@@ -32,6 +32,11 @@ import {
   quoteIdent,
 } from './shared';
 import { readTenantField, valuesMatchTenantId } from './tenant-slice';
+import {
+  getEffectiveTableRlsPredicates,
+  rowMatchesRlsPredicates,
+  type SyncRlsClaimValue,
+} from './jwt-auth';
 
 /** 8-byte wire magic `"FBARSNAP"` for multi-table Arrow IPC snapshot bundles (`M23 Item 3`). */
 const ARROW_SNAPSHOT_MAGIC = new Uint8Array([
@@ -64,6 +69,8 @@ export interface ExportArrowSnapshotOptions {
   sharedTables?: readonly string[];
   /** Optional table whitelist (e.g. from JWT `tables` claim). */
   allowedTables?: ReadonlySet<string> | null;
+  /** Optional normalized per-table RLS predicates (e.g. from JWT `rls` claim, `M24 Item 1`). */
+  rls?: ReadonlyMap<string, ReadonlyMap<string, SyncRlsClaimValue>> | null;
   /** Explicit DDL overrides keyed by table name. */
   tableDdl?: Readonly<Record<string, string>>;
   /** Parallel table export concurrency. @default 1 */
@@ -145,6 +152,10 @@ export async function exportArrowSnapshot(
           return tf.present && valuesMatchTenantId(tf.value, options.tenantId!);
         });
       }
+      const rlsPreds = getEffectiveTableRlsPredicates(options.rls, tblUpper);
+      if (rlsPreds) {
+        rows = rows.filter((r) => rowMatchesRlsPredicates(r, rlsPreds));
+      }
       const colNames =
         rows.length > 0
           ? Object.keys(rows[0]!)
@@ -196,6 +207,28 @@ export async function exportArrowSnapshot(
     if (isTenantScoped && options.tenantColumn) {
       whereClauses.push(`${quoteIdent(options.tenantColumn.toUpperCase())} = ?`);
       whereParams.push(options.tenantId as string | number);
+    }
+    const rlsPreds = getEffectiveTableRlsPredicates(options.rls, tableUpper);
+    if (rlsPreds) {
+      for (const [colUpper, expected] of rlsPreds) {
+        const colIdent = quoteIdent(colUpper);
+        if (expected === null) {
+          whereClauses.push(`${colIdent} IS NULL`);
+        } else if (Array.isArray(expected)) {
+          const nonNull = expected.filter((v) => v !== null);
+          const hasNull = nonNull.length !== expected.length;
+          const parts: string[] = [];
+          if (nonNull.length > 0) {
+            parts.push(`${colIdent} IN (${nonNull.map(() => '?').join(', ')})`);
+            whereParams.push(...nonNull);
+          }
+          if (hasNull) parts.push(`${colIdent} IS NULL`);
+          whereClauses.push(parts.length > 0 ? `(${parts.join(' OR ')})` : '1 = 0');
+        } else {
+          whereClauses.push(`${colIdent} = ?`);
+          whereParams.push(expected as string | number | boolean);
+        }
+      }
     }
     if (typeof cfg.where === 'string' && cfg.where.trim()) {
       whereClauses.push(`(${cfg.where})`);

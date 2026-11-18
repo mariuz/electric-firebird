@@ -101,7 +101,9 @@ Commands:
   sync <src> <dst>               Sync two databases (--mode auto|native|logical --bootstrap binary-image|page-diff|logical)
   wal-ship <uri>                 Ship checkpoint/WAL segments to --dir <path> or --url <http-or-s3-url>
   pitr-restore <uri>             Restore database from --dir <path> or --url <url> [--lsn <n> | --timestamp <iso>]
-  serve-sync [uri]               Start HTTP/SSE replication & Arrow IPC server [--port <n>] [--api-key <k>] [--tenant-column <col>] [--cors]
+  serve-sync [uri]               Start HTTP/SSE replication & Arrow IPC server [--port <n>] [--api-key <k>] [--jwt-secret <s>] [--jwks-url <u >]
+  export-arrow <uri> <sql>       Stream query results to an Apache Arrow IPC V5 file (--out <file.arrow> [--gzip] [--batch-size <n>])
+  import-arrow <uri> <table>     Stream an Apache Arrow IPC V5 file into <table> (--in <file.arrow> [--gzip] [--create-table] [--pk <col>])
   bench [uri]                    Benchmark IBatch, row query, columnar, Arrow IPC stream & preparePipeline [--rows <n>]
 
 Global Options:
@@ -614,9 +616,12 @@ function parseCliArgs(argv: readonly string[]): ParsedFlags {
             key === 'host' ||
             key === 'api-key' ||
             key === 'jwt-secret' ||
+            key === 'jwks-url' ||
             key === 'jwt-tenant-claim' ||
             key === 'tenant-column' ||
             key === 'shared-tables' ||
+            key === 'pk' ||
+            key === 'batch-size' ||
             key === 'duration-ms')
         ) {
           flags.set(key, next);
@@ -1232,6 +1237,10 @@ export async function runCli(
           typeof flags.get('jwt-secret') === 'string'
             ? String(flags.get('jwt-secret'))
             : undefined;
+        const jwksUrl =
+          typeof flags.get('jwks-url') === 'string'
+            ? String(flags.get('jwks-url'))
+            : undefined;
         const jwtTenantClaim =
           typeof flags.get('jwt-tenant-claim') === 'string'
             ? String(flags.get('jwt-tenant-claim'))
@@ -1242,6 +1251,7 @@ export async function runCli(
           host,
           apiKey,
           jwtSecret,
+          jwksUrl,
           jwtTenantClaim,
           tenantColumn,
           sharedTables,
@@ -1284,6 +1294,134 @@ export async function runCli(
           }
         } finally {
           await srv.close();
+          await managed.flushAndClose(true);
+        }
+        return 0;
+      }
+
+      case 'export-arrow': {
+        const uri = positional[1];
+        const sqlText = positional.slice(2).join(' ').trim();
+        const outFlag = flags.get('out');
+        if (!uri || !sqlText || typeof outFlag !== 'string' || !outFlag.trim()) {
+          err(
+            'Usage: firebird-wasm export-arrow <uri> <sql> --out <file.arrow> [--gzip] [--batch-size <n>] [--json]\n',
+          );
+          return 1;
+        }
+        const outPath = path.resolve(cwd, outFlag);
+        const batchSize = Math.max(
+          1,
+          Number(typeof flags.get('batch-size') === 'string' ? flags.get('batch-size') : 1024) || 1024,
+        );
+        const useGzip = flags.get('gzip') === true || outPath.toLowerCase().endsWith('.gz');
+        fs.mkdirSync(path.dirname(outPath), { recursive: true });
+
+        const managed = await openCliDatabase(uri, { cwd, backend });
+        try {
+          const arrowStream = managed.db.queryArrowStream(sqlText, { batchSize });
+          const rawArrowBytes = await collectArrowStreamBytes(arrowStream);
+          const decoded = decodeArrowIpc(rawArrowBytes);
+          const finalBytes = useGzip
+            ? new Uint8Array(zlib.gzipSync(rawArrowBytes))
+            : rawArrowBytes;
+          fs.writeFileSync(outPath, finalBytes);
+
+          if (flags.get('json') === true) {
+            out(
+              `${JSON.stringify(
+                {
+                  out: outPath,
+                  rows: decoded.rowCount,
+                  columns: decoded.fields.map((f) => f.name),
+                  bytes: finalBytes.byteLength,
+                  gzip: useGzip,
+                },
+                null,
+                2,
+              )}\n`,
+            );
+          } else {
+            out(
+              `Exported ${decoded.rowCount} row(s) (${finalBytes.byteLength} bytes${useGzip ? ', gzip' : ''}) to ${outPath}\n`,
+            );
+          }
+        } finally {
+          await managed.flushAndClose(false);
+        }
+        return 0;
+      }
+
+      case 'import-arrow': {
+        const uri = positional[1];
+        const tableName = positional[2]?.trim();
+        const inFlag = flags.get('in');
+        if (!uri || !tableName || typeof inFlag !== 'string' || !inFlag.trim()) {
+          err(
+            'Usage: firebird-wasm import-arrow <uri> <table> --in <file.arrow> [--gzip] [--create-table] [--pk <col>] [--upsert] [--json]\n',
+          );
+          return 1;
+        }
+        const inPath = path.resolve(cwd, inFlag);
+        if (!fs.existsSync(inPath)) {
+          err(`Input Arrow file not found: ${inPath}\n`);
+          return 1;
+        }
+        const rawBuf = fs.readFileSync(inPath);
+        const isGzip =
+          flags.get('gzip') === true ||
+          (rawBuf.byteLength >= 2 && rawBuf[0] === 0x1f && rawBuf[1] === 0x8b);
+        const unpacked = isGzip ? zlib.gunzipSync(rawBuf) : rawBuf;
+        const arrowBytes = new Uint8Array(
+          unpacked.buffer,
+          unpacked.byteOffset,
+          unpacked.byteLength,
+        );
+
+        const pkFlag = flags.get('pk');
+        const primaryKey =
+          typeof pkFlag === 'string' && pkFlag.trim()
+            ? pkFlag
+                .split(',')
+                .map((s) => s.trim())
+                .filter(Boolean)
+            : undefined;
+        const createTable = flags.get('create-table') === true;
+        const upsert = flags.get('upsert') === true;
+        const batchSize = Math.max(
+          1,
+          Number(typeof flags.get('batch-size') === 'string' ? flags.get('batch-size') : 1000) || 1000,
+        );
+
+        const managed = await openCliDatabase(uri, { cwd, backend });
+        try {
+          const result = await managed.db.loadArrowIpc(tableName, arrowBytes, {
+            createTable,
+            primaryKey,
+            upsertMatching: upsert ? (primaryKey ?? true) : undefined,
+            batchSize,
+          });
+          if (flags.get('json') === true) {
+            out(
+              `${JSON.stringify(
+                {
+                  table: result.tableName,
+                  rowsIngested: result.rowsIngested,
+                  batchesExecuted: result.batchesExecuted,
+                  bytesProcessed: result.bytesProcessed,
+                  tableCreated: result.tableCreated,
+                  columns: result.columns,
+                },
+                null,
+                2,
+              )}\n`,
+            );
+          } else {
+            out(
+              `Imported ${result.rowsIngested} row(s) into ${result.tableName} (${result.batchesExecuted} batch(es))\n`,
+            );
+          }
+        } finally {
           await managed.flushAndClose(true);
         }
         return 0;

@@ -10,6 +10,7 @@ import type {
   BlobHandle,
   BlobStreamOptions,
   BlobWritableStream,
+  DatabaseInfo,
   DataStreamOptions,
   FieldInfo,
   PreparedStatement,
@@ -21,6 +22,11 @@ import type {
   RowMode,
   StatementExecutionOptions,
 } from './types';
+import {
+  DATABASE_INFO_REQUEST_ITEMS,
+  normalizeDatabaseInfo,
+  parseDatabaseInfoBuffer,
+} from './browser/engine-transport';
 import { statementKind } from './statement-types';
 import {
   compressGzipStream,
@@ -741,4 +747,116 @@ export async function runNodeLoadDataStream(
   }
 
   await reattachNodeAttachment(host);
+}
+
+export async function readNodeDatabaseInfo(
+  rawAttachment: unknown,
+  queryFn: (sql: string) => Promise<QueryResult<Record<string, unknown>>>,
+): Promise<DatabaseInfo> {
+  const attachment = rawAttachment as {
+    attachmentHandle?: {
+      getInfoAsync?: (
+        status: unknown,
+        itemsLength: number,
+        items: Uint8Array,
+        bufferLength: number,
+        buffer: Uint8Array,
+      ) => Promise<void>;
+      getInfoSync?: (
+        status: unknown,
+        itemsLength: number,
+        items: Uint8Array,
+        bufferLength: number,
+        buffer: Uint8Array,
+      ) => void;
+    };
+    client?: {
+      statusAction?: <T>(fn: (status: unknown) => Promise<T>) => Promise<T>;
+    };
+  };
+
+  const client = attachment?.client;
+  const getInfoAsync = attachment?.attachmentHandle?.getInfoAsync;
+  const getInfoSync = attachment?.attachmentHandle?.getInfoSync;
+
+  if (typeof client?.statusAction === 'function' && typeof getInfoAsync === 'function') {
+    return client.statusAction(async (status) => {
+      const buffer = new Uint8Array(512);
+      await getInfoAsync.call(
+        attachment.attachmentHandle,
+        status,
+        DATABASE_INFO_REQUEST_ITEMS.byteLength,
+        DATABASE_INFO_REQUEST_ITEMS,
+        buffer.byteLength,
+        buffer,
+      );
+      return parseDatabaseInfoBuffer(buffer);
+    });
+  }
+  if (typeof client?.statusAction === 'function' && typeof getInfoSync === 'function') {
+    return client.statusAction(async (status) => {
+      const buffer = new Uint8Array(512);
+      getInfoSync.call(
+        attachment.attachmentHandle,
+        status,
+        DATABASE_INFO_REQUEST_ITEMS.byteLength,
+        DATABASE_INFO_REQUEST_ITEMS,
+        buffer.byteLength,
+        buffer,
+      );
+      return parseDatabaseInfoBuffer(buffer);
+    });
+  }
+
+  const dbRes = await queryFn(
+    'SELECT MON$PAGE_SIZE, MON$PAGES, MON$ODS_MAJOR, MON$ODS_MINOR, ' +
+      'MON$OLDEST_TRANSACTION, MON$OLDEST_ACTIVE, MON$OLDEST_SNAPSHOT, ' +
+      'MON$NEXT_TRANSACTION, MON$PAGE_BUFFERS FROM MON$DATABASE',
+  );
+  const dbRow = dbRes.rows[0] ?? {};
+  let currentMemory = 0;
+  let maxMemory = 0;
+  let reads = 0;
+  let writes = 0;
+  let fetches = 0;
+  let marks = 0;
+  try {
+    const memRes = await queryFn(
+      'SELECT MON$MEMORY_USED, MON$MEMORY_MAX_USED FROM MON$MEMORY_USAGE WHERE MON$STAT_GROUP = 0',
+    );
+    const memRow = memRes.rows[0] ?? {};
+    currentMemory = Number(memRow['MON$MEMORY_USED'] ?? 0);
+    maxMemory = Number(memRow['MON$MEMORY_MAX_USED'] ?? 0);
+  } catch {
+    // Optional monitoring table
+  }
+  try {
+    const ioRes = await queryFn(
+      'SELECT MON$PAGE_READS, MON$PAGE_WRITES, MON$PAGE_FETCHES, MON$PAGE_MARKS FROM MON$IO_STATS WHERE MON$STAT_GROUP = 0',
+    );
+    const ioRow = ioRes.rows[0] ?? {};
+    reads = Number(ioRow['MON$PAGE_READS'] ?? 0);
+    writes = Number(ioRow['MON$PAGE_WRITES'] ?? 0);
+    fetches = Number(ioRow['MON$PAGE_FETCHES'] ?? 0);
+    marks = Number(ioRow['MON$PAGE_MARKS'] ?? 0);
+  } catch {
+    // Optional monitoring table
+  }
+  return normalizeDatabaseInfo({
+    pageSize: Number(dbRow['MON$PAGE_SIZE'] ?? 0),
+    allocatedPages: Number(dbRow['MON$PAGES'] ?? 0),
+    odsVersion: Number(dbRow['MON$ODS_MAJOR'] ?? 0),
+    odsMinorVersion: Number(dbRow['MON$ODS_MINOR'] ?? 0),
+    oldestTransaction: Number(dbRow['MON$OLDEST_TRANSACTION'] ?? 0),
+    oldestActive: Number(dbRow['MON$OLDEST_ACTIVE'] ?? 0),
+    oldestSnapshot: Number(dbRow['MON$OLDEST_SNAPSHOT'] ?? 0),
+    nextTransaction: Number(dbRow['MON$NEXT_TRANSACTION'] ?? 0),
+    currentMemory,
+    maxMemory,
+    pageBuffers: Number(dbRow['MON$PAGE_BUFFERS'] ?? 0),
+    reads,
+    writes,
+    fetches,
+    marks,
+  });
 }

@@ -138,10 +138,10 @@ function Items() {
 | `firebird-wasm` | `openDatabase`, `FirebirdLite`, `FirebirdError` — Node.js native/embedded driver + shared schema, vector, and replication helpers |
 | `firebird-wasm/browser` | `openDatabase`, `FirebirdBrowser`, `FirebirdError`, `IndexedDBVFS`, `OPFSVFS`, snapshots/page diffs, and AES-256-GCM encryption helpers |
 | `firebird-wasm/browser/worker-entry` | Dedicated Web Worker entry point for the WASM engine |
-| `firebird-wasm/react` | React `<FirebirdProvider>`, `useFirebird`, `useQuery`, `useLiveQuery`, `useSyncStatus`, `useColumnarQuery`, `useLiveIncrementalQuery` |
-| `firebird-wasm/vue` | Vue 3 `provideFirebird`, `useFirebird`, `useQuery`, `useLiveQuery`, `useSyncStatus`, `useColumnarQuery`, `useLiveIncrementalQuery` |
-| `firebird-wasm/svelte` | Svelte 5 `setFirebirdContext`, `getFirebirdContext`, `useFirebird`, `createQuery`, `createLiveQuery`, `createSyncStatus`, `createColumnarQuery`, `createLiveIncrementalQuery` |
-| `firebird-wasm/solid` | SolidJS `setFirebirdContext`, `useFirebird`, `createQuery`, `createLiveQuery`, `createSyncStatus`, `createColumnarQuery`, `createLiveIncrementalQuery` |
+| `firebird-wasm/react` | React `<FirebirdProvider>`, `useFirebird`, `useQuery`, `useLiveQuery`, `useSyncStatus`, `useColumnarQuery`, `useLiveIncrementalQuery`, `useTable`, `useOptimisticMutation`, `useUndoRedo` |
+| `firebird-wasm/vue` | Vue 3 `provideFirebird`, `useFirebird`, `useQuery`, `useLiveQuery`, `useSyncStatus`, `useColumnarQuery`, `useLiveIncrementalQuery`, `useTable`, `useOptimisticMutation`, `useUndoRedo` |
+| `firebird-wasm/svelte` | Svelte 5 `setFirebirdContext`, `getFirebirdContext`, `useFirebird`, `createQuery`, `createLiveQuery`, `createSyncStatus`, `createColumnarQuery`, `createLiveIncrementalQuery`, `createTable`, `createOptimisticMutation`, `createUndoRedo` |
+| `firebird-wasm/solid` | SolidJS `setFirebirdContext`, `useFirebird`, `createQuery`, `createLiveQuery`, `createSyncStatus`, `createColumnarQuery`, `createLiveIncrementalQuery`, `createTable`, `createOptimisticMutation`, `createUndoRedo` |
 | `firebird-wasm/tanstack` | TanStack Query (`createFirebirdQueryOptions`, `connectFirebirdQueryClient`) & TanStack DB (`createFirebirdCollection`) adapters |
 | `firebird-wasm/rxdb` | RxDB storage adapter (`getRxStorageFirebird`) backed by Firebird SQL |
 | `firebird-wasm/repl` | `<firebird-repl>` custom element with Schema, Migrations, Profiler, Query Plan, Replication, and Arrow / Sync inspector tabs |

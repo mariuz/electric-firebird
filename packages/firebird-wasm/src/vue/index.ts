@@ -41,6 +41,12 @@ import {
   type ReactiveTableStoreOptions,
 } from '../optimistic-store';
 import type { TableExecutionHost, TableRepository } from '../table-api';
+import {
+  createUndoRedoManager,
+  type UndoRedoEntry,
+  type UndoRedoManager,
+  type UndoRedoOptions,
+} from '../undo-redo';
 import type { SqlFragment } from '../sql-tag';
 import type { QueryParams, Row } from '../types';
 
@@ -597,5 +603,106 @@ export function useTable<T extends Row = Row, K = unknown>(
     update: store.update,
     upsert: store.upsert,
     remove: store.remove,
+  };
+}
+
+export type { UndoRedoEntry, UndoRedoManager, UndoRedoOptions, UndoRedoSnapshot } from '../undo-redo';
+
+/** Vue refs returned by {@link useUndoRedo} (`M24 Item 4`). */
+export interface UndoRedoRefs {
+  readonly manager: UndoRedoManager;
+  canUndo: Ref<boolean>;
+  canRedo: Ref<boolean>;
+  undoCount: Ref<number>;
+  redoCount: Ref<number>;
+  undoStack: ShallowRef<readonly UndoRedoEntry[]>;
+  redoStack: ShallowRef<readonly UndoRedoEntry[]>;
+  lastUndone: ShallowRef<UndoRedoEntry | null>;
+  lastRedone: ShallowRef<UndoRedoEntry | null>;
+  busy: Ref<boolean>;
+  undo: UndoRedoManager['undo'];
+  redo: UndoRedoManager['redo'];
+  run: UndoRedoManager['run'];
+  clear: UndoRedoManager['clear'];
+  insert: UndoRedoManager['insert'];
+  update: UndoRedoManager['update'];
+  upsert: UndoRedoManager['upsert'];
+  delete: UndoRedoManager['delete'];
+  table: UndoRedoManager['table'];
+}
+
+function isVueUndoRedoManager(val: unknown): val is UndoRedoManager {
+  return (
+    typeof val === 'object' &&
+    val !== null &&
+    typeof (val as UndoRedoManager).undo === 'function' &&
+    typeof (val as UndoRedoManager).redo === 'function' &&
+    typeof (val as UndoRedoManager).getSnapshot === 'function'
+  );
+}
+
+/** Create or subscribe to a local-first {@link UndoRedoManager} composable in Vue (`M24 Item 4`). */
+export function useUndoRedo(
+  managerOrOptions:
+    | UndoRedoManager
+    | (UndoRedoOptions & { db?: TableExecutionHost; manager?: UndoRedoManager }) = {},
+): UndoRedoRefs {
+  const manager = isVueUndoRedoManager(managerOrOptions)
+    ? managerOrOptions
+    : managerOrOptions.manager ??
+      createUndoRedoManager(
+        (managerOrOptions.db ?? useFirebird()) as unknown as TableExecutionHost,
+        managerOrOptions,
+      );
+  const owned = !isVueUndoRedoManager(managerOrOptions) && !managerOrOptions.manager;
+  const init = manager.getSnapshot();
+  const canUndo = ref(init.canUndo);
+  const canRedo = ref(init.canRedo);
+  const undoCount = ref(init.undoCount);
+  const redoCount = ref(init.redoCount);
+  const undoStack = shallowRef<readonly UndoRedoEntry[]>(init.undoStack);
+  const redoStack = shallowRef<readonly UndoRedoEntry[]>(init.redoStack);
+  const lastUndone = shallowRef<UndoRedoEntry | null>(init.lastUndone);
+  const lastRedone = shallowRef<UndoRedoEntry | null>(init.lastRedone);
+  const busy = ref(init.busy);
+
+  const unsub = manager.subscribe(() => {
+    const s = manager.getSnapshot();
+    canUndo.value = s.canUndo;
+    canRedo.value = s.canRedo;
+    undoCount.value = s.undoCount;
+    redoCount.value = s.redoCount;
+    undoStack.value = s.undoStack;
+    redoStack.value = s.redoStack;
+    lastUndone.value = s.lastUndone;
+    lastRedone.value = s.lastRedone;
+    busy.value = s.busy;
+  });
+
+  onScopeDispose(() => {
+    unsub();
+    if (owned) manager.close();
+  });
+
+  return {
+    manager,
+    canUndo,
+    canRedo,
+    undoCount,
+    redoCount,
+    undoStack,
+    redoStack,
+    lastUndone,
+    lastRedone,
+    busy,
+    undo: manager.undo,
+    redo: manager.redo,
+    run: manager.run,
+    clear: manager.clear,
+    insert: manager.insert,
+    update: manager.update,
+    upsert: manager.upsert,
+    delete: manager.delete,
+    table: manager.table,
   };
 }

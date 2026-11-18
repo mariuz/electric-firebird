@@ -286,4 +286,22 @@ test.describe('Replication Simulator v2 (replication.html)', () => {
     await expect(page.locator('#event-feed')).toContainText('FB_OPTIMISTIC_OUTBOX$');
     await expect(page.locator('#event-feed')).toContainText('db.registerVirtualTable');
   });
+
+  test('Scenario 18: JWKS Key Rotation + Row-Level rls Claims, db.createMaterializedView() & Undo/Redo', async ({
+    page,
+  }) => {
+    await openReplicationSim(page);
+
+    await page.locator('.scenario-card[data-scenario="jwks-rls-matview-undo"]').click();
+
+    await expect(page.locator('#primary-rows')).toContainText('JWKS RLS MatView Task #4');
+    await expect(page.locator('#replica-rows')).toContainText('JWKS RLS MatView Task #5');
+    await expect(page.locator('#code-inspector')).toContainText('createJwksKeyProvider');
+    await expect(page.locator('#code-inspector')).toContainText('createUndoRedoManager');
+    await expect(page.locator('#event-feed')).toContainText('Scenario 18');
+    await expect(page.locator('#event-feed')).toContainText('JWT_RLS_FORBIDDEN');
+    await expect(page.locator('#event-feed')).toContainText('FB_MATVIEWS$');
+    await expect(page.locator('#event-feed')).toContainText('db.createMaterializedView()');
+    await expect(page.locator('#event-feed')).toContainText('undo()');
+  });
 });

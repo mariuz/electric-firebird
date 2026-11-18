@@ -74,6 +74,7 @@ import type {
   ArrowStreamOptions,
 } from '../columnar-stream';
 import type { TableOptions, TableRepository } from '../table-api';
+import type { MaterializedViewOptions } from '../materialized-view';
 import {
   DEFAULT_REPL_JOURNAL_TABLE,
   DEFAULT_REPL_WATERMARK_TABLE,
@@ -687,6 +688,18 @@ export function createReplicaRouter(options: ReplicaRouterOptions): ReplicaRoute
 
     registerVirtualTable(name, provider, vtOpts) {
       return runWrite((db) => db.registerVirtualTable(name, provider, vtOpts));
+    },
+
+    createMaterializedView<T extends Row = Row>(
+      name: string,
+      selectSql: string | SqlFragment,
+      mvOpts?: MaterializedViewOptions,
+    ) {
+      return runWrite((db) => db.createMaterializedView<T>(name, selectSql, mvOpts));
+    },
+
+    listMaterializedViews() {
+      return runRead('SELECT 1 FROM RDB$DATABASE', (db) => db.listMaterializedViews());
     },
 
     liveIncremental<T extends Row = Row>(

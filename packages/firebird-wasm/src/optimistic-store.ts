@@ -19,6 +19,55 @@ import {
 } from './frameworks/sync-store';
 import type { LiveRowDelta } from './live-incremental';
 import type { ReplicationLogEntry } from './replication/types';
+import type { BroadcastChannelLike } from './replication/transports';
+
+const inProcessOutboxChannels = new Map<string, Set<(data: unknown) => void>>();
+
+export function openSharedBroadcastChannel(
+  channelOrName: string | BroadcastChannelLike,
+): { channel: BroadcastChannelLike; owned: boolean } {
+  if (typeof channelOrName !== 'string') {
+    return { channel: channelOrName, owned: false };
+  }
+  if (typeof globalThis.BroadcastChannel === 'function') {
+    return {
+      channel: new globalThis.BroadcastChannel(channelOrName) as unknown as BroadcastChannelLike,
+      owned: true,
+    };
+  }
+  let group = inProcessOutboxChannels.get(channelOrName);
+  if (!group) {
+    group = new Set();
+    inProcessOutboxChannels.set(channelOrName, group);
+  }
+  const localHandlers = new Set<(ev: { data: unknown }) => void>();
+  const dispatch = (data: unknown) => {
+    for (const fn of localHandlers) fn({ data });
+    channel.onmessage?.({ data });
+  };
+  group.add(dispatch);
+  const channel: BroadcastChannelLike = {
+    postMessage(msg: unknown) {
+      const peers = inProcessOutboxChannels.get(channelOrName);
+      if (!peers) return;
+      for (const peer of peers) {
+        if (peer !== dispatch) peer(msg);
+      }
+    },
+    addEventListener(_type: 'message', fn: (ev: { data: unknown }) => void) {
+      localHandlers.add(fn);
+    },
+    removeEventListener(_type: 'message', fn: (ev: { data: unknown }) => void) {
+      localHandlers.delete(fn);
+    },
+    onmessage: null,
+    close() {
+      inProcessOutboxChannels.get(channelOrName)?.delete(dispatch);
+      localHandlers.clear();
+    },
+  };
+  return { channel, owned: true };
+}
 
 export const DEFAULT_OPTIMISTIC_OUTBOX_TABLE = 'FB_OPTIMISTIC_OUTBOX$';
 
@@ -83,6 +132,8 @@ export interface OptimisticMutationStoreOptions {
   outboxTable?: string;
   /** Default conflict resolution strategy used by `rebase(remoteEntries)` (`M23 Item 2`). @default 'rebase-fields' */
   conflictStrategy?: OptimisticConflictStrategy;
+  /** Optional `BroadcastChannel` name or instance synchronizing pending outbox state across sibling browser tabs (`M24 Item 4`). */
+  broadcastChannel?: string | BroadcastChannelLike;
   /** Callback invoked whenever a mutation fails remote sync and is rolled back locally. */
   onMutationFailed?: (mutation: PendingOptimisticMutation, error: Error) => void;
 }
@@ -158,6 +209,8 @@ export interface OptimisticMutationStore {
     tableName: string,
     options?: TableOptions<T>,
   ): OptimisticTableActions<T, K>;
+  /** Detach cross-tab `BroadcastChannel` listeners if configured (`M24 Item 4`). */
+  close(): void;
 }
 
 function normalizePkList(pk?: string | readonly string[]): string[] {
@@ -273,7 +326,12 @@ export function createOptimisticMutationStore(
     lastError: undefined,
   };
 
-  const emit = (): void => {
+  const tabOrigin = `opt_tab_${Math.random().toString(36).slice(2, 10)}`;
+  const bcHandle = options.broadcastChannel
+    ? openSharedBroadcastChannel(options.broadcastChannel)
+    : null;
+
+  const emit = (broadcast = true): void => {
     snapshot = {
       pendingCount: pendingList.length,
       flushing,
@@ -287,7 +345,57 @@ export function createOptimisticMutationStore(
     for (const cb of [...listeners]) {
       cb();
     }
+    if (broadcast && bcHandle) {
+      bcHandle.channel.postMessage({
+        type: 'fb_optimistic_outbox_sync',
+        origin: tabOrigin,
+        pending: persistEnabled ? undefined : snapshot.pending,
+        confirmedCount,
+        revertedCount,
+        rebasedCount,
+      });
+    }
   };
+
+  const onChannelMessage = (event: { data: unknown }) => {
+    const msg = event.data as
+      | {
+          type?: string;
+          origin?: string;
+          pending?: PendingOptimisticMutation[];
+          confirmedCount?: number;
+          revertedCount?: number;
+          rebasedCount?: number;
+        }
+      | undefined;
+    if (!msg || msg.type !== 'fb_optimistic_outbox_sync' || msg.origin === tabOrigin) {
+      return;
+    }
+    if (typeof msg.confirmedCount === 'number') {
+      confirmedCount = Math.max(confirmedCount, msg.confirmedCount);
+    }
+    if (typeof msg.revertedCount === 'number') {
+      revertedCount = Math.max(revertedCount, msg.revertedCount);
+    }
+    if (typeof msg.rebasedCount === 'number') {
+      rebasedCount = Math.max(rebasedCount, msg.rebasedCount);
+    }
+    if (persistEnabled) {
+      hydrated = false;
+      void store.hydrate().catch(() => undefined);
+    } else if (Array.isArray(msg.pending)) {
+      pendingList = [...msg.pending];
+      emit(false);
+    }
+  };
+
+  if (bcHandle) {
+    if (typeof bcHandle.channel.addEventListener === 'function') {
+      bcHandle.channel.addEventListener('message', onChannelMessage);
+    } else {
+      bcHandle.channel.onmessage = onChannelMessage;
+    }
+  }
 
   const ensureOutboxTable = async (): Promise<void> => {
     if (!persistEnabled || outboxDdlEnsured) return;
@@ -443,7 +551,7 @@ export function createOptimisticMutationStore(
         nextSeq = Math.max(nextSeq, maxSeq + 1);
         pendingList = loaded;
         hydrated = true;
-        emit();
+        emit(false);
         return pendingList;
       })();
 
@@ -827,6 +935,18 @@ export function createOptimisticMutationStore(
         revert: (id) => store.revert(id),
         flush: () => store.flush(),
       };
+    },
+
+    close(): void {
+      if (!bcHandle) return;
+      if (typeof bcHandle.channel.removeEventListener === 'function') {
+        bcHandle.channel.removeEventListener('message', onChannelMessage);
+      } else if (bcHandle.channel.onmessage === onChannelMessage) {
+        bcHandle.channel.onmessage = null;
+      }
+      if (bcHandle.owned) {
+        bcHandle.channel.close?.();
+      }
     },
   };
 

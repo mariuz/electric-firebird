@@ -52,6 +52,13 @@ import {
   type ReactiveTableStoreOptions,
 } from '../optimistic-store';
 import type { TableExecutionHost, TableRepository } from '../table-api';
+import {
+  createUndoRedoManager,
+  type UndoRedoEntry,
+  type UndoRedoManager,
+  type UndoRedoOptions,
+  type UndoRedoSnapshot,
+} from '../undo-redo';
 import type { SqlFragment } from '../sql-tag';
 import type { QueryParams, Row } from '../types';
 
@@ -897,6 +904,144 @@ export function createTable<T extends Row = Row, K = unknown>(
     update: store.update,
     upsert: store.upsert,
     remove: store.remove,
+    destroy,
+  };
+}
+
+export type { UndoRedoEntry, UndoRedoManager, UndoRedoOptions, UndoRedoSnapshot } from '../undo-redo';
+
+/** Svelte store / Runes handle returned by {@link createUndoRedo} (`M24 Item 4`). */
+export interface SvelteUndoRedoStore {
+  readonly manager: UndoRedoManager;
+  readonly canUndo: boolean;
+  readonly canRedo: boolean;
+  readonly undoCount: number;
+  readonly redoCount: number;
+  readonly undoStack: readonly UndoRedoEntry[];
+  readonly redoStack: readonly UndoRedoEntry[];
+  readonly lastUndone: UndoRedoEntry | null;
+  readonly lastRedone: UndoRedoEntry | null;
+  readonly busy: boolean;
+  readonly current: UndoRedoSnapshot;
+  subscribe(run: (value: UndoRedoSnapshot) => void): () => void;
+  undo: UndoRedoManager['undo'];
+  redo: UndoRedoManager['redo'];
+  run: UndoRedoManager['run'];
+  clear: UndoRedoManager['clear'];
+  insert: UndoRedoManager['insert'];
+  update: UndoRedoManager['update'];
+  upsert: UndoRedoManager['upsert'];
+  delete: UndoRedoManager['delete'];
+  table: UndoRedoManager['table'];
+  destroy(): void;
+}
+
+function isSvelteUndoRedoManager(val: unknown): val is UndoRedoManager {
+  return (
+    typeof val === 'object' &&
+    val !== null &&
+    typeof (val as UndoRedoManager).undo === 'function' &&
+    typeof (val as UndoRedoManager).redo === 'function' &&
+    typeof (val as UndoRedoManager).getSnapshot === 'function'
+  );
+}
+
+/** Create a reactive local-first {@link UndoRedoManager} store for Svelte 5 Runes & `$store` (`M24 Item 4`). */
+export function createUndoRedo(
+  managerOrOptions:
+    | UndoRedoManager
+    | (UndoRedoOptions & { db?: TableExecutionHost; manager?: UndoRedoManager }) = {},
+): SvelteUndoRedoStore {
+  const primitives = resolveSveltePrimitives();
+  const manager = isSvelteUndoRedoManager(managerOrOptions)
+    ? managerOrOptions
+    : managerOrOptions.manager ??
+      createUndoRedoManager(
+        (managerOrOptions.db ?? useFirebird()) as unknown as TableExecutionHost,
+        managerOrOptions,
+      );
+  const owned = !isSvelteUndoRedoManager(managerOrOptions) && !managerOrOptions.manager;
+
+  const stateBox = primitives.createStateBox
+    ? primitives.createStateBox<UndoRedoSnapshot>(manager.getSnapshot())
+    : {
+        value: manager.getSnapshot(),
+        get() {
+          return this.value;
+        },
+        set(next: UndoRedoSnapshot) {
+          this.value = next;
+        },
+      };
+
+  const subscribers = new Set<(v: UndoRedoSnapshot) => void>();
+  const unsub = manager.subscribe(() => {
+    const snap = manager.getSnapshot();
+    stateBox.set(snap);
+    for (const fn of [...subscribers]) fn(snap);
+  });
+
+  const destroy = () => {
+    unsub();
+    subscribers.clear();
+    if (owned) manager.close();
+  };
+  if (typeof primitives.onDestroy === 'function') {
+    try {
+      primitives.onDestroy(destroy);
+    } catch {
+      // Ignore outside component init
+    }
+  }
+
+  return {
+    manager,
+    get canUndo() {
+      return stateBox.get().canUndo;
+    },
+    get canRedo() {
+      return stateBox.get().canRedo;
+    },
+    get undoCount() {
+      return stateBox.get().undoCount;
+    },
+    get redoCount() {
+      return stateBox.get().redoCount;
+    },
+    get undoStack() {
+      return stateBox.get().undoStack;
+    },
+    get redoStack() {
+      return stateBox.get().redoStack;
+    },
+    get lastUndone() {
+      return stateBox.get().lastUndone;
+    },
+    get lastRedone() {
+      return stateBox.get().lastRedone;
+    },
+    get busy() {
+      return stateBox.get().busy;
+    },
+    get current() {
+      return stateBox.get();
+    },
+    subscribe(run) {
+      subscribers.add(run);
+      run(stateBox.get());
+      return () => {
+        subscribers.delete(run);
+      };
+    },
+    undo: manager.undo,
+    redo: manager.redo,
+    run: manager.run,
+    clear: manager.clear,
+    insert: manager.insert,
+    update: manager.update,
+    upsert: manager.upsert,
+    delete: manager.delete,
+    table: manager.table,
     destroy,
   };
 }

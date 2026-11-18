@@ -51,6 +51,8 @@ import type { ReplicationStats } from '../replication';
 import type { ColumnarQueryResult } from '../columnar';
 import type { SyncHandleLike } from '../frameworks/sync-store';
 import type { OptimisticMutationStore, OptimisticStoreSnapshot } from '../optimistic-store';
+import type { UndoRedoEntry, UndoRedoManager } from '../undo-redo';
+import type { MaterializedViewInfo } from '../materialized-view';
 
 export {
   computeTableIoBreakdown,
@@ -192,6 +194,7 @@ export interface ReplDatabase {
   ): Promise<ArrowIngestResult>;
   execBatch?(sql: string, rows: unknown[][]): Promise<{ affectedRows: number } | void>;
   execute?(sql: string, params?: unknown[]): Promise<{ affectedRows: number }>;
+  listMaterializedViews?(): Promise<MaterializedViewInfo[]>;
   /**
    * For a statement without rows: a transaction's `exec()` runs exactly one
    * statement and reports what it changed.  (`FirebirdBrowser.exec()` would
@@ -235,6 +238,8 @@ export interface FirebirdReplElement extends HTMLElement {
   syncHandle?: SyncHandleLike | null;
   /** Optional `OptimisticMutationStore` enabling optimistic cell edits, pending row badges, and the `Outbox` inspector (`M23 Item 5`). */
   optimisticStore?: OptimisticMutationStore | null;
+  /** Optional `UndoRedoManager` enabling local-first `Undo` / `Redo` toolbar & Outbox controls (`M24 Item 5`). */
+  undoRedoManager?: UndoRedoManager | null;
   /** Optional target table config enabling inline double-click cell editing in result grids (`M23 Item 5`). */
   editableTable?: ReplEditableTableConfig | null;
   /** The editor's text. */
@@ -281,6 +286,14 @@ export interface FirebirdReplElement extends HTMLElement {
     newValue: unknown,
     primaryKey?: string,
   ): Promise<void>;
+  /** Undo the most recent user action recorded in `undoRedoManager` (`M24 Item 5`). */
+  undo(): Promise<UndoRedoEntry | null>;
+  /** Redo the most recently undone user action recorded in `undoRedoManager` (`M24 Item 5`). */
+  redo(): Promise<UndoRedoEntry | null>;
+  /** List persistent materialized views recorded in `"FB_MATVIEWS$"` (`M24 Item 5`). */
+  materializedViews(): Promise<MaterializedViewInfo[]>;
+  /** Re-populate a persistent materialized view recorded in `"FB_MATVIEWS$"` (`M24 Item 5`). */
+  refreshMaterializedView(name: string): Promise<void>;
   /** Toggle (or switch to `tab` in) the interactive Schema Inspector, Migration Viewer, Profiler & Plan Explorer sidebar. */
   toggleInspector(tab?: ReplInspectorTab): Promise<void>;
   /** Refresh the interactive Schema Inspector, Migration Viewer, Profiler & Plan Explorer sidebar from the database. */
@@ -289,7 +302,7 @@ export interface FirebirdReplElement extends HTMLElement {
   clear(): void;
 }
 
-import { REPL_STYLE, el, asError, summary, table } from './repl-styles';
+import { REPL_STYLE, el, asError } from './repl-styles';
 import { encodeArrowIpc, rowsToColumnarResult } from '../columnar';
 import {
   loadArrowIpcIntoDatabase,
@@ -300,13 +313,14 @@ import {
 } from '../arrow-ingest';
 import {
   fetchReplArrowInspector,
+  fetchReplMaterializedViews,
   fetchReplMigrations,
   fetchReplReplication,
   fetchReplSchema,
   fetchReplStats,
-  renderPlanTreeNode,
   renderReplInspector,
 } from './repl-inspectors';
+import { renderReplEntryBlock } from './repl-entry-renderer';
 
 /**
  * Register the element under `tag` (default `firebird-repl`) and return its
@@ -324,6 +338,8 @@ export function defineFirebirdRepl(
     private syncHandleRef: SyncHandleLike | null = null;
     private optStoreRef: OptimisticMutationStore | null = null;
     private unsubOptStore: (() => void) | null = null;
+    private undoRedoRef: UndoRedoManager | null = null;
+    private unsubUndoRedo: (() => void) | null = null;
     private editableCfg: ReplEditableTableConfig | null = null;
     private readonly output: HTMLDivElement;
     private readonly inspector: HTMLDivElement;
@@ -348,6 +364,8 @@ export function defineFirebirdRepl(
     private readonly replicationButton: HTMLButtonElement;
     private readonly arrowButton: HTMLButtonElement;
     private readonly outboxButton: HTMLButtonElement;
+    private readonly undoButton: HTMLButtonElement;
+    private readonly redoButton: HTMLButtonElement;
     private readonly history: string[] = [];
     /** Position in `history` while walking it; `history.length` is the draft. */
     private cursor = 0;
@@ -356,6 +374,7 @@ export function defineFirebirdRepl(
     private isInspectorOpen = false;
     private activeTab: ReplInspectorTab = 'schema';
     private lastSchema: SchemaIntrospection | null = null;
+    private lastMatViews: MaterializedViewInfo[] = [];
     private lastMigrations: AppliedMigration[] = [];
     private lastStats: MonitorStats | null = null;
     private lastPlans: Array<{ sql: string; parsed: ParsedQueryPlan }> = [];
@@ -489,6 +508,20 @@ export function defineFirebirdRepl(
       this.outboxButton.textContent = 'Outbox';
       this.outboxButton.title = 'Inspect optimistic local-first mutation outbox (flush / revert)';
 
+      this.undoButton = document.createElement('button');
+      this.undoButton.type = 'button';
+      this.undoButton.className = 'undo';
+      this.undoButton.textContent = 'Undo';
+      this.undoButton.title = 'Undo last local-first action';
+      this.undoButton.disabled = true;
+
+      this.redoButton = document.createElement('button');
+      this.redoButton.type = 'button';
+      this.redoButton.className = 'redo';
+      this.redoButton.textContent = 'Redo';
+      this.redoButton.title = 'Redo last undone local-first action';
+      this.redoButton.disabled = true;
+
       this.sweepButton = document.createElement('button');
       this.sweepButton.type = 'button';
       this.sweepButton.className = 'sweep';
@@ -519,6 +552,8 @@ export function defineFirebirdRepl(
         this.replicationButton,
         this.arrowButton,
         this.outboxButton,
+        this.undoButton,
+        this.redoButton,
         this.sweepButton,
         this.infoButton,
         this.explainButton,
@@ -538,6 +573,8 @@ export function defineFirebirdRepl(
       this.replicationButton.addEventListener('click', () => void this.replication());
       this.arrowButton.addEventListener('click', () => void this.inspectArrow());
       this.outboxButton.addEventListener('click', () => void this.inspectOutbox());
+      this.undoButton.addEventListener('click', () => void this.undo());
+      this.redoButton.addEventListener('click', () => void this.redo());
       this.tabSchemaBtn.addEventListener('click', () => {
         this.inspectorTab = 'schema';
         void this.refreshInspector();
@@ -578,7 +615,7 @@ export function defineFirebirdRepl(
       // A property set before the element was defined (React and Vue both
       // set properties as they render) sits on the instance and would hide
       // the accessor: take it over.
-      for (const name of ['db', 'replicator', 'syncHandle', 'optimisticStore', 'editableTable', 'value', 'inspectorOpen', 'inspectorTab'] as const) {
+      for (const name of ['db', 'replicator', 'syncHandle', 'optimisticStore', 'undoRedoManager', 'editableTable', 'value', 'inspectorOpen', 'inspectorTab'] as const) {
         if (Object.prototype.hasOwnProperty.call(this, name)) {
           const early = (this as Record<string, unknown>)[name];
           delete (this as Record<string, unknown>)[name];
@@ -626,6 +663,31 @@ export function defineFirebirdRepl(
           }
         });
       }
+    }
+
+    get undoRedoManager(): UndoRedoManager | null {
+      return this.undoRedoRef;
+    }
+
+    set undoRedoManager(mgr: UndoRedoManager | null) {
+      this.unsubUndoRedo?.();
+      this.unsubUndoRedo = null;
+      this.undoRedoRef = mgr;
+      this.syncUndoRedoButtons();
+      if (mgr) {
+        this.unsubUndoRedo = mgr.subscribe(() => {
+          this.syncUndoRedoButtons();
+          if (this.isInspectorOpen && this.activeTab === 'outbox') {
+            this.renderInspector();
+          }
+        });
+      }
+    }
+
+    private syncUndoRedoButtons(): void {
+      const snap = this.undoRedoRef?.getSnapshot();
+      this.undoButton.disabled = this.busy || !snap?.canUndo;
+      this.redoButton.disabled = this.busy || !snap?.canRedo;
     }
 
     get editableTable(): ReplEditableTableConfig | null {
@@ -707,6 +769,7 @@ export function defineFirebirdRepl(
       this.arrowButton.disabled = disabled;
       this.outboxButton.disabled = disabled;
       this.inspectorRefreshBtn.disabled = disabled;
+      this.syncUndoRedoButtons();
     }
 
     clear(): void {
@@ -741,6 +804,7 @@ export function defineFirebirdRepl(
       try {
         if (this.activeTab === 'schema') {
           this.lastSchema = await this.fetchSchema();
+          this.lastMatViews = await fetchReplMaterializedViews(this.db);
         } else if (this.activeTab === 'migrations') {
           this.lastMigrations = await this.fetchMigrations();
         } else if (this.activeTab === 'profiler' || this.activeTab === 'plan') {
@@ -783,12 +847,14 @@ export function defineFirebirdRepl(
         editor: this.editor,
         activeTab: this.activeTab,
         lastSchema: this.lastSchema,
+        lastMatViews: this.lastMatViews,
         lastMigrations: this.lastMigrations,
         lastStats: this.lastStats,
         lastPlans: this.lastPlans,
         lastReplication: this.lastReplication,
         lastArrow: this.lastArrow,
         optimisticStore: this.optStoreRef,
+        undoRedoSnapshot: this.undoRedoRef ? this.undoRedoRef.getSnapshot() : null,
         onResetProfiler: () => {
           if (this.db && typeof this.db.resetMonitorStats === "function") {
             this.db.resetMonitorStats();
@@ -809,6 +875,15 @@ export function defineFirebirdRepl(
           if (this.optStoreRef) {
             void this.optStoreRef.revertAll().then(() => this.refreshInspector());
           }
+        },
+        onUndo: () => {
+          void this.undo();
+        },
+        onRedo: () => {
+          void this.redo();
+        },
+        onRefreshMaterializedView: (mvName) => {
+          void this.refreshMaterializedView(mvName);
         },
         onExportArrow: () => {
           void this.exportArrow().then((bytes) => {
@@ -1115,6 +1190,7 @@ export function defineFirebirdRepl(
       const entry: ReplEntry = { sql: 'INSPECT SCHEMA', line: 1, ms: 0 };
       try {
         const result = await this.fetchSchema(options);
+        this.lastMatViews = await fetchReplMaterializedViews(this.db);
         entry.schema = result;
         this.lastSchema = result;
         this.activeTab = 'schema';
@@ -1465,7 +1541,14 @@ export function defineFirebirdRepl(
             ? Number(newValue.trim())
             : newValue;
 
-      if (this.optStoreRef) {
+      if (this.undoRedoRef) {
+        await this.undoRedoRef.update(
+          tblUpper,
+          keyValue,
+          { [colUpper]: coerced },
+          { primaryKey: pkUpper },
+        );
+      } else if (this.optStoreRef) {
         await this.optStoreRef.update(
           tblUpper,
           keyValue,
@@ -1495,6 +1578,78 @@ export function defineFirebirdRepl(
           composed: true,
         }),
       );
+    }
+
+    async undo(): Promise<UndoRedoEntry | null> {
+      if (!this.undoRedoRef) return null;
+      const started = performance.now();
+      const undone = await this.undoRedoRef.undo();
+      if (undone) {
+        this.show({
+          sql: `UNDO (${undone.label})`,
+          line: 1,
+          ms: performance.now() - started,
+          affectedRows: undone.operations.length,
+        });
+        if (this.isInspectorOpen) await this.refreshInspector();
+      }
+      return undone;
+    }
+
+    async redo(): Promise<UndoRedoEntry | null> {
+      if (!this.undoRedoRef) return null;
+      const started = performance.now();
+      const redone = await this.undoRedoRef.redo();
+      if (redone) {
+        this.show({
+          sql: `REDO (${redone.label})`,
+          line: 1,
+          ms: performance.now() - started,
+          affectedRows: redone.operations.length,
+        });
+        if (this.isInspectorOpen) await this.refreshInspector();
+      }
+      return redone;
+    }
+
+    async materializedViews(): Promise<MaterializedViewInfo[]> {
+      if (!this.db) return [];
+      const views = await fetchReplMaterializedViews(this.db);
+      this.lastMatViews = views;
+      return views;
+    }
+
+    async refreshMaterializedView(name: string): Promise<void> {
+      if (!this.db) return;
+      const started = performance.now();
+      const views = await fetchReplMaterializedViews(this.db);
+      const target = views.find((v) => v.name.toUpperCase() === name.trim().toUpperCase());
+      if (!target) {
+        throw new Error(`Materialized view '${name}' not found in FB_MATVIEWS$`);
+      }
+      const quoted = `"${target.name.replace(/"/g, '""')}"`;
+      if (typeof this.db.execute === 'function') {
+        await this.db.execute(`DELETE FROM ${quoted}`);
+        await this.db.execute(`INSERT INTO ${quoted} ${target.selectSql}`);
+        const cnt = await this.db.query(`SELECT COUNT(*) FROM ${quoted}`, [], {
+          rowMode: 'array',
+        });
+        const nextRows = Number(cnt.rows[0]?.[0] ?? 0);
+        const dur = performance.now() - started;
+        await this.db.execute(
+          `UPDATE "FB_MATVIEWS$" SET "ROW_COUNT" = ?, "LAST_REFRESHED_AT" = ?, "LAST_DURATION_MS" = ? WHERE "VIEW_NAME" = ?`,
+          [nextRows, Date.now(), dur, target.name],
+        );
+        this.show({
+          sql: `REFRESH MATERIALIZED VIEW ${quoted}`,
+          line: 1,
+          ms: dur,
+          affectedRows: nextRows,
+        });
+      }
+      if (this.isInspectorOpen) {
+        await this.refreshInspector();
+      }
     }
 
     private onKey(event: KeyboardEvent): void {
@@ -1533,269 +1688,12 @@ export function defineFirebirdRepl(
     }
 
     private show(entry: ReplEntry): void {
-      const block = el('div', 'entry');
-      const sql = el('pre', 'sql');
-      sql.textContent = entry.sql;
-      block.append(sql);
-
-      if (entry.error) {
-        const error = el('pre', 'error');
-        error.textContent = entry.error.message;
-        block.append(error);
-      } else {
-        const fields = entry.fields ?? [];
-        const rows = entry.rows ?? [];
-        if (fields.length > 0) {
-          const editTarget = this.editableCfg;
-          const pkName = (editTarget?.primaryKey ?? 'ID').toUpperCase();
-          const pkIdx = fields.findIndex((f) => f.name.toUpperCase() === pkName);
-          const pendingKeys = new Set<string>();
-          if (this.optStoreRef) {
-            const snap = this.optStoreRef.getSnapshot();
-            for (const m of snap.pending) {
-              if (!editTarget || m.tableName === editTarget.table.toUpperCase()) {
-                pendingKeys.add(String(m.keyValue));
-              }
-            }
-          }
-          block.append(
-            table(fields, rows, {
-              pkIndex: pkIdx,
-              pendingKeys,
-              onEditCell:
-                editTarget && pkIdx >= 0
-                  ? (keyVal, colName, nextVal) =>
-                      this.editCell(editTarget.table, keyVal, colName, nextVal, pkName)
-                  : undefined,
-            }),
-          );
-        }
-        if (entry.plan !== undefined) {
-          const plan = el('pre', 'plan');
-          plan.textContent = entry.plan || '(no plan)';
-          block.append(plan);
-          if (entry.planTree && entry.planTree.format !== 'empty') {
-            const treeWrap = el('div', 'entry-plan-tree');
-            treeWrap.append(renderPlanTreeNode(entry.planTree.root));
-            block.append(treeWrap);
-          }
-        }
-        if (entry.info !== undefined) {
-          const d = entry.info;
-          block.append(
-            table(
-              [{ name: 'Metric' }, { name: 'Value' }],
-              [
-                ['Page size', d.pageSize],
-                ['Allocated pages', d.allocatedPages],
-                ['Database size (bytes)', d.databaseSizeBytes],
-                ['ODS version', `${d.odsVersion}.${d.odsMinorVersion}`],
-                ['Oldest transaction (OIT)', d.oldestTransaction],
-                ['Oldest active (OAT)', d.oldestActive],
-                ['Oldest snapshot (OST)', d.oldestSnapshot],
-                ['Next transaction', d.nextTransaction],
-                ['Transaction gap', d.transactionGap],
-                ['Current memory (bytes)', d.currentMemory],
-                ['Max memory (bytes)', d.maxMemory],
-                ['Page buffers', d.pageBuffers],
-                ['Page reads / writes', `${d.reads} / ${d.writes}`],
-                ['Page fetches / marks', `${d.fetches} / ${d.marks}`],
-              ],
-            ),
-          );
-        }
-        if (entry.sweep !== undefined) {
-          const s = entry.sweep;
-          block.append(
-            table(
-              [{ name: 'Metric' }, { name: 'Value' }],
-              [
-                ['Tables scanned', s.tablesScanned],
-                [
-                  'OIT (before → after)',
-                  `${s.before.oldestTransaction} → ${s.after.oldestTransaction}`,
-                ],
-                [
-                  'OAT (before → after)',
-                  `${s.before.oldestActive} → ${s.after.oldestActive}`,
-                ],
-                [
-                  'OST (before → after)',
-                  `${s.before.oldestSnapshot} → ${s.after.oldestSnapshot}`,
-                ],
-                [
-                  'Next transaction',
-                  `${s.before.nextTransaction} → ${s.after.nextTransaction}`,
-                ],
-                [
-                  'Transaction gap (before → after)',
-                  `${s.before.transactionGap} → ${s.after.transactionGap}`,
-                ],
-                ['OIT advanced', s.oitAdvanced],
-                ['Gap reduced', s.gapReduced],
-                [
-                  'Allocated pages (before → after)',
-                  `${s.before.allocatedPages} → ${s.after.allocatedPages}`,
-                ],
-              ],
-            ),
-          );
-        }
-        if (entry.schema !== undefined) {
-          const sc = entry.schema;
-          const schemaRows: ArrayRow[] = sc.tables.map((t) => [
-            t.name,
-            t.columns.map((c) => `${c.name} ${c.typeName}`).join(', '),
-            t.primaryKey.length > 0 ? t.primaryKey.join(', ') : null,
-            t.indexes.length,
-            t.triggers.length,
-          ]);
-          block.append(
-            table(
-              [
-                { name: 'Table' },
-                { name: 'Columns' },
-                { name: 'Primary Key' },
-                { name: 'Indexes' },
-                { name: 'Triggers' },
-              ],
-              schemaRows,
-            ),
-          );
-        }
-        if (entry.migrations !== undefined) {
-          const migRows: ArrayRow[] = entry.migrations.map((m) => [
-            m.version,
-            m.name,
-            m.appliedAt,
-          ]);
-          block.append(
-            table(
-              [{ name: 'Version' }, { name: 'Name' }, { name: 'Applied At' }],
-              migRows,
-            ),
-          );
-        }
-        if (entry.stats !== undefined) {
-          const st = entry.stats;
-          const totalStmts = st.totalQueries + st.totalExecs;
-          block.append(
-            table(
-              [{ name: 'Metric' }, { name: 'Value' }],
-              [
-                ['Queries profiled (errors)', `${totalStmts} (${st.totalErrors})`],
-                ['Total / Avg / Max duration (ms)', `${st.totalDurationMs.toFixed(2)} / ${st.avgDurationMs.toFixed(2)} / ${st.maxDurationMs.toFixed(2)}`],
-                ['Prepare cache hits / misses', `${st.prepareCacheHits} / ${st.prepareCacheMisses} (${(st.prepareCacheHitRate * 100).toFixed(1)}%)`],
-                ['Page reads / writes', `${st.io.reads} / ${st.io.writes}`],
-                ['Page fetches / marks', `${st.io.fetches} / ${st.io.marks}`],
-                ['Transaction gap (OIT → Next)', `${st.transactions.transactionGap} (${st.transactions.oldestTransaction} → ${st.transactions.nextTransaction})`],
-                ['Current / Max memory (bytes)', `${st.io.currentMemory} / ${st.io.maxMemory}`],
-              ],
-            ),
-          );
-        }
-        if (entry.replication !== undefined) {
-          const r = entry.replication;
-          const rows: ArrayRow[] = [
-            ['Journal initialized', r.journalTableExists ? 'Yes' : 'No'],
-            ['Journal entries', r.journalEntryCount],
-            ['Journal LSN range', `${r.minJournalLsn} → ${r.maxJournalLsn}`],
-            [
-              'Registered slots',
-              r.slots.length > 0
-                ? r.slots
-                    .map(
-                      (s) =>
-                        `${s.slotName} (${s.nodeId} @ LSN ${s.confirmedFlushLsn})`,
-                    )
-                    .join(', ')
-                : 'none',
-            ],
-            [
-              'Peer watermarks',
-              r.watermarks.length > 0
-                ? r.watermarks
-                    .map((w) => `${w.peerId} @ LSN ${w.lastLsn}`)
-                    .join(', ')
-                : 'none',
-            ],
-            [
-              'Dead-letter queue (FB_REPL_DLQ$)',
-              (r.dlqEntries?.length ?? 0) > 0
-                ? r.dlqEntries!
-                    .map((d) => `#${d.lsn} (${d.errorMessage}, retries ${d.retryCount})`)
-                    .join(', ')
-                : '0 quarantined',
-            ],
-          ];
-          if (r.enginePublication) {
-            const ep = r.enginePublication;
-            rows.push([
-              'Native Engine Publication (RDB$PUBLICATIONS)',
-              `${ep.name} (${ep.active ? 'ACTIVE' : 'INACTIVE'}${ep.autoEnable ? ', INCLUDE ALL' : ''}) · tables: ${ep.publishedTables.length > 0 ? ep.publishedTables.join(', ') : 'none'} · mode: ${ep.replicaMode ?? 'NONE'} · seq: ${ep.replicationSequence ?? 0}`,
-            ]);
-          }
-          if (r.liveStats) {
-            rows.push(
-              [
-                'Live Replicator Status',
-                `${r.liveStats.status} (primary LSN ${r.liveStats.primaryLsn} / watermark ${r.liveStats.replicaWatermark})`,
-              ],
-              [
-                'Live Lag (entries / ms)',
-                `${r.liveStats.lagEntries} entries / ${r.liveStats.lagMs} ms`,
-              ],
-              [
-                'Changes fetched / applied (conflicts)',
-                `${r.liveStats.totalFetched} / ${r.liveStats.totalApplied} (${r.liveStats.totalConflicts}, ${r.liveStats.bytesTransferred} B)`,
-              ],
-            );
-          }
-          block.append(table([{ name: 'Metric' }, { name: 'Value' }], rows));
-        }
-        if (entry.arrow !== undefined) {
-          const a = entry.arrow;
-          const rows: ArrayRow[] = [
-            ['Row count', a.rowCount],
-            ['Apache Arrow IPC stream (bytes)', a.arrowIpcBytes],
-            [
-              'Columnar vectors',
-              a.vectors
-                .map((v) => `${v.name}:${v.kind}(${v.bufferBytes}B, nulls=${v.nullCount})`)
-                .join(', '),
-            ],
-          ];
-          if (a.syncState) {
-            rows.push([
-              'SyncHandle status',
-              `${a.syncState.state} (${a.syncState.mode}) · LSN ${a.syncState.replicaLsn}/${a.syncState.primaryLsn} · lag ${a.syncState.lagEntries}`,
-            ]);
-          }
-          block.append(table([{ name: 'Metric' }, { name: 'Value' }], rows));
-        }
-        if (entry.outbox !== undefined) {
-          const ob = entry.outbox;
-          block.append(
-            table(
-              [{ name: 'Metric' }, { name: 'Value' }],
-              [
-                ['Pending optimistic mutations', ob.pendingCount],
-                ['Confirmed / Reverted / Rebased', `${ob.confirmedCount} / ${ob.revertedCount} / ${ob.rebasedCount}`],
-                [
-                  'Queued IDs',
-                  ob.pending.length > 0
-                    ? ob.pending.map((m) => `${m.id} (${m.operation} ${m.tableName})`).join(', ')
-                    : 'none',
-                ],
-              ],
-            ),
-          );
-        }
-        const meta = el('p', 'meta');
-        meta.textContent = `${summary(entry, fields.length > 0)} · ${entry.ms.toFixed(1)} ms`;
-        block.append(meta);
-      }
-
+      const block = renderReplEntryBlock(entry, {
+        editableTable: this.editableCfg,
+        optimisticStore: this.optStoreRef,
+        onEditCell: (tbl, keyVal, colName, nextVal, pkName) =>
+          this.editCell(tbl, keyVal, colName, nextVal, pkName),
+      });
       this.output.append(block);
       this.output.scrollTop = this.output.scrollHeight;
     }

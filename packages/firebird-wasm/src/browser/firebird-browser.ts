@@ -23,7 +23,7 @@
  */
 
 import { IndexedDBVFS } from './indexeddb-vfs';
-import { DirectTransport, buildSweepResult } from './engine-transport';
+import { DirectTransport } from './engine-transport';
 import type { EngineHandle, EngineTransport } from './engine-transport';
 import { WorkerTransport } from './worker-transport';
 import { splitStatements } from './sql-script';
@@ -68,7 +68,6 @@ import type { TypedSqlFragment } from '../schema-validation';
 import {
   createBrowserPreparedPipeline,
   executeBrowserPipeline,
-  executePipelineFallback,
   type BrowserPipelineDriverHost,
   type PipelineOperation,
   type PipelineOptions,
@@ -99,6 +98,13 @@ import {
   type VirtualTableOptions,
   type VirtualTableProvider,
 } from '../virtual-table';
+import {
+  createMaterializedViewOnDatabase,
+  listMaterializedViewsOnDatabase,
+  type MaterializedViewHandle,
+  type MaterializedViewInfo,
+  type MaterializedViewOptions,
+} from '../materialized-view';
 import { decodeWireParamRows } from './wire-params';
 import {
   type IncrementalLiveSnapshot,
@@ -113,7 +119,6 @@ import {
   extractEffectiveQuerySchema,
   finalizeQueryResultWithSchema,
   resolveColumnarQueryCall,
-  scanUserTablesForSweep,
   type QueryArrowOptions,
 } from '../shared-driver-ops';
 import type {
@@ -150,7 +155,6 @@ import type {
   StatementExecutionOptions,
   Row,
   QueryParams,
-  RowMode,
   TransactionOptions,
 } from '../types';
 import { FirebirdBrowserTransaction, type ExecResult } from './firebird-browser-tx';
@@ -203,6 +207,18 @@ import {
   setBrowserReplicaMode,
   type BrowserStorageHost,
 } from './firebird-browser-storage';
+import {
+  buildBrowserPipelineHost,
+  buildBrowserUdrExecutor,
+  captureBrowserMonitorStats,
+  captureBrowserPageIo,
+  explainBrowserQuery,
+  prepareBrowserBranchArgs,
+  readBrowserDatabaseInfo,
+  runBrowserExecBatch,
+  runBrowserSweep,
+  runBrowserTransaction,
+} from './firebird-browser-diagnostics';
 
 // ---------------------------------------------------------------------------
 // Implementation
@@ -585,111 +601,34 @@ export class FirebirdBrowser implements FirebirdDatabase {
   }
 
   /**
-   * Execute one statement once per row of parameters: a batch.
-   *
-   * The statement is prepared once and executed for each row, in one
-   * transaction that commits when every row went in and rolls back when any
-   * failed — a batch is all or nothing.  Loading 100,000 rows this way costs
-   * the inserts, not 100,000 prepares and transactions; a failure names the
-   * row.  One statement only: a script cannot say which rows belong to which.
-   *
-   * ```ts
-   * await db.execBatch('INSERT INTO t (id, name) VALUES (?, ?)', [[1, 'a'], [2, 'b']]);
-   * ```
-   *
-   * @returns the rows affected over the whole batch.
+   * Execute one statement once per row of parameters in a single atomic batch.
    */
   async execBatch(sql: string, rows: QueryParams[]): Promise<ExecResult> {
     await this.ensureReady();
-
-    if (!Array.isArray(rows)) {
-      throw new TypeError('execBatch takes an array of parameter rows');
-    }
-    const statements = splitStatements(sql);
-    if (statements.length !== 1) {
-      throw new Error(
-        `A batch runs one statement, not a script (${statements.length} statements found)`,
-      );
-    }
-
-    const startedAt = this.profiler.begin();
-    const ioBefore = await this.captureIoIfListening();
-    let affectedRows = 0;
-    try {
-      affectedRows = await this.engine.executeBatch(
-        this.dbHandle,
-        0,
-        statements[0].sql,
-        rows.map((row) => this.serialize(row)),
-      );
-      const ioAfter = await this.captureIoIfListening();
-      this.profiler.end({
-        startedAt,
-        sql: statements[0].sql,
-        params: rows[0] ?? [],
-        kind: 'execBatch',
-        rowCount: affectedRows,
-        cacheHit: rows.length > 1,
-        ioBefore,
-        ioAfter,
-      });
-    } catch (err) {
-      this.profiler.end({
-        startedAt,
-        sql: statements[0].sql,
-        params: rows[0] ?? [],
-        kind: 'execBatch',
-        cacheHit: rows.length > 1,
-        error: err,
-      });
-      throw err;
-    }
-
-    if (rows.length > 0) {
-      this.markDirty();
-      this.liveBridge.broadcastTables(extractMutatedTables(statements[0].sql));
-    }
-
-    return { affectedRows };
+    return runBrowserExecBatch(
+      this.engine,
+      this.dbHandle,
+      this.profiler,
+      this.liveBridge,
+      () => this.captureIoIfListening(),
+      (row) => this.serialize(row),
+      () => this.markDirty(),
+      sql,
+      rows,
+    );
   }
 
   private createPipelineDriverHost(): BrowserPipelineDriverHost {
-    return {
-      dbHandle: this.dbHandle,
-      packWireParams:
-        Boolean(this.engine.acceptsWireParams) || this.engine instanceof WorkerTransport,
-      shapeCache: this.columnarShapeCache,
-      serialize: (p) => this.serialize(p),
-      applyTypes: (res, rm) => applyTypes(res, this.options.types, rm),
-      prepareHandle:
-        typeof this.engine.prepare === 'function'
-          ? async (s) => (await this.engine.prepare!(this.dbHandle, 0, s)).handle
-          : undefined,
-      closeHandle:
-        typeof this.engine.stmtClose === 'function'
-          ? (h) => this.engine.stmtClose!(h)
-          : undefined,
-      runEnginePipeline:
-        typeof this.engine.pipeline === 'function'
-          ? (reqs, opts) => this.engine.pipeline!(this.dbHandle, 0, reqs, opts)
-          : undefined,
-      runFallback: (steps, txOpt) =>
-        txOpt
-          ? this.transaction(
-              (tx) => executePipelineFallback(steps, tx),
-              typeof txOpt === 'object' ? txOpt : {},
-            )
-          : executePipelineFallback(steps, this),
-      onMutatedSql: (sqls) => {
-        this.markDirty();
-        const mutated = new Set<string>();
-        for (const s of sqls) {
-          for (const tbl of extractMutatedTables(s)) mutated.add(tbl);
-        }
-        if (mutated.size > 0) this.liveBridge.broadcastTables([...mutated]);
-      },
-      assertNotAborted,
-    };
+    return buildBrowserPipelineHost(
+      this,
+      this.engine,
+      this.dbHandle,
+      this.columnarShapeCache,
+      this.options.types,
+      this.liveBridge,
+      (p) => this.serialize(p),
+      () => this.markDirty(),
+    );
   }
 
   async pipeline<const TOps extends readonly PipelineOperation[]>(
@@ -748,6 +687,22 @@ export class FirebirdBrowser implements FirebirdDatabase {
   ): Promise<VirtualTableHandle> {
     await this.ensureReady();
     return registerVirtualTableOnDatabase(this, name, provider, options);
+  }
+
+  async createMaterializedView<T extends Row = Row>(
+    name: string,
+    selectSql: string | SqlFragment,
+    options: MaterializedViewOptions = {},
+  ): Promise<MaterializedViewHandle<T>> {
+    await this.ensureReady();
+    const handle = await createMaterializedViewOnDatabase<T>(this, name, selectSql, options);
+    this.core.disposables.add(() => handle.dispose());
+    return handle;
+  }
+
+  async listMaterializedViews(): Promise<MaterializedViewInfo[]> {
+    await this.ensureReady();
+    return listMaterializedViewsOnDatabase(this);
   }
 
   /**
@@ -1180,47 +1135,20 @@ export class FirebirdBrowser implements FirebirdDatabase {
     options: ExplainOptions = {},
   ): Promise<string> {
     await this.ensureReady();
-    if (typeof this.engine.explain !== 'function') {
-      throw new Error('The configured EngineTransport does not support explain()');
-    }
-    return this.engine.explain(
-      this.dbHandle,
-      0,
-      toStatement(sql).sql,
-      options.detailed === true,
-    );
+    return explainBrowserQuery(this.engine, this.dbHandle, sql, options);
   }
 
   /**
-   * Inspect database size, page utilization, ODS version, transaction counters
-   * (OIT/OAT/OST/Next), memory pool usage, and page I/O statistics
-   * (`IAttachment::getInfo`).
-   *
-   * ```ts
-   * const info = await db.databaseInfo();
-   * // info.pageSize          → 8192
-   * // info.allocatedPages    → 280
-   * // info.databaseSizeBytes → 2293760
-   * // info.transactionGap    → info.nextTransaction - info.oldestActive
-   * ```
+   * Inspect database size, page utilization, ODS version, transaction counters,
+   * memory pool usage, and page I/O statistics (`IAttachment::getInfo`).
    */
   async databaseInfo(): Promise<DatabaseInfo> {
     await this.ensureReady();
-    if (typeof this.engine.databaseInfo !== 'function') {
-      throw new Error('The configured EngineTransport does not support databaseInfo()');
-    }
-    return this.engine.databaseInfo(this.dbHandle);
+    return readBrowserDatabaseInfo(this.engine, this.dbHandle);
   }
 
   /**
    * Subscribe to structured query execution telemetry ({@link QueryProfileEvent}).
-   * Returns an unsubscribe callback.
-   *
-   * ```ts
-   * const unsub = db.onQuery((event) => {
-   *   console.log(event.sql, `${event.durationMs.toFixed(2)}ms`, event.cacheHit, event.io);
-   * });
-   * ```
    */
   onQuery(listener: QueryProfileListener): () => void {
     return this.profiler.onQuery(listener);
@@ -1228,62 +1156,34 @@ export class FirebirdBrowser implements FirebirdDatabase {
 
   /**
    * Return aggregated query profiling metrics, prepare-cache hit/miss rates,
-   * page-level I/O counters (`isc_info_reads`, `isc_info_writes`,
-   * `isc_info_fetches`, `isc_info_marks`), and transaction health diagnostics.
+   * page-level I/O counters, and transaction health diagnostics.
    */
   async monitorStats(): Promise<MonitorStats> {
     await this.ensureReady();
-    return this.profiler.snapshot(async () => {
-      if (typeof this.engine.databaseInfo === 'function') {
-        return this.engine.databaseInfo(this.dbHandle);
-      }
-      return null;
-    });
+    return captureBrowserMonitorStats(this.profiler, this.engine, this.dbHandle);
   }
 
-  /**
-   * Reset accumulated query profiler counters and clear the recent queries buffer.
-   */
+  /** Reset accumulated query profiler counters and clear the recent queries buffer. */
   resetMonitorStats(): void {
     this.profiler.reset();
   }
 
   private async captureIoIfListening(): Promise<PageIoCounters | null> {
-    if (!this.profiler.hasListeners || typeof this.engine.databaseInfo !== 'function') {
-      return null;
-    }
-    try {
-      const info = await this.engine.databaseInfo(this.dbHandle);
-      return {
-        reads: info.reads,
-        writes: info.writes,
-        fetches: info.fetches,
-        marks: info.marks,
-      };
-    } catch {
-      return null;
-    }
+    return captureBrowserPageIo(this.profiler, this.engine, this.dbHandle);
   }
 
   /**
-   * Trigger an immediate database garbage-collection sweep (`isc_dpb_sweep =
-   * isc_dpb_records` and cooperative user-table scan), advancing OIT and
-   * returning before/after {@link DatabaseInfo} diagnostics.
+   * Trigger an immediate database garbage-collection sweep and return
+   * before/after {@link DatabaseInfo} diagnostics.
    */
   async sweep(): Promise<SweepResult> {
     await this.ensureReady();
-    if (typeof this.engine.sweep === 'function') {
-      const result = await this.engine.sweep(this.dbHandle);
-      this.markDirty();
-      return result;
-    }
-
-    const started = performance.now();
-    const before = await this.databaseInfo();
-    const tablesScanned = await scanUserTablesForSweep((s) => this.query(s));
-    const after = await this.databaseInfo();
-    this.markDirty();
-    return buildSweepResult(before, after, tablesScanned, performance.now() - started);
+    return runBrowserSweep(
+      this.engine,
+      this.dbHandle,
+      (s) => this.query(s),
+      () => this.markDirty(),
+    );
   }
 
   /**
@@ -1406,30 +1306,13 @@ export class FirebirdBrowser implements FirebirdDatabase {
   }
 
   private createUdrExecutor(txHandle: EngineHandle) {
-    const binaryBlobs = this.options.types?.binary === true;
-    return {
-      isDirect: this.engine instanceof DirectTransport,
-      query: <T extends Row = Row>(
-        sql: string,
-        params: QueryParams = [],
-        opts?: { rowMode?: RowMode },
-      ) =>
-        this.engine.query<T>(
-          this.dbHandle,
-          txHandle,
-          sql,
-          this.serialize(params),
-          opts?.rowMode ?? 'object',
-          binaryBlobs,
-        ),
-      exec: (sql: string, params: QueryParams = []) =>
-        this.engine.execute(
-          this.dbHandle,
-          txHandle,
-          sql,
-          this.serialize(params),
-        ),
-    };
+    return buildBrowserUdrExecutor(
+      this.engine,
+      this.dbHandle,
+      txHandle,
+      this.options.types?.binary === true,
+      (params) => this.serialize(params),
+    );
   }
 
   /**
@@ -1454,44 +1337,16 @@ export class FirebirdBrowser implements FirebirdDatabase {
     options: TransactionOptions = {},
   ): Promise<T> {
     await this.ensureReady();
-    const txHandle = await this.engine.startTransaction(this.dbHandle, options);
-
-    const tx = new FirebirdBrowserTransaction(
+    return runBrowserTransaction(
       this.engine,
       this.dbHandle,
-      txHandle,
       this.options.types,
-      undefined,
-      undefined,
-      undefined,
       this.udr,
+      this.liveBridge,
+      () => this.markDirty(),
+      fn,
+      options,
     );
-
-    let result: T;
-    try {
-      result = await fn(tx);
-    } catch (err) {
-      if (!tx.isFinished) {
-        await this.engine.rollback(txHandle);
-      }
-      throw err;
-    }
-
-    // The callback may have rolled back explicitly; committing after that
-    // would target a handle the engine has already finished with.
-    if (tx.isFinished) {
-      this.markDirty();
-      return result;
-    }
-
-    // A failed commit finishes the transaction too, so there is nothing left
-    // to roll back here.
-    await this.engine.commit(txHandle);
-    this.markDirty();
-    if (tx.committedTables.length > 0) {
-      this.liveBridge.broadcastTables(tx.committedTables);
-    }
-    return result;
   }
 
   async createBlobStream(
@@ -1561,30 +1416,15 @@ export class FirebirdBrowser implements FirebirdDatabase {
     branchName?: string,
     options: BranchOptions = {},
   ): Promise<FirebirdBrowser> {
-    const { fromSnapshot, ...browserOpts } = options;
-    const snap = fromSnapshot
-      ? this.snapshotStore.getSnapshot(fromSnapshot)
-      : await this.snapshot();
-    const targetName =
-      branchName?.trim() || `memory://branch-${this.fileName}-${snap.id}`;
-    const branchTransport =
-      browserOpts.transport !== undefined
-        ? browserOpts.transport
-        : this.options.transport
-          ? new Proxy(this.options.transport, {
-              get(target, prop, receiver) {
-                if (prop === 'dispose') return async () => undefined;
-                const value = Reflect.get(target, prop, receiver);
-                return typeof value === 'function' ? value.bind(target) : value;
-              },
-            })
-          : undefined;
-    return new FirebirdBrowser(targetName, {
-      ...this.options,
-      ...browserOpts,
-      ...(branchTransport ? { transport: branchTransport } : {}),
-      loadDataDir: snap.toUint8Array(),
-    });
+    const { targetName, mergedOptions } = await prepareBrowserBranchArgs(
+      this.fileName,
+      this.options,
+      this.snapshotStore,
+      () => this.snapshot(),
+      branchName,
+      options,
+    );
+    return new FirebirdBrowser(targetName, mergedOptions);
   }
 
   async dumpDataDir(): Promise<Uint8Array> {
@@ -1760,21 +1600,8 @@ export class FirebirdBrowser implements FirebirdDatabase {
 
   // ── Automatic persistence ─────────────────────────────────────────────
 
-  /**
-   * Whether this tab may write the database image to IndexedDB.
-   *
-   * In shared mode only the leader may: a follower has no engine, and its
-   * `readFile` would fetch the image across the channel only to race the
-   * leader writing the same store — reintroducing the whole-image overwrite
-   * that multi-tab safety exists to prevent.
-   */
+  /** Whether this tab may write the database image to IndexedDB. */
   private get mayPersist(): boolean {
-    // Ephemeral first: there is nowhere to persist to, so persist() is a
-    // no-op and markDirty() schedules nothing. A caller who writes code that
-    // works for both kinds should not have to branch.
-    //
-    // OPFS for the opposite reason: the engine's writes already went to the
-    // file, so there is nothing left to copy and a persist would be pure cost.
     if (this.ephemeral || this.opfs) return false;
     return this.shared === null || this.shared.isLeader;
   }

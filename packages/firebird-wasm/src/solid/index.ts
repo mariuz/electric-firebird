@@ -53,6 +53,13 @@ import {
   type ReactiveTableStoreOptions,
 } from '../optimistic-store';
 import type { TableExecutionHost, TableRepository } from '../table-api';
+import {
+  createUndoRedoManager,
+  type UndoRedoEntry,
+  type UndoRedoManager,
+  type UndoRedoOptions,
+  type UndoRedoSnapshot,
+} from '../undo-redo';
 import type { SqlFragment } from '../sql-tag';
 import type { QueryParams, Row } from '../types';
 
@@ -695,6 +702,96 @@ export function createTable<T extends Row = Row, K = unknown>(
     update: store.update,
     upsert: store.upsert,
     remove: store.remove,
+    dispose,
+  };
+}
+
+export type { UndoRedoEntry, UndoRedoManager, UndoRedoOptions, UndoRedoSnapshot } from '../undo-redo';
+
+/** SolidJS signal result returned by {@link createUndoRedo} (`M24 Item 4`). */
+export interface SolidUndoRedoResult {
+  readonly manager: UndoRedoManager;
+  state: Accessor<UndoRedoSnapshot>;
+  canUndo: Accessor<boolean>;
+  canRedo: Accessor<boolean>;
+  undoCount: Accessor<number>;
+  redoCount: Accessor<number>;
+  lastUndone: Accessor<UndoRedoEntry | null>;
+  lastRedone: Accessor<UndoRedoEntry | null>;
+  busy: Accessor<boolean>;
+  undo: UndoRedoManager['undo'];
+  redo: UndoRedoManager['redo'];
+  run: UndoRedoManager['run'];
+  clear: UndoRedoManager['clear'];
+  insert: UndoRedoManager['insert'];
+  update: UndoRedoManager['update'];
+  upsert: UndoRedoManager['upsert'];
+  delete: UndoRedoManager['delete'];
+  table: UndoRedoManager['table'];
+  dispose(): void;
+}
+
+function isSolidUndoRedoManager(val: unknown): val is UndoRedoManager {
+  return (
+    typeof val === 'object' &&
+    val !== null &&
+    typeof (val as UndoRedoManager).undo === 'function' &&
+    typeof (val as UndoRedoManager).redo === 'function' &&
+    typeof (val as UndoRedoManager).getSnapshot === 'function'
+  );
+}
+
+/** Create SolidJS signal accessors backed by {@link UndoRedoManager} (`M24 Item 4`). */
+export function createUndoRedo(
+  managerOrOptions:
+    | UndoRedoManager
+    | (UndoRedoOptions & { db?: TableExecutionHost; manager?: UndoRedoManager }) = {},
+): SolidUndoRedoResult {
+  const primitives = resolveSolidPrimitives();
+  const makeSignal = primitives.createSignal ?? createFallbackSignal;
+  const manager = isSolidUndoRedoManager(managerOrOptions)
+    ? managerOrOptions
+    : managerOrOptions.manager ??
+      createUndoRedoManager(
+        (managerOrOptions.db ?? useFirebird()) as unknown as TableExecutionHost,
+        managerOrOptions,
+      );
+  const owned = !isSolidUndoRedoManager(managerOrOptions) && !managerOrOptions.manager;
+
+  const [getSnap, setSnap] = makeSignal<UndoRedoSnapshot>(manager.getSnapshot());
+  const unsub = manager.subscribe(() => setSnap(manager.getSnapshot()));
+
+  const dispose = () => {
+    unsub();
+    if (owned) manager.close();
+  };
+  if (typeof primitives.onCleanup === 'function') {
+    try {
+      primitives.onCleanup(dispose);
+    } catch {
+      // Ignore outside reactive owner
+    }
+  }
+
+  return {
+    manager,
+    state: getSnap,
+    canUndo: () => getSnap().canUndo,
+    canRedo: () => getSnap().canRedo,
+    undoCount: () => getSnap().undoCount,
+    redoCount: () => getSnap().redoCount,
+    lastUndone: () => getSnap().lastUndone,
+    lastRedone: () => getSnap().lastRedone,
+    busy: () => getSnap().busy,
+    undo: manager.undo,
+    redo: manager.redo,
+    run: manager.run,
+    clear: manager.clear,
+    insert: manager.insert,
+    update: manager.update,
+    upsert: manager.upsert,
+    delete: manager.delete,
+    table: manager.table,
     dispose,
   };
 }

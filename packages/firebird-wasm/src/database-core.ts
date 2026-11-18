@@ -63,6 +63,11 @@ import type {
   VirtualTableProvider,
 } from './virtual-table';
 import type {
+  MaterializedViewHandle,
+  MaterializedViewInfo,
+  MaterializedViewOptions,
+} from './materialized-view';
+import type {
   IncrementalLiveSnapshot,
   LiveColumnarOptions,
   LiveColumnarQuery,
@@ -204,6 +209,7 @@ export class DatabaseCoreSubsystems {
   readonly udr = new UdrManager();
   readonly snapshotStore: CowSnapshotStore;
   readonly profiler = new QueryProfiler();
+  readonly disposables = new Set<() => void | Promise<void>>();
 
   constructor(pageSize = 8192) {
     this.snapshotStore = new CowSnapshotStore(pageSize);
@@ -211,6 +217,14 @@ export class DatabaseCoreSubsystems {
 
   /** Clear all in-memory subsystem caches on `db.close()`. */
   clear(): void {
+    for (const disposeFn of [...this.disposables]) {
+      try {
+        void Promise.resolve(disposeFn()).catch(() => undefined);
+      } catch {
+        // Ignore teardown errors
+      }
+    }
+    this.disposables.clear();
     this.udr.clear();
     this.snapshotStore.clear();
     this.profiler.clear();
@@ -478,6 +492,14 @@ export interface FirebirdDatabase {
     provider: VirtualTableProvider,
     options?: VirtualTableOptions,
   ): Promise<VirtualTableHandle>;
+  /** Create a persistent, indexed, optionally auto-refreshing Firebird materialized view (`M24 Item 2`). */
+  createMaterializedView<T extends Row = Row>(
+    name: string,
+    selectSql: string | SqlFragment,
+    options?: MaterializedViewOptions,
+  ): Promise<MaterializedViewHandle<T>>;
+  /** List all persistent materialized views stored in `"FB_MATVIEWS$"` (`M24 Item 2`). */
+  listMaterializedViews(): Promise<MaterializedViewInfo[]>;
   /**
    * Subscribe to incremental `{ rows, deltas }` (`insert` / `update` / `delete`)
    * updates with structural sharing for unchanged rows (`M20 Item 3`).

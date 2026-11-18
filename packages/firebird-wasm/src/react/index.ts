@@ -54,6 +54,12 @@ import {
   type ReactiveTableStoreOptions,
 } from '../optimistic-store';
 import type { TableExecutionHost, TableRepository } from '../table-api';
+import {
+  createUndoRedoManager,
+  type UndoRedoManager,
+  type UndoRedoOptions,
+  type UndoRedoSnapshot,
+} from '../undo-redo';
 import type { SqlFragment } from '../sql-tag';
 import type { QueryParams, Row } from '../types';
 
@@ -477,5 +483,75 @@ export function useTable<T extends Row = Row, K = unknown>(
       remove: store.remove,
     }),
     [state, store],
+  );
+}
+
+export type { UndoRedoEntry, UndoRedoManager, UndoRedoOptions, UndoRedoSnapshot } from '../undo-redo';
+
+/** Return value of {@link useUndoRedo} (`M24 Item 4`). */
+export interface UndoRedoHookResult extends UndoRedoSnapshot {
+  readonly manager: UndoRedoManager;
+  undo: UndoRedoManager['undo'];
+  redo: UndoRedoManager['redo'];
+  run: UndoRedoManager['run'];
+  clear: UndoRedoManager['clear'];
+  insert: UndoRedoManager['insert'];
+  update: UndoRedoManager['update'];
+  upsert: UndoRedoManager['upsert'];
+  delete: UndoRedoManager['delete'];
+  table: UndoRedoManager['table'];
+}
+
+function isUndoRedoInstance(val: unknown): val is UndoRedoManager {
+  return (
+    typeof val === 'object' &&
+    val !== null &&
+    typeof (val as UndoRedoManager).undo === 'function' &&
+    typeof (val as UndoRedoManager).redo === 'function' &&
+    typeof (val as UndoRedoManager).getSnapshot === 'function'
+  );
+}
+
+/**
+ * Create or subscribe to a local-first {@link UndoRedoManager} in React (`M24 Item 4`).
+ */
+export function useUndoRedo(
+  managerOrOptions:
+    | UndoRedoManager
+    | (UndoRedoOptions & { db?: TableExecutionHost; manager?: UndoRedoManager }) = {},
+): UndoRedoHookResult {
+  const provided = useContext(FirebirdContext);
+  const manager = useMemo(() => {
+    if (isUndoRedoInstance(managerOrOptions)) {
+      return managerOrOptions;
+    }
+    if (managerOrOptions.manager) {
+      return managerOrOptions.manager;
+    }
+    const db = (managerOrOptions.db ?? provided) as TableExecutionHost | null;
+    if (!db) {
+      throw new Error(
+        'useUndoRedo() found no database: wrap in <FirebirdProvider db={…}>, or pass a manager / { db }',
+      );
+    }
+    return createUndoRedoManager(db, managerOrOptions);
+  }, [managerOrOptions, provided]);
+
+  const snap = useSyncExternalStore(manager.subscribe, manager.getSnapshot, manager.getSnapshot);
+  return useMemo(
+    () => ({
+      ...snap,
+      manager,
+      undo: manager.undo,
+      redo: manager.redo,
+      run: manager.run,
+      clear: manager.clear,
+      insert: manager.insert,
+      update: manager.update,
+      upsert: manager.upsert,
+      delete: manager.delete,
+      table: manager.table,
+    }),
+    [snap, manager],
   );
 }

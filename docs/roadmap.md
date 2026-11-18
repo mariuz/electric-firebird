@@ -1876,6 +1876,37 @@ Next-horizon improvements across **Replication**, **Speed & Performance**, **Int
 
 ---
 
+### M24 — JWKS Key Rotation & Row-Level RLS Claims, Incremental Materialized Views (`db.createMaterializedView()`), Streaming CSV/NDJSON <-> Arrow IPC Converters & CLI `export-arrow`/`import-arrow`, Local-First Undo/Redo Stack & Sub-1,800-Line Module Split
+
+- [x] **1. JWKS Key Rotation, Per-Row RLS Filter Claims & Live Token Refresh (`createJwksKeyProvider`, `rls` JWT Claims & `serve-sync --jwks-url`).**
+      Add `createJwksKeyProvider({ jwksUrl | keys, cacheTtlMs? })` with `kid` lookup and
+      automatic refresh on unknown `kid`, enforce fine-grained JWT `rls` row predicates
+      across outbound `/changes` + `/snapshot` (JSON & Arrow IPC) and inbound `/push`,
+      add dynamic token rotation (`client.setAuthToken()` / `wsPeer.refreshAuth()`), and
+      add `--jwks-url <url>` to `npx firebird-wasm serve-sync`.
+- [x] **2. Persistent & Auto-Refreshing Materialized Views (`db.createMaterializedView()`).**
+      Add `db.createMaterializedView(name, selectSql, { primaryKey?, indexes?, refreshStrategy?, watchTables?, intervalMs? })`
+      and `db.listMaterializedViews()` (`FB_MATVIEWS$`) across `FirebirdBrowser`,
+      `FirebirdLite`, and `ReplicaRouter`, supporting `'full'` and keyed `'diff'` refresh,
+      automatic refresh on watched table mutations, and `mv.liveIncremental()`.
+- [x] **3. Streaming CSV / NDJSON <-> Apache Arrow IPC V5 Converters & CLI `export-arrow` / `import-arrow`.**
+      Add bounded-memory streaming transcoders (`ndjsonToArrowStream`, `csvToArrowStream`,
+      `arrowToNdjsonStream`, `arrowToCsvStream`) plus CLI `npx firebird-wasm export-arrow`
+      and `npx firebird-wasm import-arrow` subcommands (with `--gzip`, `--create-table`,
+      and `--pk`).
+- [x] **4. Local-First Undo / Redo Stack (`createUndoRedoManager`) & Framework Hooks (`useUndoRedo` / `createUndoRedo`).**
+      Add `createUndoRedoManager(db, { optimisticStore?, maxHistory?, broadcastChannel? })`
+      with grouped action checkpoints (`run(label, fn)`), selective per-user inverse row
+      `undo()` / `redo()`, cross-tab `BroadcastChannel` outbox sync, and `useUndoRedo` /
+      `createUndoRedo` across React, Vue, Svelte, and Solid.
+- [x] **5. `<firebird-repl>` Undo/Redo & Materialized View Inspector, Simulator Scenario 18 & Sub-1,800-Line Module Split.**
+      Add `Undo` / `Redo` controls and Materialized Views inspection/refresh in
+      `<firebird-repl>`, add Simulator **Scenario 18** (`jwks-rls-matview-undo`), and
+      decompose `firebird-browser.ts`, `engine-transport.ts`, and `repl/index.ts` so every
+      non-test `.ts` source file across the repository sits strictly under 1,800 lines.
+
+---
+
 ## 5. Test coverage added alongside this review
 
 `src/browser/` was excluded from Jest and had no browser tests.  It now has 73

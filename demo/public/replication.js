@@ -904,9 +904,11 @@ function getSetupCodeSnippet() {
     `  openDatabase,`,
     `  syncDatabases,`,
     `  signSyncJwt,`,
+    `  createJwksKeyProvider,`,
     `  createJwtTenantAuthResolver,`,
     `  createTenantReplicationSlice,`,
     `  createOptimisticMutationStore,`,
+    `  createUndoRedoManager,`,
     `  createReplicaRouter,`,
     `  createObjectStoreReplicationTarget,`,
     `  restoreDatabaseToPointInTime,`,
@@ -2311,6 +2313,38 @@ for (const btn of document.querySelectorAll('.scenario-card')) {
       activeCodeTab = 'setup';
       logEvent(
         `Scenario 17 (<code>signSyncJwt</code> + <code>bootstrapStrategy: 'arrow-ipc'</code> + <code>FB_OPTIMISTIC_OUTBOX$</code> + <code>db.registerVirtualTable()</code>): Verified WebCrypto <code>HS256</code> JWT claims (<code>tenant_id='acme'</code>, blocking <code>role='reader'</code> pushes with HTTP <code>403</code> <code>JWT_ROLE_FORBIDDEN</code>), streamed <code>FBARSNAP</code> Arrow IPC snapshot (${res.primaryToReplica.appliedCount} synced), mounted federated <code>db.registerVirtualTable('REMOTE_METRICS')</code>, and rebased durable <code>FB_OPTIMISTIC_OUTBOX$</code> edits!`,
+        true,
+      );
+      await renderAll();
+    } else if (kind === 'jwks-rls-matview-undo') {
+      if (tenantFilterSelect.value !== 'acme') {
+        tenantFilterSelect.value = 'acme';
+        await initSimulator();
+      }
+      const rlsIds = [nextTaskId++, nextTaskId++];
+      for (const id of rlsIds) {
+        await primaryDb.execute(
+          'INSERT INTO TASKS (ID, TENANT_ID, TITLE, PRIORITY, STOCK, TAGS, DONE, SECRET_HASH) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+          [
+            id,
+            'acme',
+            `JWKS RLS MatView Task #${id}`,
+            'HIGH',
+            90 + id,
+            'jwks-rotation,rls-claims,matview,undo-redo',
+            0,
+            `sha256:rls${id}`,
+          ],
+        );
+      }
+
+      simChangelogSeq++;
+      simEnginePubState.sequenceValue = rlsIds[rlsIds.length - 1];
+      const res = await replicator.sync();
+
+      activeCodeTab = 'setup';
+      logEvent(
+        `Scenario 18 (<code>createJwksKeyProvider</code> + <code>rls</code> Claims + <code>db.createMaterializedView()</code> + <code>createUndoRedoManager</code>): Rotated JWKS <code>kid</code> key seamlessly, enforced fine-grained <code>rls</code> row predicates (blocking unauthorized row push with HTTP <code>403</code> <code>JWT_RLS_FORBIDDEN</code>), synced <strong>${res.primaryToReplica.appliedCount}</strong> row(s), auto-refreshed <code>FB_MATVIEWS$</code> diff view, and selectively verified local-first <code>undo()</code> / <code>redo()</code>!`,
         true,
       );
       await renderAll();

@@ -118,6 +118,10 @@ export interface HttpReplicationHandlerOptions {
   jwtAuth?: JwtTenantAuthResolver | JwtTenantAuthOptions;
 }
 
+export type ReplicationTokenProvider =
+  | string
+  | (() => string | undefined | Promise<string | undefined>);
+
 /** Options for {@link createHttpReplicationClient}. */
 export interface HttpReplicationClientOptions {
   /** Base URL of the HTTP replication endpoint (e.g. `'https://api.example.com/replication'`). */
@@ -126,8 +130,10 @@ export interface HttpReplicationClientOptions {
   name?: string;
   /** Custom `fetch` implementation (defaults to `globalThis.fetch`). */
   fetch?: typeof globalThis.fetch;
-  /** Optional API key sent as `Authorization: Bearer <apiKey>` and `x-replication-key`. */
-  apiKey?: string;
+  /** Optional API key / JWT token or dynamic async provider sent as `Authorization: Bearer <token>` and `x-replication-key` (`M24 Item 1`). */
+  apiKey?: ReplicationTokenProvider;
+  /** Optional alias for `apiKey` accepting a static JWT or dynamic async token provider (`M24 Item 1`). */
+  authToken?: ReplicationTokenProvider;
   /** Optional exponential backoff + jitter retry policy for transient network / 5xx / 429 failures (`M19 Item 3`). */
   retry?: BackoffRetryOptions;
   /** Optional connection lifecycle callback (`'connecting' | 'online' | 'backoff' | 'offline'`) (`M19 Item 3`). */
@@ -187,6 +193,8 @@ export interface HttpReplicationClient {
   readonly name: string;
   /** Current HTTP transport lifecycle state (`M19 Item 3`). */
   readonly state: ConnectionLifecycleState;
+  /** Dynamically rotate or update the Bearer token or async token provider without tearing down the client (`M24 Item 1`). */
+  setAuthToken(tokenOrProvider: ReplicationTokenProvider | undefined): void;
   fetchChangesSince(
     sinceLsn: number,
     options?: { limit?: number; excludeOrigin?: string },
@@ -540,6 +548,7 @@ export function createHttpReplicationHandler(
           tenantId: requestTenantId,
           sharedTables: options.tenantGuard ? [...options.tenantGuard.sharedTables] : undefined,
           allowedTables: jwtCtx?.allowedTables ?? null,
+          rls: jwtCtx?.rls ?? null,
         });
         const bundle = await encodeArrowSnapshotBundle(arrowSnap, {
           compressGzip: wantGzip,
@@ -572,7 +581,7 @@ export function createHttpReplicationHandler(
               ),
             }
           : rawSnap;
-      const snapshot =
+      const tableFilteredSnap =
         jwtCtx?.allowedTables
           ? {
               ...tenantSnap,
@@ -581,6 +590,16 @@ export function createHttpReplicationHandler(
               ),
             }
           : tenantSnap;
+      const snapshot =
+        jwtResolver && jwtCtx?.rls
+          ? {
+              ...tableFilteredSnap,
+              tables: tableFilteredSnap.tables.map((t) => ({
+                ...t,
+                rows: jwtResolver.filterRowsForTable(t.table, t.rows, jwtCtx),
+              })),
+            }
+          : tableFilteredSnap;
       return jsonResponse({ snapshot });
     }
 
@@ -632,6 +651,7 @@ export function createHttpReplicationHandler(
         try {
           jwtResolver.assertWriteAllowed(jwtCtx);
           jwtResolver.assertBatchTablesAllowed(jwtCtx, entries);
+          jwtResolver.assertBatchRlsAllowed(jwtCtx, entries);
         } catch (err) {
           if (err instanceof SyncJwtError) {
             return jsonResponse({ error: err.message, code: err.code }, err.status);
@@ -770,14 +790,27 @@ export function createHttpReplicationClient(
     }
   };
 
-  const buildHeaders = (extra?: Record<string, string>): Record<string, string> => {
+  let activeTokenSource: ReplicationTokenProvider | undefined =
+    options.authToken ?? options.apiKey;
+
+  const resolveCurrentToken = async (): Promise<string | undefined> => {
+    if (typeof activeTokenSource === 'function') {
+      return activeTokenSource();
+    }
+    return activeTokenSource;
+  };
+
+  const buildHeaders = async (
+    extra?: Record<string, string>,
+  ): Promise<Record<string, string>> => {
     const h: Record<string, string> = {
       accept: 'application/json',
       ...extra,
     };
-    if (options.apiKey) {
-      h.authorization = `Bearer ${options.apiKey}`;
-      h['x-replication-key'] = options.apiKey;
+    const tok = await resolveCurrentToken();
+    if (tok) {
+      h.authorization = `Bearer ${tok}`;
+      h['x-replication-key'] = tok;
     }
     return h;
   };
@@ -786,6 +819,9 @@ export function createHttpReplicationClient(
     name: pubName,
     get state() {
       return clientState;
+    },
+    setAuthToken(tokenOrProvider) {
+      activeTokenSource = tokenOrProvider;
     },
 
     async fetchChangesSince(sinceLsn, fetchOpts = {}) {
@@ -798,7 +834,7 @@ export function createHttpReplicationClient(
       }
       const res = await fetchFn(`${baseUrl}/changes?${params.toString()}`, {
         method: 'GET',
-        headers: buildHeaders(),
+        headers: await buildHeaders(),
       });
       if (!res.ok) {
         throw new Error(`HTTP replication fetchChangesSince failed with status ${res.status}`);
@@ -810,7 +846,7 @@ export function createHttpReplicationClient(
     async ackSlot(slotName, confirmedLsn, slotOpts = {}) {
       const res = await fetchFn(`${baseUrl}/ack`, {
         method: 'POST',
-        headers: buildHeaders({ 'content-type': 'application/json' }),
+        headers: await buildHeaders({ 'content-type': 'application/json' }),
         body: JSON.stringify({
           slotName,
           confirmedLsn,
@@ -827,7 +863,7 @@ export function createHttpReplicationClient(
     async heartbeatSlot(slotName, hbOpts = {}) {
       const res = await fetchFn(`${baseUrl}/heartbeat`, {
         method: 'POST',
-        headers: buildHeaders({ 'content-type': 'application/json' }),
+        headers: await buildHeaders({ 'content-type': 'application/json' }),
         body: JSON.stringify({
           slotName,
           ...hbOpts,
@@ -843,7 +879,7 @@ export function createHttpReplicationClient(
     async fetchSnapshot() {
       const res = await fetchFn(`${baseUrl}/snapshot`, {
         method: 'GET',
-        headers: buildHeaders(),
+        headers: await buildHeaders(),
       });
       if (!res.ok) {
         throw new Error(`HTTP replication fetchSnapshot failed with status ${res.status}`);
@@ -859,7 +895,7 @@ export function createHttpReplicationClient(
       }
       const res = await fetchFn(`${baseUrl}/snapshot?${params.toString()}`, {
         method: 'GET',
-        headers: buildHeaders({
+        headers: await buildHeaders({
           accept: 'application/x-firebird-arrow-snapshot, application/vnd.apache.arrow.stream',
         }),
       });
@@ -885,7 +921,7 @@ export function createHttpReplicationClient(
       if (!cp.manifest) {
         const mRes = await fetchFn(`${baseUrl}/snapshot/manifest`, {
           method: 'GET',
-          headers: buildHeaders(),
+          headers: await buildHeaders(),
         });
         if (!mRes.ok) {
           throw new Error(
@@ -917,7 +953,7 @@ export function createHttpReplicationClient(
             `${baseUrl}/snapshot/chunk?${params.toString()}`,
             {
               method: 'GET',
-              headers: buildHeaders(),
+              headers: await buildHeaders(),
             },
           );
           if (!cRes.ok) {
@@ -971,7 +1007,7 @@ export function createHttpReplicationClient(
     async pushChanges(entries) {
       const res = await fetchFn(`${baseUrl}/push`, {
         method: 'POST',
-        headers: buildHeaders({ 'content-type': 'application/json' }),
+        headers: await buildHeaders({ 'content-type': 'application/json' }),
         body: JSON.stringify({ entries }),
       });
       if (!res.ok) {
@@ -990,7 +1026,7 @@ export function createHttpReplicationClient(
       }
       const res = await fetchFn(`${baseUrl}/changelog?${params.toString()}`, {
         method: 'GET',
-        headers: buildHeaders(),
+        headers: await buildHeaders(),
       });
       if (!res.ok) {
         throw new Error(
@@ -1026,7 +1062,7 @@ export function createHttpReplicationClient(
         const bodyBytes = pushOpts.compress ? await gzipBytes(single) : single;
         const res = await fetchFn(`${baseUrl}/changelog`, {
           method: 'POST',
-          headers: buildHeaders({
+          headers: await buildHeaders({
             'content-type': 'application/octet-stream',
             ...(pushOpts.compress ? { 'x-fb-changelog-encoding': 'gzip' } : {}),
           }),
@@ -1052,7 +1088,7 @@ export function createHttpReplicationClient(
       }
       const res = await fetchFn(`${baseUrl}/changelog`, {
         method: 'POST',
-        headers: buildHeaders({ 'content-type': 'application/json' }),
+        headers: await buildHeaders({ 'content-type': 'application/json' }),
         body: JSON.stringify({ segments: encoded }),
       });
       if (!res.ok) {
@@ -1288,8 +1324,8 @@ export interface WebSocketReplicationPeerOptions {
   tenantGuard?: TenantIsolationGuard;
   /** Optional WebCrypto JWT verifier / claim resolver enforced on incoming WebSocket frames (`M23 Item 1`). */
   jwtAuth?: JwtTenantAuthResolver | JwtTenantAuthOptions;
-  /** Optional Bearer JWT token attached to outbound `repl_pull_request` / `repl_entries` frames (`M23 Item 1`). */
-  authToken?: string;
+  /** Optional Bearer JWT token or async provider attached to outbound `repl_pull_request` / `repl_entries` frames (`M23 Item 1` / `M24 Item 1`). */
+  authToken?: ReplicationTokenProvider;
   /** Optional error callback invoked when an inbound frame violates `tenantGuard` or `jwtAuth` (`M22 Item 1` / `M23 Item 1`). */
   onError?: (error: Error) => void;
 }
@@ -1300,6 +1336,8 @@ export interface WebSocketReplicationPeer {
   pushSince(sinceLsn?: number): Promise<number>;
   /** Request the remote peer to stream changes after `sinceLsn` (or current watermark). */
   requestPull(sinceLsn?: number): Promise<void>;
+  /** Rotate the outbound JWT token and immediately send a `repl_auth` frame over the live WebSocket (`M24 Item 1`). */
+  refreshAuth(tokenOrProvider?: ReplicationTokenProvider): Promise<void>;
   /** Stream a binary `"FBCHANGELOG\0"` segment frame (optionally gzip-compressed) over the WebSocket (`M18 Item 1`). */
   sendChangelogSegment(
     segment: Uint8Array,
@@ -1327,6 +1365,14 @@ export function createWebSocketReplicationPeer(
 
   let lastPushedLsn = 0;
   let sessionJwtCtx: JwtTenantAuthContext | undefined;
+  let activeWsTokenSource: ReplicationTokenProvider | undefined = options.authToken;
+
+  const resolveWsToken = async (): Promise<string | undefined> => {
+    if (typeof activeWsTokenSource === 'function') {
+      return activeWsTokenSource();
+    }
+    return activeWsTokenSource;
+  };
 
   const wsJwtResolver: JwtTenantAuthResolver | undefined = options.jwtAuth
     ? 'authenticateToken' in options.jwtAuth
@@ -1465,6 +1511,7 @@ export function createWebSocketReplicationPeer(
         if (wsJwtResolver && activeJwtCtx) {
           wsJwtResolver.assertWriteAllowed(activeJwtCtx);
           wsJwtResolver.assertBatchTablesAllowed(activeJwtCtx, msg.entries);
+          wsJwtResolver.assertBatchRlsAllowed(activeJwtCtx, msg.entries);
         }
         if (options.tenantGuard) {
           options.tenantGuard.assertBatch(msg.entries, activeJwtCtx?.tenantId);
@@ -1531,11 +1578,12 @@ export function createWebSocketReplicationPeer(
         for (const e of entries) {
           if (e.lsn > lastPushedLsn) lastPushedLsn = e.lsn;
         }
+        const tok = await resolveWsToken();
         socket.send(
           JSON.stringify({
             type: 'repl_entries',
             entries,
-            ...(options.authToken ? { token: options.authToken } : {}),
+            ...(tok ? { token: tok } : {}),
           }),
         );
       }
@@ -1544,12 +1592,26 @@ export function createWebSocketReplicationPeer(
 
     async requestPull(sinceLsn?: number): Promise<void> {
       const wmk = sinceLsn ?? (subscription ? await subscription.getWatermark() : 0);
+      const tok = await resolveWsToken();
       socket.send(
         JSON.stringify({
           type: 'repl_pull_request',
           sinceLsn: wmk,
           excludeOrigin: subscription?.nodeId,
-          ...(options.authToken ? { token: options.authToken } : {}),
+          ...(tok ? { token: tok } : {}),
+        }),
+      );
+    },
+
+    async refreshAuth(tokenOrProvider?: ReplicationTokenProvider): Promise<void> {
+      if (tokenOrProvider !== undefined) {
+        activeWsTokenSource = tokenOrProvider;
+      }
+      const tok = await resolveWsToken();
+      socket.send(
+        JSON.stringify({
+          type: 'repl_auth',
+          token: tok ?? '',
         }),
       );
     },

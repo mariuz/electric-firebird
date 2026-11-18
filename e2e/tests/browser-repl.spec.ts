@@ -324,6 +324,64 @@ test.describe('<firebird-repl>', () => {
     expect(afterRevert).toEqual([[1, 'Initial Title']]);
   });
 
+  test('supports local-first Undo/Redo toolbar controls and inspects/refreshes Materialized Views', async ({
+    page,
+  }) => {
+    const repl = await openRepl(page, 'memory://repl-m24');
+
+    await repl.evaluate(async (el: any) => {
+      const w = window as any;
+      await el.run(
+        "CREATE TABLE tasks (id INTEGER NOT NULL PRIMARY KEY, title VARCHAR(64)); INSERT INTO tasks VALUES (1, 'Original');",
+      );
+      await el.db.createMaterializedView(
+        'MV_TASK_COUNT',
+        'SELECT CAST(COUNT(*) AS INTEGER) AS TOTAL_TASKS FROM tasks',
+        { refreshStrategy: 'manual' },
+      );
+      const opt = w.FB.createOptimisticMutationStore(el.db);
+      el.optimisticStore = opt;
+      el.undoRedoManager = w.FB.createUndoRedoManager(el.db, { optimisticStore: opt });
+      el.editableTable = { table: 'TASKS', primaryKey: 'ID' };
+    });
+
+    await repl.evaluate(async (el: any) => {
+      await el.editCell('TASKS', 1, 'TITLE', 'Edited Once', 'ID');
+    });
+
+    await expect(repl.locator('button.undo')).toBeEnabled();
+    await repl.locator('button.undo').click();
+    await expect(repl.locator('button.redo')).toBeEnabled();
+
+    const afterUndo = await repl.evaluate(async (el: any) => {
+      const res = await el.run('SELECT id, title FROM tasks WHERE id = 1');
+      return res[0].rows;
+    });
+    expect(afterUndo).toEqual([[1, 'Original']]);
+
+    await repl.locator('button.redo').click();
+    const afterRedo = await repl.evaluate(async (el: any) => {
+      const res = await el.run('SELECT id, title FROM tasks WHERE id = 1');
+      return res[0].rows;
+    });
+    expect(afterRedo).toEqual([[1, 'Edited Once']]);
+
+    // Insert a second row and refresh Materialized View from Schema Inspector
+    await repl.evaluate(async (el: any) => {
+      await el.run("INSERT INTO tasks VALUES (2, 'Second Task')");
+    });
+    await repl.locator('button.schema').click();
+    await expect(repl.locator('.inspector .schema-matview')).toContainText('MV_TASK_COUNT');
+    await repl.locator('.inspector button.matview-refresh-btn').click();
+    await expect(repl.locator('.inspector .schema-matview')).toContainText('1 rows');
+
+    const mvCount = await repl.evaluate(async (el: any) => {
+      const res = await el.run('SELECT TOTAL_TASKS FROM MV_TASK_COUNT');
+      return res[0].rows;
+    });
+    expect(mvCount).toEqual([[2]]);
+  });
+
   test('takes a db property set before it was defined, and reports runs', async ({ page }) => {
     await page.goto('/no-isolation/browser-harness-frameworks-st');
     await page.waitForFunction(() => Boolean((window as any).FB && (window as any).Frameworks));

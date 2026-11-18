@@ -496,6 +496,10 @@
           <strong>17. WebCrypto JWT Claims + <code>bootstrapStrategy: 'arrow-ipc'</code> &amp; Durable Outbox Rebase</strong>
           <span>Enforce <code>HS256</code> JWT tenant/role claims, stream <code>FBARSNAP</code> Arrow snapshots, mount <code>db.registerVirtualTable()</code>, and rebase <code>FB_OPTIMISTIC_OUTBOX$</code>!</span>
         </button>
+        <button type="button" class="scenario-card" data-scenario="jwks-rls-matview-undo">
+          <strong>18. JWKS Key Rotation + Row-Level <code>rls</code> Claims, <code>db.createMaterializedView()</code> &amp; Undo/Redo</strong>
+          <span>Rotate JWKS <code>kid</code> keys, enforce per-row <code>rls</code> claims, auto-refresh materialized views (<code>FB_MATVIEWS$</code>), and selectively undo/redo local edits!</span>
+        </button>
       </section>
 
       <!-- Dual Database Nodes Grid -->

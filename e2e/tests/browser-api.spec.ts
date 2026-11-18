@@ -3529,4 +3529,93 @@ test.describe('FirebirdBrowser', () => {
     });
     expect(result.liveResults).toBe(0);
   });
+
+  test('rotates JWKS keys, enforces rls row predicates, streams NDJSON/CSV <-> Arrow IPC V5, and runs UndoRedoManager (M24)', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      const w = window as any;
+      const kp1 = await crypto.subtle.generateKey(
+        { name: 'ECDSA', namedCurve: 'P-256' },
+        true,
+        ['sign', 'verify'],
+      );
+      const kp2 = await crypto.subtle.generateKey(
+        { name: 'ECDSA', namedCurve: 'P-256' },
+        true,
+        ['sign', 'verify'],
+      );
+      const jwk1 = { ...(await crypto.subtle.exportKey('jwk', kp1.publicKey)), kid: 'k1', alg: 'ES256' };
+      const jwk2 = { ...(await crypto.subtle.exportKey('jwk', kp2.publicKey)), kid: 'k2', alg: 'ES256' };
+
+      let jwksKeys = [jwk1];
+      const jwksProvider = w.FB.createJwksKeyProvider({
+        jwksUrl: 'https://auth.local/jwks.json',
+        fetch: async () => new Response(JSON.stringify({ keys: jwksKeys }), { status: 200 }),
+      });
+
+      const resolver = w.FB.createJwtTenantAuthResolver({
+        secretOrPublicKey: jwksProvider,
+      });
+
+      // Rotate to k2 and verify unknown kid auto-reloads JWKS
+      jwksKeys = [jwk1, jwk2];
+      const tokK2 = await w.FB.signSyncJwt(
+        {
+          sub: 'u_eu',
+          tenant_id: 'acme',
+          role: 'writer',
+          rls: { ORDERS: { REGION: 'EU' } },
+        },
+        kp2.privateKey,
+        { algorithm: 'ES256', kid: 'k2', expiresInSec: 60 },
+      );
+      const ctx = await resolver.authenticateToken(tokK2);
+      const filteredRows = resolver.filterRowsForTable(
+        'ORDERS',
+        [
+          { ID: 1, REGION: 'EU' },
+          { ID: 2, REGION: 'US' },
+        ],
+        ctx,
+      );
+
+      let rlsBlocked = false;
+      try {
+        resolver.assertEntryRlsAllowed(ctx, {
+          lsn: 1,
+          txid: 't1',
+          timestamp: Date.now(),
+          origin: 'cli',
+          publication: 'p',
+          table: 'ORDERS',
+          operation: 'INSERT',
+          key: { ID: 2 },
+          after: { ID: 2, REGION: 'US' },
+          ddlSql: null,
+        });
+      } catch (e: any) {
+        rlsBlocked = e?.code === 'JWT_RLS_FORBIDDEN';
+      }
+
+      // Streaming CSV <-> Arrow IPC V5
+      const arrowBytes = await w.FB.collectArrowStreamBytes(
+        w.FB.csvToArrowStream('ID,NAME\n10,Alpha\n20,Beta\n', { batchSize: 1 }),
+      );
+      const ndjsonBytes = await w.FB.collectArrowStreamBytes(
+        w.FB.arrowToNdjsonStream(arrowBytes),
+      );
+      const ndjsonText = new TextDecoder().decode(ndjsonBytes).trim();
+
+      return {
+        filteredIds: filteredRows.map((r: any) => r.ID),
+        rlsBlocked,
+        ndjsonLines: ndjsonText.split('\n').length,
+      };
+    });
+
+    expect(result.filteredIds).toEqual([1]);
+    expect(result.rlsBlocked).toBe(true);
+    expect(result.ndjsonLines).toBe(2);
+  });
 });

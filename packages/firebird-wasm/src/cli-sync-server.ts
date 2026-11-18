@@ -13,6 +13,7 @@ import { createHttpReplicationHandler } from './replication/transports';
 import { createTenantIsolationGuard, type TenantIsolationGuard } from './replication/tenant-slice';
 import {
   SyncJwtError,
+  createJwksKeyProvider,
   createJwtTenantAuthResolver,
   type JwtTenantAuthContext,
   type JwtTenantAuthOptions,
@@ -32,7 +33,9 @@ export interface StartCliReplicationServerOptions {
   apiKey?: string;
   /** Optional HMAC-SHA256 JWT secret enabling cryptographic claim & role auth (`M23 Item 1`). */
   jwtSecret?: string;
-  /** Claim name carrying the tenant ID when `jwtSecret` or `jwtAuth` is configured. @default 'tenant_id' */
+  /** Optional remote JWKS URL (`/.well-known/jwks.json`) enabling asymmetric key rotation (`M24 Item 1`). */
+  jwksUrl?: string;
+  /** Claim name carrying the tenant ID when `jwtSecret`, `jwksUrl`, or `jwtAuth` is configured. @default 'tenant_id' */
   jwtTenantClaim?: string;
   /** Optional full WebCrypto JWT resolver or options (`M23 Item 1`). */
   jwtAuth?: JwtTenantAuthResolver | JwtTenantAuthOptions;
@@ -150,12 +153,17 @@ export async function startCliReplicationServer(
     ? 'authenticateRequest' in options.jwtAuth
       ? options.jwtAuth
       : createJwtTenantAuthResolver(options.jwtAuth)
-    : options.jwtSecret
+    : options.jwksUrl
       ? createJwtTenantAuthResolver({
-          secretOrPublicKey: options.jwtSecret,
+          secretOrPublicKey: createJwksKeyProvider({ jwksUrl: options.jwksUrl }),
           tenantClaim: options.jwtTenantClaim,
         })
-      : undefined;
+      : options.jwtSecret
+        ? createJwtTenantAuthResolver({
+            secretOrPublicKey: options.jwtSecret,
+            tenantClaim: options.jwtTenantClaim,
+          })
+        : undefined;
 
   const fetchHandler = createHttpReplicationHandler({
     publication,

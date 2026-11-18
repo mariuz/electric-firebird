@@ -752,14 +752,24 @@ export {
   signSyncJwt,
   verifySyncJwt,
   extractBearerJwtFromRequest,
+  createJwksKeyProvider,
   createJwtTenantAuthResolver,
 } from './replication/jwt-auth';
 export type {
   SyncJwtAlgorithm,
   SyncJwtRole,
   SyncJwtErrorCode,
+  SyncRlsScalar,
+  SyncRlsClaimValue,
+  SyncRlsTablePredicates,
+  SyncRlsClaims,
   SyncJwtClaims,
   SyncJwtKeyInput,
+  SyncJwtKeySource,
+  JwksKeyEntry,
+  JwksDocument,
+  JwksKeyProviderOptions,
+  JwksKeyProvider,
   SignSyncJwtOptions,
   VerifySyncJwtOptions,
   JwtTenantAuthOptions,
@@ -790,3 +800,42 @@ export type {
   VirtualTableHandle,
   VirtualTableDatabaseHost,
 } from './virtual-table';
+export {
+  DEFAULT_MATVIEWS_TABLE,
+  createMaterializedViewOnDatabase,
+  listMaterializedViewsOnDatabase,
+} from './materialized-view';
+export type {
+  MaterializedViewRefreshStrategy,
+  MaterializedViewRefreshMode,
+  MaterializedViewOptions,
+  MaterializedViewRefreshOptions,
+  MaterializedViewRefreshResult,
+  MaterializedViewInfo,
+  MaterializedViewHandle,
+  MaterializedViewDatabaseHost,
+} from './materialized-view';
+export {
+  ndjsonToArrowStream,
+  csvToArrowStream,
+  arrowToNdjsonStream,
+  arrowToCsvStream,
+} from './arrow-stream-converters';
+export type {
+  TextStreamSource,
+  NdjsonToArrowStreamOptions,
+  CsvToArrowStreamOptions,
+  ArrowToNdjsonStreamOptions,
+  ArrowToCsvStreamOptions,
+} from './arrow-stream-converters';
+export { createUndoRedoManager } from './undo-redo';
+export type {
+  UndoRedoOperationRecord,
+  UndoRedoEntry,
+  UndoRedoSnapshot,
+  UndoRedoOptions,
+  UndoRedoMutationOptions,
+  UndoRedoTableActions,
+  UndoRedoActionScope,
+  UndoRedoManager,
+} from './undo-redo';

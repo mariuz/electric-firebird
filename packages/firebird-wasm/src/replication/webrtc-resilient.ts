@@ -805,6 +805,8 @@ export interface ResilientWebSocketPeerOptions {
     segment: Uint8Array,
     result?: ApplyFbChangelogResult,
   ) => void | Promise<void>;
+  /** Optional Bearer JWT token or async provider sent on WebSocket frames (`M24 Item 1`). */
+  authToken?: string | (() => string | undefined | Promise<string | undefined>);
 }
 
 /** Auto-reconnecting WebSocket replication peer returned by {@link createResilientWebSocketPeer} (`M19 Item 3`). */
@@ -846,6 +848,7 @@ export function createResilientWebSocketPeer(
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let activeSocket: ReconnectableWebSocketLike | null = null;
   let activePeer: WebSocketReplicationPeer | null = null;
+  let currentAuthToken = options.authToken;
   let detachSocketLifecycle: (() => void) | null = null;
   let lastKnownPushedLsn = 0;
   const pendingChangelogs: Array<{
@@ -964,6 +967,7 @@ export function createResilientWebSocketPeer(
       subscription: options.subscription,
       changelogTargetDb: options.changelogTargetDb,
       onChangelogSegment: options.onChangelogSegment,
+      authToken: currentAuthToken,
     });
 
     const handleOpen = () => {
@@ -1048,6 +1052,15 @@ export function createResilientWebSocketPeer(
         return;
       }
       await activePeer.requestPull(sinceLsn);
+    },
+
+    async refreshAuth(tokenOrProvider) {
+      if (tokenOrProvider !== undefined) {
+        currentAuthToken = tokenOrProvider;
+      }
+      if (activePeer && state === 'online') {
+        await activePeer.refreshAuth(tokenOrProvider);
+      }
     },
 
     async sendChangelogSegment(segment, sendOpts = {}) {
