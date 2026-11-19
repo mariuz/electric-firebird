@@ -1013,6 +1013,13 @@ export async function createSubscription(
     },
   };
 
+  if (options.transformRow) {
+    Object.defineProperty(subscriptionObj, '_transformRow', {
+      value: options.transformRow,
+      enumerable: false,
+    });
+  }
+
   return subscriptionObj;
 }
 

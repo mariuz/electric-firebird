@@ -1907,6 +1907,38 @@ Next-horizon improvements across **Replication**, **Speed & Performance**, **Int
 
 ---
 
+### M25 — Real-Time SSE Fanout Hub & Zero-Polling Sync, Client-Side Column E2EE, Auto-Synced Quantized Hybrid Vector/BM25 Search, Declarative Schema Diff/Push & Sub-1,650-Line Module Split
+
+- [x] **1. Real-Time SSE Fanout Hub, `Last-Event-ID` Resume & Zero-Polling HTTP Sync (`GET /events` Live Stream & `createSseReplicationClient`).**
+      Upgrade `GET /events` in `createHttpReplicationHandler` and `startCliReplicationServer`
+      (`npx firebird-wasm serve-sync`) into a multi-subscriber Server-Sent Events pub/sub
+      fanout hub with `Last-Event-ID` catch-up, keep-alive heartbeats, and per-subscriber
+      `tenantGuard` + JWT `tables` / `rls` delta filtering; add `createSseReplicationClient`
+      and `liveSse?: boolean` on `syncWithPeer()` / `createTenantReplicationSlice()`.
+- [x] **2. Client-Side Column-Level E2EE Sync & Key Rotation (`createColumnEncryptionTransformer` & Zero-Knowledge Relay).**
+      Add WebCrypto AES-256-GCM + HKDF column-level encryption (`enc:v1:<kid>:...` with
+      `(tableName, primaryKey, columnName)` AAD binding and multi-`kid` key-ring rotation)
+      as a composable replication `RowTransformer` so routing/RLS columns stay queryable on
+      untrusted relays while sensitive columns stay end-to-end encrypted.
+- [x] **3. Auto-Maintained Hybrid Vector + BM25 Indexes with SQL Metadata Pushdown & Quantization (`autoSync` & Binary/`Int8` Quantization).**
+      Extend `createVectorIndex`, `vectorSearch`, `createFtsIndex`, and `hybridSearch` with
+      parameterized SQL `where` metadata pre-filtering, `autoSync: true` live maintenance on
+      local `db.onQuery` + inbound replication hooks, and `int8` scalar / 1-bit binary
+      quantization (`quantizeVectorInt8`, `quantizeVectorBinary`, `hammingDistance`) with
+      exact `float32` top-$k$ rescoring.
+- [x] **4. Declarative Schema Diff / Push & CLI `schema-diff` / `schema-push` (`syncDatabaseSchema`).**
+      Add `syncDatabaseSchema(sourceDbOrSql, targetDb, { dryRun?, allowDestructive? })`
+      combining `introspect()`, `diffSchema()`, and transactional DDL execution with
+      destructive-change guards, plus `npx firebird-wasm schema-diff` and
+      `npx firebird-wasm schema-push` CLI subcommands.
+- [x] **5. `<firebird-repl>` Schema-Diff & Vector/FTS Index Inspector, Simulator Scenario 19 & Sub-1,650-Line Module Split.**
+      Surface HNSW Vector / BM25 FTS index telemetry and DDL schema-diff preview inside
+      `<firebird-repl>`, add Simulator **Scenario 19** (`sse-fanout-e2ee-hybrid-rag`), and
+      decompose `firebird-browser.ts`, `repl/index.ts`, and `firebird.ts` so every non-test
+      `.ts` source file across the repository sits strictly under 1,650 lines.
+
+---
+
 ## 5. Test coverage added alongside this review
 
 `src/browser/` was excluded from Jest and had no browser tests.  It now has 73

@@ -500,6 +500,10 @@
           <strong>18. JWKS Key Rotation + Row-Level <code>rls</code> Claims, <code>db.createMaterializedView()</code> &amp; Undo/Redo</strong>
           <span>Rotate JWKS <code>kid</code> keys, enforce per-row <code>rls</code> claims, auto-refresh materialized views (<code>FB_MATVIEWS$</code>), and selectively undo/redo local edits!</span>
         </button>
+        <button type="button" class="scenario-card" data-scenario="sse-fanout-e2ee-hybrid-rag">
+          <strong>19. SSE Fanout Hub + Column E2EE (<code>enc:v1:</code>), Auto-Synced Quantized Hybrid RAG &amp; <code>syncDatabaseSchema()</code></strong>
+          <span>Stream live SSE <code>GET /events</code> deltas, encrypt sensitive columns with <code>createColumnEncryptionTransformer()</code>, search quantized HNSW + BM25, and diff DDL!</span>
+        </button>
       </section>
 
       <!-- Dual Database Nodes Grid -->

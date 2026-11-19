@@ -5,6 +5,7 @@
  */
 
 import type { QueryParams, Row } from '../types';
+import type { ReplicationIndexHook } from '../replication/types';
 import {
   cosineDistance,
   decodeVector,
@@ -16,6 +17,19 @@ import {
   type VectorInput,
   type VectorSearchRow,
 } from './index';
+import {
+  hammingDistance,
+  int8ApproximateDistance,
+  quantizeVectorBinary,
+  quantizeVectorInt8,
+  type QuantizedInt8Vector,
+  type VectorQuantizationMode,
+} from './quantization';
+import {
+  attachIndexAutoSync,
+  buildReplicationIndexHook,
+  type QueryObservableExecutor,
+} from './auto-sync';
 
 /**
  * Configuration options for an in-memory or persistent {@link HnswIndex}.
@@ -50,6 +64,17 @@ export interface HnswIndexOptions {
    * Optional deterministic PRNG seed for reproducible level sampling.
    */
   seed?: number;
+  /**
+   * Optional vector quantization mode (`'none'`, `'int8'`, or `'binary'`) for
+   * fast quantized beam traversal followed by exact `float32` top-$k$ rescoring (`M25 Item 3`).
+   * @default 'none'
+   */
+  quantization?: VectorQuantizationMode;
+  /**
+   * Candidate oversampling multiplier before exact `float32` rescoring when
+   * `quantization` is `'int8'` or `'binary'` (`M25 Item 3`). @default 3
+   */
+  rescoreOversample?: number;
 }
 
 /**
@@ -66,6 +91,8 @@ export interface HnswSearchOptions<ID = string | number> {
   maxDistance?: number;
   /** Optional minimum similarity cutoff. */
   minSimilarity?: number;
+  /** Candidate oversampling factor when quantized search + exact rescoring is active (`M25 Item 3`). */
+  rescoreOversample?: number;
 }
 
 /**
@@ -89,6 +116,7 @@ export interface SerializedHnswGraph<ID = string | number> {
   efSearch: number;
   entryPointId: ID | null;
   maxLevel: number;
+  quantization?: VectorQuantizationMode;
   nodes: Array<{
     id: ID;
     level: number;
@@ -102,6 +130,8 @@ export interface SerializedHnswGraph<ID = string | number> {
 interface InternalHnswNode<ID> {
   id: ID;
   vector: Float32Array;
+  qInt8?: QuantizedInt8Vector;
+  qBin?: Uint8Array;
   level: number;
   /** `connections[layer]` holds neighbor internal indices. */
   connections: number[][];
@@ -163,6 +193,8 @@ export class HnswIndex<ID = string | number> {
   readonly maxM0: number;
   readonly efConstruction: number;
   readonly efSearch: number;
+  readonly quantization: VectorQuantizationMode;
+  readonly rescoreOversample: number;
   private readonly levelMult: number;
   private readonly rng: () => number;
 
@@ -204,6 +236,8 @@ export class HnswIndex<ID = string | number> {
     this.maxM0 = M * 2;
     this.efConstruction = Math.max(efConstruction, M);
     this.efSearch = efSearch;
+    this.quantization = options.quantization ?? 'none';
+    this.rescoreOversample = Math.max(1, Math.floor(options.rescoreOversample ?? 3));
     this.levelMult = 1 / Math.log(M);
     this.rng = createPrng(options.seed);
     this._dimensions = options.dimensions ?? null;
@@ -217,6 +251,19 @@ export class HnswIndex<ID = string | number> {
   /** Vector dimensionality, or `null` if empty and not pre-configured. */
   get dimensions(): number | null {
     return this._dimensions;
+  }
+
+  /** Quantized vector representation byte footprint across active nodes (`M25 Item 3`). */
+  get quantizedVectorBytes(): number {
+    const dims = this._dimensions ?? 0;
+    if (dims === 0 || this._activeCount === 0) return 0;
+    if (this.quantization === 'int8') {
+      return this._activeCount * (dims + 12);
+    }
+    if (this.quantization === 'binary') {
+      return this._activeCount * Math.ceil(dims / 8);
+    }
+    return this._activeCount * dims * 4;
   }
 
   /** Highest layer currently present in the HNSW graph (`-1` when empty). */
@@ -271,6 +318,8 @@ export class HnswIndex<ID = string | number> {
     const newNode: InternalHnswNode<ID> = {
       id,
       vector: vec,
+      qInt8: this.quantization === 'int8' ? quantizeVectorInt8(vec) : undefined,
+      qBin: this.quantization === 'binary' ? quantizeVectorBinary(vec) : undefined,
       level,
       connections,
       deleted: false,
@@ -478,6 +527,7 @@ export class HnswIndex<ID = string | number> {
     entryPoints: Candidate[],
     ef: number,
     lc: number,
+    customDistFn?: (node: InternalHnswNode<ID>) => number,
   ): Candidate[] {
     const visited = new Set<number>();
     const candidates: Candidate[] = [];
@@ -509,7 +559,7 @@ export class HnswIndex<ID = string | number> {
         visited.add(nbIdx);
 
         const nbNode = this._nodes[nbIdx]!;
-        const d = this.dist(queryVec, nbNode.vector);
+        const d = customDistFn ? customDistFn(nbNode) : this.dist(queryVec, nbNode.vector);
         const currentFurthest = results[results.length - 1]!;
 
         if (results.length < ef || d < currentFurthest.distance) {
@@ -548,10 +598,31 @@ export class HnswIndex<ID = string | number> {
     if (!Number.isInteger(k) || k < 1) {
       throw new RangeError(`HNSW search k must be a positive integer (got ${String(k)})`);
     }
-    const ef = Math.max(options.efSearch ?? this.efSearch, k);
+    const oversample =
+      this.quantization !== 'none'
+        ? Math.max(1, Math.floor(options.rescoreOversample ?? this.rescoreOversample))
+        : 1;
+    const ef = Math.max(options.efSearch ?? this.efSearch, k * oversample);
+
+    const qInt8Query = this.quantization === 'int8' ? quantizeVectorInt8(queryVec) : undefined;
+    const qBinQuery = this.quantization === 'binary' ? quantizeVectorBinary(queryVec) : undefined;
+    const approxDistFn: ((node: InternalHnswNode<ID>) => number) | undefined =
+      qInt8Query
+        ? (node) =>
+            node.qInt8
+              ? int8ApproximateDistance(this.metric, qInt8Query, node.qInt8)
+              : this.dist(queryVec, node.vector)
+        : qBinQuery
+          ? (node) =>
+              node.qBin
+                ? hammingDistance(qBinQuery, node.qBin)
+                : this.dist(queryVec, node.vector)
+          : undefined;
 
     let currObj = this._entryPointIdx;
-    let currDist = this.dist(queryVec, this._nodes[currObj]!.vector);
+    let currDist = approxDistFn
+      ? approxDistFn(this._nodes[currObj]!)
+      : this.dist(queryVec, this._nodes[currObj]!.vector);
 
     for (let lc = this._maxLevel; lc > 0; lc--) {
       let changed = true;
@@ -561,7 +632,8 @@ export class HnswIndex<ID = string | number> {
         if (!neighbors) break;
         for (let i = 0; i < neighbors.length; i++) {
           const nbIdx = neighbors[i]!;
-          const d = this.dist(queryVec, this._nodes[nbIdx]!.vector);
+          const nbNode = this._nodes[nbIdx]!;
+          const d = approxDistFn ? approxDistFn(nbNode) : this.dist(queryVec, nbNode.vector);
           if (d < currDist) {
             currDist = d;
             currObj = nbIdx;
@@ -576,6 +648,7 @@ export class HnswIndex<ID = string | number> {
       [{ nodeIdx: currObj, distance: currDist }],
       ef,
       0,
+      approxDistFn,
     );
 
     const out: Array<HnswSearchResult<ID>> = [];
@@ -584,6 +657,7 @@ export class HnswIndex<ID = string | number> {
       if (node.deleted) continue;
       if (options.filter && !options.filter(node.id)) continue;
 
+      // Exact float32 rescoring on top candidates (`M25 Item 3`)
       const { distance, similarity } = computeDistanceAndSimilarity(
         this.metric,
         queryVec,
@@ -596,7 +670,14 @@ export class HnswIndex<ID = string | number> {
         continue;
       }
       out.push({ id: node.id, distance, similarity });
-      if (out.length >= k) break;
+      if (!approxDistFn && out.length >= k) break;
+    }
+
+    if (approxDistFn && out.length > 1) {
+      out.sort((a, b) => a.distance - b.distance);
+      if (out.length > k) {
+        out.length = k;
+      }
     }
 
     // If a selective filter or high deletion ratio left fewer than `k` results
@@ -671,6 +752,7 @@ export class HnswIndex<ID = string | number> {
       efSearch: this.efSearch,
       entryPointId,
       maxLevel: entryPointId !== null ? this._maxLevel : -1,
+      ...(this.quantization !== 'none' ? { quantization: this.quantization } : {}),
       nodes,
     };
   }
@@ -688,7 +770,7 @@ export class HnswIndex<ID = string | number> {
    */
   static deserialize<ID = string | number>(
     input: Uint8Array | SerializedHnswGraph<ID> | string,
-    options?: { seed?: number },
+    options?: { seed?: number; quantization?: VectorQuantizationMode },
   ): HnswIndex<ID> {
     let data: SerializedHnswGraph<ID>;
     if (input instanceof Uint8Array) {
@@ -705,6 +787,7 @@ export class HnswIndex<ID = string | number> {
       );
     }
 
+    const qMode = options?.quantization ?? data.quantization ?? 'none';
     const index = new HnswIndex<ID>({
       dimensions: data.dimensions ?? undefined,
       metric: data.metric,
@@ -712,6 +795,7 @@ export class HnswIndex<ID = string | number> {
       efConstruction: data.efConstruction,
       efSearch: data.efSearch,
       seed: options?.seed,
+      quantization: qMode,
     });
 
     const idToIdx = new Map<ID, number>();
@@ -719,17 +803,22 @@ export class HnswIndex<ID = string | number> {
       idToIdx.set(data.nodes[i]!.id, i);
     }
 
-    index._nodes = data.nodes.map((n) => ({
-      id: n.id,
-      vector: new Float32Array(decodeVector(n.vectorBase64)),
-      level: n.level,
-      connections: n.connections.map((layer) =>
-        layer
-          .map((nbId) => idToIdx.get(nbId))
-          .filter((idx): idx is number => idx !== undefined),
-      ),
-      deleted: false,
-    }));
+    index._nodes = data.nodes.map((n) => {
+      const vec = new Float32Array(decodeVector(n.vectorBase64));
+      return {
+        id: n.id,
+        vector: vec,
+        qInt8: qMode === 'int8' ? quantizeVectorInt8(vec) : undefined,
+        qBin: qMode === 'binary' ? quantizeVectorBinary(vec) : undefined,
+        level: n.level,
+        connections: n.connections.map((layer) =>
+          layer
+            .map((nbId) => idToIdx.get(nbId))
+            .filter((idx): idx is number => idx !== undefined),
+        ),
+        deleted: false,
+      };
+    });
     index._idToIdx = idToIdx;
     index._activeCount = data.nodes.length;
     index._entryPointIdx =
@@ -758,7 +847,9 @@ function insertSortedCandidate(arr: Candidate[], item: Candidate): void {
 // Database-Backed Persistent Vector Index (`createVectorIndex`)
 // ---------------------------------------------------------------------------
 
-export interface VectorIndexDatabaseExecutor extends VectorDatabaseExecutor {
+export interface VectorIndexDatabaseExecutor
+  extends VectorDatabaseExecutor,
+    QueryObservableExecutor {
   exec?(sql: string, params?: QueryParams): Promise<unknown>;
 }
 
@@ -784,6 +875,11 @@ export interface CreateVectorIndexOptions extends HnswIndexOptions {
    * snapshot already exists in `FB_VECTOR_INDEX$` (default: `false`).
    */
   forceRebuild?: boolean;
+  /**
+   * Automatically refresh the HNSW index when local DML (`INSERT` / `UPDATE` / `DELETE`)
+   * mutates `table` via `db.onQuery` (`M25 Item 3`). @default false
+   */
+  autoSync?: boolean;
 }
 
 /**
@@ -828,6 +924,8 @@ export interface PersistentVectorIndex<ID = string | number> {
   readonly hnsw: HnswIndex<ID>;
   /** Number of indexed vectors. */
   readonly size: number;
+  /** Active vector quantization mode (`'none' | 'int8' | 'binary'`, `M25 Item 3`). */
+  readonly quantization: VectorQuantizationMode;
 
   /** Insert or update a vector in the index (and optionally persist). */
   upsert(id: ID, vector: VectorInput): Promise<void>;
@@ -839,6 +937,10 @@ export interface PersistentVectorIndex<ID = string | number> {
   save(): Promise<void>;
   /** Drop the persisted entry from `FB_VECTOR_INDEX$` and clear the in-memory index. */
   drop(): Promise<void>;
+  /** Return a `ReplicationIndexHook` keeping this index incrementally synced on inbound replication (`M25 Item 3`). */
+  asReplicationIndexHook(): ReplicationIndexHook;
+  /** Unsubscribe any `autoSync` `db.onQuery` listener (`M25 Item 3`). */
+  dispose(): void;
   /**
    * Search the HNSW index and fetch the matching rows from Firebird.
    */
@@ -935,24 +1037,22 @@ export async function createVectorIndex<ID = number | string>(
   ).toUpperCase();
   const persist = options.persist === true;
 
-  let hnsw = new HnswIndex<ID>({
-    dimensions: options.dimensions,
-    metric: options.metric,
-    M: options.M,
-    efConstruction: options.efConstruction,
-    efSearch: options.efSearch,
-    seed: options.seed,
-  });
-
-  const populateFromTable = async (): Promise<void> => {
-    hnsw = new HnswIndex<ID>({
+  const buildHnsw = () =>
+    new HnswIndex<ID>({
       dimensions: options.dimensions,
       metric: options.metric,
       M: options.M,
       efConstruction: options.efConstruction,
       efSearch: options.efSearch,
       seed: options.seed,
+      quantization: options.quantization,
+      rescoreOversample: options.rescoreOversample,
     });
+
+  let hnsw = buildHnsw();
+
+  const populateFromTable = async (): Promise<void> => {
+    hnsw = buildHnsw();
     const res = await db.query<Record<string, unknown>>(
       `SELECT ${keyIdent}, ${colIdent} FROM ${tableIdent} WHERE ${colIdent} IS NOT NULL`,
     );
@@ -994,7 +1094,10 @@ export async function createVectorIndex<ID = number | string>(
       );
       const graphJson = saved.rows[0]?.GRAPH_JSON;
       if (typeof graphJson === 'string' && graphJson.length > 0) {
-        hnsw = HnswIndex.deserialize<ID>(graphJson, { seed: options.seed });
+        hnsw = HnswIndex.deserialize<ID>(graphJson, {
+          seed: options.seed,
+          quantization: options.quantization,
+        });
       } else {
         await populateFromTable();
         await saveToCatalog();
@@ -1007,7 +1110,19 @@ export async function createVectorIndex<ID = number | string>(
     await populateFromTable();
   }
 
-  return {
+  const autoSyncCtrl = attachIndexAutoSync(
+    db,
+    cleanTable,
+    options.autoSync === true,
+    async () => {
+      await populateFromTable();
+      if (persist) {
+        await saveToCatalog();
+      }
+    },
+  );
+
+  const handle: PersistentVectorIndex<ID> = {
     name: indexName,
     table: options.table,
     column: options.column,
@@ -1017,6 +1132,9 @@ export async function createVectorIndex<ID = number | string>(
     },
     get size(): number {
       return hnsw.size;
+    },
+    get quantization(): VectorQuantizationMode {
+      return hnsw.quantization;
     },
     async upsert(id: ID, vector: VectorInput): Promise<void> {
       hnsw.add(id, vector);
@@ -1041,6 +1159,7 @@ export async function createVectorIndex<ID = number | string>(
       await saveToCatalog();
     },
     async drop(): Promise<void> {
+      autoSyncCtrl.dispose();
       for (const node of hnsw.toJSON().nodes) {
         hnsw.remove(node.id);
       }
@@ -1053,10 +1172,31 @@ export async function createVectorIndex<ID = number | string>(
         );
       }
     },
+    asReplicationIndexHook(): ReplicationIndexHook {
+      return buildReplicationIndexHook<ID>({
+        cleanTableUpper: cleanTable,
+        keyColumn: cleanKey,
+        async onUpsertRow(id, row) {
+          const vEntry = getFieldCI(row, cleanCol);
+          if (!vEntry || vEntry.value === null || vEntry.value === undefined) {
+            await handle.remove(id);
+            return;
+          }
+          await handle.upsert(id, vEntry.value as VectorInput);
+        },
+        async onDeleteId(id) {
+          await handle.remove(id);
+        },
+      });
+    },
+    dispose(): void {
+      autoSyncCtrl.dispose();
+    },
     async search<T extends Row = Row>(
       query: VectorInput,
       searchOpts: PersistentVectorIndexSearchOptions = {},
     ): Promise<Array<VectorSearchRow<T>>> {
+      await autoSyncCtrl.ensureSynced();
       const limit = searchOpts.limit ?? 10;
       const distanceCol = searchOpts.distanceColumn ?? 'DISTANCE';
       const similarityCol = searchOpts.similarityColumn ?? 'SIMILARITY';
@@ -1140,4 +1280,5 @@ export async function createVectorIndex<ID = number | string>(
       return out;
     },
   };
+  return handle;
 }

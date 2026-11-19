@@ -47,6 +47,11 @@ import type { BootstrapStrategy, ReplicableDatabase } from './replication/types'
 import { collectArrowStreamBytes } from './columnar-stream';
 import { decodeArrowIpc } from './columnar';
 import { startCliReplicationServer } from './cli-sync-server';
+import {
+  runCliBench,
+  runCliSchemaDiff,
+  runCliSchemaPush,
+} from './cli-schema-commands';
 export {
   startCliReplicationServer,
   type CliReplicationServerHandle,
@@ -104,6 +109,8 @@ Commands:
   serve-sync [uri]               Start HTTP/SSE replication & Arrow IPC server [--port <n>] [--api-key <k>] [--jwt-secret <s>] [--jwks-url <u >]
   export-arrow <uri> <sql>       Stream query results to an Apache Arrow IPC V5 file (--out <file.arrow> [--gzip] [--batch-size <n>])
   import-arrow <uri> <table>     Stream an Apache Arrow IPC V5 file into <table> (--in <file.arrow> [--gzip] [--create-table] [--pk <col>])
+  schema-diff <from> <to>        Diff two schemas (.fdb/URI or .sql) and print DDL (--sql | --json)
+  schema-push <target>           Declaratively push schema from --from <uriOrSqlFile> [--dry-run] [--allow-destructive] [--json]
   bench [uri]                    Benchmark IBatch, row query, columnar, Arrow IPC stream & preparePipeline [--rows <n>]
 
 Global Options:
@@ -622,7 +629,9 @@ function parseCliArgs(argv: readonly string[]): ParsedFlags {
             key === 'shared-tables' ||
             key === 'pk' ||
             key === 'batch-size' ||
-            key === 'duration-ms')
+            key === 'duration-ms' ||
+            key === 'from' ||
+            key === 'to')
         ) {
           flags.set(key, next);
           i += 1;
@@ -1427,116 +1436,41 @@ export async function runCli(
         return 0;
       }
 
-      case 'bench': {
-        const uri = positional[1] ?? 'memory://cli_bench';
-        const rowCount = Math.max(
-          10,
-          Number(typeof flags.get('rows') === 'string' ? flags.get('rows') : 250) || 250,
-        );
-        const format =
-          flags.get('json') === true || String(flags.get('format') ?? '').toLowerCase() === 'json'
-            ? 'json'
-            : 'table';
+      case 'schema-diff':
+        return runCliSchemaDiff({
+          positional,
+          flags,
+          cwd,
+          backend,
+          out,
+          err,
+          formatCliTable,
+          openCliDatabase,
+        });
 
-        const managed = await openCliDatabase(uri, { cwd, backend });
-        try {
-          await managed.db.execute(
-            'RECREATE TABLE FB_CLI_BENCH$ (ID INTEGER NOT NULL PRIMARY KEY, LABEL VARCHAR(64), SCORE DOUBLE PRECISION)',
-          );
-          const tbl = managed.db.table<{ ID: number; LABEL: string; SCORE: number }, number>(
-            'FB_CLI_BENCH$',
-            { primaryKey: 'ID' },
-          );
+      case 'schema-push':
+        return runCliSchemaPush({
+          positional,
+          flags,
+          cwd,
+          backend,
+          out,
+          err,
+          formatCliTable,
+          openCliDatabase,
+        });
 
-          const batchInput = Array.from({ length: rowCount }, (_, i) => ({
-            ID: i + 1,
-            LABEL: `row_${i + 1}`,
-            SCORE: (i + 1) * 1.25,
-          }));
-
-          const tInsert0 = performance.now();
-          await tbl.insertMany(batchInput);
-          const insertMs = performance.now() - tInsert0;
-
-          const tRow0 = performance.now();
-          const rowRes = await managed.db.query('SELECT ID, LABEL, SCORE FROM FB_CLI_BENCH$ ORDER BY ID');
-          const rowQueryMs = performance.now() - tRow0;
-
-          const tCol0 = performance.now();
-          const colRes = await managed.db.queryColumnar('SELECT ID, LABEL, SCORE FROM FB_CLI_BENCH$ ORDER BY ID');
-          const colQueryMs = performance.now() - tCol0;
-
-          const tArrow0 = performance.now();
-          const arrowBytes = await collectArrowStreamBytes(
-            managed.db.queryArrowStream('SELECT ID, LABEL, SCORE FROM FB_CLI_BENCH$ ORDER BY ID', {
-              batchSize: Math.max(25, Math.ceil(rowCount / 4)),
-            }),
-          );
-          const decodedArrow = decodeArrowIpc(arrowBytes);
-          const arrowStreamMs = performance.now() - tArrow0;
-
-          const prepPipe = await managed.db.preparePipeline([
-            { kind: 'query', sql: 'SELECT ID, SCORE FROM FB_CLI_BENCH$ WHERE ID = ?' },
-            { kind: 'queryColumnar', sql: 'SELECT ID, SCORE FROM FB_CLI_BENCH$ WHERE ID <= ?' },
-          ] as const);
-          const tPipe0 = performance.now();
-          try {
-            await prepPipe.run([[1], [Math.min(20, rowCount)]]);
-          } finally {
-            await prepPipe.close();
-          }
-          const prepPipeMs = performance.now() - tPipe0;
-
-          await managed.db.execute('DROP TABLE FB_CLI_BENCH$');
-
-          const metrics = [
-            {
-              WORKLOAD: 'insertMany (IBatch)',
-              ROWS: rowCount,
-              MS: Number(insertMs.toFixed(2)),
-              ROWS_PER_SEC: Math.round((rowCount / Math.max(0.05, insertMs)) * 1000),
-            },
-            {
-              WORKLOAD: 'query (JS objects)',
-              ROWS: rowRes.rows.length,
-              MS: Number(rowQueryMs.toFixed(2)),
-              ROWS_PER_SEC: Math.round((rowRes.rows.length / Math.max(0.05, rowQueryMs)) * 1000),
-            },
-            {
-              WORKLOAD: 'queryColumnar (TypedArrays)',
-              ROWS: colRes.rowCount,
-              MS: Number(colQueryMs.toFixed(2)),
-              ROWS_PER_SEC: Math.round((colRes.rowCount / Math.max(0.05, colQueryMs)) * 1000),
-            },
-            {
-              WORKLOAD: 'queryArrowStream (IPC V5)',
-              ROWS: decodedArrow.rowCount,
-              MS: Number(arrowStreamMs.toFixed(2)),
-              ROWS_PER_SEC: Math.round((decodedArrow.rowCount / Math.max(0.05, arrowStreamMs)) * 1000),
-            },
-            {
-              WORKLOAD: 'preparePipeline (stmtHandle)',
-              ROWS: Math.min(20, rowCount) + 1,
-              MS: Number(prepPipeMs.toFixed(2)),
-              ROWS_PER_SEC: Math.round(((Math.min(20, rowCount) + 1) / Math.max(0.05, prepPipeMs)) * 1000),
-            },
-          ];
-
-          if (format === 'json') {
-            out(`${JSON.stringify({ uri, rows: rowCount, benchmarks: metrics }, null, 2)}\n`);
-          } else {
-            out(
-              formatCliTable(
-                [{ name: 'WORKLOAD' }, { name: 'ROWS' }, { name: 'MS' }, { name: 'ROWS_PER_SEC' }],
-                metrics,
-              ),
-            );
-          }
-        } finally {
-          await managed.flushAndClose(false);
-        }
-        return 0;
-      }
+      case 'bench':
+        return runCliBench({
+          positional,
+          flags,
+          cwd,
+          backend,
+          out,
+          err,
+          formatCliTable,
+          openCliDatabase,
+        });
 
       default: {
         err(`Unknown command "${cmd}". Run "firebird-wasm --help" for usage.\n`);

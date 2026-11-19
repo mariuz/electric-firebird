@@ -18,12 +18,19 @@ import type {
   RegisteredRoutine,
   Row,
 } from '../types';
+import type { ReplicationIndexHook } from '../replication/types';
 import {
   vectorSearch,
   type PersistentVectorIndex,
   type VectorDistanceMetric,
   type VectorInput,
+  type VectorQuantizationMode,
 } from '../vector';
+import {
+  attachIndexAutoSync,
+  buildReplicationIndexHook,
+  type QueryObservableExecutor,
+} from '../vector/auto-sync';
 
 // ---------------------------------------------------------------------------
 // Stopwords & Porter Stemmer
@@ -736,7 +743,7 @@ export class Bm25Index<ID = string | number> {
 // Database-Backed Persistent Full-Text Index (`createFtsIndex`)
 // ---------------------------------------------------------------------------
 
-export interface FtsDatabaseExecutor {
+export interface FtsDatabaseExecutor extends QueryObservableExecutor {
   query<T extends Row = Row>(
     sql: string,
     params?: QueryParams,
@@ -768,6 +775,11 @@ export interface CreateFtsIndexOptions extends Bm25IndexOptions {
   persist?: boolean;
   /** Force a full rebuild from `table` even if `FB_FTS_INDEX$` has a snapshot. */
   forceRebuild?: boolean;
+  /**
+   * Automatically refresh the BM25 index when local DML (`INSERT` / `UPDATE` / `DELETE`)
+   * mutates `table` via `db.onQuery` (`M25 Item 3`). @default false
+   */
+  autoSync?: boolean;
 }
 
 /**
@@ -818,6 +830,10 @@ export interface PersistentFtsIndex<ID = string | number> {
   rebuild(): Promise<void>;
   save(): Promise<void>;
   drop(): Promise<void>;
+  /** Return a `ReplicationIndexHook` keeping this BM25 index incrementally synced on inbound replication (`M25 Item 3`). */
+  asReplicationIndexHook(): ReplicationIndexHook;
+  /** Unsubscribe any `autoSync` `db.onQuery` listener (`M25 Item 3`). */
+  dispose(): void;
   search<T extends Row = Row>(
     query: string,
     options?: PersistentFtsSearchOptions,
@@ -969,7 +985,19 @@ export async function createFtsIndex<ID = number | string>(
     await populateFromTable();
   }
 
-  return {
+  const autoSyncCtrl = attachIndexAutoSync(
+    db,
+    cleanTable,
+    options.autoSync === true,
+    async () => {
+      await populateFromTable();
+      if (persist) {
+        await saveToCatalog();
+      }
+    },
+  );
+
+  const handle: PersistentFtsIndex<ID> = {
     name: indexName,
     table: options.table,
     columns: options.columns,
@@ -1003,6 +1031,7 @@ export async function createFtsIndex<ID = number | string>(
       await saveToCatalog();
     },
     async drop(): Promise<void> {
+      autoSyncCtrl.dispose();
       for (const d of bm25.toJSON().docs) {
         bm25.remove(d.id);
       }
@@ -1015,10 +1044,33 @@ export async function createFtsIndex<ID = number | string>(
         );
       }
     },
+    asReplicationIndexHook(): ReplicationIndexHook {
+      return buildReplicationIndexHook<ID>({
+        cleanTableUpper: cleanTable,
+        keyColumn: cleanKey,
+        async onUpsertRow(id, row) {
+          const fieldsObj: Record<string, unknown> = {};
+          for (const col of cleanCols) {
+            const cEntry = getFieldCI(row, col);
+            if (cEntry && cEntry.value !== null && cEntry.value !== undefined) {
+              fieldsObj[col.toUpperCase()] = cEntry.value;
+            }
+          }
+          await handle.upsert(id, fieldsObj);
+        },
+        async onDeleteId(id) {
+          await handle.remove(id);
+        },
+      });
+    },
+    dispose(): void {
+      autoSyncCtrl.dispose();
+    },
     async search<T extends Row = Row>(
       query: string,
       searchOpts: PersistentFtsSearchOptions = {},
     ): Promise<Array<FtsSearchRow<T>>> {
+      await autoSyncCtrl.ensureSynced();
       const limit = searchOpts.limit ?? 10;
       const scoreCol = searchOpts.scoreColumn ?? 'BM25_SCORE';
       const highlightTargetCol = searchOpts.highlightTargetColumn ?? 'HIGHLIGHT';
@@ -1093,6 +1145,7 @@ export async function createFtsIndex<ID = number | string>(
       return out;
     },
   };
+  return handle;
 }
 
 // ---------------------------------------------------------------------------
@@ -1281,10 +1334,14 @@ export interface HybridSearchOptions {
   metric?: VectorDistanceMetric;
   /** Optional pre-built {@link PersistentVectorIndex}. */
   vectorIndex?: Pick<PersistentVectorIndex<never>, 'search'>;
+  /** Optional vector quantization pre-pass (`'none' | 'int8' | 'binary'`, `M25 Item 3`). */
+  quantization?: VectorQuantizationMode;
   /** Optional SQL `WHERE` filter applied to both arms. */
   where?: string;
   /** Positional parameters for `where`. */
   params?: QueryParams;
+  /** Optional column projection applied to both arms (`M25 Item 3`). */
+  select?: readonly string[] | '*';
   /** Maximum number of fused results to return (default: `10`). */
   limit?: number;
   /** Candidate pool size fetched from each arm before RRF fusion (default: `limit * 3`). */
@@ -1332,6 +1389,7 @@ export async function hybridSearch<T extends Row = Row>(
       limit: candidateLimit,
       where: options.where,
       params: options.params,
+      select: options.select,
       highlightColumn: options.highlightColumn,
     });
   } else {
@@ -1347,6 +1405,7 @@ export async function hybridSearch<T extends Row = Row>(
       limit: candidateLimit,
       where: options.where,
       params: options.params,
+      select: options.select,
       highlightColumn: options.highlightColumn,
     });
   }
@@ -1359,8 +1418,10 @@ export async function hybridSearch<T extends Row = Row>(
     metric: options.metric,
     where: options.where,
     params: options.params,
+    select: options.select,
     limit: candidateLimit,
     index: options.vectorIndex,
+    quantization: options.quantization,
   });
 
   // 3. Fuse via Reciprocal Rank Fusion

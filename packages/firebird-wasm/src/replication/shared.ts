@@ -20,6 +20,14 @@ export function decodeJson(text: unknown): Record<string, unknown> | null {
     if (v && typeof v === 'object' && Array.isArray(v.$bytes)) {
       return new Uint8Array(v.$bytes);
     }
+    if (v && typeof v === 'object' && typeof v.$hex === 'string') {
+      const hex = v.$hex;
+      const out = new Uint8Array(Math.floor(hex.length / 2));
+      for (let i = 0; i < out.length; i++) {
+        out[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16) || 0;
+      }
+      return out;
+    }
     if (v && typeof v === 'object' && typeof v.$bigint === 'string') {
       return BigInt(v.$bigint);
     }

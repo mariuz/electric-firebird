@@ -382,6 +382,67 @@ test.describe('<firebird-repl>', () => {
     expect(mvCount).toEqual([[2]]);
   });
 
+  test('M25: inspects persisted HNSW/BM25 search indexes and previews/applies declarative schema diff in <firebird-repl>', async ({
+    page,
+  }) => {
+    await page.goto('/no-isolation/browser-harness-frameworks-st');
+    await page.waitForFunction(() => Boolean((window as any).FB && (window as any).Frameworks));
+
+    const outcome = await page.evaluate(async () => {
+      const w = window as any;
+      w.Frameworks.FBRepl.defineFirebirdRepl();
+      const repl = document.createElement('firebird-repl') as any;
+      const db = new w.FB.FirebirdBrowser('memory://repl-m25', { types: { binary: true } });
+      repl.db = db;
+      document.getElementById('app')!.replaceChildren(repl);
+
+      await db.execute(
+        'CREATE TABLE DOCS (ID INTEGER NOT NULL PRIMARY KEY, TITLE VARCHAR(100), EMB VARBINARY(12))',
+      );
+      await db.execute('INSERT INTO DOCS VALUES (?, ?, ?)', [
+        1,
+        'Vector FTS Inspector Doc',
+        w.FB.encodeVector([1, 0, 0]),
+      ]);
+
+      await w.FB.createVectorIndex(db, {
+        table: 'DOCS',
+        column: 'EMB',
+        quantization: 'int8',
+        persist: true,
+      });
+      await w.FB.createFtsIndex(db, {
+        table: 'DOCS',
+        columns: ['TITLE'],
+        persist: true,
+      });
+
+      const indexes = await repl.searchIndexes();
+      const diffPreview = await repl.previewSchemaDiff(
+        'CREATE TABLE DOCS (ID INTEGER NOT NULL PRIMARY KEY, TITLE VARCHAR(100), EMB VARBINARY(12), CATEGORY VARCHAR(32));',
+      );
+      const inspectorText = repl.shadowRoot?.querySelector('.inspector')?.textContent ?? '';
+      await repl.applySchemaPush(
+        'CREATE TABLE DOCS (ID INTEGER NOT NULL PRIMARY KEY, TITLE VARCHAR(100), EMB VARBINARY(12), CATEGORY VARCHAR(32));',
+      );
+      const afterCols = (await db.introspect()).tables[0]?.columns.map((c: any) => c.name);
+      await db.close();
+
+      return {
+        indexCount: indexes.length,
+        previewStatements: diffPreview?.statements ?? [],
+        inspectorText,
+        afterCols,
+      };
+    });
+
+    expect(outcome.indexCount).toBe(2);
+    expect(outcome.previewStatements.some((s: string) => /ADD CATEGORY/i.test(s))).toBe(true);
+    expect(outcome.inspectorText).toContain('Search Indexes (Vector HNSW & BM25 FTS)');
+    expect(outcome.inspectorText).toContain('int8');
+    expect(outcome.afterCols).toEqual(['ID', 'TITLE', 'EMB', 'CATEGORY']);
+  });
+
   test('takes a db property set before it was defined, and reports runs', async ({ page }) => {
     await page.goto('/no-isolation/browser-harness-frameworks-st');
     await page.waitForFunction(() => Boolean((window as any).FB && (window as any).Frameworks));

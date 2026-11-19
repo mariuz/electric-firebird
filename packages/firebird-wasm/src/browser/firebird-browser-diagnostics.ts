@@ -13,6 +13,7 @@ import type {
   QueryResult,
   Row,
   RowMode,
+  StatementExecutionOptions,
   SweepResult,
   TransactionOptions,
 } from '../types';
@@ -26,7 +27,7 @@ import type { BranchOptions, FirebirdBrowserOptions } from './firebird-browser-t
 import { splitStatements } from './sql-script';
 import { extractMutatedTables, type CrossTabLiveBridge } from './live-tables';
 import { applyTypes, type TypeOptions } from './value-types';
-import { assertNotAborted, type FirebirdDatabase } from '../database-core';
+import { assertNotAborted, runWithCancellation, validateTimeoutMs, type FirebirdDatabase } from '../database-core';
 import { executePipelineFallback, type BrowserPipelineDriverHost } from '../pipeline';
 import { FirebirdBrowserTransaction, type ExecResult } from './firebird-browser-tx';
 import type { UdrManager } from './udr';
@@ -325,4 +326,108 @@ export async function runBrowserTransaction<T>(
     liveBridge.broadcastTables(tx.committedTables);
   }
   return result;
+}
+
+export async function runBrowserExecScript(
+  host: {
+    engine: EngineTransport;
+    getDbHandle: () => EngineHandle;
+    udr: UdrManager;
+    profiler: QueryProfiler;
+    liveBridge: CrossTabLiveBridge;
+    liveTriggerPromises: Map<string, Promise<string>>;
+    captureIo: () => Promise<PageIoCounters | null>;
+    applyOneShotTimeout: (timeoutMs?: number) => Promise<void>;
+    cancelOperation: () => Promise<void>;
+    serialize: (params: QueryParams) => QueryParams;
+    markDirty: () => void;
+    ensureReady: () => Promise<void>;
+  },
+  sql: string | SqlFragment,
+  paramsOrOptions: QueryParams | StatementExecutionOptions = [],
+  maybeOptions: StatementExecutionOptions = {},
+): Promise<ExecResult[]> {
+  const params = Array.isArray(paramsOrOptions) ? paramsOrOptions : [];
+  const options = Array.isArray(paramsOrOptions) ? maybeOptions : (paramsOrOptions ?? {});
+  assertNotAborted(options.signal);
+  validateTimeoutMs(options.timeoutMs);
+
+  await host.ensureReady();
+
+  const script = toStatement(sql, params);
+  const statements = splitStatements(script.sql);
+
+  if (script.params.length > 0 && statements.length > 1) {
+    throw new Error(
+      `Parameters cannot be used with a multi-statement script ` +
+        `(${statements.length} statements found); run the statements separately`,
+    );
+  }
+
+  const results: ExecResult[] = [];
+  for (const statement of statements) {
+    host.udr.inspectDdl(statement.sql);
+    if (host.udr.hasBridgeRoutines) {
+      const intercepted = await host.udr.executeIfIntercepted(
+        statement.sql,
+        script.params,
+      );
+      if (intercepted.intercepted) {
+        results.push({ affectedRows: intercepted.affectedRows });
+        continue;
+      }
+      const rewritten = await host.udr.rewriteStatement(statement.sql, script.params);
+      statement.sql = rewritten.sql;
+      script.params = rewritten.params;
+    }
+    assertNotAborted(options.signal);
+    if (/^\s*(DROP|RECREATE)\b/i.test(statement.sql)) {
+      host.liveTriggerPromises.clear();
+    }
+    const startedAt = host.profiler.begin();
+    const ioBefore = await host.captureIo();
+    try {
+      const affectedRows = await runWithCancellation(
+        async () => {
+          await host.applyOneShotTimeout(options.timeoutMs);
+          return host.engine.execute(
+            host.getDbHandle(),
+            0,
+            statement.sql,
+            host.serialize(script.params),
+          );
+        },
+        options,
+        () => host.cancelOperation(),
+      );
+      const ioAfter = await host.captureIo();
+      host.profiler.end({
+        startedAt,
+        sql: statement.sql,
+        params: script.params,
+        kind: 'exec',
+        rowCount: affectedRows,
+        cacheHit: false,
+        ioBefore,
+        ioAfter,
+      });
+      host.liveBridge.broadcastTables(extractMutatedTables(statement.sql));
+      results.push({ affectedRows });
+    } catch (err) {
+      host.profiler.end({
+        startedAt,
+        sql: statement.sql,
+        params: script.params,
+        kind: 'exec',
+        cacheHit: false,
+        error: err,
+      });
+      throw err;
+    }
+  }
+
+  if (results.length > 0) {
+    host.markDirty();
+  }
+  return results;
 }

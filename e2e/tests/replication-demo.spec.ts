@@ -304,4 +304,24 @@ test.describe('Replication Simulator v2 (replication.html)', () => {
     await expect(page.locator('#event-feed')).toContainText('db.createMaterializedView()');
     await expect(page.locator('#event-feed')).toContainText('undo()');
   });
+
+  test('Scenario 19: SSE Fanout Hub + Column E2EE (enc:v1:), Auto-Synced Quantized Hybrid RAG & syncDatabaseSchema()', async ({
+    page,
+  }) => {
+    await openReplicationSim(page);
+
+    await page.locator('.scenario-card[data-scenario="sse-fanout-e2ee-hybrid-rag"]').click();
+
+    await expect(page.locator('#primary-rows')).toContainText('SSE E2EE Hybrid RAG Task #4');
+    await expect(page.locator('#replica-rows')).toContainText('SSE E2EE Hybrid RAG Task #5');
+    await expect(page.locator('#replica-rows')).toContainText('enc:v1:k2:');
+    await expect(page.locator('#code-inspector')).toContainText('createSseReplicationHub');
+    await expect(page.locator('#code-inspector')).toContainText('createColumnEncryptionTransformer');
+    await expect(page.locator('#code-inspector')).toContainText('syncDatabaseSchema');
+    await expect(page.locator('#event-feed')).toContainText('Scenario 19');
+    await expect(page.locator('#event-feed')).toContainText('Last-Event-ID');
+    await expect(page.locator('#event-feed')).toContainText('enc:v1:k2:');
+    await expect(page.locator('#event-feed')).toContainText('hybridSearch()');
+    await expect(page.locator('#event-feed')).toContainText('syncDatabaseSchema()');
+  });
 });

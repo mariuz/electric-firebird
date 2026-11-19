@@ -9,7 +9,11 @@ import type { FirebirdDatabase } from './database-core';
 import type { ReplicableDatabase, ReplicationPublication, ReplicationSubscription } from './replication/types';
 import { publishAllTables } from './replication/publication';
 import { createSubscription } from './replication/subscription';
-import { createHttpReplicationHandler } from './replication/transports';
+import {
+  createHttpReplicationHandler,
+  createSseReplicationHub,
+  type SseReplicationHub,
+} from './replication/transports';
 import { createTenantIsolationGuard, type TenantIsolationGuard } from './replication/tenant-slice';
 import {
   SyncJwtError,
@@ -57,6 +61,7 @@ export interface CliReplicationServerHandle {
   readonly url: string;
   readonly publication: ReplicationPublication;
   readonly subscription: ReplicationSubscription;
+  readonly sseHub: SseReplicationHub;
   readonly tenantGuard?: TenantIsolationGuard;
   close(): Promise<void>;
   [Symbol.asyncDispose](): Promise<void>;
@@ -66,7 +71,7 @@ const CORS_HEADERS: Readonly<Record<string, string>> = {
   'access-control-allow-origin': '*',
   'access-control-allow-methods': 'GET, POST, OPTIONS',
   'access-control-allow-headers':
-    'content-type, authorization, x-replication-key, x-tenant-id, x-fb-changelog-encoding',
+    'content-type, authorization, x-replication-key, x-tenant-id, x-fb-changelog-encoding, last-event-id',
 };
 
 function readIncomingBody(req: http.IncomingMessage): Promise<Uint8Array> {
@@ -165,13 +170,58 @@ export async function startCliReplicationServer(
           })
         : undefined;
 
+  const sseHub = createSseReplicationHub({
+    publication,
+    tenantGuard,
+    jwtResolver,
+  });
+
   const fetchHandler = createHttpReplicationHandler({
     publication,
     subscription,
     apiKey: options.apiKey,
     tenantGuard,
     jwtAuth: jwtResolver,
+    sseHub,
   });
+
+  // Auto-fanout local DML executed directly on `options.db` to connected SSE subscribers (`M25 Item 1`)
+  let sseNotifyInFlight = false;
+  let sseNotifyQueued = false;
+  const triggerSseFanout = (): void => {
+    if (sseNotifyInFlight) {
+      sseNotifyQueued = true;
+      return;
+    }
+    sseNotifyInFlight = true;
+    void (async () => {
+      try {
+        do {
+          sseNotifyQueued = false;
+          await sseHub.notifyChanges();
+        } while (sseNotifyQueued);
+      } catch {
+        // Ignore background fanout errors
+      } finally {
+        sseNotifyInFlight = false;
+      }
+    })();
+  };
+
+  const fullDbForHook = options.db as Partial<FirebirdDatabase>;
+  const unsubOnQuery =
+    typeof fullDbForHook.onQuery === 'function'
+      ? fullDbForHook.onQuery((ev) => {
+          if (sseNotifyInFlight && /\bFB_REPL_/i.test(ev.sql)) return;
+          if (/\bFB_REPL_/i.test(ev.sql)) return;
+          if (!/^\s*(INSERT|UPDATE|DELETE|MERGE|RECREATE|CREATE|ALTER|DROP|EXECUTE)\b/i.test(ev.sql)) {
+            return;
+          }
+          if (sseHub.subscriberCount > 0) {
+            triggerSseFanout();
+          }
+        })
+      : undefined;
 
   const server = http.createServer((req, res) => {
     void (async () => {
@@ -305,8 +355,7 @@ export async function startCliReplicationServer(
                     bodyBytes,
                     { createTable, primaryKey: pk },
                   );
-            await publication.refreshPublishedTables();
-            await publication.captureTableChanges();
+            await sseHub.notifyChanges();
             sendJson(res, 200, { result: ingestRes }, enableCors);
             return;
           }
@@ -314,8 +363,7 @@ export async function startCliReplicationServer(
 
         // Refresh / capture any direct SQL mutations before serving replication pulls
         if (req.method === 'GET') {
-          await publication.refreshPublishedTables();
-          await publication.captureTableChanges();
+          await sseHub.notifyChanges();
         }
 
         const bodyBytes =
@@ -332,9 +380,14 @@ export async function startCliReplicationServer(
           }
         }
 
+        const reqAbort = new AbortController();
+        const onReqClose = () => reqAbort.abort();
+        req.once('close', onReqClose);
+
         const webReq = new Request(`http://${host}${rawUrl}`, {
           method: req.method ?? 'GET',
           headers,
+          signal: reqAbort.signal,
           ...(bodyBytes && bodyBytes.byteLength > 0
             ? { body: new Uint8Array(bodyBytes) }
             : {}),
@@ -345,6 +398,41 @@ export async function startCliReplicationServer(
         webRes.headers.forEach((v, k) => {
           outHeaders[k] = v;
         });
+
+        const contentType = (webRes.headers.get('content-type') ?? '').toLowerCase();
+        if (contentType.includes('text/event-stream') && webRes.body) {
+          res.writeHead(webRes.status, outHeaders);
+          res.flushHeaders?.();
+          const reader = webRes.body.getReader();
+          const onSseDisconnect = () => {
+            reqAbort.abort();
+            void reader.cancel().catch(() => undefined);
+          };
+          req.once('close', onSseDisconnect);
+          res.once('close', onSseDisconnect);
+          try {
+            for (;;) {
+              const { done, value } = await reader.read();
+              if (done || res.writableEnded || res.destroyed) break;
+              if (value && value.byteLength > 0) {
+                res.write(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
+              }
+            }
+          } catch {
+            // Stream closed by client or server shutdown
+          } finally {
+            req.removeListener('close', onReqClose);
+            req.removeListener('close', onSseDisconnect);
+            res.removeListener('close', onSseDisconnect);
+            await reader.cancel().catch(() => undefined);
+            if (!res.writableEnded && !res.destroyed) {
+              res.end();
+            }
+          }
+          return;
+        }
+
+        req.removeListener('close', onReqClose);
         const respBuf = Buffer.from(await webRes.arrayBuffer());
         res.writeHead(webRes.status, outHeaders);
         res.end(respBuf);
@@ -376,7 +464,10 @@ export async function startCliReplicationServer(
   const close = async (): Promise<void> => {
     if (closed) return;
     closed = true;
+    unsubOnQuery?.();
+    sseHub.close();
     subscription.stop();
+    (server as http.Server & { closeAllConnections?: () => void }).closeAllConnections?.();
     await new Promise<void>((resolve) => {
       server.close(() => resolve());
     });
@@ -388,6 +479,7 @@ export async function startCliReplicationServer(
     url: baseUrl,
     publication,
     subscription,
+    sseHub,
     tenantGuard,
     close,
     async [Symbol.asyncDispose]() {

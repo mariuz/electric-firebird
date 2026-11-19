@@ -839,3 +839,72 @@ export type {
   UndoRedoActionScope,
   UndoRedoManager,
 } from './undo-redo';
+export {
+  createSseReplicationHub,
+  createSseReplicationClient,
+} from './replication/sse-fanout';
+export type {
+  SseSubscriberContext,
+  SseReplicationHubOptions,
+  SseReplicationHub,
+  SseReplicationClientOptions,
+  SseReplicationClient,
+} from './replication/sse-fanout';
+export {
+  COLUMN_E2EE_PREFIX,
+  ColumnEncryptionError,
+  isEncryptedColumnEnvelope,
+  parseEncryptedColumnEnvelope,
+  createColumnEncryptionTransformer,
+} from './replication/column-encryption';
+export type {
+  ColumnEncryptionErrorReason,
+  ColumnKeyMaterial,
+  ColumnEncryptionOptions,
+  ColumnEncryptionTransformer,
+} from './replication/column-encryption';
+export {
+  quantizeVectorInt8,
+  dequantizeVectorInt8,
+  encodeQuantizedInt8,
+  decodeQuantizedInt8,
+  int8ApproximateDistance,
+  quantizeVectorBinary,
+  hammingDistance,
+  HnswIndex,
+  createVectorIndex,
+} from './vector';
+export type {
+  VectorQuantizationMode,
+  QuantizedInt8Vector,
+  HnswIndexOptions,
+  HnswSearchOptions,
+  HnswSearchResult,
+  SerializedHnswGraph,
+  CreateVectorIndexOptions,
+  PersistentVectorIndexSearchOptions,
+  PersistentVectorIndex,
+} from './vector';
+export {
+  createFtsIndex,
+  hybridSearch,
+  reciprocalRankFusion,
+} from './fts';
+export type {
+  CreateFtsIndexOptions,
+  PersistentFtsSearchOptions,
+  PersistentFtsIndex,
+  HybridSearchOptions,
+  HybridSearchRow,
+} from './fts';
+export {
+  DestructiveSchemaSyncError,
+  introspectSqlScript,
+  syncDatabaseSchema,
+} from './schema-sync';
+export type {
+  DeclarativeSchemaInput,
+  SchemaSyncTarget,
+  SyncDatabaseSchemaOptions,
+  SchemaSyncResult,
+} from './schema-sync';

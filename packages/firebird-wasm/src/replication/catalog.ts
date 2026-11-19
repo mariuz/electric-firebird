@@ -65,6 +65,7 @@ export function replicationEventName(publication = 'default'): string {
 function buildJsonObjectSqlExpr(
   recordPrefix: 'NEW' | 'OLD',
   cols: readonly string[],
+  binaryCols?: ReadonlySet<string>,
 ): string {
   if (cols.length === 0) {
     return `'{}'`;
@@ -74,6 +75,12 @@ function buildJsonObjectSqlExpr(
     const quotedCol = quoteIdent(upperCol);
     const keyLiteral = escapeSqlLiteral(`"${upperCol}":`);
     const valRef = `${recordPrefix}.${quotedCol}`;
+    if (binaryCols?.has(upperCol)) {
+      return (
+        `'${keyLiteral}' || IIF(${valRef} IS NULL, 'null', ` +
+        `'{"$hex":"' || HEX_ENCODE(${valRef}) || '"}')`
+      );
+    }
     return (
       `'${keyLiteral}' || IIF(${valRef} IS NULL, 'null', ` +
       `'"' || REPLACE(REPLACE(CAST(${valRef} AS VARCHAR(4000)), '\\', '\\\\'), '"', '\\"') || '"')`
@@ -114,10 +121,10 @@ export function buildReplicationTriggerDdl(
   const triggerName = replicationTriggerName(tableUpper, pubName);
   const eventName = replicationEventName(pubName);
 
-  const newKeyExpr = buildJsonObjectSqlExpr('NEW', pkCols);
-  const oldKeyExpr = buildJsonObjectSqlExpr('OLD', pkCols);
-  const afterExpr = buildJsonObjectSqlExpr('NEW', allCols);
-  const beforeExpr = buildJsonObjectSqlExpr('OLD', allCols);
+  const newKeyExpr = buildJsonObjectSqlExpr('NEW', pkCols, options.binaryColumns);
+  const oldKeyExpr = buildJsonObjectSqlExpr('OLD', pkCols, options.binaryColumns);
+  const afterExpr = buildJsonObjectSqlExpr('NEW', allCols, options.binaryColumns);
+  const beforeExpr = buildJsonObjectSqlExpr('OLD', allCols, options.binaryColumns);
 
   const ddl = [
     `CREATE OR ALTER TRIGGER ${triggerName} FOR ${quoteIdent(tableUpper)}`,
@@ -175,22 +182,39 @@ export function buildReplicationTriggerDdl(
   return { triggerName, eventName, ddl };
 }
 
-async function discoverTableColumns(
+async function discoverTableColumnMeta(
   db: ReplicableDatabase,
   tableUpper: string,
   fallbackCols: readonly string[],
-): Promise<readonly string[]> {
-  // 1. Try Firebird system catalog RDB$RELATION_FIELDS
+): Promise<{ columns: readonly string[]; binaryColumns: Set<string> }> {
+  const binaryColumns = new Set<string>();
+  // 1. Try Firebird system catalog RDB$RELATION_FIELDS + RDB$FIELDS
   try {
     const sysRes = await db.query<Row>(
-      `SELECT TRIM(RDB$FIELD_NAME) AS COL_NAME FROM RDB$RELATION_FIELDS WHERE TRIM(RDB$RELATION_NAME) = ? AND COALESCE(RDB$SYSTEM_FLAG, 0) = 0 ORDER BY RDB$FIELD_POSITION`,
+      `SELECT TRIM(rf.RDB$FIELD_NAME) AS COL_NAME, ` +
+        `COALESCE(f.RDB$CHARACTER_SET_ID, 0) AS CHARSET_ID, ` +
+        `COALESCE(f.RDB$FIELD_TYPE, 0) AS FIELD_TYPE, ` +
+        `COALESCE(f.RDB$FIELD_SUB_TYPE, 0) AS SUB_TYPE ` +
+        `FROM RDB$RELATION_FIELDS rf ` +
+        `JOIN RDB$FIELDS f ON f.RDB$FIELD_NAME = rf.RDB$FIELD_SOURCE ` +
+        `WHERE TRIM(rf.RDB$RELATION_NAME) = ? AND COALESCE(rf.RDB$SYSTEM_FLAG, 0) = 0 ` +
+        `ORDER BY rf.RDB$FIELD_POSITION`,
       [tableUpper],
     );
-    const cols = sysRes.rows
-      .map((r) => String(r.COL_NAME ?? r.col_name ?? '').trim().toUpperCase())
-      .filter((c) => c.length > 0);
+    const cols: string[] = [];
+    for (const r of sysRes.rows) {
+      const colName = String(r.COL_NAME ?? r.col_name ?? '').trim().toUpperCase();
+      if (!colName) continue;
+      cols.push(colName);
+      const charsetId = Number(r.CHARSET_ID ?? r.charset_id ?? 0);
+      const fieldType = Number(r.FIELD_TYPE ?? r.field_type ?? 0);
+      const subType = Number(r.SUB_TYPE ?? r.sub_type ?? 0);
+      if (charsetId === 1 || (fieldType === 261 && subType === 0)) {
+        binaryColumns.add(colName);
+      }
+    }
     if (cols.length > 0) {
-      return cols;
+      return { columns: cols, binaryColumns };
     }
   } catch {
     // System catalog query unsupported on mock DB; fall through
@@ -203,17 +227,17 @@ async function discoverTableColumns(
       const cols = sample.fields
         .map((f) => f.name.trim().toUpperCase())
         .filter((c) => c.length > 0);
-      if (cols.length > 0) return cols;
+      if (cols.length > 0) return { columns: cols, binaryColumns };
     }
     if (sample.rows[0]) {
       const cols = Object.keys(sample.rows[0]).map((k) => k.toUpperCase());
-      if (cols.length > 0) return cols;
+      if (cols.length > 0) return { columns: cols, binaryColumns };
     }
   } catch {
     // Ignore and return fallback
   }
 
-  return fallbackCols;
+  return { columns: fallbackCols, binaryColumns };
 }
 
 /**
@@ -266,13 +290,14 @@ export async function installReplicationTriggers(
         ? item.columns.map((c) => c.toUpperCase())
         : undefined;
 
-    const columns =
-      explicitCols ?? (await discoverTableColumns(db, tableUpper, pkCols));
+    const discovered = await discoverTableColumnMeta(db, tableUpper, pkCols);
+    const columns = explicitCols ?? discovered.columns;
 
     const { triggerName, eventName, ddl } = buildReplicationTriggerDdl({
       table: tableUpper,
       primaryKey: pkCols,
       columns,
+      binaryColumns: discovered.binaryColumns,
       publication: pubName,
       nodeId,
       journalTable: options.journalTable ?? DEFAULT_REPL_JOURNAL_TABLE,

@@ -36,6 +36,8 @@ import {
   type MaterializedViewInfo,
   type MaterializedViewRefreshStrategy,
 } from '../materialized-view';
+import type { SchemaSyncResult } from '../schema-sync';
+import type { ReplSearchIndexSummary } from './repl-actions';
 import { el } from './repl-styles';
 import type {
   ReplArrowInspectorInfo,
@@ -728,6 +730,9 @@ export interface ReplInspectorRenderContext {
   readonly activeTab: ReplInspectorTab;
   readonly lastSchema: SchemaIntrospection | null;
   readonly lastMatViews?: readonly MaterializedViewInfo[];
+  readonly lastSearchIndexes?: readonly ReplSearchIndexSummary[];
+  readonly lastSchemaDiff?: SchemaSyncResult | null;
+  readonly schemaDiffDraft?: string;
   readonly lastMigrations: AppliedMigration[];
   readonly lastStats: MonitorStats | null;
   readonly lastPlans: ReadonlyArray<{ sql: string; parsed: ParsedQueryPlan }>;
@@ -744,6 +749,8 @@ export interface ReplInspectorRenderContext {
   readonly onUndo?: () => void;
   readonly onRedo?: () => void;
   readonly onRefreshMaterializedView?: (name: string) => void;
+  readonly onPreviewSchemaDiff?: (ddlSql: string) => void;
+  readonly onApplySchemaPush?: (ddlSql: string) => void;
 }
 
 export function renderReplInspector(ctx: ReplInspectorRenderContext): void {
@@ -1335,6 +1342,73 @@ export function renderReplInspector(ctx: ReplInspectorRenderContext): void {
           seqList.append(li);
         }
         panel.append(seqList);
+      }
+
+      if (ctx.lastSearchIndexes && ctx.lastSearchIndexes.length > 0) {
+        const siTitle = el('div', 'schema-group-title');
+        siTitle.textContent = 'Search Indexes (Vector HNSW & BM25 FTS)';
+        panel.append(siTitle);
+        const siList = el('ul', 'schema-list schema-search-indexes');
+        for (const idx of ctx.lastSearchIndexes) {
+          const li = el('li', 'schema-meta-item schema-search-index');
+          const nameSpan = el('span', 'col-name');
+          nameSpan.textContent = `${idx.name} → ${idx.tableName}`;
+          const badge = el('span', 'schema-badge');
+          badge.textContent = `${idx.details} · ${idx.entryCount} ${idx.kind === 'vector' ? 'vectors' : 'docs'}`;
+          li.append(nameSpan, badge);
+          siList.append(li);
+        }
+        panel.append(siList);
+      }
+
+      if (ctx.onPreviewSchemaDiff || ctx.lastSchemaDiff) {
+        const diffBox = el('div', 'schema-sub schema-diff-preview');
+        const diffTitle = el('div', 'schema-group-title');
+        diffTitle.textContent = 'Declarative Schema Diff';
+        diffBox.append(diffTitle);
+
+        const diffInput = document.createElement('input');
+        diffInput.type = 'text';
+        diffInput.className = 'schema-diff-input';
+        diffInput.placeholder = 'Paste desired CREATE TABLE DDL to preview migration diff…';
+        diffInput.value = ctx.schemaDiffDraft ?? '';
+        diffBox.append(diffInput);
+
+        const btnRow = el('div', 'schema-sub');
+        const diffBtn = document.createElement('button');
+        diffBtn.type = 'button';
+        diffBtn.className = 'schema-diff-btn';
+        diffBtn.textContent = 'Preview Diff';
+        diffBtn.addEventListener('click', () => {
+          ctx.onPreviewSchemaDiff?.(diffInput.value);
+        });
+        btnRow.append(diffBtn);
+
+        if (ctx.onApplySchemaPush) {
+          const pushBtn = document.createElement('button');
+          pushBtn.type = 'button';
+          pushBtn.className = 'schema-push-btn';
+          pushBtn.textContent = 'Push Additive DDL';
+          pushBtn.addEventListener('click', () => {
+            ctx.onApplySchemaPush?.(diffInput.value);
+          });
+          btnRow.append(pushBtn);
+        }
+        diffBox.append(btnRow);
+
+        if (ctx.lastSchemaDiff) {
+          const diffOut = el('pre', 'schema-view-source schema-diff-output');
+          if (ctx.lastSchemaDiff.statements.length === 0) {
+            diffOut.textContent = '-- Schemas match (0 DDL statements needed).';
+          } else {
+            const headerWarn = ctx.lastSchemaDiff.hasDestructiveChanges
+              ? `-- ⚠ DESTRUCTIVE CHANGES DETECTED (${ctx.lastSchemaDiff.destructiveStatements.length})\n`
+              : '';
+            diffOut.textContent = `${headerWarn}${ctx.lastSchemaDiff.sql}`;
+          }
+          diffBox.append(diffOut);
+        }
+        panel.append(diffBox);
       }
 
       ctx.inspectorBody.append(panel);

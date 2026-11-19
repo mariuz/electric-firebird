@@ -3618,4 +3618,134 @@ test.describe('FirebirdBrowser', () => {
     expect(result.rlsBlocked).toBe(true);
     expect(result.ndjsonLines).toBe(2);
   });
+
+  test('M25: Column-level E2EE key rotation, SSE fanout hub, int8/binary vector quantization & syncDatabaseSchema in browser', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      const w = window as any;
+      const e2ee = w.FB.createColumnEncryptionTransformer({
+        columns: { SECRETS: ['API_TOKEN'] },
+        keys: { k1: 'browser-secret-v1' },
+        activeKid: 'k1',
+      });
+
+      const encV1 = await e2ee.encryptRow('SECRETS', {
+        ID: 10,
+        TENANT_ID: 'acme',
+        API_TOKEN: 'tok_live_123',
+      });
+      e2ee.rotateKey('k2', 'browser-secret-v2');
+      const encV2 = await e2ee.encryptRow('SECRETS', {
+        ID: 11,
+        TENANT_ID: 'acme',
+        API_TOKEN: 'tok_live_456',
+      });
+
+      const decV1 = await e2ee.decryptRow('SECRETS', encV1);
+      const decV2 = await e2ee.decryptRow('SECRETS', encV2);
+
+      let tamperedBlocked = false;
+      try {
+        await e2ee.decryptRow('SECRETS', { ...encV2, ID: 99 });
+      } catch (e: any) {
+        tamperedBlocked = e?.code === 'COLUMN_ENCRYPTION_ERROR';
+      }
+
+      const sseHub = w.FB.createSseReplicationHub({ heartbeatIntervalMs: 0 });
+      const onceRes = await sseHub.openStream({ once: true });
+      const onceText = await onceRes.text();
+      sseHub.close();
+
+      const q8 = w.FB.quantizeVectorInt8([0.5, -0.5, 0.25, -0.25]);
+      const qbA = w.FB.quantizeVectorBinary([1, -1, 1, -1, 1, 1, -1, -1]);
+      const qbB = w.FB.quantizeVectorBinary([1, 1, 1, -1, 1, 1, -1, -1]);
+
+      const executedDdl: string[] = [];
+      const currentSnap = {
+        tables: [
+          {
+            name: 'ITEMS',
+            columns: [
+              {
+                tableName: 'ITEMS',
+                name: 'ID',
+                position: 0,
+                dataType: 'INTEGER',
+                typeName: 'INTEGER',
+                nullable: false,
+                defaultSource: null,
+                isPrimaryKey: true,
+                isIdentity: false,
+                isComputed: false,
+              },
+            ],
+            primaryKey: ['ID'],
+            foreignKeys: [],
+            indexes: [],
+            triggers: [],
+          },
+        ],
+        views: [],
+        columns: [],
+        primaryKeys: [{ tableName: 'ITEMS', constraintName: 'PK_ITEMS', indexName: 'PK_ITEMS', columns: ['ID'] }],
+        foreignKeys: [],
+        indexes: [],
+        sequences: [],
+        triggers: [],
+      };
+      const desiredSnap = {
+        ...currentSnap,
+        tables: [
+          {
+            ...currentSnap.tables[0]!,
+            columns: [
+              ...currentSnap.tables[0]!.columns,
+              {
+                tableName: 'ITEMS',
+                name: 'TAG',
+                position: 1,
+                dataType: 'VARYING',
+                typeName: 'VARCHAR(32)',
+                nullable: true,
+                defaultSource: null,
+                isPrimaryKey: false,
+                isIdentity: false,
+                isComputed: false,
+              },
+            ],
+          },
+        ],
+      };
+      const syncRes = await w.FB.syncDatabaseSchema(desiredSnap, {
+        introspect: async () => currentSnap,
+        query: async () => ({ fields: [], rows: [] }),
+        execute: async (sql: string) => {
+          executedDdl.push(sql);
+        },
+      });
+
+      return {
+        v1Prefix: String(encV1.API_TOKEN).startsWith('enc:v1:k1:'),
+        v2Prefix: String(encV2.API_TOKEN).startsWith('enc:v1:k2:'),
+        decTokens: [decV1.API_TOKEN, decV2.API_TOKEN],
+        tamperedBlocked,
+        hasSseReplicationEvent: onceText.includes('event: replication'),
+        q8Dims: q8.dimensions,
+        hamming: w.FB.hammingDistance(qbA, qbB),
+        ddlApplied: syncRes.applied,
+        executedDdl,
+      };
+    });
+
+    expect(result.v1Prefix).toBe(true);
+    expect(result.v2Prefix).toBe(true);
+    expect(result.decTokens).toEqual(['tok_live_123', 'tok_live_456']);
+    expect(result.tamperedBlocked).toBe(true);
+    expect(result.hasSseReplicationEvent).toBe(true);
+    expect(result.q8Dims).toBe(4);
+    expect(result.hamming).toBe(1);
+    expect(result.ddlApplied).toBe(true);
+    expect(result.executedDdl.some((s: string) => /ADD TAG/i.test(s))).toBe(true);
+  });
 });

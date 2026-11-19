@@ -21,7 +21,21 @@ import type {
   Row,
   RowMode,
   StatementExecutionOptions,
+  TransactionOptions,
 } from './types';
+import {
+  buildPreparedEnginePipelineRequests,
+  executePipelineFallback,
+  type PipelineOptions,
+  type PreparedPipeline,
+  type PreparedPipelineResults,
+  type PreparedPipelineStepInputs,
+  type PreparedPipelineStepTemplate,
+} from './pipeline';
+import { FirebirdTransaction } from './firebird-tx';
+import type { UdrManager } from './browser/udr';
+import { liveTableEventName } from './browser/live-tables';
+import type { FirebirdDatabase } from './database-core';
 import {
   DATABASE_INFO_REQUEST_ITEMS,
   normalizeDatabaseInfo,
@@ -859,4 +873,107 @@ export async function readNodeDatabaseInfo(
     fetches,
     marks,
   });
+}
+
+export function createNodePreparedPipeline<
+  const TTemplates extends readonly PreparedPipelineStepTemplate[],
+>(
+  db: FirebirdDatabase & {
+    transaction<T>(fn: (tx: FirebirdTransaction) => Promise<T>, options?: TransactionOptions): Promise<T>;
+  },
+  serialize: (params: QueryParams) => QueryParams,
+  templates: TTemplates,
+): PreparedPipeline<TTemplates> {
+  let isClosed = false;
+  const handle: PreparedPipeline<TTemplates> = {
+    length: templates.length,
+    get closed() {
+      return isClosed;
+    },
+    run: async (
+      inputs?: PreparedPipelineStepInputs<TTemplates>,
+      options: PipelineOptions = {},
+    ): Promise<PreparedPipelineResults<TTemplates>> => {
+      if (isClosed) {
+        throw new Error('PreparedPipeline has already been closed');
+      }
+      assertNotAborted(options.signal);
+      if (templates.length === 0) {
+        return [] as unknown as PreparedPipelineResults<TTemplates>;
+      }
+      const { steps } = buildPreparedEnginePipelineRequests(
+        templates,
+        [],
+        inputs as readonly unknown[] | undefined,
+        serialize,
+        false,
+      );
+      const results = options.transaction
+        ? await db.transaction(
+            (tx) => executePipelineFallback(steps, tx),
+            typeof options.transaction === 'object' ? options.transaction : {},
+          )
+        : await executePipelineFallback(steps, db);
+      assertNotAborted(options.signal);
+      return results as PreparedPipelineResults<TTemplates>;
+    },
+    close: async (): Promise<void> => {
+      isClosed = true;
+    },
+    [Symbol.asyncDispose]: async (): Promise<void> => {
+      await handle.close();
+    },
+  };
+  return handle;
+}
+
+export async function runNodeTransaction<T>(
+  attachment: Attachment,
+  statements: StatementCache | null,
+  types: TypeOptions | undefined,
+  udr: UdrManager,
+  endReadTransaction: () => Promise<void>,
+  dispatchLocalEvent: (name: string) => void,
+  fn: (tx: FirebirdTransaction) => Promise<T>,
+  options: TransactionOptions = {},
+): Promise<T> {
+  const txOptions = buildTransactionOptions(options);
+  await endReadTransaction();
+  const transaction = await attachment.startTransaction(txOptions);
+
+  const tx = new FirebirdTransaction(
+    attachment,
+    transaction,
+    endReadTransaction,
+    statements ?? undefined,
+    types,
+    undefined,
+    undefined,
+    udr,
+  );
+
+  let result: T;
+  try {
+    result = await fn(tx);
+  } catch (err) {
+    if (!tx.isFinished) {
+      await transaction.rollback().catch(() => undefined);
+    }
+    throw err;
+  }
+
+  if (tx.isFinished) {
+    return result;
+  }
+
+  try {
+    await transaction.commit();
+  } catch (err) {
+    await transaction.rollback().catch(() => undefined);
+    throw err;
+  }
+  for (const tbl of tx.committedTables) {
+    dispatchLocalEvent(liveTableEventName(tbl));
+  }
+  return result;
 }

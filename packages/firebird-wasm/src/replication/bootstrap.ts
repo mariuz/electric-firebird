@@ -335,41 +335,60 @@ export async function bootstrapReplica(
           }
         }
 
-        if (typeof runner.execBatch === 'function' && tbl.rows.length > 0) {
-          const batchItems = tbl.rows.map((row) => {
-            const normRow = normalizeRowKeysUpper(row);
-            const keyRec = extractKeyRecord(normRow, tbl.primaryKey);
-            bytesTransferred += JSON.stringify(normRow).length;
-            return { key: keyRec, rowValues: normRow };
-          });
+        const subRowTx = (
+          options.subscription as ReplicationSubscription & {
+            _transformRow?: import('./types').RowTransformer;
+          }
+        )._transformRow;
+
+        const preparedRows: Array<{ key: Record<string, unknown>; rowValues: Record<string, unknown> }> = [];
+        for (const row of tbl.rows) {
+          let normRow: Record<string, unknown> | null = normalizeRowKeysUpper(row);
+          const keyRec = extractKeyRecord(normRow, tbl.primaryKey);
+          if (subRowTx) {
+            const txRes = await subRowTx(normRow, {
+              table: tableUpper,
+              operation: 'INSERT',
+              key: keyRec,
+              origin: snapshot.origin,
+            });
+            normRow = txRes ? normalizeRowKeysUpper(txRes) : null;
+          }
+          if (normRow) {
+            preparedRows.push({ key: keyRec, rowValues: normRow });
+          }
+        }
+
+        if (typeof runner.execBatch === 'function' && preparedRows.length > 0) {
+          for (const item of preparedRows) {
+            bytesTransferred += JSON.stringify(item.rowValues).length;
+          }
           await applyBatchedRowMutationsToTable(
             runner,
             tableUpper,
             tbl.primaryKey,
             'INSERT',
-            batchItems,
+            preparedRows,
           );
           if (hasLocalMirror) {
-            for (const item of batchItems) {
+            for (const item of preparedRows) {
               syncLocalMirror(tableUpper, 'INSERT', item.key, item.rowValues);
             }
           }
-          rowsCopied += batchItems.length;
+          rowsCopied += preparedRows.length;
         } else {
-          for (const row of tbl.rows) {
-            const normRow = normalizeRowKeysUpper(row);
-            const keyRec = extractKeyRecord(normRow, tbl.primaryKey);
+          for (const item of preparedRows) {
             await applyRowMutationToTable(
               runner,
               tableUpper,
               tbl.primaryKey,
               'INSERT',
-              keyRec,
-              normRow,
+              item.key,
+              item.rowValues,
             );
-            syncLocalMirror(tableUpper, 'INSERT', keyRec, normRow);
+            syncLocalMirror(tableUpper, 'INSERT', item.key, item.rowValues);
             rowsCopied++;
-            bytesTransferred += JSON.stringify(normRow).length;
+            bytesTransferred += JSON.stringify(item.rowValues).length;
           }
         }
       };

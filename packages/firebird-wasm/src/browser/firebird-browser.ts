@@ -26,11 +26,7 @@ import { IndexedDBVFS } from './indexeddb-vfs';
 import { DirectTransport } from './engine-transport';
 import type { EngineHandle, EngineTransport } from './engine-transport';
 import { WorkerTransport } from './worker-transport';
-import { splitStatements } from './sql-script';
-import {
-  extractMutatedTables,
-  CrossTabLiveBridge,
-} from './live-tables';
+import { CrossTabLiveBridge } from './live-tables';
 import {
   type DatabaseSnapshot,
   type DatabaseSnapshotInfo,
@@ -216,6 +212,7 @@ import {
   prepareBrowserBranchArgs,
   readBrowserDatabaseInfo,
   runBrowserExecBatch,
+  runBrowserExecScript,
   runBrowserSweep,
   runBrowserTransaction,
 } from './firebird-browser-diagnostics';
@@ -439,96 +436,25 @@ export class FirebirdBrowser implements FirebirdDatabase {
     paramsOrOptions: QueryParams | StatementExecutionOptions = [],
     maybeOptions: StatementExecutionOptions = {},
   ): Promise<ExecResult[]> {
-    const params = Array.isArray(paramsOrOptions) ? paramsOrOptions : [];
-    const options = Array.isArray(paramsOrOptions)
-      ? maybeOptions
-      : (paramsOrOptions ?? {});
-    assertNotAborted(options.signal);
-    validateTimeoutMs(options.timeoutMs);
-
-    await this.ensureReady();
-
-    const script = toStatement(sql, params);
-    const statements = splitStatements(script.sql);
-
-    if (script.params.length > 0 && statements.length > 1) {
-      throw new Error(
-        `Parameters cannot be used with a multi-statement script ` +
-          `(${statements.length} statements found); run the statements separately`,
-      );
-    }
-
-    const results: ExecResult[] = [];
-
-    for (const statement of statements) {
-      this.udr.inspectDdl(statement.sql);
-      if (this.udr.hasBridgeRoutines) {
-        const intercepted = await this.udr.executeIfIntercepted(
-          statement.sql,
-          script.params,
-        );
-        if (intercepted.intercepted) {
-          results.push({ affectedRows: intercepted.affectedRows });
-          continue;
-        }
-        const rewritten = await this.udr.rewriteStatement(
-          statement.sql,
-          script.params,
-        );
-        statement.sql = rewritten.sql;
-        script.params = rewritten.params;
-      }
-      assertNotAborted(options.signal);
-      if (/^\s*(DROP|RECREATE)\b/i.test(statement.sql)) {
-        this.liveTriggerPromises.clear();
-      }
-      const startedAt = this.profiler.begin();
-      const ioBefore = await this.captureIoIfListening();
-      try {
-        const affectedRows = await runWithCancellation(
-          async () => {
-            await this.applyOneShotTimeout(options.timeoutMs);
-            return this.engine.execute(
-              this.dbHandle,
-              0,
-              statement.sql,
-              this.serialize(script.params),
-            );
-          },
-          options,
-          () => this.cancelOperation(),
-        );
-        const ioAfter = await this.captureIoIfListening();
-        this.profiler.end({
-          startedAt,
-          sql: statement.sql,
-          params: script.params,
-          kind: 'exec',
-          rowCount: affectedRows,
-          cacheHit: false,
-          ioBefore,
-          ioAfter,
-        });
-        this.liveBridge.broadcastTables(extractMutatedTables(statement.sql));
-        results.push({ affectedRows });
-      } catch (err) {
-        this.profiler.end({
-          startedAt,
-          sql: statement.sql,
-          params: script.params,
-          kind: 'exec',
-          cacheHit: false,
-          error: err,
-        });
-        throw err;
-      }
-    }
-
-    if (results.length > 0) {
-      this.markDirty();
-    }
-
-    return results;
+    return runBrowserExecScript(
+      {
+        engine: this.engine,
+        getDbHandle: () => this.dbHandle,
+        udr: this.udr,
+        profiler: this.profiler,
+        liveBridge: this.liveBridge,
+        liveTriggerPromises: this.liveTriggerPromises,
+        captureIo: () => this.captureIoIfListening(),
+        applyOneShotTimeout: (t) => this.applyOneShotTimeout(t),
+        cancelOperation: () => this.cancelOperation(),
+        serialize: (p) => this.serialize(p),
+        markDirty: () => this.markDirty(),
+        ensureReady: () => this.ensureReady(),
+      },
+      sql,
+      paramsOrOptions,
+      maybeOptions,
+    );
   }
 
   /**
@@ -1090,46 +1016,13 @@ export class FirebirdBrowser implements FirebirdDatabase {
     return runBrowserLiveColumnar(this.streamsHost, sql, optionsOrListener, maybeListener);
   }
 
-  /**
-   * Describe a statement's shape without running it.
-   *
-   * ```ts
-   * const shape = await db.describeQuery('SELECT id, name FROM items WHERE id = ?');
-   * // shape.params        → [{ type: 496, typeName: 'INTEGER', … }]
-   * // shape.fields        → [{ name: 'ID', … }, { name: 'NAME', … }]
-   * // shape.statementType → 'SELECT'
-   * ```
-   *
-   * The statement is prepared and dropped, so nothing happens: describing an
-   * `INSERT` inserts nothing. Preparing is not free — the engine parses and
-   * plans — but it is the only way to learn a shape, and the alternative,
-   * running the statement to see what comes back, is not one.
-   *
-   * A `` sql`…` `` fragment is accepted and its values ignored; only the text
-   * decides the shape, and a fragment is often what a caller has to hand.
-   */
+  /** Describe a statement's input/output shape without running it. */
   async describeQuery(sql: string | SqlFragment): Promise<QueryDescription> {
     await this.ensureReady();
     return this.engine.describe(this.dbHandle, 0, toStatement(sql).sql);
   }
 
-  /**
-   * Run a function inside an explicit transaction.
-   */
-  /**
-   * Return Firebird's execution plan for `sql` (`IStatement::getPlan`) without
-   * executing the statement.
-   *
-   * ```ts
-   * const plan = await db.explain('SELECT * FROM items WHERE id = ?');
-   * // → 'PLAN (ITEMS INDEX (RDB$PRIMARY1))'
-   *
-   * const detailed = await db.explain('SELECT * FROM items WHERE id = ?', { detailed: true });
-   * // → 'Select Expression\n    -> Filter\n        -> Table "ITEMS" Access By ID\n...'
-   * ```
-   *
-   * Statements that carry no execution plan (such as DDL) return `""`.
-   */
+  /** Return Firebird's execution plan for `sql` (`IStatement::getPlan`) without executing it. */
   async explain(
     sql: string | SqlFragment,
     options: ExplainOptions = {},
@@ -1568,20 +1461,14 @@ export class FirebirdBrowser implements FirebirdDatabase {
 
     try {
       if (this.opfs) {
-        // The mount owns the sync access handle and releases it with the
-        // module; nothing here writes, because nothing was ever buffered.
+        // Sync access handle is released with the module.
       } else if (this.ephemeral) {
-        // Reclaim it: the engine's filesystem outlives this instance — the
-        // module is cached for the whole page — so a long-lived tab that
-        // opened many scratch databases would hold every one of them.
         await this.engine.unlink(this.dbPath).catch(() => undefined);
       } else {
         await this.vfs.close();
       }
       await this.engine.dispose();
     } finally {
-      // Last, and unconditionally: a lock still held after a failed teardown
-      // locks the database out of every future tab until the page is gone.
       await this.releaseLock();
     }
   }
@@ -1591,29 +1478,22 @@ export class FirebirdBrowser implements FirebirdDatabase {
     await this.close();
   }
 
-  /** Release the cross-tab lock, if this instance holds one. */
   private async releaseLock(): Promise<void> {
     const lock = this.lock;
     this.lock = null;
     await lock?.release();
   }
 
-  // ── Automatic persistence ─────────────────────────────────────────────
-
-  /** Whether this tab may write the database image to IndexedDB. */
   private get mayPersist(): boolean {
     if (this.ephemeral || this.opfs) return false;
     return this.shared === null || this.shared.isLeader;
   }
 
-  /** Note that the database has changed and schedule a persist. */
   private markDirty(): void {
     if (!this.autoPersist || this.closed || !this.mayPersist) return;
-
     if (this.persistTimer !== null) {
       clearTimeout(this.persistTimer);
     }
-
     this.persistTimer = setTimeout(() => {
       this.persistTimer = null;
       void this.persistInBackground();
@@ -1627,12 +1507,6 @@ export class FirebirdBrowser implements FirebirdDatabase {
     }
   }
 
-  /**
-   * Persist without a caller to reject into.
-   *
-   * Failures are reported through `onPersistError`; letting them become
-   * unhandled rejections would hide data loss.
-   */
   private async persistInBackground(): Promise<void> {
     if (this.closed) return;
     try {
@@ -1642,21 +1516,11 @@ export class FirebirdBrowser implements FirebirdDatabase {
     }
   }
 
-  /**
-   * Flush when the page is being hidden or unloaded.
-   *
-   * `visibilitychange` to hidden is the event to rely on: it fires on mobile
-   * when an app is backgrounded, where `beforeunload` and `unload` often do
-   * not fire at all.  `pagehide` covers the bfcache case.  Neither can await
-   * an async write, so this is best-effort — which is why writes are also
-   * persisted on a debounce rather than only here.
-   */
   private attachLifecycleListeners(): void {
     if (this.lifecycleAttached || !this.autoPersist) return;
     if (typeof document === 'undefined' || typeof addEventListener !== 'function') {
-      return; // not a browser
+      return;
     }
-
     this.lifecycleAttached = true;
     document.addEventListener('visibilitychange', this.onVisibilityChange);
     addEventListener('pagehide', this.onPageHide);
@@ -1681,15 +1545,11 @@ export class FirebirdBrowser implements FirebirdDatabase {
     void this.persistInBackground();
   };
 
-  // ── Initialisation ────────────────────────────────────────────────────
-
   private async ensureReady(): Promise<void> {
     if (this.dbHandle) return;
     if (this.closed) {
       throw new Error('FirebirdBrowser instance has been closed');
     }
-
-    // Prevent concurrent initialisation
     if (!this.initPromise) {
       this.initPromise = this.init();
     }
@@ -1697,17 +1557,11 @@ export class FirebirdBrowser implements FirebirdDatabase {
   }
 
   private async init(): Promise<void> {
-    // Before anything reads the stored image.  A tab that loaded the database
-    // and then waited for the lock would resume with a snapshot the departing
-    // tab has since replaced — the very overwrite the lock prevents.
     if (this.multiTab === 'exclusive') {
       this.lock = await acquireDatabaseLock(this.dbName, {
         timeoutMs: this.lockTimeoutMs,
       });
     }
-    // 'shared' deliberately takes no lock here: the transport's election holds
-    // it, and a second request from the same tab would queue behind itself.
-
     try {
       await this.engine.init();
       if (this.options.icuLocaleData) {
@@ -1718,20 +1572,12 @@ export class FirebirdBrowser implements FirebirdDatabase {
         await this.applyIcuLocaleData(localeBytes);
       }
       if (this.opfs) {
-        // The mount both opens the file and decides where it lives, so the path
-        // comes back rather than being assumed on this side.
         this.opfsPath = await this.engine.mountOpfs(this.fileName);
       } else if (!this.ephemeral) {
-        // An ephemeral database never touches IndexedDB, so the store is not
-        // opened at all — opening it would create an empty one on disk for a
-        // database whose whole point is leaving nothing behind.
         await this.vfs.open(this.dbName);
       }
       await this.openDatabase();
     } catch (err) {
-      // An instance that failed to open never opens: every later call
-      // rethrows this.  Holding the name past that would keep a fresh
-      // instance, in this page or another tab, from trying again.
       await this.releaseLock();
       throw err;
     }
@@ -1750,13 +1596,6 @@ export class FirebirdBrowser implements FirebirdDatabase {
     });
   }
 
-  /**
-   * The engine behind this connection was replaced; attach to the new one.
-   *
-   * Called on every tab after a leadership change, promoted or not. Silence
-   * here would leave the caller holding a handle from an engine that no longer
-   * exists, and writes through it would go nowhere — visibly succeeding.
-   */
   private async reopenAfterEngineChange(): Promise<void> {
     if (this.closed) return;
     this.dbHandle = 0;

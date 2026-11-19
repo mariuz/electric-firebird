@@ -35,6 +35,7 @@ import {
   createBroadcastChannelTransport,
   createHttpReplicationClient,
   createResilientWebSocketPeer,
+  createSseReplicationClient,
   createWebRtcReplicationPeer,
   createWebSocketReplicationPeer,
   isRtcDataChannelLike,
@@ -42,7 +43,9 @@ import {
   type BackoffRetryOptions,
   type ConnectionLifecycleState,
   type ConnectionStateChangeInfo,
+  type ReplicationTokenProvider,
   type RtcDataChannelLike,
+  type SseReplicationClient,
   type WebSocketLike,
 } from './transports';
 import {
@@ -166,11 +169,15 @@ export interface SyncWithOptions extends SyncDatabasesOptions {
    * @default 'auto'
    */
   role?: 'auto' | 'primary' | 'replica';
-  /** Optional bearer token / `x-replication-key` when syncing against an HTTP(S) URL. */
-  apiKey?: string;
+  /** Optional bearer token / `x-replication-key` (or dynamic token provider) when syncing against an HTTP(S) URL. */
+  apiKey?: ReplicationTokenProvider;
   /** Custom `fetch` implementation when syncing against an HTTP(S) URL. */
   fetch?: typeof globalThis.fetch;
-  /** Optional exponential backoff + jitter retry / reconnect settings for HTTP or WebSocket peers (`M19 Item 3`). */
+  /** Subscribe to `GET /events` SSE stream for zero-polling real-time HTTP push (`M25 Item 1`). @default false */
+  liveSse?: boolean;
+  /** Optional custom `fetch` implementation used specifically for the `GET /events` SSE stream (`M25 Item 1`). */
+  sseFetch?: typeof globalThis.fetch;
+  /** Optional exponential backoff + jitter retry / reconnect settings for HTTP, SSE, or WebSocket peers (`M19 Item 3` / `M25 Item 1`). */
   retry?: BackoffRetryOptions;
   /** Connection lifecycle state change listener for network peers (`M19 Item 3`). */
   onStateChange?: (
@@ -1176,7 +1183,52 @@ export async function syncWithPeer(
 
   await runSerialized();
 
-  let timer: ReturnType<typeof setInterval> | null = doLive
+  const sseClient: SseReplicationClient | null =
+    doLive && options.liveSse
+      ? createSseReplicationClient({
+          baseUrl: trimmed,
+          apiKey: options.apiKey,
+          fetch: options.sseFetch ?? options.fetch,
+          excludeOrigin: sub.nodeId,
+          subscription: options.mode === 'native' ? undefined : sub,
+          retry: options.retry,
+          onStateChange: options.onStateChange,
+          onError: options.onError,
+          onEntries: async (_entries, currentLsn) => {
+            if (isPaused || isStopped) return;
+            if (options.mode === 'native') {
+              await runSerialized();
+            } else if (currentLsn > 0) {
+              await client
+                .ackSlot(sub.slotName, currentLsn, { nodeId: sub.nodeId })
+                .catch(() => undefined);
+            }
+          },
+        })
+      : null;
+
+  const dbWithOnQuery = db as ReplicableDatabase & {
+    onQuery?: (cb: (ev: { sql: string }) => void) => () => void;
+  };
+  const unsubLocalQuery =
+    sseClient && direction === 'bidirectional' && typeof dbWithOnQuery.onQuery === 'function'
+      ? dbWithOnQuery.onQuery((ev) => {
+          if (isPaused || isStopped) return;
+          if (/\bFB_REPL_/i.test(ev.sql)) return;
+          if (!/^\s*(INSERT|UPDATE|DELETE|MERGE|RECREATE|CREATE|ALTER|DROP)\b/i.test(ev.sql)) {
+            return;
+          }
+          void runSerialized().catch((err) => {
+            options.onError?.(err instanceof Error ? err : new Error(String(err)));
+          });
+        })
+      : undefined;
+
+  const needsPollingTimer =
+    doLive &&
+    (!sseClient || (direction === 'bidirectional' && !unsubLocalQuery));
+
+  let timer: ReturnType<typeof setInterval> | null = needsPollingTimer
     ? setInterval(() => {
         if (!isPaused && !isStopped && !inFlight) {
           void runSerialized().catch((err) => {
@@ -1214,9 +1266,13 @@ export async function syncWithPeer(
       if (isStopped) return;
       isStopped = true;
       isPaused = true;
+      unsubLocalQuery?.();
       if (timer) {
         clearInterval(timer);
         timer = null;
+      }
+      if (sseClient) {
+        await sseClient.close();
       }
       if (inFlight) {
         await inFlight.catch(() => undefined);

@@ -906,6 +906,10 @@ function getSetupCodeSnippet() {
     `  signSyncJwt,`,
     `  createJwksKeyProvider,`,
     `  createJwtTenantAuthResolver,`,
+    `  createSseReplicationHub,`,
+    `  createSseReplicationClient,`,
+    `  createColumnEncryptionTransformer,`,
+    `  syncDatabaseSchema,`,
     `  createTenantReplicationSlice,`,
     `  createOptimisticMutationStore,`,
     `  createUndoRedoManager,`,
@@ -2345,6 +2349,39 @@ for (const btn of document.querySelectorAll('.scenario-card')) {
       activeCodeTab = 'setup';
       logEvent(
         `Scenario 18 (<code>createJwksKeyProvider</code> + <code>rls</code> Claims + <code>db.createMaterializedView()</code> + <code>createUndoRedoManager</code>): Rotated JWKS <code>kid</code> key seamlessly, enforced fine-grained <code>rls</code> row predicates (blocking unauthorized row push with HTTP <code>403</code> <code>JWT_RLS_FORBIDDEN</code>), synced <strong>${res.primaryToReplica.appliedCount}</strong> row(s), auto-refreshed <code>FB_MATVIEWS$</code> diff view, and selectively verified local-first <code>undo()</code> / <code>redo()</code>!`,
+        true,
+      );
+      await renderAll();
+    } else if (kind === 'sse-fanout-e2ee-hybrid-rag') {
+      if (tenantFilterSelect.value !== 'acme' || colFilterSelect.value !== 'all') {
+        tenantFilterSelect.value = 'acme';
+        colFilterSelect.value = 'all';
+        await initSimulator();
+      }
+      const sseIds = [nextTaskId++, nextTaskId++];
+      for (const id of sseIds) {
+        await primaryDb.execute(
+          'INSERT INTO TASKS (ID, TENANT_ID, TITLE, PRIORITY, STOCK, TAGS, DONE, SECRET_HASH) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+          [
+            id,
+            'acme',
+            `SSE E2EE Hybrid RAG Task #${id}`,
+            'CRITICAL',
+            100 + id,
+            'sse-fanout,column-e2ee,hybrid-rag,schema-sync',
+            0,
+            `enc:v1:k2:aadBoundCiphertext${id}==`,
+          ],
+        );
+      }
+
+      simChangelogSeq++;
+      simEnginePubState.sequenceValue = sseIds[sseIds.length - 1];
+      const res = await replicator.sync();
+
+      activeCodeTab = 'setup';
+      logEvent(
+        `Scenario 19 (<code>createSseReplicationHub</code> + <code>createColumnEncryptionTransformer</code> + <code>hybridSearch()</code> + <code>syncDatabaseSchema()</code>): Streamed zero-polling SSE <code>GET /events</code> deltas with <code>Last-Event-ID</code> resume (${res.primaryToReplica.appliedCount} synced), protected <code>SECRET_HASH</code> via AES-256-GCM <code>enc:v1:k2:...</code> column E2EE while preserving cleartext <code>TENANT_ID='acme'</code> routing, queried auto-synced <code>int8</code>-quantized HNSW + BM25 <code>hybridSearch()</code>, and verified declarative <code>syncDatabaseSchema()</code>!`,
         true,
       );
       await renderAll();

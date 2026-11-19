@@ -67,15 +67,12 @@ import {
   liveTableEventName,
 } from './browser/live-tables';
 import {
-  buildPreparedEnginePipelineRequests,
   executePipelineFallback,
   normalizePipelineOperations,
   type PipelineOperation,
   type PipelineOptions,
   type PipelineResults,
   type PreparedPipeline,
-  type PreparedPipelineResults,
-  type PreparedPipelineStepInputs,
   type PreparedPipelineStepTemplate,
 } from './pipeline';
 import {
@@ -167,11 +164,13 @@ import {
   captureNodeSnapshot,
   createNodeBlobStream,
   createNodeDumpDataStream,
+  createNodePreparedPipeline,
   createNodePreparedStatement,
   openNodeBlobStream,
   readNodeDatabaseInfo,
   restoreNodeSnapshot,
   runNodeLoadDataStream,
+  runNodeTransaction,
   type NodeStreamHost,
 } from './firebird-streams';
 
@@ -559,47 +558,7 @@ export class FirebirdLite implements FirebirdDatabase {
     const TTemplates extends readonly PreparedPipelineStepTemplate[],
   >(templates: TTemplates): Promise<PreparedPipeline<TTemplates>> {
     await this.ensureReady();
-    let isClosed = false;
-    const handle: PreparedPipeline<TTemplates> = {
-      length: templates.length,
-      get closed() {
-        return isClosed;
-      },
-      run: async (
-        inputs?: PreparedPipelineStepInputs<TTemplates>,
-        options: PipelineOptions = {},
-      ): Promise<PreparedPipelineResults<TTemplates>> => {
-        if (isClosed) {
-          throw new Error('PreparedPipeline has already been closed');
-        }
-        assertNotAborted(options.signal);
-        if (templates.length === 0) {
-          return [] as unknown as PreparedPipelineResults<TTemplates>;
-        }
-        const { steps } = buildPreparedEnginePipelineRequests(
-          templates,
-          [],
-          inputs as readonly unknown[] | undefined,
-          (p) => this.serialize(p),
-          false,
-        );
-        const results = options.transaction
-          ? await this.transaction(
-              (tx) => executePipelineFallback(steps, tx),
-              typeof options.transaction === 'object' ? options.transaction : {},
-            )
-          : await executePipelineFallback(steps, this);
-        assertNotAborted(options.signal);
-        return results as PreparedPipelineResults<TTemplates>;
-      },
-      close: async (): Promise<void> => {
-        isClosed = true;
-      },
-      [Symbol.asyncDispose]: async (): Promise<void> => {
-        await handle.close();
-      },
-    };
-    return handle;
+    return createNodePreparedPipeline(this, (p) => this.serialize(p), templates);
   }
 
   /**
@@ -1417,51 +1376,16 @@ export class FirebirdLite implements FirebirdDatabase {
     options: TransactionOptions = {},
   ): Promise<T> {
     await this.ensureReady();
-    const attachment = this.attachment!;
-    const txOptions = buildTransactionOptions(options);
-    await this.endReadTransaction();
-    const transaction = await attachment.startTransaction(txOptions);
-
-    // A shared read made from inside the callback starts the shared
-    // transaction again; each statement here ends it first.
-    const tx = new FirebirdTransaction(
-      attachment,
-      transaction,
-      () => this.endReadTransaction(),
-      this.statements ?? undefined,
+    return runNodeTransaction(
+      this.attachment!,
+      this.statements,
       this.types,
-      undefined,
-      undefined,
       this.udr,
+      () => this.endReadTransaction(),
+      (evName) => this.dispatchLocalEvent(evName),
+      fn,
+      options,
     );
-
-    let result: T;
-    try {
-      result = await fn(tx);
-    } catch (err) {
-      // The callback may have rolled back before throwing; rolling back twice
-      // targets a transaction the driver has already finished with.
-      if (!tx.isFinished) {
-        await transaction.rollback().catch(() => undefined);
-      }
-      throw err;
-    }
-
-    // A callback that rolled back deliberately must not then be committed.
-    if (tx.isFinished) {
-      return result;
-    }
-
-    try {
-      await transaction.commit();
-    } catch (err) {
-      await transaction.rollback().catch(() => undefined);
-      throw err;
-    }
-    for (const tbl of tx.committedTables) {
-      this.dispatchLocalEvent(liveTableEventName(tbl));
-    }
-    return result;
   }
 
   /**

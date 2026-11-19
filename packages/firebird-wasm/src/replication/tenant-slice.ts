@@ -19,6 +19,12 @@ import { discoverUserTables, syncCatalog } from './catalog';
 import { createPublication } from './publication';
 import { createSubscription } from './subscription';
 import { bootstrapReplica, dropAllClonedReplicationTriggers, needsBootstrap } from './bootstrap';
+import {
+  createSseReplicationClient,
+  type SseReplicationClient,
+} from './sse-fanout';
+import type { BackoffRetryOptions } from './webrtc-resilient';
+import type { ReplicationTokenProvider } from './transports';
 import type { SyncHandle } from './presets';
 import type { ReplicationSyncCycleResult } from './orchestration';
 
@@ -344,10 +350,18 @@ export interface CreateTenantReplicationSliceOptions {
   name?: string;
   /** Install native Firebird PSQL capture triggers (`FB_REPL_TRG$<table>`) on primary & replica. @default true */
   installTriggers?: boolean;
+  /** Optional SSE live wakeup endpoint for zero-polling tenant slice updates (`M25 Item 1`). */
+  liveSse?: {
+    baseUrl: string;
+    authToken?: ReplicationTokenProvider;
+    fetch?: typeof globalThis.fetch;
+    retry?: BackoffRetryOptions;
+  };
 }
 
 export interface TenantReplicationSliceHandle extends SyncHandle {
   readonly tenantColumn: string;
+  readonly sseClient?: SseReplicationClient;
   readonly tenantId: string | number;
   readonly partitionedTables: readonly string[];
   readonly sharedTables: readonly string[];
@@ -632,7 +646,12 @@ export async function createTenantReplicationSlice(
     ReplicationSyncCycleResult & { pulled: number; pushed: number; conflicts: number }
   > | null = null;
 
-  const pullFromPrimary = async (): Promise<SubscriptionPullResult> => {
+  const pullFromPrimary = async (
+    explicitEntries?: readonly ReplicationLogEntry[],
+  ): Promise<SubscriptionPullResult> => {
+    if (explicitEntries) {
+      return replicaSub.applyChanges(guard.filterOutboundEntries(explicitEntries, tenantId));
+    }
     await primaryPub.captureTableChanges();
     return replicaSub.pull();
   };
@@ -730,8 +749,25 @@ export async function createTenantReplicationSlice(
     start();
   };
 
+  const sseClient: SseReplicationClient | undefined = options.liveSse
+    ? createSseReplicationClient({
+        baseUrl: options.liveSse.baseUrl,
+        authToken: options.liveSse.authToken,
+        fetch: options.liveSse.fetch,
+        retry: options.liveSse.retry,
+        excludeOrigin: `replica_${baseName}`,
+        onEntries: async (entries) => {
+          if (closed || paused) return;
+          await pullFromPrimary(entries);
+        },
+      })
+    : undefined;
+
   const stop = async (): Promise<void> => {
     pause();
+    if (sseClient) {
+      await sseClient.close();
+    }
     replicaSub.stop();
     primaryInboundSub?.stop();
   };
@@ -742,7 +778,7 @@ export async function createTenantReplicationSlice(
     await stop();
   };
 
-  if (options.live) {
+  if (options.live && !sseClient) {
     start();
   }
 
@@ -753,6 +789,7 @@ export async function createTenantReplicationSlice(
       return paused;
     },
     tenantColumn: tenantCol,
+    sseClient,
     tenantId,
     partitionedTables: partitionedConfigs.map((c) => c.table),
     sharedTables: sharedConfigs.map((c) => c.table),

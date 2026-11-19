@@ -268,6 +268,8 @@ export interface BuildReplicationTriggerDdlOptions {
   primaryKey?: readonly string[];
   /** Column names serialized into `AFTER_JSON` and `BEFORE_JSON`. Defaults to `primaryKey`. */
   columns?: readonly string[];
+  /** Optional upper-case column names using `OCTETS` / binary storage (`HEX_ENCODE` in PSQL triggers). */
+  binaryColumns?: ReadonlySet<string>;
   /** Logical publication name. @default 'default' */
   publication?: string;
   /** Default origin node identifier if `RDB$GET_CONTEXT('USER_SESSION', 'FB_REPL_ORIGIN')` is unset. @default 'node_default' */

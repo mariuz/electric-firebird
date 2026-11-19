@@ -53,6 +53,10 @@ import type { SyncHandleLike } from '../frameworks/sync-store';
 import type { OptimisticMutationStore, OptimisticStoreSnapshot } from '../optimistic-store';
 import type { UndoRedoEntry, UndoRedoManager } from '../undo-redo';
 import type { MaterializedViewInfo } from '../materialized-view';
+import type { DeclarativeSchemaInput, SchemaSyncResult } from '../schema-sync';
+import type { ReplSearchIndexSummary } from './repl-actions';
+
+export type { ReplSearchIndexSummary } from './repl-actions';
 
 export {
   computeTableIoBreakdown,
@@ -294,6 +298,15 @@ export interface FirebirdReplElement extends HTMLElement {
   materializedViews(): Promise<MaterializedViewInfo[]>;
   /** Re-populate a persistent materialized view recorded in `"FB_MATVIEWS$"` (`M24 Item 5`). */
   refreshMaterializedView(name: string): Promise<void>;
+  /** List persisted Vector HNSW (`FB_VECTOR_INDEX$`) and BM25 FTS (`FB_FTS_INDEX$`) indexes (`M25 Item 5`). */
+  searchIndexes(): Promise<ReplSearchIndexSummary[]>;
+  /** Preview declarative DDL schema diff against `desiredSource` without mutating the database (`M25 Item 5`). */
+  previewSchemaDiff(desiredSource: DeclarativeSchemaInput): Promise<SchemaSyncResult | null>;
+  /** Push declarative schema changes from `desiredSource` onto the database (`M25 Item 5`). */
+  applySchemaPush(
+    desiredSource: DeclarativeSchemaInput,
+    options?: { allowDestructive?: boolean },
+  ): Promise<SchemaSyncResult | null>;
   /** Toggle (or switch to `tab` in) the interactive Schema Inspector, Migration Viewer, Profiler & Plan Explorer sidebar. */
   toggleInspector(tab?: ReplInspectorTab): Promise<void>;
   /** Refresh the interactive Schema Inspector, Migration Viewer, Profiler & Plan Explorer sidebar from the database. */
@@ -303,13 +316,10 @@ export interface FirebirdReplElement extends HTMLElement {
 }
 
 import { REPL_STYLE, el, asError } from './repl-styles';
-import { encodeArrowIpc, rowsToColumnarResult } from '../columnar';
-import {
-  loadArrowIpcIntoDatabase,
-  type ArrowIngestHost,
-  type ArrowIngestResult,
-  type ArrowIngestSource,
-  type LoadArrowIpcOptions,
+import type {
+  ArrowIngestResult,
+  ArrowIngestSource,
+  LoadArrowIpcOptions,
 } from '../arrow-ingest';
 import {
   fetchReplArrowInspector,
@@ -320,6 +330,16 @@ import {
   fetchReplStats,
   renderReplInspector,
 } from './repl-inspectors';
+import {
+  executeReplArrowExport,
+  executeReplArrowImport,
+  executeReplCellEdit,
+  executeReplMatViewRefresh,
+  executeReplSchemaDiff,
+  fetchReplSearchIndexes,
+  stepReplHistoryKey,
+  triggerArrowBrowserDownload,
+} from './repl-actions';
 import { renderReplEntryBlock } from './repl-entry-renderer';
 
 /**
@@ -375,6 +395,9 @@ export function defineFirebirdRepl(
     private activeTab: ReplInspectorTab = 'schema';
     private lastSchema: SchemaIntrospection | null = null;
     private lastMatViews: MaterializedViewInfo[] = [];
+    private lastSearchIndexes: ReplSearchIndexSummary[] = [];
+    private lastSchemaDiff: SchemaSyncResult | null = null;
+    private schemaDiffDraft = '';
     private lastMigrations: AppliedMigration[] = [];
     private lastStats: MonitorStats | null = null;
     private lastPlans: Array<{ sql: string; parsed: ParsedQueryPlan }> = [];
@@ -805,6 +828,7 @@ export function defineFirebirdRepl(
         if (this.activeTab === 'schema') {
           this.lastSchema = await this.fetchSchema();
           this.lastMatViews = await fetchReplMaterializedViews(this.db);
+          this.lastSearchIndexes = await fetchReplSearchIndexes(this.db);
         } else if (this.activeTab === 'migrations') {
           this.lastMigrations = await this.fetchMigrations();
         } else if (this.activeTab === 'profiler' || this.activeTab === 'plan') {
@@ -848,6 +872,9 @@ export function defineFirebirdRepl(
         activeTab: this.activeTab,
         lastSchema: this.lastSchema,
         lastMatViews: this.lastMatViews,
+        lastSearchIndexes: this.lastSearchIndexes,
+        lastSchemaDiff: this.lastSchemaDiff,
+        schemaDiffDraft: this.schemaDiffDraft,
         lastMigrations: this.lastMigrations,
         lastStats: this.lastStats,
         lastPlans: this.lastPlans,
@@ -885,21 +912,16 @@ export function defineFirebirdRepl(
         onRefreshMaterializedView: (mvName) => {
           void this.refreshMaterializedView(mvName);
         },
+        onPreviewSchemaDiff: (ddlSql) => {
+          this.schemaDiffDraft = ddlSql;
+          void this.previewSchemaDiff(ddlSql);
+        },
+        onApplySchemaPush: (ddlSql) => {
+          this.schemaDiffDraft = ddlSql;
+          void this.applySchemaPush(ddlSql);
+        },
         onExportArrow: () => {
-          void this.exportArrow().then((bytes) => {
-            if (typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function') {
-              const blob = new Blob(
-                [new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength) as unknown as BlobPart],
-                { type: 'application/vnd.apache.arrow.stream' },
-              );
-              const url = URL.createObjectURL(blob);
-              const a = document.createElement('a');
-              a.href = url;
-              a.download = 'query.arrow';
-              a.click();
-              URL.revokeObjectURL(url);
-            }
-          });
+          void this.exportArrow().then(triggerArrowBrowserDownload);
         },
         onImportArrowFile: (fileName, bytes) => {
           const base = fileName
@@ -1191,6 +1213,7 @@ export function defineFirebirdRepl(
       try {
         const result = await this.fetchSchema(options);
         this.lastMatViews = await fetchReplMaterializedViews(this.db);
+        this.lastSearchIndexes = await fetchReplSearchIndexes(this.db);
         entry.schema = result;
         this.lastSchema = result;
         this.activeTab = 'schema';
@@ -1404,23 +1427,7 @@ export function defineFirebirdRepl(
       if (!this.db) {
         throw new Error('No database: set the element’s db property first');
       }
-      const targetSql =
-        (sql ?? this.editor.value ?? '').trim() ||
-        'SELECT 1 AS SAMPLE_ID FROM RDB$DATABASE';
-      let bytes: Uint8Array;
-      if (typeof this.db.queryArrow === 'function') {
-        bytes = await this.db.queryArrow(targetSql);
-      } else {
-        const res = await this.db.query(targetSql, [], { rowMode: 'array' });
-        const rowsObj = res.rows.map((arr) => {
-          const r: Record<string, unknown> = {};
-          for (let i = 0; i < res.fields.length; i++) {
-            r[res.fields[i]!.name] = arr[i];
-          }
-          return r;
-        });
-        bytes = encodeArrowIpc(rowsToColumnarResult({ rows: rowsObj, fields: res.fields }));
-      }
+      const { targetSql, bytes } = await executeReplArrowExport(this.db, this.editor.value, sql);
       await this.inspectArrow(targetSql);
       this.dispatchEvent(
         new CustomEvent('firebird-repl-arrow-export', {
@@ -1440,50 +1447,7 @@ export function defineFirebirdRepl(
       if (!this.db) {
         throw new Error('No database: set the element’s db property first');
       }
-      const started = performance.now();
-      const db = this.db;
-      let result: ArrowIngestResult;
-      if (typeof db.loadArrowIpc === 'function') {
-        result = await db.loadArrowIpc(tableName, source, options);
-      } else {
-        const fallbackHost: ArrowIngestHost = {
-          execute: async (s) => {
-            const r = await db.transaction((tx) => tx.exec(s));
-            return { affectedRows: r.affectedRows };
-          },
-          execBatch: async (s, rows) => {
-            if (typeof db.execBatch === 'function') {
-              return db.execBatch(s, rows);
-            }
-            let total = 0;
-            for (const row of rows) {
-              if (typeof db.execute === 'function') {
-                const er = await db.execute(s, row);
-                total += er.affectedRows;
-              }
-            }
-            return { affectedRows: total };
-          },
-          query: async <T extends Record<string, unknown>>(s: string, p?: unknown[]) => {
-            const arr = await db.query(s, p ?? [], { rowMode: 'array' });
-            const objs = arr.rows.map((rowArr) => {
-              const obj: Record<string, unknown> = {};
-              for (let i = 0; i < arr.fields.length; i++) {
-                obj[arr.fields[i]!.name] = rowArr[i];
-              }
-              return obj as T;
-            });
-            return { rows: objs };
-          },
-        };
-        result = await loadArrowIpcIntoDatabase(fallbackHost, tableName, source, options);
-      }
-      const entry: ReplEntry = {
-        sql: `IMPORT ARROW INTO "${result.tableName}"`,
-        line: 1,
-        ms: performance.now() - started,
-        affectedRows: result.rowsIngested,
-      };
+      const { result, entry } = await executeReplArrowImport(this.db, tableName, source, options);
       this.show(entry);
       if (this.isInspectorOpen) {
         await this.refreshInspector();
@@ -1531,49 +1495,22 @@ export function defineFirebirdRepl(
       if (!this.db) {
         throw new Error('No database: set the element’s db property first');
       }
-      const tblUpper = tableName.trim().toUpperCase();
-      const colUpper = column.trim().toUpperCase();
-      const pkUpper = primaryKey.trim().toUpperCase();
-      const coerced: unknown =
-        typeof newValue === 'string' && /^-?\d+$/.test(newValue.trim())
-          ? Number(newValue.trim())
-          : typeof newValue === 'string' && /^-?\d+\.\d+$/.test(newValue.trim())
-            ? Number(newValue.trim())
-            : newValue;
-
-      if (this.undoRedoRef) {
-        await this.undoRedoRef.update(
-          tblUpper,
-          keyValue,
-          { [colUpper]: coerced },
-          { primaryKey: pkUpper },
-        );
-      } else if (this.optStoreRef) {
-        await this.optStoreRef.update(
-          tblUpper,
-          keyValue,
-          { [colUpper]: coerced },
-          { primaryKey: pkUpper },
-        );
-      } else if (typeof this.db.execute === 'function') {
-        await this.db.execute(
-          `UPDATE "${tblUpper.replace(/"/g, '""')}" SET "${colUpper.replace(/"/g, '""')}" = ? WHERE "${pkUpper.replace(/"/g, '""')}" = ?`,
-          [coerced, keyValue],
-        );
-      } else {
-        await this.db.query(
-          `UPDATE "${tblUpper.replace(/"/g, '""')}" SET "${colUpper.replace(/"/g, '""')}" = ? WHERE "${pkUpper.replace(/"/g, '""')}" = ?`,
-          [coerced, keyValue],
-          { rowMode: 'array' },
-        );
-      }
-
+      const detail = await executeReplCellEdit(
+        this.db,
+        this.undoRedoRef,
+        this.optStoreRef,
+        tableName,
+        keyValue,
+        column,
+        newValue,
+        primaryKey,
+      );
       if (this.isInspectorOpen) {
         await this.refreshInspector();
       }
       this.dispatchEvent(
         new CustomEvent('firebird-repl-cell-edit', {
-          detail: { table: tblUpper, keyValue, column: colUpper, value: coerced },
+          detail,
           bubbles: true,
           composed: true,
         }),
@@ -1621,35 +1558,43 @@ export function defineFirebirdRepl(
 
     async refreshMaterializedView(name: string): Promise<void> {
       if (!this.db) return;
-      const started = performance.now();
-      const views = await fetchReplMaterializedViews(this.db);
-      const target = views.find((v) => v.name.toUpperCase() === name.trim().toUpperCase());
-      if (!target) {
-        throw new Error(`Materialized view '${name}' not found in FB_MATVIEWS$`);
-      }
-      const quoted = `"${target.name.replace(/"/g, '""')}"`;
-      if (typeof this.db.execute === 'function') {
-        await this.db.execute(`DELETE FROM ${quoted}`);
-        await this.db.execute(`INSERT INTO ${quoted} ${target.selectSql}`);
-        const cnt = await this.db.query(`SELECT COUNT(*) FROM ${quoted}`, [], {
-          rowMode: 'array',
-        });
-        const nextRows = Number(cnt.rows[0]?.[0] ?? 0);
-        const dur = performance.now() - started;
-        await this.db.execute(
-          `UPDATE "FB_MATVIEWS$" SET "ROW_COUNT" = ?, "LAST_REFRESHED_AT" = ?, "LAST_DURATION_MS" = ? WHERE "VIEW_NAME" = ?`,
-          [nextRows, Date.now(), dur, target.name],
-        );
-        this.show({
-          sql: `REFRESH MATERIALIZED VIEW ${quoted}`,
-          line: 1,
-          ms: dur,
-          affectedRows: nextRows,
-        });
-      }
+      const entry = await executeReplMatViewRefresh(this.db, name);
+      if (entry) this.show(entry);
       if (this.isInspectorOpen) {
         await this.refreshInspector();
       }
+    }
+
+    async searchIndexes(): Promise<ReplSearchIndexSummary[]> {
+      if (!this.db) return [];
+      this.lastSearchIndexes = await fetchReplSearchIndexes(this.db);
+      return this.lastSearchIndexes;
+    }
+
+    async previewSchemaDiff(desiredSource: DeclarativeSchemaInput): Promise<SchemaSyncResult | null> {
+      if (!this.db) return null;
+      if (typeof desiredSource === 'string') this.schemaDiffDraft = desiredSource;
+      this.lastSchemaDiff = await executeReplSchemaDiff(this.db, desiredSource, { dryRun: true });
+      this.activeTab = 'schema';
+      this.updateActiveTabButtons();
+      this.inspectorOpen = true;
+      await this.refreshInspector();
+      return this.lastSchemaDiff;
+    }
+
+    async applySchemaPush(
+      desiredSource: DeclarativeSchemaInput,
+      options: { allowDestructive?: boolean } = {},
+    ): Promise<SchemaSyncResult | null> {
+      if (!this.db) return null;
+      if (typeof desiredSource === 'string') this.schemaDiffDraft = desiredSource;
+      const res = await executeReplSchemaDiff(this.db, desiredSource, {
+        dryRun: false,
+        allowDestructive: options.allowDestructive,
+      });
+      this.lastSchemaDiff = res;
+      if (this.isInspectorOpen) await this.refreshInspector();
+      return res;
     }
 
     private onKey(event: KeyboardEvent): void {
@@ -1658,33 +1603,12 @@ export function defineFirebirdRepl(
         void this.run();
         return;
       }
-      if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return;
-      if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
-
-      const { value, selectionStart, selectionEnd } = this.editor;
-      if (selectionStart !== selectionEnd) return;
-      const onFirstLine = !value.slice(0, selectionStart).includes('\n');
-      const onLastLine = !value.slice(selectionEnd).includes('\n');
-
-      if (event.key === 'ArrowUp' && onFirstLine && this.cursor > 0) {
-        if (this.cursor === this.history.length) this.draft = value;
-        this.cursor--;
-      } else if (
-        event.key === 'ArrowDown' &&
-        onLastLine &&
-        this.cursor < this.history.length
-      ) {
-        this.cursor++;
-      } else {
-        return;
-      }
-      event.preventDefault();
-      this.editor.value =
-        this.cursor === this.history.length
-          ? this.draft
-          : this.history[this.cursor]!;
-      const end = this.editor.value.length;
-      this.editor.setSelectionRange(end, end);
+      const state = { cursor: this.cursor, draft: this.draft };
+      stepReplHistoryKey(event, this.editor, this.history, state, () => {
+        void this.run();
+      });
+      this.cursor = state.cursor;
+      this.draft = state.draft;
     }
 
     private show(entry: ReplEntry): void {

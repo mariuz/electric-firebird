@@ -696,13 +696,32 @@ export async function createPublication(
           } else {
             res = await db.query<Row>(`SELECT * FROM ${quoteIdent(tableUpper)}`);
           }
-          rows = res.rows
+          const projectedRows = res.rows
             .map((r) => normalizeRowKeysUpper(r))
             .filter((r) => matchesRowFilter(r, cfg.where))
             .map(
               (r) =>
                 projectReplicatedRow(r, cfg.primaryKey, cfg.columns, cfg.excludeColumns) ?? r,
             );
+          const rowTx = cfg.transformRow ?? options.transformRow;
+          if (rowTx) {
+            const transformedList: Row[] = [];
+            for (const r of projectedRows) {
+              const keyRec = extractKeyRecord(r, cfg.primaryKey);
+              const txRow = await rowTx(r, {
+                table: tableUpper,
+                operation: 'INSERT',
+                key: keyRec,
+                origin: nodeId,
+              });
+              if (txRow) {
+                transformedList.push(txRow);
+              }
+            }
+            rows = transformedList;
+          } else {
+            rows = projectedRows;
+          }
         } catch {
           rows = [];
         }

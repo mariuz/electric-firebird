@@ -36,6 +36,13 @@
 import type { QueryParams, QueryResult, RegisteredRoutine, Row } from '../types';
 import type { RegisterFunctionOptions, JsFunctionHandler } from '../types';
 import type { PersistentVectorIndex } from './hnsw';
+import {
+  hammingDistance,
+  int8ApproximateDistance,
+  quantizeVectorBinary,
+  quantizeVectorInt8,
+  type VectorQuantizationMode,
+} from './quantization';
 
 export {
   HnswIndex,
@@ -49,6 +56,7 @@ export {
   type PersistentVectorIndexSearchOptions,
   type PersistentVectorIndex,
 } from './hnsw';
+export * from './quantization';
 
 /**
  * Supported vector similarity/distance metrics.
@@ -176,6 +184,15 @@ export interface VectorSearchOptions {
    * HNSW beam width (`efSearch`) when `index` is provided.
    */
   efSearch?: number;
+  /**
+   * Optional scalar `'int8'` or `'binary'` quantization pre-pass followed by
+   * exact `float32` top-$k$ rescoring (`M25 Item 3`).
+   */
+  quantization?: VectorQuantizationMode;
+  /**
+   * Candidate oversampling multiplier before exact `float32` rescoring (`M25 Item 3`). @default 4
+   */
+  rescoreOversample?: number;
 }
 
 /**
@@ -902,6 +919,64 @@ export async function vectorSearch<T extends Row = Row>(
 
   const sql = `SELECT ${selectClause} FROM ${tableIdent}${whereClause}`;
   const res = await db.query<Record<string, unknown>>(sql, options.params ?? []);
+
+  const qMode = options.quantization ?? 'none';
+  if (qMode === 'int8' || qMode === 'binary') {
+    const oversample = Math.max(1, Math.floor(options.rescoreOversample ?? 4));
+    const poolSize = Math.max(limit * oversample, limit);
+    const qInt8Query = qMode === 'int8' ? quantizeVectorInt8(queryVec) : undefined;
+    const qBinQuery = qMode === 'binary' ? quantizeVectorBinary(queryVec) : undefined;
+
+    const approxPool: Array<{
+      row: Record<string, unknown>;
+      vecKey: string;
+      rowVec: Float32Array;
+      approxDist: number;
+    }> = [];
+
+    for (const row of res.rows) {
+      const found = getRowCaseInsensitive(row, rawColName);
+      if (!found || found.value === null || found.value === undefined) continue;
+      const rowVec = decodeVector(found.value);
+      const approxDist = qInt8Query
+        ? int8ApproximateDistance(metric, qInt8Query, quantizeVectorInt8(rowVec))
+        : hammingDistance(qBinQuery!, quantizeVectorBinary(rowVec));
+      approxPool.push({ row, vecKey: found.key, rowVec, approxDist });
+    }
+
+    approxPool.sort((a, b) => a.approxDist - b.approxDist);
+    const topPool = approxPool.slice(0, poolSize);
+
+    const rescored: Array<VectorSearchRow<T>> = [];
+    for (const cand of topPool) {
+      let distance: number;
+      let similarity: number;
+      if (metric === 'cosine') {
+        distance = cosineDistance(queryVec, cand.rowVec);
+        similarity = 1 - distance;
+      } else if (metric === 'l2') {
+        distance = l2Distance(queryVec, cand.rowVec);
+        similarity = 1 / (1 + distance);
+      } else {
+        const dot = dotProduct(queryVec, cand.rowVec);
+        distance = Object.is(-dot, -0) ? 0 : -dot;
+        similarity = dot;
+      }
+      if (options.maxDistance !== undefined && distance > options.maxDistance) continue;
+      if (options.minSimilarity !== undefined && similarity < options.minSimilarity) continue;
+
+      const outRow: Record<string, unknown> = { ...cand.row };
+      if (!includeVector) delete outRow[cand.vecKey];
+      outRow[distanceCol] = distance;
+      outRow[similarityCol] = similarity;
+      rescored.push(outRow as VectorSearchRow<T>);
+    }
+
+    rescored.sort(
+      (a, b) => (a[distanceCol] as number) - (b[distanceCol] as number),
+    );
+    return rescored.slice(0, limit);
+  }
 
   const scored: Array<VectorSearchRow<T>> = [];
 
