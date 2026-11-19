@@ -20,7 +20,6 @@ import {
 } from './shared';
 import {
   applyFbChangelogSegmentToDatabase,
-  isFbChangelogSegment,
   parseFbChangelogSegment,
   type ApplyFbChangelogResult,
   type JrdColumnDescriptor,
@@ -54,10 +53,17 @@ import {
   createSseReplicationHub,
   type SseReplicationHub,
 } from './sse-fanout';
+import {
+  createPresenceHub,
+  type PresenceCursor,
+  type PresenceHub,
+} from './presence';
 
 export * from './webrtc-resilient';
 export * from './broadcast-transport';
 export * from './sse-fanout';
+export * from './presence';
+export * from './websocket-transport';
 
 // ---------------------------------------------------------------------------
 // 4. Network Replication Transports (HTTP/SSE, WebSocket & BroadcastChannel — M12 Item 7 / M18 Item 1)
@@ -126,6 +132,8 @@ export interface HttpReplicationHandlerOptions {
   sseHub?: SseReplicationHub;
   /** Keep-alive comment interval in ms for `GET /events` SSE streams (`M25 Item 1`). @default 15000 */
   sseHeartbeatIntervalMs?: number;
+  /** Optional ephemeral collaborative presence hub (`M26 Item 1`). */
+  presenceHub?: PresenceHub;
 }
 
 export type ReplicationTokenProvider =
@@ -292,6 +300,7 @@ export function createHttpReplicationHandler(
       jwtResolver,
       heartbeatIntervalMs: options.sseHeartbeatIntervalMs,
     });
+  const presenceHub: PresenceHub = options.presenceHub ?? createPresenceHub();
 
   return async (request: Request): Promise<Response> => {
     if (apiKey && !jwtResolver) {
@@ -466,6 +475,89 @@ export function createHttpReplicationHandler(
       return jsonResponse({ results });
     }
 
+    if (request.method === 'GET' && path.endsWith('/presence')) {
+      const roomId = url.searchParams.get('roomId') ?? 'default';
+      return jsonResponse({
+        roomId,
+        peers: presenceHub.listPeers({ roomId, tenantId: requestTenantId }),
+      });
+    }
+
+    if (request.method === 'POST' && path.endsWith('/presence')) {
+      const body = (await request.json()) as {
+        action?: 'update' | 'leave';
+        roomId?: string;
+        peerId?: string;
+        version?: number;
+        cursor?: PresenceCursor | null;
+        typing?: boolean;
+        state?: Record<string, unknown>;
+        ttlMs?: number;
+      };
+      const roomId = (body.roomId ?? 'default').trim() || 'default';
+      const peerId = (body.peerId ?? '').trim();
+      if (!peerId) {
+        return jsonResponse({ error: 'POST /presence requires peerId' }, 400);
+      }
+      if (body.action === 'leave') {
+        presenceHub.removePeer(peerId, {
+          roomId,
+          tenantId: requestTenantId,
+          version: body.version,
+        });
+        sseHub.broadcastPresence(
+          { action: 'leave', roomId, peerId, version: body.version },
+          { tenantId: requestTenantId },
+        );
+      } else {
+        const peer = presenceHub.upsertPeer(
+          {
+            roomId,
+            peerId,
+            version: body.version,
+            cursor: body.cursor,
+            typing: body.typing,
+            state: body.state,
+            ttlMs: body.ttlMs,
+          },
+          { tenantId: requestTenantId },
+        );
+        sseHub.broadcastPresence(
+          { action: 'update', roomId: peer.roomId, peer },
+          { tenantId: requestTenantId },
+        );
+      }
+      return jsonResponse({
+        ok: true,
+        roomId,
+        peers: presenceHub.listPeers({ roomId, tenantId: requestTenantId }),
+      });
+    }
+
+    if (request.method === 'GET' && path.endsWith('/events')) {
+      const rawLastEventId =
+        request.headers.get('last-event-id') ?? url.searchParams.get('sinceLsn');
+      const parsedSinceLsn =
+        rawLastEventId !== null && rawLastEventId.trim() !== ''
+          ? Number(rawLastEventId)
+          : undefined;
+      const once =
+        url.searchParams.get('once') === '1' ||
+        url.searchParams.get('once') === 'true' ||
+        url.searchParams.get('stream') === '0';
+      return sseHub.openStream({
+        tenantId: requestTenantId,
+        jwtCtx,
+        excludeOrigin: url.searchParams.get('excludeOrigin') ?? undefined,
+        sinceLsn:
+          parsedSinceLsn !== undefined && Number.isFinite(parsedSinceLsn)
+            ? parsedSinceLsn
+            : undefined,
+        once,
+        signal: request.signal,
+      });
+    }
+
     if (!publication) {
       return jsonResponse({ error: `Not Found: ${request.method} ${url.pathname}` }, 404);
     }
@@ -620,30 +712,6 @@ export function createHttpReplicationHandler(
             }
           : tableFilteredSnap;
       return jsonResponse({ snapshot });
-    }
-
-    if (request.method === 'GET' && path.endsWith('/events')) {
-      const rawLastEventId =
-        request.headers.get('last-event-id') ?? url.searchParams.get('sinceLsn');
-      const parsedSinceLsn =
-        rawLastEventId !== null && rawLastEventId.trim() !== ''
-          ? Number(rawLastEventId)
-          : undefined;
-      const once =
-        url.searchParams.get('once') === '1' ||
-        url.searchParams.get('once') === 'true' ||
-        url.searchParams.get('stream') === '0';
-      return sseHub.openStream({
-        tenantId: requestTenantId,
-        jwtCtx,
-        excludeOrigin: url.searchParams.get('excludeOrigin') ?? undefined,
-        sinceLsn:
-          parsedSinceLsn !== undefined && Number.isFinite(parsedSinceLsn)
-            ? parsedSinceLsn
-            : undefined,
-        once,
-        signal: request.signal,
-      });
     }
 
     if (request.method === 'POST' && path.endsWith('/ack')) {
@@ -1150,341 +1218,6 @@ export function createHttpReplicationClient(
         );
       }
       return results;
-    },
-  };
-}
-
-/** Structural interface for a standard `WebSocket` or duplex test socket. */
-export interface WebSocketLike {
-  send(data: string | Uint8Array): void;
-  addEventListener?(type: 'message', listener: (event: { data: unknown }) => void): void;
-  removeEventListener?(type: 'message', listener: (event: { data: unknown }) => void): void;
-  onmessage?: ((event: { data: unknown }) => void) | null;
-  close?(): void;
-}
-
-/** Options for {@link createWebSocketReplicationPeer}. */
-export interface WebSocketReplicationPeerOptions {
-  /** Duplex WebSocket connection. */
-  socket: WebSocketLike;
-  /** Local publication to stream changes from. */
-  publication?: ReplicationPublication;
-  /** Local subscription to apply incoming changes to. */
-  subscription?: ReplicationSubscription;
-  /** Optional replica database to automatically apply incoming `"FBCHANGELOG\0"` binary frames to (`M18 Item 1`). */
-  changelogTargetDb?: ReplicableDatabase;
-  /** Optional callback invoked when a binary `"FBCHANGELOG\0"` segment frame arrives (`M18 Item 1`). */
-  onChangelogSegment?: (
-    segment: Uint8Array,
-    result?: ApplyFbChangelogResult,
-  ) => void | Promise<void>;
-  /** Optional inbound tenant isolation guard enforced on incoming `repl_entries` frames (`M22 Item 1`). */
-  tenantGuard?: TenantIsolationGuard;
-  /** Optional WebCrypto JWT verifier / claim resolver enforced on incoming WebSocket frames (`M23 Item 1`). */
-  jwtAuth?: JwtTenantAuthResolver | JwtTenantAuthOptions;
-  /** Optional Bearer JWT token or async provider attached to outbound `repl_pull_request` / `repl_entries` frames (`M23 Item 1` / `M24 Item 1`). */
-  authToken?: ReplicationTokenProvider;
-  /** Optional error callback invoked when an inbound frame violates `tenantGuard` or `jwtAuth` (`M22 Item 1` / `M23 Item 1`). */
-  onError?: (error: Error) => void;
-}
-
-/** Duplex WebSocket replication peer returned by {@link createWebSocketReplicationPeer}. */
-export interface WebSocketReplicationPeer {
-  /** Push local journal entries after `sinceLsn` (or last pushed LSN) over the WebSocket. */
-  pushSince(sinceLsn?: number): Promise<number>;
-  /** Request the remote peer to stream changes after `sinceLsn` (or current watermark). */
-  requestPull(sinceLsn?: number): Promise<void>;
-  /** Rotate the outbound JWT token and immediately send a `repl_auth` frame over the live WebSocket (`M24 Item 1`). */
-  refreshAuth(tokenOrProvider?: ReplicationTokenProvider): Promise<void>;
-  /** Stream a binary `"FBCHANGELOG\0"` segment frame (optionally gzip-compressed) over the WebSocket (`M18 Item 1`). */
-  sendChangelogSegment(
-    segment: Uint8Array,
-    options?: { compress?: boolean },
-  ): Promise<void>;
-  /** Detach message listeners from the WebSocket. */
-  close(): void;
-}
-
-/**
- * Create a duplex WebSocket replication peer that streams `ReplicationLogEntry`
- * batches, pull requests, slot acknowledgements, and raw/gzipped `"FBCHANGELOG\0"`
- * binary frames over a `WebSocketLike` channel.
- */
-export function createWebSocketReplicationPeer(
-  options: WebSocketReplicationPeerOptions,
-): WebSocketReplicationPeer {
-  const {
-    socket,
-    publication,
-    subscription,
-    changelogTargetDb,
-    onChangelogSegment,
-  } = options;
-
-  let lastPushedLsn = 0;
-  let sessionJwtCtx: JwtTenantAuthContext | undefined;
-  let activeWsTokenSource: ReplicationTokenProvider | undefined = options.authToken;
-
-  const resolveWsToken = async (): Promise<string | undefined> => {
-    if (typeof activeWsTokenSource === 'function') {
-      return activeWsTokenSource();
-    }
-    return activeWsTokenSource;
-  };
-
-  const wsJwtResolver: JwtTenantAuthResolver | undefined = options.jwtAuth
-    ? 'authenticateToken' in options.jwtAuth
-      ? options.jwtAuth
-      : createJwtTenantAuthResolver(options.jwtAuth)
-    : undefined;
-
-  const sendWsJwtError = (err: SyncJwtError): void => {
-    options.onError?.(err);
-    socket.send(
-      JSON.stringify({
-        type: 'repl_error',
-        status: err.status,
-        code: err.code,
-        error: err.message,
-      }),
-    );
-  };
-
-  const handleBinaryChangelog = async (bytes: Uint8Array): Promise<boolean> => {
-    let candidate = bytes;
-    if (isGzipBytes(bytes)) {
-      try {
-        candidate = await gunzipBytes(bytes);
-      } catch {
-        return false;
-      }
-    }
-    if (!isFbChangelogSegment(candidate)) {
-      return false;
-    }
-    let applyResult: ApplyFbChangelogResult | undefined;
-    if (changelogTargetDb) {
-      applyResult = await applyFbChangelogSegmentToDatabase(changelogTargetDb, candidate);
-    }
-    if (onChangelogSegment) {
-      await onChangelogSegment(candidate, applyResult);
-    }
-    const seq = applyResult?.sequence ?? parseFbChangelogSegment(candidate).header.sequence;
-    socket.send(
-      JSON.stringify({
-        type: 'repl_changelog_ack',
-        sequence: seq,
-      }),
-    );
-    return true;
-  };
-
-  const handleMessage = async (raw: unknown): Promise<void> => {
-    let text: string;
-    if (raw instanceof Uint8Array) {
-      if (await handleBinaryChangelog(raw)) {
-        return;
-      }
-      text = new TextDecoder().decode(raw);
-    } else if (raw instanceof ArrayBuffer) {
-      const bytes = new Uint8Array(raw);
-      if (await handleBinaryChangelog(bytes)) {
-        return;
-      }
-      text = new TextDecoder().decode(bytes);
-    } else if (typeof raw === 'string') {
-      text = raw;
-    } else {
-      return;
-    }
-
-    let msg: {
-      type?: string;
-      token?: string;
-      sinceLsn?: number;
-      excludeOrigin?: string;
-      entries?: ReplicationLogEntry[];
-      slotName?: string;
-      confirmedLsn?: number;
-      nodeId?: string;
-    };
-    try {
-      msg = JSON.parse(text) as typeof msg;
-    } catch {
-      return;
-    }
-
-    if (msg.type === 'repl_auth') {
-      if (wsJwtResolver) {
-        try {
-          sessionJwtCtx = await wsJwtResolver.authenticateToken(msg.token);
-          socket.send(
-            JSON.stringify({
-              type: 'repl_auth_ok',
-              role: sessionJwtCtx.role,
-              tenantId: sessionJwtCtx.tenantId ?? null,
-            }),
-          );
-        } catch (err) {
-          if (err instanceof SyncJwtError) sendWsJwtError(err);
-        }
-      }
-      return;
-    }
-
-    let activeJwtCtx = sessionJwtCtx;
-    if (wsJwtResolver && (!activeJwtCtx || msg.token)) {
-      try {
-        activeJwtCtx = await wsJwtResolver.authenticateToken(msg.token);
-        sessionJwtCtx = activeJwtCtx;
-      } catch (err) {
-        if (err instanceof SyncJwtError) {
-          sendWsJwtError(err);
-          return;
-        }
-        throw err;
-      }
-    }
-
-    if (msg.type === 'repl_pull_request' && publication) {
-      const rawEntries = await publication.fetchChangesSince(msg.sinceLsn ?? 0, {
-        excludeOrigin: msg.excludeOrigin,
-      });
-      const tenantEntries =
-        options.tenantGuard && activeJwtCtx?.tenantId !== undefined
-          ? options.tenantGuard.filterOutboundEntries(rawEntries, activeJwtCtx.tenantId)
-          : rawEntries;
-      const entries =
-        wsJwtResolver && activeJwtCtx
-          ? wsJwtResolver.filterEntriesForContext(tenantEntries, activeJwtCtx)
-          : tenantEntries;
-      socket.send(
-        JSON.stringify({
-          type: 'repl_entries',
-          entries,
-        }),
-      );
-    } else if (msg.type === 'repl_entries' && Array.isArray(msg.entries) && subscription) {
-      try {
-        if (wsJwtResolver && activeJwtCtx) {
-          wsJwtResolver.assertWriteAllowed(activeJwtCtx);
-          wsJwtResolver.assertBatchTablesAllowed(activeJwtCtx, msg.entries);
-          wsJwtResolver.assertBatchRlsAllowed(activeJwtCtx, msg.entries);
-        }
-        if (options.tenantGuard) {
-          options.tenantGuard.assertBatch(msg.entries, activeJwtCtx?.tenantId);
-        }
-        const res = await subscription.applyChanges(msg.entries);
-        socket.send(
-          JSON.stringify({
-            type: 'repl_ack',
-            slotName: subscription.slotName,
-            confirmedLsn: res.currentLsn,
-            nodeId: subscription.nodeId,
-          }),
-        );
-      } catch (err) {
-        const errorObj = err instanceof Error ? err : new Error(String(err));
-        if (err instanceof SyncJwtError) {
-          sendWsJwtError(err);
-        } else {
-          options.onError?.(errorObj);
-          if (err instanceof TenantIsolationError) {
-            socket.send(
-              JSON.stringify({
-                type: 'repl_error',
-                status: 403,
-                code: err.code,
-                table: err.table,
-                reason: err.reason,
-                error: err.message,
-              }),
-            );
-          }
-        }
-      }
-    } else if (
-      msg.type === 'repl_ack' &&
-      publication &&
-      msg.slotName &&
-      typeof msg.confirmedLsn === 'number'
-    ) {
-      await publication.advanceSlot(msg.slotName, msg.confirmedLsn, {
-        nodeId: msg.nodeId,
-      });
-    }
-  };
-
-  const listener = (event: { data: unknown }) => {
-    void handleMessage(event.data);
-  };
-
-  if (typeof socket.addEventListener === 'function') {
-    socket.addEventListener('message', listener);
-  } else {
-    socket.onmessage = listener;
-  }
-
-  return {
-    async pushSince(sinceLsn?: number): Promise<number> {
-      if (!publication) return 0;
-      const fromLsn = sinceLsn ?? lastPushedLsn;
-      const entries = await publication.fetchChangesSince(fromLsn, {
-        excludeOrigin: subscription?.nodeId,
-      });
-      if (entries.length > 0) {
-        for (const e of entries) {
-          if (e.lsn > lastPushedLsn) lastPushedLsn = e.lsn;
-        }
-        const tok = await resolveWsToken();
-        socket.send(
-          JSON.stringify({
-            type: 'repl_entries',
-            entries,
-            ...(tok ? { token: tok } : {}),
-          }),
-        );
-      }
-      return entries.length;
-    },
-
-    async requestPull(sinceLsn?: number): Promise<void> {
-      const wmk = sinceLsn ?? (subscription ? await subscription.getWatermark() : 0);
-      const tok = await resolveWsToken();
-      socket.send(
-        JSON.stringify({
-          type: 'repl_pull_request',
-          sinceLsn: wmk,
-          excludeOrigin: subscription?.nodeId,
-          ...(tok ? { token: tok } : {}),
-        }),
-      );
-    },
-
-    async refreshAuth(tokenOrProvider?: ReplicationTokenProvider): Promise<void> {
-      if (tokenOrProvider !== undefined) {
-        activeWsTokenSource = tokenOrProvider;
-      }
-      const tok = await resolveWsToken();
-      socket.send(
-        JSON.stringify({
-          type: 'repl_auth',
-          token: tok ?? '',
-        }),
-      );
-    },
-
-    async sendChangelogSegment(segment, sendOpts = {}): Promise<void> {
-      const payload = sendOpts.compress ? await gzipBytes(segment) : segment;
-      socket.send(payload);
-    },
-
-    close() {
-      if (typeof socket.removeEventListener === 'function') {
-        socket.removeEventListener('message', listener);
-      } else if (socket.onmessage === listener) {
-        socket.onmessage = null;
-      }
     },
   };
 }

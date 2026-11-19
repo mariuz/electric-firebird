@@ -3748,4 +3748,96 @@ test.describe('FirebirdBrowser', () => {
     expect(result.ddlApplied).toBe(true);
     expect(result.executedDdl.some((s: string) => /ADD TAG/i.test(s))).toBe(true);
   });
+
+  test('M26: createPresenceRoom, computeAuditEntryHash/MerkleRoot, mmrRerank & packRagContext in browser bundle', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      const w = window as any;
+      let nowMs = 1_000;
+      const room = w.FB.createPresenceRoom({
+        roomId: 'doc-42',
+        peerId: 'tab-a',
+        initialState: { name: 'Alice' },
+        ttlMs: 5_000,
+        heartbeatIntervalMs: 0,
+        now: () => nowMs,
+      });
+      room.setCursor({ table: 'TASKS', rowKey: 7, column: 'TITLE' });
+      room.applyRemoteUpdate({
+        peerId: 'tab-b',
+        roomId: 'doc-42',
+        version: 1,
+        updatedAt: nowMs,
+        expiresAt: nowMs + 5_000,
+        cursor: { table: 'TASKS', rowKey: 8, column: 'DONE' },
+        typing: true,
+        state: { name: 'Bob' },
+      });
+      const snapBeforeExpire = room.getSnapshot();
+      nowMs = 10_000;
+      room.pruneExpired(nowMs);
+      const snapAfterExpire = room.getSnapshot();
+      await room.close();
+
+      const h1 = await w.FB.computeAuditEntryHash({
+        prevHash: w.FB.GENESIS_AUDIT_HASH,
+        seq: 1,
+        ts: 1700000000000,
+        actor: 'alice@acme.io',
+        tableName: 'TASKS',
+        op: 'INSERT',
+        keyJson: '{"ID":1}',
+        diffJson: '{"after":{"ID":1},"before":null,"changedColumns":["ID"]}',
+      });
+      const h2 = await w.FB.computeAuditEntryHash({
+        prevHash: h1,
+        seq: 2,
+        ts: 1700000001000,
+        actor: 'alice@acme.io',
+        tableName: 'TASKS',
+        op: 'UPDATE',
+        keyJson: '{"ID":1}',
+        diffJson: '{"after":{"DONE":1},"before":{"DONE":0},"changedColumns":["DONE"]}',
+      });
+      const merkle = await w.FB.computeAuditMerkleRoot([h1, h2]);
+
+      const reranked = w.FB.mmrRerank(
+        [
+          { ID: 1, CONTENT: 'firebird wasm opfs storage engine', SIMILARITY: 0.95 },
+          { ID: 2, CONTENT: 'firebird wasm opfs storage engine durability', SIMILARITY: 0.94 },
+          { ID: 3, CONTENT: 'logical replication crdt hlc conflict merge', SIMILARITY: 0.82 },
+        ],
+        { diversityLambda: 0.3, limit: 2 },
+      );
+      const packed = w.FB.packRagContext(
+        [
+          { ID: 1, TITLE: 'Storage', CONTENT: 'Firebird WASM runs over OPFS.' },
+          { ID: 2, TITLE: 'Storage Dup', CONTENT: 'Firebird WASM runs over OPFS.' },
+          { ID: 3, TITLE: 'Sync', CONTENT: 'CRDT replication merges concurrent edits.' },
+        ],
+        { tokenBudget: 40, dedupeOverlap: 0.8 },
+      );
+
+      return {
+        onlineBefore: snapBeforeExpire.onlineCount,
+        onlineAfter: snapAfterExpire.onlineCount,
+        selfTable: snapBeforeExpire.self.cursor?.table,
+        merkleLen: merkle?.length ?? 0,
+        rerankedIds: reranked.map((r: any) => r.ID),
+        packedCount: packed.includedChunks.length,
+        dupCount: packed.duplicateCount,
+        withinBudget: packed.estimatedTokens <= 40,
+      };
+    });
+
+    expect(result.onlineBefore).toBe(2);
+    expect(result.onlineAfter).toBe(1);
+    expect(result.selfTable).toBe('TASKS');
+    expect(result.merkleLen).toBe(64);
+    expect(result.rerankedIds).toEqual([1, 3]);
+    expect(result.packedCount).toBe(2);
+    expect(result.dupCount).toBe(1);
+    expect(result.withinBudget).toBe(true);
+  });
 });

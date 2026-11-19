@@ -443,6 +443,79 @@ test.describe('<firebird-repl>', () => {
     expect(outcome.afterCols).toEqual(['ID', 'TITLE', 'EMB', 'CATEGORY']);
   });
 
+  test('M26: renders collaborative presence badges and verifies cryptographic FB_AUDIT_LOG$ hash chain', async ({
+    page,
+  }) => {
+    await page.goto('/no-isolation/browser-harness-frameworks-st');
+    await page.waitForFunction(() => Boolean((window as any).FB && (window as any).Frameworks));
+
+    const outcome = await page.evaluate(async () => {
+      const w = window as any;
+      w.Frameworks.FBRepl.defineFirebirdRepl();
+      const repl = document.createElement('firebird-repl') as any;
+      const db = new w.FB.FirebirdBrowser('memory://repl-m26');
+      repl.db = db;
+
+      const room = w.FB.createPresenceRoom({
+        roomId: 'repl-collab',
+        peerId: 'editor-1',
+        initialState: { name: 'Alice' },
+        heartbeatIntervalMs: 0,
+      });
+      room.setCursor({ table: 'NOTES', rowKey: 1, column: 'BODY' });
+      room.applyRemoteUpdate({
+        peerId: 'editor-2',
+        roomId: 'repl-collab',
+        version: 1,
+        updatedAt: Date.now(),
+        expiresAt: Date.now() + 30_000,
+        cursor: { table: 'NOTES', rowKey: 2, column: 'BODY' },
+        typing: true,
+        state: { name: 'Bob' },
+      });
+      repl.presenceRoom = room;
+      document.getElementById('app')!.replaceChildren(repl);
+
+      await db.execute('CREATE TABLE NOTES (ID INTEGER NOT NULL PRIMARY KEY, BODY VARCHAR(100))');
+      const audit = w.FB.createAuditLog(db, { actorResolver: () => 'alice@acme.io' });
+      const notesRepo = audit.wrapTable(db.table('NOTES'));
+      await notesRepo.insert({ ID: 1, BODY: 'Signed genesis note' });
+      await notesRepo.update(1, { BODY: 'Updated audited note' });
+
+      const validReport = await repl.verifyAuditChain();
+      const validInspectorText = repl.shadowRoot?.querySelector('.inspector')?.textContent ?? '';
+      const badgeCount = repl.shadowRoot?.querySelectorAll('.presence-peer-badge').length ?? 0;
+
+      // Tamper with SEQ 1 directly in SQL and verify detection
+      await db.execute(`UPDATE "FB_AUDIT_LOG$" SET ACTOR = 'mallory@evil.io' WHERE SEQ = 1`);
+      const tamperedReport = await repl.verifyAuditChain();
+      const tamperedInspectorText = repl.shadowRoot?.querySelector('.inspector')?.textContent ?? '';
+
+      await room.close();
+      await db.close();
+
+      return {
+        validOk: validReport?.valid,
+        checkedCount: validReport?.checkedCount,
+        badgeCount,
+        validInspectorText,
+        tamperedOk: tamperedReport?.valid,
+        tamperedSeq: tamperedReport?.tamperedAtSeq,
+        tamperedInspectorText,
+      };
+    });
+
+    expect(outcome.validOk).toBe(true);
+    expect(outcome.checkedCount).toBe(2);
+    expect(outcome.badgeCount).toBe(2);
+    expect(outcome.validInspectorText).toContain('Alice (editor-1)');
+    expect(outcome.validInspectorText).toContain('Bob (editor-2)');
+    expect(outcome.validInspectorText).toContain('VALID · 2 records');
+    expect(outcome.tamperedOk).toBe(false);
+    expect(outcome.tamperedSeq).toBe(1);
+    expect(outcome.tamperedInspectorText).toContain('TAMPERED at SEQ #1');
+  });
+
   test('takes a db property set before it was defined, and reports runs', async ({ page }) => {
     await page.goto('/no-isolation/browser-harness-frameworks-st');
     await page.waitForFunction(() => Boolean((window as any).FB && (window as any).Frameworks));

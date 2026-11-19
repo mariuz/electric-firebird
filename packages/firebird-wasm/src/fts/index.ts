@@ -20,17 +20,27 @@ import type {
 } from '../types';
 import type { ReplicationIndexHook } from '../replication/types';
 import {
-  vectorSearch,
-  type PersistentVectorIndex,
-  type VectorDistanceMetric,
-  type VectorInput,
-  type VectorQuantizationMode,
-} from '../vector';
-import {
   attachIndexAutoSync,
   buildReplicationIndexHook,
   type QueryObservableExecutor,
 } from '../vector/auto-sync';
+
+export * from './hybrid';
+export {
+  DEFAULT_SEMANTIC_CACHE_TABLE,
+  mmrRerank,
+  packRagContext,
+  createSemanticCache,
+  type MmrRerankOptions,
+  type PackRagContextOptions,
+  type PackedRagChunk,
+  type PackedRagContext,
+  type SemanticCacheDatabaseExecutor,
+  type SemanticCacheOptions,
+  type SemanticCacheHit,
+  type SemanticCacheStats,
+  type SemanticCacheHandle,
+} from '../rag-cache';
 
 // ---------------------------------------------------------------------------
 // Stopwords & Porter Stemmer
@@ -1252,254 +1262,4 @@ export async function registerFtsFunctions(
   );
 
   return routines;
-}
-
-// ---------------------------------------------------------------------------
-// Reciprocal Rank Fusion (RRF) & Hybrid Search (`hybridSearch`)
-// ---------------------------------------------------------------------------
-
-/**
- * Options for {@link reciprocalRankFusion}.
- */
-export interface RrfOptions {
-  /** RRF smoothing constant $k$ (default: `60`). */
-  rrfK?: number;
-  /** Maximum number of fused items to return (default: `10`). */
-  limit?: number;
-}
-
-/**
- * Fuse multiple ranked lists using Reciprocal Rank Fusion (RRF):
- * $$\text{RRF\_SCORE}(d) = \sum_{i} w_i \cdot \frac{1}{k + \text{rank}_i(d)}$$
- * where $\text{rank}_i(d) \ge 1$ is the 1-based position of document $d$ in list $i$.
- */
-export function reciprocalRankFusion<ID = string | number>(
-  lists: ReadonlyArray<{
-    items: readonly ID[];
-    weight?: number;
-  }>,
-  options: RrfOptions = {},
-): Array<{ id: ID; rrfScore: number; ranks: Array<number | null> }> {
-  const k = options.rrfK ?? 60;
-  const limit = options.limit ?? 10;
-  const fused = new Map<
-    ID,
-    { id: ID; rrfScore: number; ranks: Array<number | null> }
-  >();
-
-  lists.forEach((list, listIdx) => {
-    const weight = list.weight ?? 1.0;
-    list.items.forEach((id, idx) => {
-      const rank = idx + 1;
-      let entry = fused.get(id);
-      if (!entry) {
-        entry = {
-          id,
-          rrfScore: 0,
-          ranks: new Array(lists.length).fill(null),
-        };
-        fused.set(id, entry);
-      }
-      if (entry.ranks[listIdx] === null) {
-        entry.ranks[listIdx] = rank;
-        entry.rrfScore += weight / (k + rank);
-      }
-    });
-  });
-
-  const sorted = Array.from(fused.values()).sort((a, b) => b.rrfScore - a.rrfScore);
-  return sorted.slice(0, limit);
-}
-
-/**
- * Options for {@link hybridSearch} combining BM25 Full-Text Search with Vector
- * Similarity Search via Reciprocal Rank Fusion (RRF).
- */
-export interface HybridSearchOptions {
-  /** Target table name. */
-  table: string;
-  /** Primary-key column name on `table` (default: `'ID'`). */
-  keyColumn?: string;
-  /** Full-text keyword query string. */
-  textQuery: string;
-  /** Text columns to search when `ftsIndex` is not supplied. */
-  ftsColumns?: readonly string[];
-  /** Optional pre-built {@link PersistentFtsIndex}. */
-  ftsIndex?: Pick<PersistentFtsIndex<never>, 'search'>;
-  /** Vector column name on `table`. */
-  vectorColumn: string;
-  /** Query embedding vector. */
-  vectorQuery: VectorInput;
-  /** Vector distance metric (default: `'cosine'`). */
-  metric?: VectorDistanceMetric;
-  /** Optional pre-built {@link PersistentVectorIndex}. */
-  vectorIndex?: Pick<PersistentVectorIndex<never>, 'search'>;
-  /** Optional vector quantization pre-pass (`'none' | 'int8' | 'binary'`, `M25 Item 3`). */
-  quantization?: VectorQuantizationMode;
-  /** Optional SQL `WHERE` filter applied to both arms. */
-  where?: string;
-  /** Positional parameters for `where`. */
-  params?: QueryParams;
-  /** Optional column projection applied to both arms (`M25 Item 3`). */
-  select?: readonly string[] | '*';
-  /** Maximum number of fused results to return (default: `10`). */
-  limit?: number;
-  /** Candidate pool size fetched from each arm before RRF fusion (default: `limit * 3`). */
-  candidateLimit?: number;
-  /** RRF smoothing constant $k$ (default: `60`). */
-  rrfK?: number;
-  /** Weight for the FTS BM25 arm (default: `1.0`). */
-  ftsWeight?: number;
-  /** Weight for the vector similarity arm (default: `1.0`). */
-  vectorWeight?: number;
-  /** Optional column to generate a `<mark>`-highlighted snippet from. */
-  highlightColumn?: string;
-}
-
-export type HybridSearchRow<T extends Row = Row> = T & {
-  RRF_SCORE: number;
-  BM25_SCORE: number | null;
-  FTS_RANK: number | null;
-  VECTOR_DISTANCE: number | null;
-  VECTOR_SIMILARITY: number | null;
-  VECTOR_RANK: number | null;
-  HIGHLIGHT?: string;
-};
-
-/**
- * Execute a Hybrid Full-Text (BM25) + Vector Similarity search against a
- * Firebird table and fuse both rankings with Reciprocal Rank Fusion (RRF).
- */
-export async function hybridSearch<T extends Row = Row>(
-  db: FtsDatabaseExecutor,
-  options: HybridSearchOptions,
-): Promise<Array<HybridSearchRow<T>>> {
-  const limit = options.limit ?? 10;
-  const candidateLimit = Math.max(limit, options.candidateLimit ?? limit * 3);
-  const keyColRaw = options.keyColumn ?? 'ID';
-  const cleanKey = keyColRaw.trim().replace(/^"|"$/g, '');
-  const rrfK = options.rrfK ?? 60;
-  const ftsWeight = options.ftsWeight ?? 1.0;
-  const vectorWeight = options.vectorWeight ?? 1.0;
-
-  // 1. Run FTS arm
-  let ftsRows: Array<FtsSearchRow<Record<string, unknown>>>;
-  if (options.ftsIndex) {
-    ftsRows = await options.ftsIndex.search<Record<string, unknown>>(options.textQuery, {
-      limit: candidateLimit,
-      where: options.where,
-      params: options.params,
-      select: options.select,
-      highlightColumn: options.highlightColumn,
-    });
-  } else {
-    if (!options.ftsColumns || options.ftsColumns.length === 0) {
-      throw new RangeError('hybridSearch requires either ftsIndex or ftsColumns');
-    }
-    const tempFts = await createFtsIndex(db, {
-      table: options.table,
-      columns: options.ftsColumns,
-      keyColumn: keyColRaw,
-    });
-    ftsRows = await tempFts.search<Record<string, unknown>>(options.textQuery, {
-      limit: candidateLimit,
-      where: options.where,
-      params: options.params,
-      select: options.select,
-      highlightColumn: options.highlightColumn,
-    });
-  }
-
-  // 2. Run Vector arm
-  const vecRows = await vectorSearch<Record<string, unknown>>(db, {
-    table: options.table,
-    column: options.vectorColumn,
-    query: options.vectorQuery,
-    metric: options.metric,
-    where: options.where,
-    params: options.params,
-    select: options.select,
-    limit: candidateLimit,
-    index: options.vectorIndex,
-    quantization: options.quantization,
-  });
-
-  // 3. Fuse via Reciprocal Rank Fusion
-  const rowMap = new Map<string, Record<string, unknown>>();
-  const ftsScoreMap = new Map<string, number>();
-  const highlightMap = new Map<string, string>();
-  const ftsIds: string[] = [];
-
-  for (const r of ftsRows) {
-    const kv = getFieldCI(r, cleanKey);
-    if (!kv || kv.value === null || kv.value === undefined) continue;
-    const idKey = String(kv.value);
-    ftsIds.push(idKey);
-    ftsScoreMap.set(idKey, r.BM25_SCORE);
-    if (typeof r.HIGHLIGHT === 'string') {
-      highlightMap.set(idKey, r.HIGHLIGHT);
-    }
-    const cleanRow: Record<string, unknown> = { ...r };
-    delete cleanRow.BM25_SCORE;
-    delete cleanRow.HIGHLIGHT;
-    rowMap.set(idKey, cleanRow);
-  }
-
-  const vecDistMap = new Map<string, { distance: number; similarity: number }>();
-  const vecIds: string[] = [];
-
-  for (const r of vecRows) {
-    const kv = getFieldCI(r, cleanKey);
-    if (!kv || kv.value === null || kv.value === undefined) continue;
-    const idKey = String(kv.value);
-    vecIds.push(idKey);
-    vecDistMap.set(idKey, { distance: r.DISTANCE, similarity: r.SIMILARITY });
-    if (!rowMap.has(idKey)) {
-      const cleanRow: Record<string, unknown> = { ...r };
-      delete cleanRow.DISTANCE;
-      delete cleanRow.SIMILARITY;
-      rowMap.set(idKey, cleanRow);
-    }
-  }
-
-  const fused = reciprocalRankFusion(
-    [
-      { items: ftsIds, weight: ftsWeight },
-      { items: vecIds, weight: vectorWeight },
-    ],
-    { rrfK, limit },
-  );
-
-  const out: Array<HybridSearchRow<T>> = [];
-  for (const item of fused) {
-    const baseRow = rowMap.get(item.id);
-    if (!baseRow) continue;
-    const vecMeta = vecDistMap.get(item.id);
-    const hl =
-      highlightMap.get(item.id) ??
-      (options.highlightColumn
-        ? (() => {
-            const f = getFieldCI(baseRow, options.highlightColumn);
-            return f && f.value != null
-              ? highlightSnippet(String(f.value), options.textQuery)
-              : undefined;
-          })()
-        : undefined);
-
-    const merged: Record<string, unknown> = {
-      ...baseRow,
-      RRF_SCORE: item.rrfScore,
-      BM25_SCORE: ftsScoreMap.get(item.id) ?? null,
-      FTS_RANK: item.ranks[0] ?? null,
-      VECTOR_DISTANCE: vecMeta?.distance ?? null,
-      VECTOR_SIMILARITY: vecMeta?.similarity ?? null,
-      VECTOR_RANK: item.ranks[1] ?? null,
-    };
-    if (hl !== undefined) {
-      merged.HIGHLIGHT = hl;
-    }
-    out.push(merged as HybridSearchRow<T>);
-  }
-
-  return out;
 }

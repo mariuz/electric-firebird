@@ -37,7 +37,10 @@ import {
   type MaterializedViewRefreshStrategy,
 } from '../materialized-view';
 import type { SchemaSyncResult } from '../schema-sync';
+import type { AuditChainVerificationResult } from '../audit-log';
+import type { PresenceRoom } from '../replication/presence';
 import type { ReplSearchIndexSummary } from './repl-actions';
+import { appendPresenceAndAuditSections } from './repl-presence-audit';
 import { el } from './repl-styles';
 import type {
   ReplArrowInspectorInfo,
@@ -740,7 +743,10 @@ export interface ReplInspectorRenderContext {
   readonly lastArrow: ReplArrowInspectorInfo | null;
   readonly optimisticStore?: OptimisticMutationStore | null;
   readonly undoRedoSnapshot?: UndoRedoSnapshot | null;
+  readonly presenceRoom?: PresenceRoom | null;
+  readonly lastAuditReport?: AuditChainVerificationResult | null;
   readonly onResetProfiler: () => void;
+  readonly onVerifyAudit?: () => void;
   readonly onExportArrow?: () => void;
   readonly onImportArrowFile?: (fileName: string, bytes: Uint8Array) => void;
   readonly onFlushOutbox?: () => void;
@@ -943,6 +949,11 @@ export function renderReplInspector(ctx: ReplInspectorRenderContext): void {
 
       if (ctx.activeTab === 'replication') {
         const panel = el('div', 'inspector-replication');
+        appendPresenceAndAuditSections(panel, {
+          presenceRoom: ctx.presenceRoom,
+          lastAuditReport: ctx.lastAuditReport,
+          onVerifyAudit: ctx.onVerifyAudit,
+        });
         const repl = ctx.lastReplication;
         if (!repl) {
           const empty = el('p', 'inspector-empty');

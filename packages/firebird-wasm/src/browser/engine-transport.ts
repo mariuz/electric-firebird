@@ -76,6 +76,12 @@ import {
   fallbackReadDatabaseInfo,
   type EncodedColumn,
 } from './result-decoder';
+import {
+  runDirectPipeline,
+  runDirectReplicateChangelog,
+  runDirectSetReplicaMode,
+  runDirectSweep,
+} from './engine-direct-ops';
 
 export {
   OPFS_MOUNT,
@@ -1217,108 +1223,28 @@ export class DirectTransport implements EngineTransport {
   }
 
   async sweep(dbHandle: EngineHandle): Promise<SweepResult> {
-    const started = performance.now();
-    const before = await this.databaseInfo(dbHandle);
-    const mod = this.module;
-
-    // 1. Scan all user tables to trigger cooperative garbage collection of
-    //    old record versions on data pages.
-    let tablesScanned = 0;
-    try {
-      const relRes = await this.query<Record<string, unknown>>(
-        dbHandle,
-        0,
-        'SELECT TRIM(RDB$RELATION_NAME) AS REL FROM RDB$RELATIONS ' +
-          'WHERE COALESCE(RDB$SYSTEM_FLAG, 0) = 0 AND RDB$VIEW_BLR IS NULL ' +
-          'ORDER BY RDB$RELATION_NAME',
-      );
-      for (const row of relRes.rows) {
-        const rel = String(row['REL'] ?? row['rel'] ?? '').trim();
-        if (!rel) continue;
-        const escaped = rel.replace(/"/g, '""');
-        await this.query(dbHandle, 0, `SELECT COUNT(*) AS C FROM "${escaped}"`);
-        tablesScanned += 1;
-      }
-    } catch {
-      // Ignore table scan errors during sweep if a relation is inaccessible.
-    }
-
-    // 2. Run native DPB sweep (`isc_dpb_sweep = isc_dpb_records`) when
-    //    exported by the WASM bridge to advance OIT.
-    if (typeof mod._fb_sweep === 'function') {
-      const rc = mod._fb_sweep(dbHandle);
-      if (rc !== 0) {
-        throw engineError(mod, 'Database sweep failed', rc);
-      }
-    } else {
-      // Fallback for older WASM binaries without `_fb_sweep`: commit a fresh
-      // transaction so OAT/OST move forward.
-      const tx = await this.startTransaction(dbHandle, {
-        isolationLevel: 'READ_COMMITTED',
-      });
-      await this.commit(tx);
-    }
-
-    const after = await this.databaseInfo(dbHandle);
-    return buildSweepResult(before, after, tablesScanned, performance.now() - started);
+    return runDirectSweep(
+      this.module,
+      dbHandle,
+      (h) => this.databaseInfo(h),
+      (db, tx, sql, params) => this.query(db, tx, sql, params),
+      (db, opts) => this.startTransaction(db, opts),
+      (tx) => this.commit(tx),
+    );
   }
 
   async setReplicaMode(
     dbHandle: EngineHandle,
     mode: 0 | 1 | 2 | 'none' | 'read_only' | 'read_write',
   ): Promise<void> {
-    const mod = this.module;
-    const modeCode: 0 | 1 | 2 =
-      mode === 'none' || mode === 0
-        ? 0
-        : mode === 'read_only' || mode === 1
-          ? 1
-          : 2;
-
-    for (const [stmtHandle, entry] of this.preparedStatements) {
-      if (entry.dbHandle === dbHandle) {
-        this.preparedStatements.delete(stmtHandle);
-      }
-    }
-
-    if (typeof mod._fb_set_replica_mode === 'function') {
-      const rc = mod._fb_set_replica_mode(dbHandle, modeCode);
-      if (rc !== 0) {
-        throw engineError(mod, 'Failed to set database replica mode', rc);
-      }
-      return;
-    }
-
-    throw new Error(
-      'Native _fb_set_replica_mode is not exported by the loaded Firebird WASM module.',
-    );
+    runDirectSetReplicaMode(this.module, dbHandle, mode, this.preparedStatements);
   }
 
   async replicateChangelog(
     dbHandle: EngineHandle,
     data: Uint8Array,
   ): Promise<number> {
-    const mod = this.module;
-    if (typeof mod._fb_replicate_changelog !== 'function') {
-      throw new Error(
-        'Native _fb_replicate_changelog (IAttachment::createReplicator) is not exported by the loaded Firebird WASM module.',
-      );
-    }
-    if (data.byteLength === 0) {
-      return 0;
-    }
-    const ptr = mod._malloc(data.byteLength);
-    let processed: number;
-    try {
-      mod.HEAPU8.set(data, ptr);
-      processed = mod._fb_replicate_changelog(dbHandle, ptr, data.byteLength);
-    } finally {
-      mod._free(ptr);
-    }
-    if (processed < 0) {
-      throw engineError(mod, 'Failed to apply Firebird changelog segment', processed);
-    }
-    return processed;
+    return runDirectReplicateChangelog(this.module, dbHandle, data);
   }
 
   private fallbackDatabaseInfo(dbHandle: EngineHandle): Promise<DatabaseInfo> {
@@ -1361,83 +1287,7 @@ export class DirectTransport implements EngineTransport {
     steps: readonly EnginePipelineStepRequest[],
     options: EnginePipelineWireOptions = {},
   ): Promise<EnginePipelineStepResponse[]> {
-    let activeTx = txHandle;
-    const ownsTx = activeTx === 0 && Boolean(options.transaction);
-    if (ownsTx) {
-      const txOpts =
-        typeof options.transaction === 'object' && options.transaction !== null
-          ? options.transaction
-          : {};
-      activeTx = await this.startTransaction(dbHandle, txOpts);
-    }
-
-    const out: EnginePipelineStepResponse[] = new Array(steps.length);
-    try {
-      for (let i = 0; i < steps.length; i++) {
-        const step = steps[i]!;
-        if (step.op === 'execute') {
-          const affectedRows =
-            step.stmtHandle && step.stmtHandle > 0
-              ? await this.executeStmt(
-                  dbHandle,
-                  activeTx,
-                  step.stmtHandle,
-                  step.params,
-                )
-              : await this.execute(
-                  dbHandle,
-                  activeTx,
-                  step.sql,
-                  step.params,
-                );
-          out[i] = { kind: 'affected', affectedRows };
-        } else if (step.op === 'executeBatch') {
-          const affectedRows =
-            step.stmtHandle && step.stmtHandle > 0
-              ? await this.executeBatchStmt(
-                  dbHandle,
-                  activeTx,
-                  step.stmtHandle,
-                  step.rows,
-                )
-              : await this.executeBatch(
-                  dbHandle,
-                  activeTx,
-                  step.sql,
-                  step.rows,
-                );
-          out[i] = { kind: 'affected', affectedRows };
-        } else {
-          const payload =
-            step.stmtHandle && step.stmtHandle > 0
-              ? await this.queryStmtBinary(
-                  dbHandle,
-                  activeTx,
-                  step.stmtHandle,
-                  step.params,
-                  step.binaryBlobs,
-                )
-              : await this.queryBinary(
-                  dbHandle,
-                  activeTx,
-                  step.sql,
-                  step.params,
-                  step.binaryBlobs,
-                );
-          out[i] = { kind: 'binary', payload };
-        }
-      }
-
-      if (ownsTx) {
-        await this.commit(activeTx);
-      }
-      return out;
-    } catch (err) {
-      if (ownsTx && activeTx !== 0) {
-        await this.rollback(activeTx).catch(() => undefined);
-      }
-      throw err;
-    }
+    return runDirectPipeline(this, dbHandle, txHandle, steps, options);
   }
 
   // ── Filesystem ─────────────────────────────────────────────────────────

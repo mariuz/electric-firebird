@@ -910,6 +910,12 @@ function getSetupCodeSnippet() {
     `  createSseReplicationClient,`,
     `  createColumnEncryptionTransformer,`,
     `  syncDatabaseSchema,`,
+    `  createPresenceRoom,`,
+    `  createAuditLog,`,
+    `  createSemanticCache,`,
+    `  packRagContext,`,
+    `  anonymizeDatabase,`,
+    `  seedDatabase,`,
     `  createTenantReplicationSlice,`,
     `  createOptimisticMutationStore,`,
     `  createUndoRedoManager,`,
@@ -2382,6 +2388,39 @@ for (const btn of document.querySelectorAll('.scenario-card')) {
       activeCodeTab = 'setup';
       logEvent(
         `Scenario 19 (<code>createSseReplicationHub</code> + <code>createColumnEncryptionTransformer</code> + <code>hybridSearch()</code> + <code>syncDatabaseSchema()</code>): Streamed zero-polling SSE <code>GET /events</code> deltas with <code>Last-Event-ID</code> resume (${res.primaryToReplica.appliedCount} synced), protected <code>SECRET_HASH</code> via AES-256-GCM <code>enc:v1:k2:...</code> column E2EE while preserving cleartext <code>TENANT_ID='acme'</code> routing, queried auto-synced <code>int8</code>-quantized HNSW + BM25 <code>hybridSearch()</code>, and verified declarative <code>syncDatabaseSchema()</code>!`,
+        true,
+      );
+      await renderAll();
+    } else if (kind === 'presence-audit-chain-rag-cache') {
+      if (tenantFilterSelect.value !== 'acme' || colFilterSelect.value !== 'all') {
+        tenantFilterSelect.value = 'acme';
+        colFilterSelect.value = 'all';
+        await initSimulator();
+      }
+      const m26Ids = [nextTaskId++, nextTaskId++];
+      for (const id of m26Ids) {
+        await primaryDb.execute(
+          'INSERT INTO TASKS (ID, TENANT_ID, TITLE, PRIORITY, STOCK, TAGS, DONE, SECRET_HASH) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+          [
+            id,
+            'acme',
+            `Presence Audit RAG Task #${id}`,
+            'HIGH',
+            110 + id,
+            'presence,audit-merkle,semantic-cache,pii-anonymizer',
+            0,
+            `audit:sha256:merkle${id}`,
+          ],
+        );
+      }
+
+      simChangelogSeq++;
+      simEnginePubState.sequenceValue = m26Ids[m26Ids.length - 1];
+      const res = await replicator.sync();
+
+      activeCodeTab = 'setup';
+      logEvent(
+        `Scenario 20 (<code>createPresenceRoom</code> + <code>createAuditLog</code> + <code>createSemanticCache</code> + <code>packRagContext</code> + <code>anonymizeDatabase</code>): Synced ephemeral peer cursors across SSE <code>event: presence</code> (${res.primaryToReplica.appliedCount} replicated), verified tamper-evident <code>FB_AUDIT_LOG$</code> SHA-256 Merkle chain (<code>verifyChain() =&gt; valid: true</code>), served <code>int8</code> HNSW semantic cache hit + MMR-diversified <code>packRagContext()</code> within token budget, and deterministically scrubbed PII via <code>anonymizeDatabase()</code>!`,
         true,
       );
       await renderAll();

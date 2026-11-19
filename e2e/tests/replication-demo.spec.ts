@@ -324,4 +324,24 @@ test.describe('Replication Simulator v2 (replication.html)', () => {
     await expect(page.locator('#event-feed')).toContainText('hybridSearch()');
     await expect(page.locator('#event-feed')).toContainText('syncDatabaseSchema()');
   });
+
+  test('Scenario 20: Collaborative Presence + Merkle Audit Chain (FB_AUDIT_LOG$), Semantic RAG Cache & PII Anonymizer', async ({
+    page,
+  }) => {
+    await openReplicationSim(page);
+
+    await page.locator('.scenario-card[data-scenario="presence-audit-chain-rag-cache"]').click();
+
+    await expect(page.locator('#primary-rows')).toContainText('Presence Audit RAG Task #4');
+    await expect(page.locator('#replica-rows')).toContainText('Presence Audit RAG Task #5');
+    await expect(page.locator('#code-inspector')).toContainText('createPresenceRoom');
+    await expect(page.locator('#code-inspector')).toContainText('createAuditLog');
+    await expect(page.locator('#code-inspector')).toContainText('createSemanticCache');
+    await expect(page.locator('#code-inspector')).toContainText('anonymizeDatabase');
+    await expect(page.locator('#event-feed')).toContainText('Scenario 20');
+    await expect(page.locator('#event-feed')).toContainText('FB_AUDIT_LOG$');
+    await expect(page.locator('#event-feed')).toContainText('verifyChain()');
+    await expect(page.locator('#event-feed')).toContainText('packRagContext()');
+    await expect(page.locator('#event-feed')).toContainText('anonymizeDatabase()');
+  });
 });

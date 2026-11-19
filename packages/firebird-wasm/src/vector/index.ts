@@ -57,6 +57,21 @@ export {
   type PersistentVectorIndex,
 } from './hnsw';
 export * from './quantization';
+export {
+  DEFAULT_SEMANTIC_CACHE_TABLE,
+  mmrRerank,
+  packRagContext,
+  createSemanticCache,
+  type MmrRerankOptions,
+  type PackRagContextOptions,
+  type PackedRagChunk,
+  type PackedRagContext,
+  type SemanticCacheDatabaseExecutor,
+  type SemanticCacheOptions,
+  type SemanticCacheHit,
+  type SemanticCacheStats,
+  type SemanticCacheHandle,
+} from '../rag-cache';
 
 /**
  * Supported vector similarity/distance metrics.
@@ -193,6 +208,11 @@ export interface VectorSearchOptions {
    * Candidate oversampling multiplier before exact `float32` rescoring (`M25 Item 3`). @default 4
    */
   rescoreOversample?: number;
+  /**
+   * Optional Maximal Marginal Relevance diversity weight $\lambda \in [0, 1]$ (`M26 Item 3`).
+   * `1.0` preserves pure similarity order; lower values penalize redundant near-duplicate embeddings.
+   */
+  diversityLambda?: number;
 }
 
 /**
@@ -870,9 +890,14 @@ export async function vectorSearch<T extends Row = Row>(
   db: VectorDatabaseExecutor,
   options: VectorSearchOptions,
 ): Promise<Array<VectorSearchRow<T>>> {
+  const useMmr =
+    options.diversityLambda !== undefined &&
+    options.diversityLambda >= 0 &&
+    options.diversityLambda < 1;
+
   if (options.index) {
-    return options.index.search<T>(options.query, {
-      limit: options.limit,
+    const idxHits = await options.index.search<T>(options.query, {
+      limit: useMmr ? Math.max((options.limit ?? 10) * 4, 20) : options.limit,
       efSearch: options.efSearch,
       where: options.where,
       params: options.params,
@@ -881,8 +906,32 @@ export async function vectorSearch<T extends Row = Row>(
       minSimilarity: options.minSimilarity,
       distanceColumn: options.distanceColumn,
       similarityColumn: options.similarityColumn,
-      includeVector: options.includeVector,
+      includeVector: useMmr ? true : options.includeVector,
     });
+    if (!useMmr || idxHits.length <= 1) {
+      return idxHits.slice(0, options.limit ?? 10);
+    }
+    const { mmrRerank } = await import('../rag-cache');
+    const rawCol = options.column.trim().replace(/^"|"$/g, '');
+    const simColName = options.similarityColumn ?? 'SIMILARITY';
+    const reranked = mmrRerank(idxHits, {
+      limit: options.limit ?? 10,
+      diversityLambda: options.diversityLambda,
+      getRelevance: (item) => Number((item as Record<string, unknown>)[simColName] ?? 0),
+      getVector: (item) => {
+        const found = getRowCaseInsensitive(item as Record<string, unknown>, rawCol);
+        return (found?.value as VectorInput | undefined) ?? undefined;
+      },
+    });
+    if (!options.includeVector) {
+      return reranked.map((r) => {
+        const clone: Record<string, unknown> = { ...r };
+        const found = getRowCaseInsensitive(clone, rawCol);
+        if (found) delete clone[found.key];
+        return clone as VectorSearchRow<T>;
+      });
+    }
+    return reranked;
   }
 
   const tableIdent = quoteSqlIdentifier(options.table, 'table name');
@@ -979,6 +1028,7 @@ export async function vectorSearch<T extends Row = Row>(
   }
 
   const scored: Array<VectorSearchRow<T>> = [];
+  const scoredVecMap = new Map<VectorSearchRow<T>, Float32Array>();
 
   for (const row of res.rows) {
     const found = getRowCaseInsensitive(row, rawColName);
@@ -1015,13 +1065,26 @@ export async function vectorSearch<T extends Row = Row>(
     }
     outRow[distanceCol] = distance;
     outRow[similarityCol] = similarity;
-    scored.push(outRow as VectorSearchRow<T>);
+    const typedRow = outRow as VectorSearchRow<T>;
+    scored.push(typedRow);
+    if (useMmr) scoredVecMap.set(typedRow, rowVec);
   }
 
   scored.sort(
     (a, b) =>
       (a[distanceCol] as number) - (b[distanceCol] as number),
   );
+
+  if (useMmr && scored.length > 1) {
+    const { mmrRerank } = await import('../rag-cache');
+    const pool = scored.slice(0, Math.max(limit * 4, 20));
+    return mmrRerank(pool, {
+      limit,
+      diversityLambda: options.diversityLambda,
+      getRelevance: (item) => Number((item as Record<string, unknown>)[similarityCol] ?? 0),
+      getVector: (item) => scoredVecMap.get(item),
+    });
+  }
 
   return scored.slice(0, limit);
 }

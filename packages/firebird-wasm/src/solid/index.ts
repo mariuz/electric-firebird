@@ -795,3 +795,84 @@ export function createUndoRedo(
     dispose,
   };
 }
+
+import {
+  createPresenceRoom,
+  type PresenceCursor,
+  type PresencePeerState,
+  type PresenceRoom,
+  type PresenceRoomOptions,
+  type PresenceRoomSnapshot,
+} from '../replication/presence';
+
+export type {
+  PresenceCursor,
+  PresencePeerState,
+  PresenceRoom,
+  PresenceRoomOptions,
+  PresenceRoomSnapshot,
+};
+
+/** SolidJS signal accessors returned by {@link createPresence} (`M26 Item 1`). */
+export interface SolidPresenceResult<TState = Record<string, unknown>> {
+  readonly room: PresenceRoom<TState>;
+  state: Accessor<PresenceRoomSnapshot<TState>>;
+  self: Accessor<PresencePeerState<TState>>;
+  peers: Accessor<readonly PresencePeerState<TState>[]>;
+  onlineCount: Accessor<number>;
+  updateState: PresenceRoom<TState>['updateState'];
+  setCursor: PresenceRoom<TState>['setCursor'];
+  setTyping: PresenceRoom<TState>['setTyping'];
+  leave: PresenceRoom<TState>['leave'];
+  dispose(): void;
+}
+
+function isSolidPresenceRoom<TState>(val: unknown): val is PresenceRoom<TState> {
+  return (
+    typeof val === 'object' &&
+    val !== null &&
+    typeof (val as PresenceRoom<TState>).getSnapshot === 'function' &&
+    typeof (val as PresenceRoom<TState>).setCursor === 'function' &&
+    typeof (val as PresenceRoom<TState>).subscribe === 'function'
+  );
+}
+
+/** Create SolidJS signal accessors backed by a collaborative {@link PresenceRoom} (`M26 Item 1`). */
+export function createPresence<TState = Record<string, unknown>>(
+  roomOrOptions: PresenceRoom<TState> | PresenceRoomOptions<TState>,
+): SolidPresenceResult<TState> {
+  const primitives = resolveSolidPrimitives();
+  const makeSignal = primitives.createSignal ?? createFallbackSignal;
+  const owned = !isSolidPresenceRoom<TState>(roomOrOptions);
+  const room = isSolidPresenceRoom<TState>(roomOrOptions)
+    ? roomOrOptions
+    : createPresenceRoom<TState>(roomOrOptions);
+
+  const [getSnap, setSnap] = makeSignal<PresenceRoomSnapshot<TState>>(room.getSnapshot());
+  const unsub = room.subscribe((snap) => setSnap(snap));
+
+  const dispose = () => {
+    unsub();
+    if (owned) void room.close();
+  };
+  if (typeof primitives.onCleanup === 'function') {
+    try {
+      primitives.onCleanup(dispose);
+    } catch {
+      // Ignore outside reactive owner
+    }
+  }
+
+  return {
+    room,
+    state: getSnap,
+    self: () => getSnap().self,
+    peers: () => getSnap().peers,
+    onlineCount: () => getSnap().onlineCount,
+    updateState: (p) => room.updateState(p),
+    setCursor: (c) => room.setCursor(c),
+    setTyping: (t) => room.setTyping(t),
+    leave: () => room.leave(),
+    dispose,
+  };
+}

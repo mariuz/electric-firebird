@@ -18,3 +18,4 @@ export * from './tenant-slice';
 export * from './jwt-auth';
 export * from './arrow-snapshot';
 export * from './column-encryption';
+export * from './presence';

@@ -138,10 +138,10 @@ function Items() {
 | `firebird-wasm` | `openDatabase`, `FirebirdLite`, `FirebirdError` — Node.js native/embedded driver + shared schema, vector, and replication helpers |
 | `firebird-wasm/browser` | `openDatabase`, `FirebirdBrowser`, `FirebirdError`, `IndexedDBVFS`, `OPFSVFS`, snapshots/page diffs, and AES-256-GCM encryption helpers |
 | `firebird-wasm/browser/worker-entry` | Dedicated Web Worker entry point for the WASM engine |
-| `firebird-wasm/react` | React `<FirebirdProvider>`, `useFirebird`, `useQuery`, `useLiveQuery`, `useSyncStatus`, `useColumnarQuery`, `useLiveIncrementalQuery`, `useTable`, `useOptimisticMutation`, `useUndoRedo` |
-| `firebird-wasm/vue` | Vue 3 `provideFirebird`, `useFirebird`, `useQuery`, `useLiveQuery`, `useSyncStatus`, `useColumnarQuery`, `useLiveIncrementalQuery`, `useTable`, `useOptimisticMutation`, `useUndoRedo` |
-| `firebird-wasm/svelte` | Svelte 5 `setFirebirdContext`, `getFirebirdContext`, `useFirebird`, `createQuery`, `createLiveQuery`, `createSyncStatus`, `createColumnarQuery`, `createLiveIncrementalQuery`, `createTable`, `createOptimisticMutation`, `createUndoRedo` |
-| `firebird-wasm/solid` | SolidJS `setFirebirdContext`, `useFirebird`, `createQuery`, `createLiveQuery`, `createSyncStatus`, `createColumnarQuery`, `createLiveIncrementalQuery`, `createTable`, `createOptimisticMutation`, `createUndoRedo` |
+| `firebird-wasm/react` | React `<FirebirdProvider>`, `useFirebird`, `useQuery`, `useLiveQuery`, `useSyncStatus`, `useColumnarQuery`, `useLiveIncrementalQuery`, `useTable`, `useOptimisticMutation`, `useUndoRedo`, `usePresence` |
+| `firebird-wasm/vue` | Vue 3 `provideFirebird`, `useFirebird`, `useQuery`, `useLiveQuery`, `useSyncStatus`, `useColumnarQuery`, `useLiveIncrementalQuery`, `useTable`, `useOptimisticMutation`, `useUndoRedo`, `usePresence` |
+| `firebird-wasm/svelte` | Svelte 5 `setFirebirdContext`, `getFirebirdContext`, `useFirebird`, `createQuery`, `createLiveQuery`, `createSyncStatus`, `createColumnarQuery`, `createLiveIncrementalQuery`, `createTable`, `createOptimisticMutation`, `createUndoRedo`, `createPresence` |
+| `firebird-wasm/solid` | SolidJS `setFirebirdContext`, `useFirebird`, `createQuery`, `createLiveQuery`, `createSyncStatus`, `createColumnarQuery`, `createLiveIncrementalQuery`, `createTable`, `createOptimisticMutation`, `createUndoRedo`, `createPresence` |
 | `firebird-wasm/tanstack` | TanStack Query (`createFirebirdQueryOptions`, `connectFirebirdQueryClient`) & TanStack DB (`createFirebirdCollection`) adapters |
 | `firebird-wasm/rxdb` | RxDB storage adapter (`getRxStorageFirebird`) backed by Firebird SQL |
 | `firebird-wasm/repl` | `<firebird-repl>` custom element with Schema, Migrations, Profiler, Query Plan, Replication, and Arrow / Sync inspector tabs |
@@ -149,8 +149,8 @@ function Items() {
 | `firebird-wasm/electric-server` | Firebird-backed shape server & HTTP handler (`createShapeServer`, `applyWrite`) |
 | `firebird-wasm/kysely` | Kysely dialect (`FirebirdDialect`, `createKysely`) & TypeScript schema codegen (`generateKyselyTypes`) |
 | `firebird-wasm/drizzle` | Drizzle-style query builder (`drizzle`, `firebirdTable`) & schema codegen (`generateDrizzleSchema`) |
-| `firebird-wasm/vector` | Float32/Int8 vector codec, persistent HNSW ANN index (`HnswIndex`, `createVectorIndex`), SQL UDRs, and `vectorSearch` |
-| `firebird-wasm/fts` | Okapi BM25 full-text search (`Bm25Index`, `createFtsIndex`), stemming/highlighting SQL UDRs, and RRF `hybridSearch` |
+| `firebird-wasm/vector` | Float32/Int8 vector codec, persistent HNSW ANN index (`HnswIndex`, `createVectorIndex`), semantic LLM cache (`createSemanticCache`), MMR diversity reranking (`mmrRerank`), `packRagContext`, and `vectorSearch` |
+| `firebird-wasm/fts` | Okapi BM25 full-text search (`Bm25Index`, `createFtsIndex`), stemming/highlighting SQL UDRs, RRF + MMR `hybridSearch`, and `packRagContext` |
 | `firebird-wasm/columnar` | Standalone zero-copy columnar vector decoder (`decodeBinaryResultColumnar`) & Apache Arrow IPC V5 codec (`encodeArrowIpc`, `decodeArrowIpc`) |
 | `firebird-wasm/schema` | Standalone Standard Schema v1 row validator (`createRowSchema`, `validateRows`) & schema-aware SQL builder (`createTypedSql<DB>()`) |
 | `firebird-wasm/replication` | One-liner (`syncDatabases`, `db.syncWith`), binary `.fdb` / page-diff bootstrap, S3/R2/HTTP object-store WAL shipping (`createObjectStoreReplicationTarget`, `restoreDatabaseToPointInTime`), CRDTs, mesh/hub, DLQ, PITR, `"FBCHANGELOG\0"` & `IReplicator` |

@@ -706,3 +706,78 @@ export function useUndoRedo(
     table: manager.table,
   };
 }
+
+import {
+  createPresenceRoom,
+  type PresenceCursor,
+  type PresencePeerState,
+  type PresenceRoom,
+  type PresenceRoomOptions,
+  type PresenceRoomSnapshot,
+} from '../replication/presence';
+
+export type {
+  PresenceCursor,
+  PresencePeerState,
+  PresenceRoom,
+  PresenceRoomOptions,
+  PresenceRoomSnapshot,
+};
+
+/** Vue reactive refs returned by {@link usePresence} (`M26 Item 1`). */
+export interface PresenceRefs<TState = Record<string, unknown>> {
+  readonly room: PresenceRoom<TState>;
+  self: ShallowRef<PresencePeerState<TState>>;
+  peers: ShallowRef<readonly PresencePeerState<TState>[]>;
+  onlineCount: Ref<number>;
+  updateState: PresenceRoom<TState>['updateState'];
+  setCursor: PresenceRoom<TState>['setCursor'];
+  setTyping: PresenceRoom<TState>['setTyping'];
+  leave: PresenceRoom<TState>['leave'];
+}
+
+function isVuePresenceRoom<TState>(val: unknown): val is PresenceRoom<TState> {
+  return (
+    typeof val === 'object' &&
+    val !== null &&
+    typeof (val as PresenceRoom<TState>).getSnapshot === 'function' &&
+    typeof (val as PresenceRoom<TState>).setCursor === 'function' &&
+    typeof (val as PresenceRoom<TState>).subscribe === 'function'
+  );
+}
+
+/** Create or subscribe to a collaborative {@link PresenceRoom} composable in Vue (`M26 Item 1`). */
+export function usePresence<TState = Record<string, unknown>>(
+  roomOrOptions: PresenceRoom<TState> | PresenceRoomOptions<TState>,
+): PresenceRefs<TState> {
+  const owned = !isVuePresenceRoom<TState>(roomOrOptions);
+  const room = isVuePresenceRoom<TState>(roomOrOptions)
+    ? roomOrOptions
+    : createPresenceRoom<TState>(roomOrOptions);
+  const init = room.getSnapshot();
+  const self = shallowRef<PresencePeerState<TState>>(init.self);
+  const peers = shallowRef<readonly PresencePeerState<TState>[]>(init.peers);
+  const onlineCount = ref(init.onlineCount);
+
+  const unsub = room.subscribe((s) => {
+    self.value = s.self;
+    peers.value = s.peers;
+    onlineCount.value = s.onlineCount;
+  });
+
+  onScopeDispose(() => {
+    unsub();
+    if (owned) void room.close();
+  });
+
+  return {
+    room,
+    self,
+    peers,
+    onlineCount,
+    updateState: (p) => room.updateState(p),
+    setCursor: (c) => room.setCursor(c),
+    setTyping: (t) => room.setTyping(t),
+    leave: () => room.leave(),
+  };
+}

@@ -38,20 +38,26 @@ import {
 import { syncDatabases } from './replication/presets';
 import {
   createHttpObjectStoreAdapter,
-  createObjectStoreReplicationTarget,
-  restoreDatabaseToPointInTime,
   type ObjectStoreAdapter,
-  type ObjectStorePitrTarget,
 } from './replication/object-store-wal';
 import type { BootstrapStrategy, ReplicableDatabase } from './replication/types';
 import { collectArrowStreamBytes } from './columnar-stream';
 import { decodeArrowIpc } from './columnar';
-import { startCliReplicationServer } from './cli-sync-server';
 import {
   runCliBench,
   runCliSchemaDiff,
   runCliSchemaPush,
 } from './cli-schema-commands';
+import {
+  runCliPitrRestore,
+  runCliServeSync,
+  runCliWalShip,
+} from './cli-sync-commands';
+import {
+  runCliAnonymize,
+  runCliSeed,
+  runCliVerifyAudit,
+} from './cli-audit-seed-commands';
 export {
   startCliReplicationServer,
   type CliReplicationServerHandle,
@@ -111,6 +117,9 @@ Commands:
   import-arrow <uri> <table>     Stream an Apache Arrow IPC V5 file into <table> (--in <file.arrow> [--gzip] [--create-table] [--pk <col>])
   schema-diff <from> <to>        Diff two schemas (.fdb/URI or .sql) and print DDL (--sql | --json)
   schema-push <target>           Declaratively push schema from --from <uriOrSqlFile> [--dry-run] [--allow-destructive] [--json]
+  verify-audit <uri>             Verify cryptographic FB_AUDIT_LOG$ hash & Merkle chain [--sign-key <secret>] [--json]
+  anonymize <srcUri>             Scrub PII deterministically (--rules <jsonOrFile> [--out <dstUri>] [--seed <n>] [--json])
+  seed <uri>                     Generate FK-valid synthetic rows ([--rows <n>] [--table <name>] [--seed <n>] [--json])
   bench [uri]                    Benchmark IBatch, row query, columnar, Arrow IPC stream & preparePipeline [--rows <n>]
 
 Global Options:
@@ -631,7 +640,11 @@ function parseCliArgs(argv: readonly string[]): ParsedFlags {
             key === 'batch-size' ||
             key === 'duration-ms' ||
             key === 'from' ||
-            key === 'to')
+            key === 'to' ||
+            key === 'rules' ||
+            key === 'seed' ||
+            key === 'table' ||
+            key === 'sign-key')
         ) {
           flags.set(key, next);
           i += 1;
@@ -1093,220 +1106,29 @@ export async function runCli(
         return 0;
       }
 
-      case 'wal-ship': {
-        const sourceUri = positional[1];
-        const store = resolveCliObjectStore(flags, cwd);
-        if (!sourceUri || !store) {
-          err(
-            'Usage: firebird-wasm wal-ship <source-uri> (--dir <wal-dir> | --url <store-url>) [--prefix <pfx>] [--checkpoint] [--prune] [--key <passphrase>] [--json]\n',
-          );
-          return 1;
-        }
-        const prefix =
-          typeof flags.get('prefix') === 'string' ? String(flags.get('prefix')) : undefined;
-        const encryptionKey =
-          typeof flags.get('key') === 'string' ? String(flags.get('key')) : undefined;
+      case 'wal-ship':
+        return runCliWalShip(
+          { positional, flags, cwd, backend, out, err, formatCliTable, openCliDatabase },
+          resolveCliObjectStore,
+        );
 
-        const srcManaged = await openCliDatabase(sourceUri, {
+      case 'pitr-restore':
+        return runCliPitrRestore(
+          { positional, flags, cwd, backend, out, err, formatCliTable, openCliDatabase },
+          resolveCliObjectStore,
+        );
+
+      case 'serve-sync':
+        return runCliServeSync({
+          positional,
+          flags,
           cwd,
           backend,
-          allowMissing: false,
+          out,
+          err,
+          formatCliTable,
+          openCliDatabase,
         });
-        try {
-          const target = await createObjectStoreReplicationTarget({
-            db: srcManaged.db as unknown as ReplicableDatabase,
-            store,
-            prefix,
-            encryptionKey,
-            installTriggers: true,
-          });
-          try {
-            let checkpointId: string | null = null;
-            const currentManifest = await target.getManifest();
-            if (flags.get('checkpoint') === true || currentManifest.checkpoints.length === 0) {
-              const ckpt = await target.createCheckpoint();
-              checkpointId = ckpt.id;
-            }
-            const shipped = await target.shipWalOnce();
-            const pruned =
-              flags.get('prune') === true
-                ? await target.pruneArchivedSegments()
-                : null;
-            const finalManifest = await target.getManifest();
-            const report = {
-              checkpointCreated: checkpointId,
-              segmentsShipped: shipped.length,
-              entriesShipped: shipped.reduce((acc, s) => acc + s.entryCount, 0),
-              prunedSegments: pruned?.deletedSegments ?? 0,
-              latestLsn: finalManifest.latestLsn,
-              totalCheckpoints: finalManifest.checkpoints.length,
-              totalSegments: finalManifest.segments.length,
-            };
-            if (flags.get('json') === true) {
-              out(`${JSON.stringify(report, null, 2)}\n`);
-            } else {
-              out(
-                `Shipped WAL for ${sourceUri}: checkpoint=${report.checkpointCreated ?? 'none'}, segments=${report.segmentsShipped}, latestLsn=${report.latestLsn}\n`,
-              );
-            }
-          } finally {
-            await target.stop();
-          }
-        } finally {
-          await srcManaged.flushAndClose(true);
-        }
-        return 0;
-      }
-
-      case 'pitr-restore': {
-        const targetUri = positional[1];
-        const store = resolveCliObjectStore(flags, cwd);
-        if (!targetUri || !store) {
-          err(
-            'Usage: firebird-wasm pitr-restore <target-uri> (--dir <wal-dir> | --url <store-url>) [--prefix <pfx>] [--lsn <n>] [--timestamp <iso-or-ms>] [--hlc <hlc>] [--key <passphrase>] [--json]\n',
-          );
-          return 1;
-        }
-        const prefix =
-          typeof flags.get('prefix') === 'string' ? String(flags.get('prefix')) : undefined;
-        const decryptionKey =
-          typeof flags.get('key') === 'string' ? String(flags.get('key')) : undefined;
-
-        const pitrTarget: ObjectStorePitrTarget = {};
-        let hasCutoff = false;
-        if (typeof flags.get('lsn') === 'string') {
-          pitrTarget.lsn = Number(flags.get('lsn'));
-          hasCutoff = true;
-        }
-        if (typeof flags.get('timestamp') === 'string') {
-          const rawTs = String(flags.get('timestamp'));
-          pitrTarget.timestamp = /^\d+$/.test(rawTs) ? Number(rawTs) : Date.parse(rawTs);
-          hasCutoff = true;
-        }
-        if (typeof flags.get('hlc') === 'string') {
-          pitrTarget.hlc = String(flags.get('hlc'));
-          hasCutoff = true;
-        }
-
-        const dstManaged = await openCliDatabase(targetUri, { cwd, backend });
-        try {
-          const res = await restoreDatabaseToPointInTime({
-            targetDb: dstManaged.db as unknown as ReplicableDatabase,
-            store,
-            prefix,
-            decryptionKey,
-            ...(hasCutoff ? { target: pitrTarget } : {}),
-          });
-          if (flags.get('json') === true) {
-            out(`${JSON.stringify(res, null, 2)}\n`);
-          } else {
-            out(
-              `Restored ${targetUri} to LSN ${res.restoredToLsn} (checkpoint=${res.checkpointUsed ?? 'none'}, segments=${res.segmentsReplayed}, entries=${res.entriesApplied})\n`,
-            );
-          }
-        } finally {
-          await dstManaged.flushAndClose(true);
-        }
-        return 0;
-      }
-
-      case 'serve-sync': {
-        const uri = positional[1] ?? 'memory://cli_serve_sync';
-        const port =
-          typeof flags.get('port') === 'string'
-            ? Number(flags.get('port'))
-            : 8787;
-        const host =
-          typeof flags.get('host') === 'string'
-            ? String(flags.get('host'))
-            : '127.0.0.1';
-        const apiKey =
-          typeof flags.get('api-key') === 'string'
-            ? String(flags.get('api-key'))
-            : undefined;
-        const tenantColumn =
-          typeof flags.get('tenant-column') === 'string'
-            ? String(flags.get('tenant-column'))
-            : undefined;
-        const sharedTables =
-          typeof flags.get('shared-tables') === 'string'
-            ? String(flags.get('shared-tables'))
-                .split(',')
-                .map((s) => s.trim())
-                .filter(Boolean)
-            : undefined;
-        const cors = flags.get('no-cors') !== true;
-        const durationMs =
-          typeof flags.get('duration-ms') === 'string'
-            ? Number(flags.get('duration-ms'))
-            : undefined;
-
-        const managed = await openCliDatabase(uri, { cwd, backend });
-        const jwtSecret =
-          typeof flags.get('jwt-secret') === 'string'
-            ? String(flags.get('jwt-secret'))
-            : undefined;
-        const jwksUrl =
-          typeof flags.get('jwks-url') === 'string'
-            ? String(flags.get('jwks-url'))
-            : undefined;
-        const jwtTenantClaim =
-          typeof flags.get('jwt-tenant-claim') === 'string'
-            ? String(flags.get('jwt-tenant-claim'))
-            : undefined;
-        const srv = await startCliReplicationServer({
-          db: managed.db,
-          port,
-          host,
-          apiKey,
-          jwtSecret,
-          jwksUrl,
-          jwtTenantClaim,
-          tenantColumn,
-          sharedTables,
-          cors,
-        });
-
-        try {
-          if (flags.get('json') === true) {
-            out(
-              `${JSON.stringify(
-                {
-                  url: srv.url,
-                  host: srv.host,
-                  port: srv.port,
-                  publication: srv.publication.name,
-                  tenantColumn: tenantColumn ?? null,
-                },
-                null,
-                2,
-              )}\n`,
-            );
-          } else {
-            out(
-              `Serving Firebird replication & Arrow IPC on ${srv.url} (publication=${srv.publication.name}${tenantColumn ? `, tenant=${tenantColumn}` : ''})\n`,
-            );
-          }
-
-          if (durationMs !== undefined && Number.isFinite(durationMs) && durationMs >= 0) {
-            await new Promise<void>((resolve) => setTimeout(resolve, durationMs));
-          } else {
-            await new Promise<void>((resolve) => {
-              const onStop = () => {
-                process.off('SIGINT', onStop);
-                process.off('SIGTERM', onStop);
-                resolve();
-              };
-              process.on('SIGINT', onStop);
-              process.on('SIGTERM', onStop);
-            });
-          }
-        } finally {
-          await srv.close();
-          await managed.flushAndClose(true);
-        }
-        return 0;
-      }
 
       case 'export-arrow': {
         const uri = positional[1];
@@ -1469,6 +1291,39 @@ export async function runCli(
           out,
           err,
           formatCliTable,
+          openCliDatabase,
+        });
+
+      case 'verify-audit':
+        return runCliVerifyAudit({
+          positional,
+          flags,
+          cwd,
+          backend,
+          out,
+          err,
+          openCliDatabase,
+        });
+
+      case 'anonymize':
+        return runCliAnonymize({
+          positional,
+          flags,
+          cwd,
+          backend,
+          out,
+          err,
+          openCliDatabase,
+        });
+
+      case 'seed':
+        return runCliSeed({
+          positional,
+          flags,
+          cwd,
+          backend,
+          out,
+          err,
           openCliDatabase,
         });
 

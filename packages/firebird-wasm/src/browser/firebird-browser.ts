@@ -36,8 +36,7 @@ import {
 } from './snapshots';
 import { introspect as introspectSchema, migrate as runMigrations } from './schema';
 import { buildCopyToStream } from './copy-stream';
-import { hasTransactionOptions } from './isolation';
-import { applyTypes, applySerializers } from './value-types';
+import { applySerializers } from './value-types';
 import { acquireDatabaseLock } from './db-lock';
 import { SharedEngineTransport } from './shared-transport';
 import type { DatabaseLock } from './db-lock';
@@ -47,7 +46,6 @@ import {
   assertNotAborted,
   DatabaseCoreSubsystems,
   type FirebirdDatabase,
-  runWithCancellation,
   type UnifiedExecuteResult,
   validateTimeoutMs,
 } from '../database-core';
@@ -112,11 +110,13 @@ import {
 import {
   assertUdrCallback,
   executeArrowFromColumnar,
-  extractEffectiveQuerySchema,
-  finalizeQueryResultWithSchema,
   resolveColumnarQueryCall,
   type QueryArrowOptions,
 } from '../shared-driver-ops';
+import {
+  executeBrowserQuery,
+  teardownBrowserDatabase,
+} from './firebird-browser-lifecycle';
 import type {
   ArrayRow,
   FieldInfo,
@@ -679,145 +679,24 @@ export class FirebirdBrowser implements FirebirdDatabase {
     paramsOrOptions: QueryParams | QueryOptions<T> = [],
     maybeOptions: QueryOptions<T> = {},
   ): Promise<QueryResult<T>> {
-    const { statement, options } = resolveQueryCall(
+    return executeBrowserQuery<T>(
+      {
+        ensureReady: () => this.ensureReady(),
+        getDbHandle: () => this.dbHandle,
+        engine: this.engine,
+        types: this.options.types,
+        udr: this.udr,
+        createUdrExecutor: (tx) => this.createUdrExecutor(tx),
+        profiler: this.profiler,
+        captureIo: () => this.captureIoIfListening(),
+        applyOneShotTimeout: (t) => this.applyOneShotTimeout(t),
+        cancelOperation: () => this.cancelOperation(),
+        serialize: (p) => this.serialize(p),
+      },
       sql,
       paramsOrOptions,
       maybeOptions,
     );
-    const queryOpts = options as QueryOptions<T>;
-    const schema = extractEffectiveQuerySchema<T>(sql, queryOpts);
-    assertNotAborted(queryOpts.signal);
-    validateTimeoutMs(queryOpts.timeoutMs);
-
-    await this.ensureReady();
-
-    // Without options the engine's own auto-commit transaction is used, which
-    // is one fewer round trip to the Worker.  With them, the statement has to
-    // run inside a transaction that carries them — matching the Node backend,
-    // which starts one for every query.
-    const rowMode = queryOpts.rowMode ?? 'object';
-    // `types.binary` asks for Uint8Array values; the side channel is how they
-    // travel. Same result for the caller, without the base64 round trip.
-    const binaryBlobs = this.options.types?.binary === true;
-
-    if (this.udr.hasBridgeRoutines) {
-      const rewritten = await this.udr.rewriteStatement(
-        statement.sql,
-        statement.params,
-      );
-      statement.sql = rewritten.sql;
-      statement.params = rewritten.params;
-      const intercepted = await this.udr.queryIfIntercepted<T>(
-        statement.sql,
-        statement.params,
-        rowMode,
-        this.createUdrExecutor(0),
-      );
-      if (intercepted) {
-        const typedIntercepted = applyTypes(intercepted, this.options.types, rowMode);
-        return finalizeQueryResultWithSchema(typedIntercepted, schema, rowMode);
-      }
-    }
-    if (!hasTransactionOptions(queryOpts)) {
-      const startedAt = this.profiler.begin();
-      const ioBefore = await this.captureIoIfListening();
-      try {
-        const raw = await runWithCancellation(
-          async () => {
-            await this.applyOneShotTimeout(queryOpts.timeoutMs);
-            return this.engine.query<T>(
-              this.dbHandle,
-              0,
-              statement.sql,
-              this.serialize(statement.params),
-              rowMode,
-              binaryBlobs,
-            );
-          },
-          queryOpts,
-          () => this.cancelOperation(),
-        );
-        const typed = await finalizeQueryResultWithSchema(
-          applyTypes(raw, this.options.types, rowMode),
-          schema,
-          rowMode,
-        );
-        const ioAfter = await this.captureIoIfListening();
-        this.profiler.end({
-          startedAt,
-          sql: statement.sql,
-          params: statement.params,
-          kind: 'query',
-          rowCount: typed.rows.length,
-          cacheHit: false,
-          ioBefore,
-          ioAfter,
-        });
-        return typed;
-      } catch (err) {
-        this.profiler.end({
-          startedAt,
-          sql: statement.sql,
-          params: statement.params,
-          kind: 'query',
-          cacheHit: false,
-          error: err,
-        });
-        throw err;
-      }
-    }
-
-    const startedAt = this.profiler.begin();
-    const ioBefore = await this.captureIoIfListening();
-    const txHandle = await this.engine.startTransaction(this.dbHandle, queryOpts);
-    try {
-      const result = await runWithCancellation(
-        async () => {
-          await this.applyOneShotTimeout(queryOpts.timeoutMs);
-          return this.engine.query<T>(
-            this.dbHandle,
-            txHandle,
-            statement.sql,
-            this.serialize(statement.params),
-            rowMode,
-            binaryBlobs,
-          );
-        },
-        queryOpts,
-        () => this.cancelOperation(),
-      );
-      await this.engine.commit(txHandle);
-      const typed = await finalizeQueryResultWithSchema(
-        applyTypes(result, this.options.types, rowMode),
-        schema,
-        rowMode,
-      );
-      const ioAfter = await this.captureIoIfListening();
-      this.profiler.end({
-        startedAt,
-        sql: statement.sql,
-        params: statement.params,
-        kind: 'query',
-        rowCount: typed.rows.length,
-        cacheHit: false,
-        ioBefore,
-        ioAfter,
-      });
-      return typed;
-    } catch (err) {
-      // A failed commit finishes the transaction itself, so only a failure
-      // from the query leaves anything to roll back.
-      await this.engine.rollback(txHandle).catch(() => undefined);
-      this.profiler.end({
-        startedAt,
-        sql: statement.sql,
-        params: statement.params,
-        kind: 'query',
-        cacheHit: false,
-        error: err,
-      });
-      throw err;
-    }
   }
 
   async queryColumnar(
@@ -1423,54 +1302,30 @@ export class FirebirdBrowser implements FirebirdDatabase {
    */
   async close(): Promise<void> {
     if (this.closed) return;
-
-    // Stop scheduling before marking closed, so nothing fires mid-teardown.
-    this.cancelScheduledPersist();
-    this.detachLifecycleListeners();
-
-    // A background persist may still be running; let it finish so it cannot
-    // write after the engine has gone.
-    if (this.persistInFlight) {
-      try {
-        await this.persistInFlight;
-      } catch {
-        // Already reported through onPersistError.
-      }
-    }
-
-    // Before the handle goes: each one holds a subscription on it, and a
-    // timer that would otherwise keep firing at a closed database.
-    for (const stmt of [...this.preparedStatements]) {
-      await stmt.close().catch(() => undefined);
-    }
-    for (const live of [...this.liveQueries]) {
-      await live.unsubscribe().catch(() => undefined);
-    }
-
-    this.closed = true;
-    this.liveTriggerPromises.clear();
-    this.core.clear();
-    this.liveBridge.close();
-
-    if (this.dbHandle) {
-      // Persist before closing.
-      await this.persist();
-      await this.engine.detachDatabase(this.dbHandle);
-      this.dbHandle = 0;
-    }
-
-    try {
-      if (this.opfs) {
-        // Sync access handle is released with the module.
-      } else if (this.ephemeral) {
-        await this.engine.unlink(this.dbPath).catch(() => undefined);
-      } else {
-        await this.vfs.close();
-      }
-      await this.engine.dispose();
-    } finally {
-      await this.releaseLock();
-    }
+    return teardownBrowserDatabase({
+      cancelScheduledPersist: () => this.cancelScheduledPersist(),
+      detachLifecycleListeners: () => this.detachLifecycleListeners(),
+      getPersistInFlight: () => this.persistInFlight,
+      preparedStatements: this.preparedStatements,
+      liveQueries: this.liveQueries,
+      markClosedAndClear: () => {
+        this.closed = true;
+        this.liveTriggerPromises.clear();
+        this.core.clear();
+        this.liveBridge.close();
+      },
+      getDbHandle: () => this.dbHandle,
+      resetDbHandle: () => {
+        this.dbHandle = 0;
+      },
+      persist: () => this.persist(),
+      engine: this.engine,
+      dbPath: this.dbPath,
+      opfs: this.opfs,
+      ephemeral: this.ephemeral,
+      closeVfs: () => this.vfs.close(),
+      releaseLock: () => this.releaseLock(),
+    });
   }
 
   /** Async resource disposal (`await using db = ...`) (`M18 Item 3`). */

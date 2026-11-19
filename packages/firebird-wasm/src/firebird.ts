@@ -48,7 +48,6 @@ import {
   createTimeoutError,
   DatabaseCoreSubsystems,
   type FirebirdDatabase,
-  runWithCancellation,
   type UnifiedExecuteResult,
   validateTimeoutMs,
 } from './database-core';
@@ -119,14 +118,13 @@ import {
   assertUdrCallback,
   executeArrowFromColumnar,
   executeColumnarViaArrayQuery,
-  extractEffectiveQuerySchema,
-  finalizeQueryResultWithSchema,
   resolveColumnarQueryCall,
   runDriverApplyDiff,
   runDriverExportDiff,
   scanUserTablesForSweep,
   type QueryArrowOptions,
 } from './shared-driver-ops';
+import { executeNodeQuery } from './firebird-query-runner';
 import type {
   JsFunctionHandler,
   JsProcedureHandler,
@@ -655,142 +653,26 @@ export class FirebirdLite implements FirebirdDatabase {
     paramsOrOptions: QueryParams | QueryOptions<T> = [],
     maybeOptions: QueryOptions<T> = {},
   ): Promise<QueryResult<T>> {
-    const { statement, options } = resolveQueryCall(sql, paramsOrOptions, maybeOptions);
-    const queryOpts = options as QueryOptions<T>;
-    const schema = extractEffectiveQuerySchema<T>(sql, queryOpts);
-    assertNotAborted(queryOpts.signal);
-    validateTimeoutMs(queryOpts.timeoutMs);
-
-    await this.ensureReady();
-    const rowMode: RowMode = queryOpts.rowMode ?? 'object';
-    if (this.udr.hasBridgeRoutines) {
-      const rewritten = await this.udr.rewriteStatement(
-        statement.sql,
-        this.serialize(statement.params),
-      );
-      statement.sql = rewritten.sql;
-      statement.params = rewritten.params;
-      const intercepted = await this.udr.queryIfIntercepted<T>(
-        statement.sql,
-        statement.params,
-        rowMode,
-        this.createUdrExecutor(),
-      );
-      if (intercepted) {
-        return finalizeQueryResultWithSchema(
-          applyTypes(intercepted, this.types, rowMode),
-          schema,
-          rowMode,
-        );
-      }
-    }
-    const attachment = this.attachment!;
-
-    const startedAt = this.profiler.begin();
-    let cacheHit = false;
-    try {
-      if (
-        this.sharedReads &&
-        queryOpts.isolationLevel === undefined &&
-        queryOpts.readOnly === undefined &&
-        queryOpts.signal === undefined &&
-        queryOpts.timeoutMs === undefined &&
-        !this.ownTransaction.has(statement.sql)
-      ) {
-        const shared = await this.sharedRead<T>(statement.sql, statement.params, rowMode);
-        if (shared) {
-          const validatedShared = await finalizeQueryResultWithSchema(
-            shared.result,
-            schema,
-            rowMode,
-          );
-          this.profiler.end({
-            startedAt,
-            sql: statement.sql,
-            params: statement.params,
-            kind: 'query',
-            rowCount: validatedShared.rows.length,
-            cacheHit: shared.cacheHit,
-          });
-          return validatedShared;
-        }
-      }
-      await this.endReadTransaction();
-
-      const serializedParams = this.serialize(statement.params);
-      const txOptions = buildTransactionOptions(queryOpts);
-      const transaction = await attachment.startTransaction(txOptions);
-
-      let rows: T[];
-      let fields: FieldInfo[];
-      try {
-        const lease = await this.statements!.acquire(transaction, statement.sql);
-        cacheHit = lease.cacheHit;
-        const stmt = lease.stmt;
-
-        // Released in `finally`, not after the fetch: a statement that throws on
-        // execute — a lock conflict, an overflow, a wrong parameter count — would
-        // otherwise leak its handle, and the retry loop such failures are usually
-        // wrapped in leaks one per attempt until the attachment refuses more.
-        let failed = true;
-        try {
-          fields = await outputFields(stmt);
-          if (queryOpts.timeoutMs !== undefined && queryOpts.timeoutMs > 0) {
-            await applyStatementHandleTimeout(stmt, queryOpts.timeoutMs);
-          }
-
-          const rawRows = await runWithCancellation(
-            () => fetchRows(stmt, transaction, serializedParams, fields, this.types),
-            queryOpts,
-            () => this.cancelOperation(),
-          );
-          rows = shapeRows<T>(rawRows, fields, rowMode);
-          failed = false;
-        } finally {
-          if (queryOpts.timeoutMs !== undefined && queryOpts.timeoutMs > 0 && !failed) {
-            await applyStatementHandleTimeout(stmt, 0).catch(() => undefined);
-          }
-          await lease.release(failed);
-        }
-
-        // After the statement is disposed, as before — the commit is the last
-        // thing that happens on the success path.
-        try {
-          await transaction.commit();
-        } catch (err) {
-          await transaction.rollback().catch(() => undefined);
-          throw err;
-        }
-      } catch (err) {
-        await transaction.rollback().catch(() => undefined);
-        throw err;
-      }
-
-      const typed = await finalizeQueryResultWithSchema(
-        applyTypes({ rows, fields }, this.types, rowMode),
-        schema,
-        rowMode,
-      );
-      this.profiler.end({
-        startedAt,
-        sql: statement.sql,
-        params: statement.params,
-        kind: 'query',
-        rowCount: typed.rows.length,
-        cacheHit,
-      });
-      return typed;
-    } catch (err) {
-      this.profiler.end({
-        startedAt,
-        sql: statement.sql,
-        params: statement.params,
-        kind: 'query',
-        cacheHit,
-        error: err,
-      });
-      throw err;
-    }
+    return executeNodeQuery<T>(
+      {
+        ensureReady: () => this.ensureReady(),
+        getAttachment: () => this.attachment!,
+        getStatements: () => this.statements!,
+        types: this.types,
+        udr: this.udr,
+        createUdrExecutor: () => this.createUdrExecutor(),
+        profiler: this.profiler,
+        sharedReads: this.sharedReads,
+        ownTransaction: this.ownTransaction,
+        sharedRead: (sqlText, p, rm) => this.sharedRead(sqlText, p, rm),
+        endReadTransaction: () => this.endReadTransaction(),
+        serialize: (p) => this.serialize(p),
+        cancelOperation: () => this.cancelOperation(),
+      },
+      sql,
+      paramsOrOptions,
+      maybeOptions,
+    );
   }
 
   /**

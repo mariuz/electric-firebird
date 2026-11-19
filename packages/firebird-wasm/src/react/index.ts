@@ -555,3 +555,79 @@ export function useUndoRedo(
     [snap, manager],
   );
 }
+
+import {
+  createPresenceRoom,
+  type PresenceCursor,
+  type PresencePeerState,
+  type PresenceRoom,
+  type PresenceRoomOptions,
+  type PresenceRoomSnapshot,
+} from '../replication/presence';
+
+export type {
+  PresenceCursor,
+  PresencePeerState,
+  PresenceRoom,
+  PresenceRoomOptions,
+  PresenceRoomSnapshot,
+};
+
+/** Return value of {@link usePresence} (`M26 Item 1`). */
+export interface PresenceHookResult<TState = Record<string, unknown>>
+  extends PresenceRoomSnapshot<TState> {
+  readonly room: PresenceRoom<TState>;
+  updateState: PresenceRoom<TState>['updateState'];
+  setCursor: PresenceRoom<TState>['setCursor'];
+  setTyping: PresenceRoom<TState>['setTyping'];
+  leave: PresenceRoom<TState>['leave'];
+}
+
+function isPresenceRoomInstance<TState>(val: unknown): val is PresenceRoom<TState> {
+  return (
+    typeof val === 'object' &&
+    val !== null &&
+    typeof (val as PresenceRoom<TState>).getSnapshot === 'function' &&
+    typeof (val as PresenceRoom<TState>).setCursor === 'function' &&
+    typeof (val as PresenceRoom<TState>).subscribe === 'function'
+  );
+}
+
+/**
+ * Subscribe to or create a collaborative {@link PresenceRoom} in React (`M26 Item 1`).
+ */
+export function usePresence<TState = Record<string, unknown>>(
+  roomOrOptions: PresenceRoom<TState> | PresenceRoomOptions<TState>,
+): PresenceHookResult<TState> {
+  const { room, owned } = useMemo(() => {
+    if (isPresenceRoomInstance<TState>(roomOrOptions)) {
+      return { room: roomOrOptions, owned: false };
+    }
+    return { room: createPresenceRoom<TState>(roomOrOptions), owned: true };
+  }, [roomOrOptions]);
+
+  useEffect(() => {
+    if (!owned) return undefined;
+    return () => {
+      void room.close();
+    };
+  }, [room, owned]);
+
+  const snap = useSyncExternalStore(
+    (cb) => room.subscribe(() => cb()),
+    () => room.getSnapshot(),
+    () => room.getSnapshot(),
+  );
+
+  return useMemo(
+    () => ({
+      ...snap,
+      room,
+      updateState: (p) => room.updateState(p),
+      setCursor: (c) => room.setCursor(c),
+      setTyping: (t) => room.setTyping(t),
+      leave: () => room.leave(),
+    }),
+    [snap, room],
+  );
+}

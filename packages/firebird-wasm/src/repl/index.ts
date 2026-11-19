@@ -54,9 +54,12 @@ import type { OptimisticMutationStore, OptimisticStoreSnapshot } from '../optimi
 import type { UndoRedoEntry, UndoRedoManager } from '../undo-redo';
 import type { MaterializedViewInfo } from '../materialized-view';
 import type { DeclarativeSchemaInput, SchemaSyncResult } from '../schema-sync';
+import type { AuditChainVerificationResult, AuditSignAlgorithm } from '../audit-log';
+import type { PresenceRoom } from '../replication/presence';
 import type { ReplSearchIndexSummary } from './repl-actions';
 
 export type { ReplSearchIndexSummary } from './repl-actions';
+export type { AuditChainVerificationResult } from '../audit-log';
 
 export {
   computeTableIoBreakdown,
@@ -244,6 +247,8 @@ export interface FirebirdReplElement extends HTMLElement {
   optimisticStore?: OptimisticMutationStore | null;
   /** Optional `UndoRedoManager` enabling local-first `Undo` / `Redo` toolbar & Outbox controls (`M24 Item 5`). */
   undoRedoManager?: UndoRedoManager | null;
+  /** Optional collaborative `PresenceRoom` displaying live peer awareness badges in the Replication Inspector (`M26 Item 5`). */
+  presenceRoom?: PresenceRoom | null;
   /** Optional target table config enabling inline double-click cell editing in result grids (`M23 Item 5`). */
   editableTable?: ReplEditableTableConfig | null;
   /** The editor's text. */
@@ -307,6 +312,12 @@ export interface FirebirdReplElement extends HTMLElement {
     desiredSource: DeclarativeSchemaInput,
     options?: { allowDestructive?: boolean },
   ): Promise<SchemaSyncResult | null>;
+  /** Verify `"FB_AUDIT_LOG$"` SHA-256 hash chain & Merkle root integrity and render status in the Replication Inspector (`M26 Item 5`). */
+  verifyAuditChain(options?: {
+    tableName?: string;
+    verifyKey?: CryptoKey | string | Uint8Array;
+    signAlgorithm?: AuditSignAlgorithm;
+  }): Promise<AuditChainVerificationResult | null>;
   /** Toggle (or switch to `tab` in) the interactive Schema Inspector, Migration Viewer, Profiler & Plan Explorer sidebar. */
   toggleInspector(tab?: ReplInspectorTab): Promise<void>;
   /** Refresh the interactive Schema Inspector, Migration Viewer, Profiler & Plan Explorer sidebar from the database. */
@@ -315,7 +326,8 @@ export interface FirebirdReplElement extends HTMLElement {
   clear(): void;
 }
 
-import { REPL_STYLE, el, asError } from './repl-styles';
+import { asError } from './repl-styles';
+import { createReplDomElements } from './repl-dom';
 import type {
   ArrowIngestResult,
   ArrowIngestSource,
@@ -341,6 +353,10 @@ import {
   triggerArrowBrowserDownload,
 } from './repl-actions';
 import { renderReplEntryBlock } from './repl-entry-renderer';
+import {
+  executeReplVerifyAuditChain,
+  runReplBusyDiagnostic,
+} from './repl-presence-audit';
 
 /**
  * Register the element under `tag` (default `firebird-repl`) and return its
@@ -360,6 +376,9 @@ export function defineFirebirdRepl(
     private unsubOptStore: (() => void) | null = null;
     private undoRedoRef: UndoRedoManager | null = null;
     private unsubUndoRedo: (() => void) | null = null;
+    private presenceRoomRef: PresenceRoom | null = null;
+    private unsubPresence: (() => void) | null = null;
+    private lastAuditReport: AuditChainVerificationResult | null = null;
     private editableCfg: ReplEditableTableConfig | null = null;
     private readonly output: HTMLDivElement;
     private readonly inspector: HTMLDivElement;
@@ -407,182 +426,32 @@ export function defineFirebirdRepl(
     constructor() {
       super();
       const root = this.attachShadow({ mode: 'open' });
-      const style = document.createElement('style');
-      style.textContent = REPL_STYLE;
-
-      const workspace = el('div', 'workspace');
-      this.output = el('div', 'output');
-      this.output.setAttribute('role', 'log');
-      this.output.setAttribute('aria-live', 'polite');
-
-      this.inspector = el('div', 'inspector');
-      this.inspector.hidden = true;
-      this.inspector.setAttribute(
-        'aria-label',
-        'Schema, migrations, profiler, and query plan inspector',
-      );
-
-      const inspectorHeader = el('div', 'inspector-header');
-      const inspectorTabs = el('div', 'inspector-tabs');
-      this.tabSchemaBtn = document.createElement('button');
-      this.tabSchemaBtn.type = 'button';
-      this.tabSchemaBtn.className = 'tab-schema active';
-      this.tabSchemaBtn.textContent = 'Schema';
-
-      this.tabMigrationsBtn = document.createElement('button');
-      this.tabMigrationsBtn.type = 'button';
-      this.tabMigrationsBtn.className = 'tab-migrations';
-      this.tabMigrationsBtn.textContent = 'Migrations';
-
-      this.tabProfilerBtn = document.createElement('button');
-      this.tabProfilerBtn.type = 'button';
-      this.tabProfilerBtn.className = 'tab-profiler';
-      this.tabProfilerBtn.textContent = 'Profiler';
-
-      this.tabPlanBtn = document.createElement('button');
-      this.tabPlanBtn.type = 'button';
-      this.tabPlanBtn.className = 'tab-plan';
-      this.tabPlanBtn.textContent = 'Plan';
-
-      this.tabReplicationBtn = document.createElement('button');
-      this.tabReplicationBtn.type = 'button';
-      this.tabReplicationBtn.className = 'tab-replication';
-      this.tabReplicationBtn.textContent = 'Replication';
-
-      this.tabArrowBtn = document.createElement('button');
-      this.tabArrowBtn.type = 'button';
-      this.tabArrowBtn.className = 'tab-arrow';
-      this.tabArrowBtn.textContent = 'Arrow / Sync';
-
-      this.tabOutboxBtn = document.createElement('button');
-      this.tabOutboxBtn.type = 'button';
-      this.tabOutboxBtn.className = 'tab-outbox';
-      this.tabOutboxBtn.textContent = 'Outbox';
-
-      inspectorTabs.append(
-        this.tabSchemaBtn,
-        this.tabMigrationsBtn,
-        this.tabProfilerBtn,
-        this.tabPlanBtn,
-        this.tabReplicationBtn,
-        this.tabArrowBtn,
-        this.tabOutboxBtn,
-      );
-
-      const inspectorActions = el('div', 'inspector-actions');
-      this.inspectorRefreshBtn = document.createElement('button');
-      this.inspectorRefreshBtn.type = 'button';
-      this.inspectorRefreshBtn.className = 'inspector-refresh';
-      this.inspectorRefreshBtn.textContent = 'Refresh';
-      this.inspectorRefreshBtn.title = 'Refresh schema, migrations, profiler, and plan';
-
-      this.inspectorCloseBtn = document.createElement('button');
-      this.inspectorCloseBtn.type = 'button';
-      this.inspectorCloseBtn.className = 'inspector-close';
-      this.inspectorCloseBtn.textContent = '×';
-      this.inspectorCloseBtn.title = 'Close inspector';
-      inspectorActions.append(this.inspectorRefreshBtn, this.inspectorCloseBtn);
-
-      inspectorHeader.append(inspectorTabs, inspectorActions);
-      this.inspectorBody = el('div', 'inspector-body');
-      this.inspector.append(inspectorHeader, this.inspectorBody);
-
-      workspace.append(this.output, this.inspector);
-
-      const input = el('div', 'input');
-      this.editor = document.createElement('textarea');
-      this.editor.spellcheck = false;
-      this.editor.placeholder = 'SQL; Ctrl+Enter runs it';
-      this.editor.setAttribute('aria-label', 'SQL');
-
-      this.schemaButton = document.createElement('button');
-      this.schemaButton.type = 'button';
-      this.schemaButton.className = 'schema';
-      this.schemaButton.textContent = 'Schema';
-      this.schemaButton.title = 'Inspect tables, columns, keys, indexes, sequences, and triggers';
-
-      this.migrationsButton = document.createElement('button');
-      this.migrationsButton.type = 'button';
-      this.migrationsButton.className = 'migrations';
-      this.migrationsButton.textContent = 'Migrations';
-      this.migrationsButton.title = 'Inspect applied schema migrations (FB_MIGRATIONS$)';
-
-      this.profilerButton = document.createElement('button');
-      this.profilerButton.type = 'button';
-      this.profilerButton.className = 'profiler';
-      this.profilerButton.textContent = 'Profiler';
-      this.profilerButton.title = 'Inspect query telemetry, cache hits, and MON$ monitoring counters';
-
-      this.replicationButton = document.createElement('button');
-      this.replicationButton.type = 'button';
-      this.replicationButton.className = 'replication';
-      this.replicationButton.textContent = 'Replication';
-      this.replicationButton.title = 'Inspect replication journal, slots, watermarks, and lag telemetry';
-
-      this.arrowButton = document.createElement('button');
-      this.arrowButton.type = 'button';
-      this.arrowButton.className = 'arrow';
-      this.arrowButton.textContent = 'Arrow';
-      this.arrowButton.title = 'Inspect typed columnar vectors, Apache Arrow IPC stream size, and SyncHandle telemetry';
-
-      this.outboxButton = document.createElement('button');
-      this.outboxButton.type = 'button';
-      this.outboxButton.className = 'outbox';
-      this.outboxButton.textContent = 'Outbox';
-      this.outboxButton.title = 'Inspect optimistic local-first mutation outbox (flush / revert)';
-
-      this.undoButton = document.createElement('button');
-      this.undoButton.type = 'button';
-      this.undoButton.className = 'undo';
-      this.undoButton.textContent = 'Undo';
-      this.undoButton.title = 'Undo last local-first action';
-      this.undoButton.disabled = true;
-
-      this.redoButton = document.createElement('button');
-      this.redoButton.type = 'button';
-      this.redoButton.className = 'redo';
-      this.redoButton.textContent = 'Redo';
-      this.redoButton.title = 'Redo last undone local-first action';
-      this.redoButton.disabled = true;
-
-      this.sweepButton = document.createElement('button');
-      this.sweepButton.type = 'button';
-      this.sweepButton.className = 'sweep';
-      this.sweepButton.textContent = 'Sweep';
-      this.sweepButton.title = 'Run garbage-collection sweep and advance OIT';
-
-      this.infoButton = document.createElement('button');
-      this.infoButton.type = 'button';
-      this.infoButton.className = 'info';
-      this.infoButton.textContent = 'Info';
-      this.infoButton.title = 'Inspect database diagnostics and transaction counters';
-
-      this.explainButton = document.createElement('button');
-      this.explainButton.type = 'button';
-      this.explainButton.className = 'explain';
-      this.explainButton.textContent = 'Explain';
-      this.explainButton.title = 'Explain query plan (Shift+click for detailed plan)';
-
-      this.button = document.createElement('button');
-      this.button.type = 'button';
-      this.button.textContent = 'Run';
-
-      input.append(
-        this.editor,
-        this.schemaButton,
-        this.migrationsButton,
-        this.profilerButton,
-        this.replicationButton,
-        this.arrowButton,
-        this.outboxButton,
-        this.undoButton,
-        this.redoButton,
-        this.sweepButton,
-        this.infoButton,
-        this.explainButton,
-        this.button,
-      );
-      root.append(style, workspace, input);
+      const dom = createReplDomElements(root);
+      this.output = dom.output;
+      this.inspector = dom.inspector;
+      this.inspectorBody = dom.inspectorBody;
+      this.tabSchemaBtn = dom.tabSchemaBtn;
+      this.tabMigrationsBtn = dom.tabMigrationsBtn;
+      this.tabProfilerBtn = dom.tabProfilerBtn;
+      this.tabPlanBtn = dom.tabPlanBtn;
+      this.tabReplicationBtn = dom.tabReplicationBtn;
+      this.tabArrowBtn = dom.tabArrowBtn;
+      this.tabOutboxBtn = dom.tabOutboxBtn;
+      this.inspectorRefreshBtn = dom.inspectorRefreshBtn;
+      this.inspectorCloseBtn = dom.inspectorCloseBtn;
+      this.editor = dom.editor;
+      this.button = dom.button;
+      this.explainButton = dom.explainButton;
+      this.infoButton = dom.infoButton;
+      this.sweepButton = dom.sweepButton;
+      this.schemaButton = dom.schemaButton;
+      this.migrationsButton = dom.migrationsButton;
+      this.profilerButton = dom.profilerButton;
+      this.replicationButton = dom.replicationButton;
+      this.arrowButton = dom.arrowButton;
+      this.outboxButton = dom.outboxButton;
+      this.undoButton = dom.undoButton;
+      this.redoButton = dom.redoButton;
 
       this.button.addEventListener('click', () => void this.run());
       this.explainButton.addEventListener('click', (event) =>
@@ -638,7 +507,7 @@ export function defineFirebirdRepl(
       // A property set before the element was defined (React and Vue both
       // set properties as they render) sits on the instance and would hide
       // the accessor: take it over.
-      for (const name of ['db', 'replicator', 'syncHandle', 'optimisticStore', 'undoRedoManager', 'editableTable', 'value', 'inspectorOpen', 'inspectorTab'] as const) {
+      for (const name of ['db', 'replicator', 'syncHandle', 'optimisticStore', 'undoRedoManager', 'presenceRoom', 'editableTable', 'value', 'inspectorOpen', 'inspectorTab'] as const) {
         if (Object.prototype.hasOwnProperty.call(this, name)) {
           const early = (this as Record<string, unknown>)[name];
           delete (this as Record<string, unknown>)[name];
@@ -711,6 +580,26 @@ export function defineFirebirdRepl(
       const snap = this.undoRedoRef?.getSnapshot();
       this.undoButton.disabled = this.busy || !snap?.canUndo;
       this.redoButton.disabled = this.busy || !snap?.canRedo;
+    }
+
+    get presenceRoom(): PresenceRoom | null {
+      return this.presenceRoomRef;
+    }
+
+    set presenceRoom(room: PresenceRoom | null) {
+      this.unsubPresence?.();
+      this.unsubPresence = null;
+      this.presenceRoomRef = room;
+      if (room) {
+        this.unsubPresence = room.subscribe(() => {
+          if (this.isInspectorOpen && this.activeTab === 'replication') {
+            this.renderInspector();
+          }
+        });
+      }
+      if (this.isInspectorOpen && this.activeTab === 'replication') {
+        this.renderInspector();
+      }
     }
 
     get editableTable(): ReplEditableTableConfig | null {
@@ -835,6 +724,7 @@ export function defineFirebirdRepl(
           this.lastStats = await this.fetchStats();
         } else if (this.activeTab === 'replication') {
           this.lastReplication = await this.fetchReplication();
+          this.lastAuditReport = await executeReplVerifyAuditChain(this.db);
         } else if (this.activeTab === 'arrow') {
           this.lastArrow = await this.fetchArrowInspector(this.lastArrow?.sql);
         }
@@ -882,11 +772,16 @@ export function defineFirebirdRepl(
         lastArrow: this.lastArrow,
         optimisticStore: this.optStoreRef,
         undoRedoSnapshot: this.undoRedoRef ? this.undoRedoRef.getSnapshot() : null,
+        presenceRoom: this.presenceRoomRef,
+        lastAuditReport: this.lastAuditReport,
         onResetProfiler: () => {
           if (this.db && typeof this.db.resetMonitorStats === "function") {
             this.db.resetMonitorStats();
             void this.refreshInspector();
           }
+        },
+        onVerifyAudit: () => {
+          void this.verifyAuditChain();
         },
         onFlushOutbox: () => {
           if (this.optStoreRef) {
@@ -1111,204 +1006,93 @@ export function defineFirebirdRepl(
       return entries;
     }
 
-    async info(): Promise<ReplEntry | undefined> {
-      if (this.busy) return undefined;
-      if (!this.db || typeof this.db.databaseInfo !== 'function') {
-        const entry: ReplEntry = {
-          sql: 'DATABASE INFO',
-          line: 1,
-          ms: 0,
-          error: new Error(
-            !this.db
-              ? 'No database: set the element’s db property first'
-              : 'Database does not support databaseInfo()',
-          ),
-        };
-        this.show(entry);
-        return entry;
-      }
+    private runDiagnostic(
+      sqlLabel: string,
+      eventName: string,
+      guardError: Error | null,
+      execute: (entry: ReplEntry) => Promise<void>,
+    ): Promise<ReplEntry | undefined> {
+      return runReplBusyDiagnostic({
+        isBusy: () => this.busy,
+        setBusy: (b) => {
+          this.busy = b;
+          this.setButtonsDisabled(b);
+        },
+        sqlLabel,
+        eventName,
+        guardError,
+        execute,
+        show: (e) => this.show(e),
+        dispatch: (ev) => this.dispatchEvent(ev),
+      });
+    }
 
-      this.busy = true;
-      this.setButtonsDisabled(true);
-      const started = performance.now();
-      const entry: ReplEntry = { sql: 'DATABASE INFO', line: 1, ms: 0 };
-      try {
-        entry.info = await this.db.databaseInfo();
-      } catch (err) {
-        entry.error = asError(err);
-      } finally {
-        entry.ms = performance.now() - started;
-        this.busy = false;
-        this.setButtonsDisabled(false);
-      }
-      this.show(entry);
-      this.dispatchEvent(
-        new CustomEvent('firebird-repl-info', {
-          detail: entry,
-          bubbles: true,
-          composed: true,
-        }),
-      );
-      return entry;
+    async info(): Promise<ReplEntry | undefined> {
+      const err =
+        !this.db
+          ? new Error('No database: set the element’s db property first')
+          : typeof this.db.databaseInfo !== 'function'
+            ? new Error('Database does not support databaseInfo()')
+            : null;
+      return this.runDiagnostic('DATABASE INFO', 'firebird-repl-info', err, async (entry) => {
+        entry.info = await this.db!.databaseInfo!();
+      });
     }
 
     async sweep(): Promise<ReplEntry | undefined> {
-      if (this.busy) return undefined;
-      if (!this.db || typeof this.db.sweep !== 'function') {
-        const entry: ReplEntry = {
-          sql: 'SWEEP DATABASE',
-          line: 1,
-          ms: 0,
-          error: new Error(
-            !this.db
-              ? 'No database: set the element’s db property first'
-              : 'Database does not support sweep()',
-          ),
-        };
-        this.show(entry);
-        return entry;
-      }
-
-      this.busy = true;
-      this.setButtonsDisabled(true);
-      const started = performance.now();
-      const entry: ReplEntry = { sql: 'SWEEP DATABASE', line: 1, ms: 0 };
-      try {
-        entry.sweep = await this.db.sweep();
-      } catch (err) {
-        entry.error = asError(err);
-      } finally {
-        entry.ms = performance.now() - started;
-        this.busy = false;
-        this.setButtonsDisabled(false);
-      }
-      this.show(entry);
-      this.dispatchEvent(
-        new CustomEvent('firebird-repl-sweep', {
-          detail: entry,
-          bubbles: true,
-          composed: true,
-        }),
-      );
-      return entry;
+      const err =
+        !this.db
+          ? new Error('No database: set the element’s db property first')
+          : typeof this.db.sweep !== 'function'
+            ? new Error('Database does not support sweep()')
+            : null;
+      return this.runDiagnostic('SWEEP DATABASE', 'firebird-repl-sweep', err, async (entry) => {
+        entry.sweep = await this.db!.sweep!();
+      });
     }
 
     async schema(options?: IntrospectOptions): Promise<ReplEntry | undefined> {
-      if (this.busy) return undefined;
-      if (!this.db) {
-        const entry: ReplEntry = {
-          sql: 'INSPECT SCHEMA',
-          line: 1,
-          ms: 0,
-          error: new Error('No database: set the element’s db property first'),
-        };
-        this.show(entry);
-        return entry;
-      }
-
-      this.busy = true;
-      this.setButtonsDisabled(true);
-      const started = performance.now();
-      const entry: ReplEntry = { sql: 'INSPECT SCHEMA', line: 1, ms: 0 };
-      try {
+      const err = !this.db ? new Error('No database: set the element’s db property first') : null;
+      return this.runDiagnostic('INSPECT SCHEMA', 'firebird-repl-schema', err, async (entry) => {
         const result = await this.fetchSchema(options);
-        this.lastMatViews = await fetchReplMaterializedViews(this.db);
-        this.lastSearchIndexes = await fetchReplSearchIndexes(this.db);
+        this.lastMatViews = await fetchReplMaterializedViews(this.db!);
+        this.lastSearchIndexes = await fetchReplSearchIndexes(this.db!);
         entry.schema = result;
         this.lastSchema = result;
         this.activeTab = 'schema';
         this.updateActiveTabButtons();
         this.inspectorOpen = true;
         this.renderInspector();
-      } catch (err) {
-        entry.error = asError(err);
-      } finally {
-        entry.ms = performance.now() - started;
-        this.busy = false;
-        this.setButtonsDisabled(false);
-      }
-      this.show(entry);
-      this.dispatchEvent(
-        new CustomEvent('firebird-repl-schema', {
-          detail: entry,
-          bubbles: true,
-          composed: true,
-        }),
-      );
-      return entry;
+      });
     }
 
     async migrations(
       options: Pick<MigrateOptions, 'tableName'> = {},
     ): Promise<ReplEntry | undefined> {
-      if (this.busy) return undefined;
-      if (!this.db) {
-        const entry: ReplEntry = {
-          sql: 'INSPECT MIGRATIONS',
-          line: 1,
-          ms: 0,
-          error: new Error('No database: set the element’s db property first'),
-        };
-        this.show(entry);
-        return entry;
-      }
-
-      this.busy = true;
-      this.setButtonsDisabled(true);
-      const started = performance.now();
-      const entry: ReplEntry = { sql: 'INSPECT MIGRATIONS', line: 1, ms: 0 };
-      try {
-        const list = await this.fetchMigrations(options);
-        entry.migrations = list;
-        this.lastMigrations = list;
-        this.activeTab = 'migrations';
-        this.updateActiveTabButtons();
-        this.inspectorOpen = true;
-        this.renderInspector();
-      } catch (err) {
-        entry.error = asError(err);
-      } finally {
-        entry.ms = performance.now() - started;
-        this.busy = false;
-        this.setButtonsDisabled(false);
-      }
-      this.show(entry);
-      this.dispatchEvent(
-        new CustomEvent('firebird-repl-migrations', {
-          detail: entry,
-          bubbles: true,
-          composed: true,
-        }),
+      const err = !this.db ? new Error('No database: set the element’s db property first') : null;
+      return this.runDiagnostic(
+        'INSPECT MIGRATIONS',
+        'firebird-repl-migrations',
+        err,
+        async (entry) => {
+          const list = await this.fetchMigrations(options);
+          entry.migrations = list;
+          this.lastMigrations = list;
+          this.activeTab = 'migrations';
+          this.updateActiveTabButtons();
+          this.inspectorOpen = true;
+          this.renderInspector();
+        },
       );
-      return entry;
     }
 
     async profiler(): Promise<ReplEntry | undefined> {
-      if (this.busy) return undefined;
-      if (
-        !this.db ||
-        (typeof this.db.monitorStats !== 'function' &&
-          typeof this.db.databaseInfo !== 'function')
-      ) {
-        const entry: ReplEntry = {
-          sql: 'MONITOR STATS',
-          line: 1,
-          ms: 0,
-          error: new Error(
-            !this.db
-              ? 'No database: set the element’s db property first'
-              : 'Database does not support monitorStats()',
-          ),
-        };
-        this.show(entry);
-        return entry;
-      }
-
-      this.busy = true;
-      this.setButtonsDisabled(true);
-      const started = performance.now();
-      const entry: ReplEntry = { sql: 'MONITOR STATS', line: 1, ms: 0 };
-      try {
+      const err = !this.db
+        ? new Error('No database: set the element’s db property first')
+        : typeof this.db.monitorStats !== 'function' && typeof this.db.databaseInfo !== 'function'
+          ? new Error('Database does not support monitorStats()')
+          : null;
+      return this.runDiagnostic('MONITOR STATS', 'firebird-repl-profiler', err, async (entry) => {
         const stats = await this.fetchStats();
         if (stats) {
           entry.stats = stats;
@@ -1318,86 +1102,32 @@ export function defineFirebirdRepl(
         this.updateActiveTabButtons();
         this.inspectorOpen = true;
         this.renderInspector();
-      } catch (err) {
-        entry.error = asError(err);
-      } finally {
-        entry.ms = performance.now() - started;
-        this.busy = false;
-        this.setButtonsDisabled(false);
-      }
-      this.show(entry);
-      this.dispatchEvent(
-        new CustomEvent('firebird-repl-profiler', {
-          detail: entry,
-          bubbles: true,
-          composed: true,
-        }),
-      );
-      return entry;
+      });
     }
 
     async replication(): Promise<ReplEntry | undefined> {
-      if (this.busy) return undefined;
-      if (!this.db) {
-        const entry: ReplEntry = {
-          sql: 'INSPECT REPLICATION',
-          line: 1,
-          ms: 0,
-          error: new Error('No database: set the element’s db property first'),
-        };
-        this.show(entry);
-        return entry;
-      }
-
-      this.busy = true;
-      this.setButtonsDisabled(true);
-      const started = performance.now();
-      const entry: ReplEntry = { sql: 'INSPECT REPLICATION', line: 1, ms: 0 };
-      try {
-        const info = await this.fetchReplication();
-        entry.replication = info;
-        this.lastReplication = info;
-        this.activeTab = 'replication';
-        this.updateActiveTabButtons();
-        this.inspectorOpen = true;
-        this.renderInspector();
-      } catch (err) {
-        entry.error = asError(err);
-      } finally {
-        entry.ms = performance.now() - started;
-        this.busy = false;
-        this.setButtonsDisabled(false);
-      }
-      this.show(entry);
-      this.dispatchEvent(
-        new CustomEvent('firebird-repl-replication', {
-          detail: entry,
-          bubbles: true,
-          composed: true,
-        }),
+      const err = !this.db ? new Error('No database: set the element’s db property first') : null;
+      return this.runDiagnostic(
+        'INSPECT REPLICATION',
+        'firebird-repl-replication',
+        err,
+        async (entry) => {
+          const info = await this.fetchReplication();
+          this.lastAuditReport = await executeReplVerifyAuditChain(this.db!);
+          entry.replication = info;
+          this.lastReplication = info;
+          this.activeTab = 'replication';
+          this.updateActiveTabButtons();
+          this.inspectorOpen = true;
+          this.renderInspector();
+        },
       );
-      return entry;
     }
 
     async inspectArrow(sql?: string): Promise<ReplEntry | undefined> {
-      if (this.busy) return undefined;
       const sqlLabel = (sql ?? this.editor.value ?? '').trim() || 'INSPECT ARROW';
-      if (!this.db) {
-        const entry: ReplEntry = {
-          sql: sqlLabel,
-          line: 1,
-          ms: 0,
-          error: new Error('No database: set the element’s db property first'),
-        };
-        this.show(entry);
-        return entry;
-      }
-
-      this.busy = true;
-      this.setButtonsDisabled(true);
-      const started = performance.now();
-      const entry: ReplEntry = { sql: sqlLabel, line: 1, ms: 0 };
-      try {
+      const err = !this.db ? new Error('No database: set the element’s db property first') : null;
+      return this.runDiagnostic(sqlLabel, 'firebird-repl-arrow', err, async (entry) => {
         const info = await this.fetchArrowInspector(sql);
         entry.arrow = info;
         this.lastArrow = info;
@@ -1405,22 +1135,7 @@ export function defineFirebirdRepl(
         this.updateActiveTabButtons();
         this.inspectorOpen = true;
         this.renderInspector();
-      } catch (err) {
-        entry.error = asError(err);
-      } finally {
-        entry.ms = performance.now() - started;
-        this.busy = false;
-        this.setButtonsDisabled(false);
-      }
-      this.show(entry);
-      this.dispatchEvent(
-        new CustomEvent('firebird-repl-arrow', {
-          detail: entry,
-          bubbles: true,
-          composed: true,
-        }),
-      );
-      return entry;
+      });
     }
 
     async exportArrow(sql?: string): Promise<Uint8Array> {
@@ -1595,6 +1310,30 @@ export function defineFirebirdRepl(
       this.lastSchemaDiff = res;
       if (this.isInspectorOpen) await this.refreshInspector();
       return res;
+    }
+
+    async verifyAuditChain(
+      options: {
+        tableName?: string;
+        verifyKey?: CryptoKey | string | Uint8Array;
+        signAlgorithm?: AuditSignAlgorithm;
+      } = {},
+    ): Promise<AuditChainVerificationResult | null> {
+      if (!this.db) return null;
+      const report = await executeReplVerifyAuditChain(this.db, options);
+      this.lastAuditReport = report;
+      this.activeTab = 'replication';
+      this.updateActiveTabButtons();
+      this.inspectorOpen = true;
+      this.renderInspector();
+      this.dispatchEvent(
+        new CustomEvent('firebird-repl-audit-verify', {
+          detail: report,
+          bubbles: true,
+          composed: true,
+        }),
+      );
+      return report;
     }
 
     private onKey(event: KeyboardEvent): void {

@@ -1939,6 +1939,37 @@ Next-horizon improvements across **Replication**, **Speed & Performance**, **Int
 
 ---
 
+### M26 — Real-Time Collaborative Presence & Awareness, Tamper-Evident Cryptographic Audit Chains, Semantic Query Cache & MMR/RAG Context Packer, Deterministic Anonymizer/Seeder & Sub-1,500-Line Module Split
+
+- [x] **1. Real-Time Collaborative Presence, Ephemeral Awareness & Framework Hooks (`createPresenceRoom` & SSE / WS / Cross-Tab Awareness).**
+      Add an ephemeral, non-WAL collaborative awareness layer (`createPresenceRoom({ peerId, initialState?, ttlMs?, heartbeatIntervalMs? })`)
+      over `BroadcastChannel`, WebSocket, and HTTP/SSE (`POST /presence` + `event: presence` frames on
+      `createHttpReplicationHandler` and `npx firebird-wasm serve-sync`, isolated per tenant/JWT) for live online
+      peers, active table/row/cell cursors, and typing indicators, plus `usePresence` / `createPresence` hooks
+      across React, Vue, Svelte 5, and SolidJS.
+- [x] **2. Tamper-Evident Cryptographic Audit Log & Merkle Hash-Chain Verification (`createAuditLog` & `"FB_AUDIT_LOG$"` + CLI `verify-audit`).**
+      Add `createAuditLog(db, { tables, actorResolver?, signKey? })` recording structured row diffs into
+      `"FB_AUDIT_LOG$"` where each record links `ENTRY_HASH = SHA-256(PREV_HASH || SEQ || TS || ACTOR || TABLE || OP || KEY_JSON || DIFF_JSON)`
+      (plus optional WebCrypto `ES256` / `EdDSA` / `HMAC` detached signatures and Merkle root checkpoints),
+      `await audit.verifyChain()`, and `npx firebird-wasm verify-audit <uri> [--json]`.
+- [x] **3. Semantic Query Cache, MMR Diversity Reranking & Token-Budgeted RAG Context Packer (`createSemanticCache` & `packRagContext`).**
+      Add `createSemanticCache(db, { similarityThreshold?, ttlMs?, maxEntries?, quantization? })` backed by a
+      persistent Firebird table + auto-synced quantized HNSW index for local/edge LLM & tool caching with hit/miss
+      telemetry, Maximal Marginal Relevance (`mmrRerank` / `diversityLambda` on `vectorSearch` & `hybridSearch`),
+      and `packRagContext(hits, { tokenBudget, dedupeOverlap?, formatCitation? })`.
+- [x] **4. Deterministic PII Anonymizer & Foreign-Key-Aware Database Seeder (`anonymizeDatabase`, `seedDatabase` & CLI `anonymize` / `seed`).**
+      Add `anonymizeDatabase(sourceDb, targetDbOrInPlace, { rules, seed? })` for deterministic dev/staging snapshot
+      scrubbing and `seedDatabase(db, { tables?, rowsPerTable?, seed? })` generating synthetic rows from
+      `introspect()` metadata (`NOT NULL`, `PRIMARY KEY`, `UNIQUE`, and topological foreign-key order), plus
+      `npx firebird-wasm anonymize` and `npx firebird-wasm seed` CLI subcommands.
+- [x] **5. `<firebird-repl>` Presence & Audit Chain Inspector, Simulator Scenario 20 & Sub-1,500-Line Module Split.**
+      Surface live collaborative peer awareness badges and `"FB_AUDIT_LOG$"` hash-chain integrity verification inside
+      `<firebird-repl>`, add Simulator **Scenario 20** (`presence-audit-chain-rag-cache`), and decompose
+      `repl/index.ts`, `firebird-browser.ts`, `firebird.ts`, `engine-transport.ts`, and `fts/index.ts` so every
+      non-test `.ts` source file across the repository sits strictly under 1,500 lines.
+
+---
+
 ## 5. Test coverage added alongside this review
 
 `src/browser/` was excluded from Jest and had no browser tests.  It now has 73

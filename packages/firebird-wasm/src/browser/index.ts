@@ -950,3 +950,72 @@ export type {
   SyncDatabaseSchemaOptions,
   SchemaSyncResult,
 } from '../schema-sync';
+export {
+  createPresenceRoom,
+  createPresenceHub,
+} from '../replication/presence';
+export type {
+  PresenceCursor,
+  PresencePeerState,
+  PresenceRoomSnapshot,
+  PresenceHttpSseTransportOptions,
+  PresenceRoomOptions,
+  PresenceWireFrame,
+  PresenceRoom,
+  PresenceHubUpsertInput,
+  PresenceHub,
+} from '../replication/presence';
+export {
+  DEFAULT_AUDIT_LOG_TABLE,
+  GENESIS_AUDIT_HASH,
+  canonicalAuditJson,
+  computeAuditEntryHash,
+  computeAuditMerkleRoot,
+  verifyAuditChain,
+  createAuditLog,
+} from '../audit-log';
+export type {
+  AuditSignAlgorithm,
+  AuditDatabaseExecutor,
+  AuditDiffPayload,
+  AuditLogEntry,
+  RecordAuditInput,
+  AuditChainVerificationResult,
+  AuditLogOptions,
+  AuditLogHandle,
+} from '../audit-log';
+export {
+  DEFAULT_SEMANTIC_CACHE_TABLE,
+  mmrRerank,
+  packRagContext,
+  createSemanticCache,
+} from '../rag-cache';
+export type {
+  MmrRerankOptions,
+  PackRagContextOptions,
+  PackedRagChunk,
+  PackedRagContext,
+  SemanticCacheDatabaseExecutor,
+  SemanticCacheOptions,
+  SemanticCacheHit,
+  SemanticCacheStats,
+  SemanticCacheHandle,
+} from '../rag-cache';
+export {
+  sortTablesByForeignKeys,
+  anonymizeDatabase,
+  seedDatabase,
+} from '../data-seeder';
+export type {
+  SeederDatabaseExecutor,
+  BuiltinAnonymizeKind,
+  AnonymizeRuleContext,
+  AnonymizeColumnRule,
+  AnonymizeRulesMap,
+  AnonymizeDatabaseOptions,
+  AnonymizeDatabaseResult,
+  SeedColumnContext,
+  SeedColumnOverride,
+  SeedDatabaseOptions,
+  SeedDatabaseResult,
+} from '../data-seeder';

@@ -8,7 +8,7 @@ import type {
   ReplicationPublication,
   ReplicationSubscription,
 } from './types';
-import type { TenantIsolationGuard } from './tenant-slice';
+import { valuesMatchTenantId, type TenantIsolationGuard } from './tenant-slice';
 import type { JwtTenantAuthContext, JwtTenantAuthResolver } from './jwt-auth';
 import {
   computeBackoffDelayMs,
@@ -43,6 +43,8 @@ export interface SseReplicationHub {
   openStream(ctx?: SseSubscriberContext): Promise<Response>;
   /** Broadcast explicit journal entries to all connected SSE subscribers (filtered by each subscriber's tenant/table/RLS scope). */
   broadcastEntries(entries: readonly ReplicationLogEntry[], currentLsn?: number): void;
+  /** Broadcast an ephemeral `event: presence` awareness frame scoped to matching tenant subscribers (`M26 Item 1`). */
+  broadcastPresence(payload: unknown, scope?: { tenantId?: string | number }): void;
   /** Capture newly committed publication changes since the hub's last watermark and fan them out to all connected subscribers. */
   notifyChanges(): Promise<number>;
   /** Close all open SSE streams and timers cleanly. */
@@ -318,6 +320,32 @@ export function createSseReplicationHub(
       return newEntries.length;
     },
 
+    broadcastPresence(payload: unknown, scope: { tenantId?: string | number } = {}): void {
+      if (subscribers.size === 0) return;
+      const enforceTenant =
+        scope.tenantId !== undefined ||
+        Boolean(options.tenantGuard) ||
+        Boolean(options.jwtResolver);
+      const frame = formatSseEvent('presence', payload);
+      for (const sub of [...subscribers.values()]) {
+        if (sub.closed) continue;
+        if (enforceTenant) {
+          if (scope.tenantId === undefined && sub.tenantId === undefined) {
+            // Both un-scoped: allow
+          } else if (
+            scope.tenantId !== undefined &&
+            sub.tenantId !== undefined &&
+            valuesMatchTenantId(sub.tenantId, scope.tenantId)
+          ) {
+            // Matching tenant: allow
+          } else {
+            continue;
+          }
+        }
+        sub.enqueue(frame);
+      }
+    },
+
     close(): void {
       hubClosed = true;
       if (heartbeatTimer !== null) {
@@ -354,6 +382,8 @@ export interface SseReplicationClientOptions {
   ) => void | Promise<void>;
   /** Callback invoked when the initial or periodic `replication` status frame arrives. */
   onSyncEvent?: (info: { publication: string; currentLsn: number }) => void;
+  /** Callback invoked when an ephemeral `event: presence` frame arrives (`M26 Item 1`). */
+  onPresence?: (payload: Record<string, unknown>) => void;
   /** Lifecycle callback (`'connecting' | 'online' | 'backoff' | 'offline'`). */
   onStateChange?: (
     state: ConnectionLifecycleState,
@@ -453,6 +483,11 @@ export function createSseReplicationClient(
         publication: String(parsed.publication ?? 'default'),
         currentLsn: Number.isFinite(lsn) ? lsn : 0,
       });
+      return;
+    }
+
+    if (eventType === 'presence') {
+      options.onPresence?.(parsed);
       return;
     }
 
