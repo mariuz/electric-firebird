@@ -1,6 +1,7 @@
 /**
  * repl-presence-audit.ts – Collaborative Presence Peer Badges, `"FB_AUDIT_LOG$"`
- * Hash-Chain Verification & Diagnostic Runner Helpers for `<firebird-repl>` (`M26 Item 5`).
+ * Hash-Chain Verification, MCP/Prometheus, Adaptive Index Advisor & Job Queue
+ * Helpers for `<firebird-repl>` (`M26`–`M28`).
  */
 
 import {
@@ -13,11 +14,41 @@ import {
   type McpToolDescriptor,
 } from '../mcp-server';
 import { formatPrometheusMetrics } from '../otel-metrics';
+import {
+  createWorkloadAdvisor,
+  type WorkloadAdvisorReport,
+} from '../workload-advisor';
+import {
+  DEFAULT_JOB_QUEUE_TABLE,
+  createJobQueue,
+  type JobQueueStats,
+} from '../job-queue';
 import type { ReplicationStats } from '../replication';
 import type { PresenceRoom } from '../replication/presence';
 import type { Row } from '../types';
 import { asError, el } from './repl-styles';
-import type { ReplDatabase, ReplEntry } from './index';
+import type { ReplDatabase, ReplEntry } from './repl-types';
+
+function createReplObjectQueryAdapter(db: ReplDatabase) {
+  return {
+    query: async <T extends Row = Row>(sqlText: string, params: unknown[] = []) => {
+      const res = await db.query(sqlText, params, { rowMode: 'array' });
+      const rows = res.rows.map((cols) =>
+        Object.fromEntries(res.fields.map((f, idx) => [f.name, cols[idx]])),
+      ) as unknown as T[];
+      return { fields: res.fields, rows };
+    },
+    ...(typeof db.explain === 'function'
+      ? { explain: (s: string, o?: { detailed?: boolean }) => db.explain!(s, o) }
+      : {}),
+    ...(typeof db.introspect === 'function'
+      ? { introspect: () => db.introspect!() }
+      : {}),
+    ...(typeof db.monitorStats === 'function'
+      ? { monitorStats: () => db.monitorStats!() }
+      : {}),
+  };
+}
 
 export function getReplMcpTools(
   db: ReplDatabase | null,
@@ -51,14 +82,118 @@ export async function exportReplPrometheusMetrics(
   return formatPrometheusMetrics({ monitor, dbInfo, replication });
 }
 
+export async function executeReplWorkloadAdvisor(
+  db: ReplDatabase,
+  extraQueries: readonly string[] = [],
+): Promise<WorkloadAdvisorReport> {
+  const adapter = createReplObjectQueryAdapter(db);
+  const advisor = createWorkloadAdvisor(adapter, { captureLiveQueries: false });
+  try {
+    return await advisor.analyze(extraQueries);
+  } finally {
+    advisor.dispose();
+  }
+}
+
+export async function fetchReplJobQueueStats(
+  db: ReplDatabase,
+): Promise<JobQueueStats> {
+  try {
+    const check = await db.query(
+      `SELECT 1 FROM RDB$RELATIONS WHERE TRIM(RDB$RELATION_NAME) = ?`,
+      [DEFAULT_JOB_QUEUE_TABLE],
+      { rowMode: 'array' },
+    );
+    if (check.rows.length === 0) {
+      return {
+        pending: 0,
+        running: 0,
+        completed: 0,
+        dead: 0,
+        dlqCount: 0,
+        schedulesCount: 0,
+      };
+    }
+    const queue = createJobQueue(createReplObjectQueryAdapter(db));
+    return await queue.stats();
+  } catch {
+    return {
+      pending: 0,
+      running: 0,
+      completed: 0,
+      dead: 0,
+      dlqCount: 0,
+      schedulesCount: 0,
+    };
+  }
+}
+
 export function appendMcpAndPrometheusSections(
   panel: HTMLElement,
   opts: {
     mcpTools?: readonly McpToolDescriptor[];
     prometheusText?: string | null;
     onExportPrometheus?: () => void;
+    advisorReport?: WorkloadAdvisorReport | null;
+    onRunAdvisor?: () => void;
+    onLoadAdvisorSql?: (ddl: string) => void;
+    jobQueueStats?: JobQueueStats | null;
   },
 ): void {
+  if (opts.onRunAdvisor || opts.advisorReport) {
+    const advBox = el('div', 'schema-sub workload-advisor-panel');
+    const title = el('div', 'schema-group-title');
+    title.textContent = 'Adaptive Index & Workload Advisor';
+    advBox.append(title);
+    if (opts.onRunAdvisor) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'advisor-run-btn';
+      btn.textContent = 'Run Index Advisor';
+      btn.addEventListener('click', () => opts.onRunAdvisor?.());
+      advBox.append(btn);
+    }
+    if (opts.advisorReport) {
+      const recs = opts.advisorReport.recommendations;
+      const summary = el('p', 'inspector-summary workload-advisor-summary');
+      summary.textContent =
+        recs.length === 0
+          ? `0 index issues across ${opts.advisorReport.analyzedQueries} analyzed query(s).`
+          : `${recs.length} recommendation(s) across ${opts.advisorReport.analyzedQueries} query(s):`;
+      advBox.append(summary);
+      if (recs.length > 0) {
+        const ddlScript = recs.map((r) => `-- [${r.severity.toUpperCase()}] ${r.kind}: ${r.rationale}\n${r.sql}`).join('\n');
+        const pre = el('pre', 'schema-view-source workload-advisor-output');
+        pre.textContent = ddlScript;
+        advBox.append(pre);
+        if (opts.onLoadAdvisorSql) {
+          const loadBtn = document.createElement('button');
+          loadBtn.type = 'button';
+          loadBtn.className = 'advisor-load-ddl-btn';
+          loadBtn.textContent = 'Load Recommended DDL in Editor';
+          const rawDdl = recs.map((r) => r.sql).join('\n');
+          loadBtn.addEventListener('click', () => opts.onLoadAdvisorSql?.(rawDdl));
+          advBox.append(loadBtn);
+        }
+      }
+    }
+    panel.append(advBox);
+  }
+
+  if (opts.jobQueueStats) {
+    const jq = opts.jobQueueStats;
+    const jqBox = el('div', 'schema-sub job-queue-panel');
+    const title = el('div', 'schema-group-title');
+    title.textContent = 'Durable Job Queue (FB_JOB_QUEUE$)';
+    jqBox.append(title);
+    const summary = el('p', 'inspector-summary job-queue-summary');
+    summary.textContent =
+      `pending: ${jq.pending} · running: ${jq.running} · completed: ${jq.completed} · ` +
+      `dead: ${jq.dead} · DLQ: ${jq.dlqCount} · cron: ${jq.schedulesCount}`;
+    jqBox.append(summary);
+    panel.append(jqBox);
+  }
+
   if (opts.mcpTools && opts.mcpTools.length > 0) {
     const mcpBox = el('div', 'schema-sub mcp-tools-panel');
     const title = el('div', 'schema-group-title');
@@ -105,18 +240,7 @@ export async function executeReplVerifyAuditChain(
     signAlgorithm?: AuditSignAlgorithm;
   } = {},
 ): Promise<AuditChainVerificationResult> {
-  return verifyAuditChain(
-    {
-      query: async <T extends Row = Row>(sqlText: string, params: unknown[] = []) => {
-        const res = await db.query(sqlText, params, { rowMode: 'array' });
-        const rows = res.rows.map((cols) =>
-          Object.fromEntries(res.fields.map((f, idx) => [f.name, cols[idx]])),
-        ) as unknown as T[];
-        return { fields: res.fields, rows };
-      },
-    },
-    options,
-  );
+  return verifyAuditChain(createReplObjectQueryAdapter(db), options);
 }
 
 export function appendPresenceAndAuditSections(

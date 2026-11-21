@@ -64,6 +64,12 @@ import {
   type OtelInstrumentationHandle,
   type OtelObservableDatabase,
 } from '../otel-metrics';
+import {
+  runHttpFetchChangelogSegments,
+  runHttpFetchSnapshotResumable,
+  runHttpPullAndApplyChangelog,
+  runHttpPushChangelogSegment,
+} from './http-client-ops';
 
 export * from './webrtc-resilient';
 export * from './broadcast-transport';
@@ -1094,99 +1100,10 @@ export function createHttpReplicationClient(
     },
 
     async fetchSnapshotResumable(resumableOpts = {}) {
-      const chunkSize = Math.max(1, resumableOpts.chunkSize ?? 500);
-      const cp: ResumableSnapshotCheckpoint =
-        resumableOpts.checkpoint ?? {
-          currentTableIndex: 0,
-          currentRowOffset: 0,
-          completedTables: [],
-          partialRows: [],
-        };
-
-      if (!cp.manifest) {
-        const mRes = await fetchFn(`${baseUrl}/snapshot/manifest`, {
-          method: 'GET',
-          headers: await buildHeaders(),
-        });
-        if (!mRes.ok) {
-          throw new Error(
-            `HTTP replication fetchSnapshotResumable manifest failed with status ${mRes.status}`,
-          );
-        }
-        const mJson = (await mRes.json()) as { manifest: ResumableSnapshotManifest };
-        cp.manifest = mJson.manifest;
-      }
-
-      const manifest = cp.manifest;
-      const grandTotalRows = manifest.tables.reduce((acc, t) => acc + t.totalRows, 0);
-      let loadedPriorTables = cp.completedTables.reduce(
-        (acc, t) => acc + t.rows.length,
-        0,
+      return runHttpFetchSnapshotResumable(
+        { baseUrl, fetchFn, buildHeaders },
+        resumableOpts,
       );
-
-      while (cp.currentTableIndex < manifest.tables.length) {
-        const tblMeta = manifest.tables[cp.currentTableIndex]!;
-
-        while (cp.currentRowOffset < tblMeta.totalRows) {
-          const params = new URLSearchParams({
-            snapshotId: manifest.snapshotId,
-            table: tblMeta.table,
-            offset: String(cp.currentRowOffset),
-            limit: String(chunkSize),
-          });
-          const cRes = await fetchFn(
-            `${baseUrl}/snapshot/chunk?${params.toString()}`,
-            {
-              method: 'GET',
-              headers: await buildHeaders(),
-            },
-          );
-          if (!cRes.ok) {
-            throw new Error(
-              `HTTP replication fetchSnapshotResumable chunk failed with status ${cRes.status}`,
-            );
-          }
-          const cJson = (await cRes.json()) as {
-            rows?: Record<string, unknown>[];
-            hasMore?: boolean;
-          };
-          const rows = cJson.rows ?? [];
-          if (rows.length === 0) {
-            cp.currentRowOffset = tblMeta.totalRows;
-            break;
-          }
-          cp.partialRows.push(...rows);
-          cp.currentRowOffset += rows.length;
-
-          resumableOpts.onProgress?.({
-            table: tblMeta.table,
-            tableLoadedRows: cp.partialRows.length,
-            tableTotalRows: tblMeta.totalRows,
-            totalLoadedRows: loadedPriorTables + cp.partialRows.length,
-            totalRows: grandTotalRows,
-          });
-        }
-
-        cp.completedTables.push({
-          table: tblMeta.table,
-          primaryKey: tblMeta.primaryKey,
-          ddlSql: tblMeta.ddlSql,
-          rows: cp.partialRows,
-        });
-        loadedPriorTables += cp.partialRows.length;
-        cp.partialRows = [];
-        cp.currentRowOffset = 0;
-        cp.currentTableIndex++;
-      }
-
-      return {
-        publication: manifest.publication,
-        origin: manifest.origin,
-        watermarkLsn: manifest.watermarkLsn,
-        timestamp: manifest.timestamp,
-        mode: 'logical',
-        tables: cp.completedTables,
-      };
     },
 
     async pushChanges(entries) {
@@ -1205,102 +1122,28 @@ export function createHttpReplicationClient(
     },
 
     async fetchChangelogSegments(sinceSequence = 0, fetchOpts = {}) {
-      const params = new URLSearchParams({ sinceSequence: String(sinceSequence) });
-      if (fetchOpts.compress) {
-        params.set('compress', 'gzip');
-      }
-      const res = await fetchFn(`${baseUrl}/changelog?${params.toString()}`, {
-        method: 'GET',
-        headers: await buildHeaders(),
-      });
-      if (!res.ok) {
-        throw new Error(
-          `HTTP replication fetchChangelogSegments failed with status ${res.status}`,
-        );
-      }
-      const ctype = (res.headers.get('content-type') ?? '').toLowerCase();
-      if (ctype.includes('application/octet-stream')) {
-        const raw = new Uint8Array(await res.arrayBuffer());
-        const decoded =
-          res.headers.get('x-fb-changelog-encoding') === 'gzip' || isGzipBytes(raw)
-            ? await gunzipBytes(raw)
-            : raw;
-        return decoded.byteLength > 0 ? [decoded] : [];
-      }
-      const data = (await res.json()) as {
-        segments?: Array<{ sequence: number; encoding?: string; data: string }>;
-      };
-      const out: Uint8Array[] = [];
-      for (const s of data.segments ?? []) {
-        const raw = base64ToBytes(s.data);
-        out.push(
-          s.encoding === 'gzip+base64' || isGzipBytes(raw) ? await gunzipBytes(raw) : raw,
-        );
-      }
-      return out;
+      return runHttpFetchChangelogSegments(
+        { baseUrl, fetchFn, buildHeaders },
+        sinceSequence,
+        fetchOpts,
+      );
     },
 
     async pushChangelogSegment(segments, pushOpts = {}) {
-      const list = segments instanceof Uint8Array ? [segments] : segments;
-      if (list.length === 1) {
-        const single = list[0]!;
-        const bodyBytes = pushOpts.compress ? await gzipBytes(single) : single;
-        const res = await fetchFn(`${baseUrl}/changelog`, {
-          method: 'POST',
-          headers: await buildHeaders({
-            'content-type': 'application/octet-stream',
-            ...(pushOpts.compress ? { 'x-fb-changelog-encoding': 'gzip' } : {}),
-          }),
-          body: new Uint8Array(bodyBytes),
-        });
-        if (!res.ok) {
-          throw new Error(
-            `HTTP replication pushChangelogSegment failed with status ${res.status}`,
-          );
-        }
-        const data = (await res.json()) as { results?: ApplyFbChangelogResult[] };
-        return data.results ?? [];
-      }
-
-      const encoded: Array<{ encoding: 'base64' | 'gzip+base64'; data: string }> = [];
-      for (const seg of list) {
-        if (pushOpts.compress) {
-          const gz = await gzipBytes(seg);
-          encoded.push({ encoding: 'gzip+base64', data: bytesToBase64(gz) });
-        } else {
-          encoded.push({ encoding: 'base64', data: bytesToBase64(seg) });
-        }
-      }
-      const res = await fetchFn(`${baseUrl}/changelog`, {
-        method: 'POST',
-        headers: await buildHeaders({ 'content-type': 'application/json' }),
-        body: JSON.stringify({ segments: encoded }),
-      });
-      if (!res.ok) {
-        throw new Error(
-          `HTTP replication pushChangelogSegment failed with status ${res.status}`,
-        );
-      }
-      const data = (await res.json()) as { results?: ApplyFbChangelogResult[] };
-      return data.results ?? [];
+      return runHttpPushChangelogSegment(
+        { baseUrl, fetchFn, buildHeaders },
+        segments,
+        pushOpts,
+      );
     },
 
     async pullAndApplyChangelog(targetDb, sinceSequence = 0, pullOpts = {}) {
-      const segments = await this.fetchChangelogSegments(sinceSequence, {
-        compress: pullOpts.compress,
-      });
-      const results: ApplyFbChangelogResult[] = [];
-      for (const segBytes of segments) {
-        results.push(
-          await applyFbChangelogSegmentToDatabase(targetDb, segBytes, {
-            preferLogicalFallback: pullOpts.preferLogicalFallback,
-            ...(pullOpts.tableSchemas !== undefined
-              ? { tableSchemas: pullOpts.tableSchemas }
-              : {}),
-          }),
-        );
-      }
-      return results;
+      return runHttpPullAndApplyChangelog(
+        { baseUrl, fetchFn, buildHeaders },
+        targetDb,
+        sinceSequence,
+        pullOpts,
+      );
     },
   };
 }

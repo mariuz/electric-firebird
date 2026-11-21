@@ -364,4 +364,27 @@ test.describe('Replication Simulator v2 (replication.html)', () => {
     await expect(page.locator('#event-feed')).toContainText('traceparent');
     await expect(page.locator('#event-feed')).toContainText('verifyBackupArchive()');
   });
+
+  test('Scenario 22: Durable Job Queue & Workflows + WITH RECURSIVE GraphRAG, Online Migrator & Index Advisor', async ({
+    page,
+  }) => {
+    await openReplicationSim(page);
+
+    await page
+      .locator('.scenario-card[data-scenario="job-queue-graphrag-online-migrate-advisor"]')
+      .click();
+
+    await expect(page.locator('#primary-rows')).toContainText('JobQueue GraphRAG OnlineMig Task #4');
+    await expect(page.locator('#replica-rows')).toContainText('JobQueue GraphRAG OnlineMig Task #5');
+    await expect(page.locator('#code-inspector')).toContainText('createJobQueue');
+    await expect(page.locator('#code-inspector')).toContainText('graphRagSearch');
+    await expect(page.locator('#code-inspector')).toContainText('createOnlineMigrator');
+    await expect(page.locator('#code-inspector')).toContainText('createWorkloadAdvisor');
+    await expect(page.locator('#event-feed')).toContainText('Scenario 22');
+    await expect(page.locator('#event-feed')).toContainText('FB_JOB_QUEUE$');
+    await expect(page.locator('#event-feed')).toContainText('runWorkflow()');
+    await expect(page.locator('#event-feed')).toContainText('graphRagSearch()');
+    await expect(page.locator('#event-feed')).toContainText('verifyParity()');
+    await expect(page.locator('#event-feed')).toContainText('createWorkloadAdvisor()');
+  });
 });

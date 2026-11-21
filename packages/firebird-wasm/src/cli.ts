@@ -29,14 +29,10 @@ import {
   isFbChangelogSegment,
   parseFbChangelogSegment,
 } from './replication/native-changelog';
-import { syncDatabases } from './replication/presets';
 import {
   createHttpObjectStoreAdapter,
   type ObjectStoreAdapter,
 } from './replication/object-store-wal';
-import type { BootstrapStrategy, ReplicableDatabase } from './replication/types';
-import { collectArrowStreamBytes } from './columnar-stream';
-import { decodeArrowIpc } from './columnar';
 import {
   runCliBench,
   runCliSchemaDiff,
@@ -54,14 +50,22 @@ import {
 } from './cli-audit-seed-commands';
 import {
   runCliCodegen,
+  runCliExportArrow,
+  runCliImportArrow,
   runCliInteractiveRepl,
   runCliMigrate,
+  runCliSync,
 } from './cli-dev-commands';
 import {
   runCliBackup,
   runCliMcp,
   runCliVerifyBackup,
 } from './cli-mcp-backup-commands';
+import {
+  runCliAdvise,
+  runCliMigrateOnline,
+  runCliWorker,
+} from './cli-m28-commands';
 export {
   startCliReplicationServer,
   type CliReplicationServerHandle,
@@ -127,6 +131,9 @@ Commands:
   mcp [uri]                      Start Model Context Protocol JSON-RPC server (stdio or --port <n>) [--allow-writes] [--audit]
   backup <uri> --out <file.fbkp> Create AES-256-GCM encrypted .fbkp backup (--key <passphrase> [--base <base.fdb>] [--json])
   verify-backup <file.fbkp>      Verify .fbkp Merkle & AES-256-GCM integrity ([--key <pass>] [--restore-to <uri>] [--json])
+  worker [uri]                   Drain durable FB_JOB_QUEUE$ background jobs & due cron schedules ([--queue <name>] [--max-jobs <n>])
+  migrate-online <uri>           Run zero-downtime Expand/Backfill/Contract online migration (--plan <fileOrJson> [--drop-source])
+  advise [uri]                   Inspect query plans & catalog for missing/redundant/FK indexes ([--sql <queries>] [--apply] [--json])
   bench [uri]                    Benchmark IBatch, row query, columnar, Arrow IPC stream & preparePipeline [--rows <n>]
 
 Global Options:
@@ -653,7 +660,12 @@ function parseCliArgs(argv: readonly string[]): ParsedFlags {
             key === 'table' ||
             key === 'sign-key' ||
             key === 'base' ||
-            key === 'restore-to')
+            key === 'restore-to' ||
+            key === 'plan' ||
+            key === 'queue' ||
+            key === 'max-jobs' ||
+            key === 'sql' ||
+            key === 'query')
         ) {
           flags.set(key, next);
           i += 1;
@@ -913,77 +925,21 @@ export async function runCli(
           openCliDatabase,
         });
 
-      case 'sync': {
-        const sourceUri = positional[1];
-        const targetUri = positional[2];
-        if (!sourceUri || !targetUri) {
-          err(
-            'Usage: firebird-wasm sync <source-uri> <target-uri> [--mode auto|native|logical] [--bootstrap logical|binary-image|page-diff] [--direction one-way|bidirectional] [--json]\n',
-          );
-          return 1;
-        }
-        const modeRaw = String(flags.get('mode') ?? 'auto').toLowerCase();
-        const mode: 'auto' | 'native' | 'logical' =
-          modeRaw === 'native' || modeRaw === 'logical' ? modeRaw : 'auto';
-        const bootRaw = String(flags.get('bootstrap') ?? 'logical').toLowerCase();
-        const bootstrapStrategy: BootstrapStrategy =
-          bootRaw === 'binary-image' || bootRaw === 'page-diff' || bootRaw === 'arrow-ipc'
-            ? bootRaw
-            : 'logical';
-        const direction: 'one-way' | 'bidirectional' =
-          String(flags.get('direction') ?? 'one-way').toLowerCase() === 'bidirectional'
-            ? 'bidirectional'
-            : 'one-way';
-
-        const srcManaged = await openCliDatabase(sourceUri, {
+      case 'sync':
+        return runCliSync({
+          positional,
+          flags,
           cwd,
           backend,
-          allowMissing: false,
+          io,
+          out,
+          err,
+          formatCliTable,
+          isSelectLike,
+          isMutatingStatement,
+          loadMigrationsFromDirectory,
+          openCliDatabase,
         });
-        const dstManaged = await openCliDatabase(targetUri, { cwd, backend });
-        try {
-          const handle = await syncDatabases(
-            srcManaged.db as unknown as ReplicableDatabase,
-            dstManaged.db as unknown as ReplicableDatabase,
-            {
-              mode,
-              bootstrapStrategy,
-              direction,
-              live: false,
-            },
-          );
-          try {
-            const cycle = await handle.syncNow();
-            const stats = await handle.stats();
-            const appliedCount =
-              'primaryToReplica' in cycle
-                ? cycle.primaryToReplica.appliedCount
-                : cycle.appliedCount;
-            const summary = {
-              mode: handle.mode,
-              bootstrapStrategy,
-              direction,
-              appliedCount,
-              primaryLsn: stats.primaryLsn,
-              replicaWatermark: stats.replicaWatermark,
-              lagEntries: stats.lagEntries,
-            };
-            if (flags.get('json') === true) {
-              out(`${JSON.stringify(summary, null, 2)}\n`);
-            } else {
-              out(
-                `Synced ${sourceUri} -> ${targetUri} (mode=${summary.mode}, bootstrap=${bootstrapStrategy}, applied=${summary.appliedCount}, LSN=${summary.replicaWatermark}/${summary.primaryLsn})\n`,
-              );
-            }
-          } finally {
-            await handle.stop();
-          }
-        } finally {
-          await dstManaged.flushAndClose(true);
-          await srcManaged.flushAndClose(true);
-        }
-        return 0;
-      }
 
       case 'wal-ship':
         return runCliWalShip(
@@ -1009,133 +965,37 @@ export async function runCli(
           openCliDatabase,
         });
 
-      case 'export-arrow': {
-        const uri = positional[1];
-        const sqlText = positional.slice(2).join(' ').trim();
-        const outFlag = flags.get('out');
-        if (!uri || !sqlText || typeof outFlag !== 'string' || !outFlag.trim()) {
-          err(
-            'Usage: firebird-wasm export-arrow <uri> <sql> --out <file.arrow> [--gzip] [--batch-size <n>] [--json]\n',
-          );
-          return 1;
-        }
-        const outPath = path.resolve(cwd, outFlag);
-        const batchSize = Math.max(
-          1,
-          Number(typeof flags.get('batch-size') === 'string' ? flags.get('batch-size') : 1024) || 1024,
-        );
-        const useGzip = flags.get('gzip') === true || outPath.toLowerCase().endsWith('.gz');
-        fs.mkdirSync(path.dirname(outPath), { recursive: true });
+      case 'export-arrow':
+        return runCliExportArrow({
+          positional,
+          flags,
+          cwd,
+          backend,
+          io,
+          out,
+          err,
+          formatCliTable,
+          isSelectLike,
+          isMutatingStatement,
+          loadMigrationsFromDirectory,
+          openCliDatabase,
+        });
 
-        const managed = await openCliDatabase(uri, { cwd, backend });
-        try {
-          const arrowStream = managed.db.queryArrowStream(sqlText, { batchSize });
-          const rawArrowBytes = await collectArrowStreamBytes(arrowStream);
-          const decoded = decodeArrowIpc(rawArrowBytes);
-          const finalBytes = useGzip
-            ? new Uint8Array(zlib.gzipSync(rawArrowBytes))
-            : rawArrowBytes;
-          fs.writeFileSync(outPath, finalBytes);
-
-          if (flags.get('json') === true) {
-            out(
-              `${JSON.stringify(
-                {
-                  out: outPath,
-                  rows: decoded.rowCount,
-                  columns: decoded.fields.map((f) => f.name),
-                  bytes: finalBytes.byteLength,
-                  gzip: useGzip,
-                },
-                null,
-                2,
-              )}\n`,
-            );
-          } else {
-            out(
-              `Exported ${decoded.rowCount} row(s) (${finalBytes.byteLength} bytes${useGzip ? ', gzip' : ''}) to ${outPath}\n`,
-            );
-          }
-        } finally {
-          await managed.flushAndClose(false);
-        }
-        return 0;
-      }
-
-      case 'import-arrow': {
-        const uri = positional[1];
-        const tableName = positional[2]?.trim();
-        const inFlag = flags.get('in');
-        if (!uri || !tableName || typeof inFlag !== 'string' || !inFlag.trim()) {
-          err(
-            'Usage: firebird-wasm import-arrow <uri> <table> --in <file.arrow> [--gzip] [--create-table] [--pk <col>] [--upsert] [--json]\n',
-          );
-          return 1;
-        }
-        const inPath = path.resolve(cwd, inFlag);
-        if (!fs.existsSync(inPath)) {
-          err(`Input Arrow file not found: ${inPath}\n`);
-          return 1;
-        }
-        const rawBuf = fs.readFileSync(inPath);
-        const isGzip =
-          flags.get('gzip') === true ||
-          (rawBuf.byteLength >= 2 && rawBuf[0] === 0x1f && rawBuf[1] === 0x8b);
-        const unpacked = isGzip ? zlib.gunzipSync(rawBuf) : rawBuf;
-        const arrowBytes = new Uint8Array(
-          unpacked.buffer,
-          unpacked.byteOffset,
-          unpacked.byteLength,
-        );
-
-        const pkFlag = flags.get('pk');
-        const primaryKey =
-          typeof pkFlag === 'string' && pkFlag.trim()
-            ? pkFlag
-                .split(',')
-                .map((s) => s.trim())
-                .filter(Boolean)
-            : undefined;
-        const createTable = flags.get('create-table') === true;
-        const upsert = flags.get('upsert') === true;
-        const batchSize = Math.max(
-          1,
-          Number(typeof flags.get('batch-size') === 'string' ? flags.get('batch-size') : 1000) || 1000,
-        );
-
-        const managed = await openCliDatabase(uri, { cwd, backend });
-        try {
-          const result = await managed.db.loadArrowIpc(tableName, arrowBytes, {
-            createTable,
-            primaryKey,
-            upsertMatching: upsert ? (primaryKey ?? true) : undefined,
-            batchSize,
-          });
-          if (flags.get('json') === true) {
-            out(
-              `${JSON.stringify(
-                {
-                  table: result.tableName,
-                  rowsIngested: result.rowsIngested,
-                  batchesExecuted: result.batchesExecuted,
-                  bytesProcessed: result.bytesProcessed,
-                  tableCreated: result.tableCreated,
-                  columns: result.columns,
-                },
-                null,
-                2,
-              )}\n`,
-            );
-          } else {
-            out(
-              `Imported ${result.rowsIngested} row(s) into ${result.tableName} (${result.batchesExecuted} batch(es))\n`,
-            );
-          }
-        } finally {
-          await managed.flushAndClose(true);
-        }
-        return 0;
-      }
+      case 'import-arrow':
+        return runCliImportArrow({
+          positional,
+          flags,
+          cwd,
+          backend,
+          io,
+          out,
+          err,
+          formatCliTable,
+          isSelectLike,
+          isMutatingStatement,
+          loadMigrationsFromDirectory,
+          openCliDatabase,
+        });
 
       case 'schema-diff':
         return runCliSchemaDiff({
@@ -1239,6 +1099,42 @@ export async function runCli(
           io,
           out,
           err,
+          openCliDatabase,
+        });
+
+      case 'worker':
+        return runCliWorker({
+          positional,
+          flags,
+          cwd,
+          backend,
+          out,
+          err,
+          formatCliTable,
+          openCliDatabase,
+        });
+
+      case 'migrate-online':
+        return runCliMigrateOnline({
+          positional,
+          flags,
+          cwd,
+          backend,
+          out,
+          err,
+          formatCliTable,
+          openCliDatabase,
+        });
+
+      case 'advise':
+        return runCliAdvise({
+          positional,
+          flags,
+          cwd,
+          backend,
+          out,
+          err,
+          formatCliTable,
           openCliDatabase,
         });
 

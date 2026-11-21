@@ -5,15 +5,11 @@
 import { DirectTransport, type EngineHandle, type EngineTransport } from './engine-transport';
 import { extractMutatedTables } from './live-tables';
 import {
-  BLOB_INTERNAL_DATA,
-  type InternalBlobHandle,
-  buildBlobReadableStream,
-  buildBlobWritableStream,
-  createBlobHandle,
-  isBlobHandle,
-  resolveBlobColumnIndex,
-  resolveBlobSegmentSize,
-} from './blob-stream';
+  createBrowserTxBlobStream,
+  openBrowserTxBlobStream,
+  streamBrowserTxQuery,
+  type BrowserTxStreamHost,
+} from './firebird-browser-tx-streams';
 import { buildCopyToStream, executeCopyFromStream } from './copy-stream';
 import { applyTypes, applySerializers, type TypeOptions } from './value-types';
 import { toStatement, resolveQueryCall, resolveBatchSize } from '../sql-tag';
@@ -22,7 +18,6 @@ import type { UdrManager } from './udr';
 import {
   type ArrayModeOptions,
   assertNotAborted,
-  createTimeoutError,
   type FirebirdTransactionClient,
   runWithCancellation,
   type UnifiedExecuteResult,
@@ -957,83 +952,34 @@ export class FirebirdBrowserTransaction implements FirebirdTransactionClient {
     return buildCopyToStream(this, tableOrQuery, paramsOrOptions, maybeOptions);
   }
 
-  /**
-   * Create a segmented writable BLOB stream (`WritableStream<Uint8Array>`)
-   * inside this transaction backed by Firebird `IBlob::putSegment`.
-   */
+  private get txStreamHost(): BrowserTxStreamHost {
+    return {
+      engine: this.engine,
+      dbHandle: this.dbHandle,
+      txHandle: this.txHandle,
+      types: this.types,
+      get isFinished() {
+        return false;
+      },
+      assertUsable: () => this.assertUsable(),
+      applyOneShotTimeout: (t) => this.applyOneShotTimeout(t),
+      cancelOperation: () => this.cancelOperation(),
+      describeQuery: (s) => this.describeQuery(s),
+      queryArray: (s, p) => this.query(s, p, { rowMode: 'array' }),
+      queryFull: <R>(s: string, p: QueryParams, o: QueryOptions<R>) =>
+        this.query(s, p, o as QueryOptions<Row>) as Promise<QueryResult<R>>,
+    };
+  }
+
   async createBlobStream(
     options: BlobStreamOptions = {},
   ): Promise<BlobWritableStream> {
-    this.assertUsable();
-    resolveBlobSegmentSize(options.segmentSize, true);
-
-    if (
-      typeof this.engine.blobCreate === 'function' &&
-      typeof this.engine.blobPutSegment === 'function' &&
-      typeof this.engine.blobClose === 'function'
-    ) {
-      const { blobHandle, blobId } = await this.engine.blobCreate(
-        this.dbHandle,
-        this.txHandle,
-      );
-      return buildBlobWritableStream(
-        {
-          writeSegment: async (segment) => {
-            this.assertUsable();
-            await this.engine.blobPutSegment!(blobHandle, segment);
-          },
-          close: async (totalBytes) => {
-            this.assertUsable();
-            const finalId = await this.engine.blobClose!(blobHandle, false);
-            return createBlobHandle(
-              finalId.byteLength === 8 ? finalId : blobId,
-              totalBytes,
-            );
-          },
-          abort: async () => {
-            if (!this.finished) {
-              await this.engine
-                .blobClose!(blobHandle, true)
-                .catch(() => undefined);
-            }
-          },
-        },
-        options,
-      );
-    }
-
-    const chunks: Uint8Array[] = [];
-    return buildBlobWritableStream(
-      {
-        writeSegment: async (segment) => {
-          this.assertUsable();
-          chunks.push(segment.slice());
-        },
-        close: async (totalBytes) => {
-          this.assertUsable();
-          const stagedBytes = new Uint8Array(totalBytes);
-          let pos = 0;
-          for (const c of chunks) {
-            stagedBytes.set(c, pos);
-            pos += c.byteLength;
-          }
-          return createBlobHandle(new Uint8Array(8), totalBytes, {
-            stagedBytes,
-          });
-        },
-        abort: async () => {
-          chunks.length = 0;
-        },
-      },
+    return createBrowserTxBlobStream(
+      { ...this.txStreamHost, isFinished: this.finished },
       options,
     );
   }
 
-  /**
-   * Open a Firebird `BLOB` column (from a `SELECT` query or a {@link BlobHandle})
-   * inside this transaction as a segmented Web `ReadableStream<Uint8Array>`
-   * backed by `IBlob::getSegment`.
-   */
   async openBlobStream(
     handle: BlobHandle,
     options?: BlobStreamOptions,
@@ -1052,127 +998,11 @@ export class FirebirdBrowserTransaction implements FirebirdTransactionClient {
     paramsOrOptions: QueryParams | BlobStreamOptions = [],
     maybeOptions: BlobStreamOptions = {},
   ): Promise<ReadableStream<Uint8Array>> {
-    this.assertUsable();
-
-    if (isBlobHandle(sqlOrHandle)) {
-      const opts = Array.isArray(paramsOrOptions) ? maybeOptions : paramsOrOptions;
-      resolveBlobSegmentSize(opts.segmentSize, false);
-    const stagingId = (sqlOrHandle as InternalBlobHandle)[BLOB_INTERNAL_DATA]?.stagedBytes;
-      const staged = stagingId;
-      if (staged || typeof this.engine.blobOpenId !== 'function') {
-        const bytes = staged ?? new Uint8Array(0);
-        let offset = 0;
-        return buildBlobReadableStream(
-          {
-            readSegment: async (maxBytes) => {
-              this.assertUsable();
-              if (offset >= bytes.byteLength) return null;
-              const end = Math.min(offset + maxBytes, bytes.byteLength);
-              const slice = bytes.slice(offset, end);
-              offset = end;
-              return slice;
-            },
-            close: async () => undefined,
-          },
-          opts,
-        );
-      }
-
-      const blobHandle = await this.engine.blobOpenId(
-        this.dbHandle,
-        this.txHandle,
-        sqlOrHandle.blobId,
-      );
-      return buildBlobReadableStream(
-        {
-          readSegment: async (maxBytes) => {
-            this.assertUsable();
-            return this.engine.blobGetSegment!(blobHandle, maxBytes);
-          },
-          close: async () => {
-            if (!this.finished) {
-              await this.engine.blobClose!(blobHandle, false);
-            }
-          },
-        },
-        opts,
-      );
-    }
-
-    const { statement, options } = resolveQueryCall<BlobStreamOptions>(
+    return openBrowserTxBlobStream(
+      { ...this.txStreamHost, isFinished: this.finished },
       sqlOrHandle,
       paramsOrOptions,
       maybeOptions,
-    );
-    resolveBlobSegmentSize(options.segmentSize, false);
-
-    let colIndex = 0;
-    if (options.column !== undefined) {
-      const desc = await this.describeQuery(statement.sql);
-      colIndex = resolveBlobColumnIndex(
-        options.column,
-        desc.fields.map((f) => f.name),
-      );
-    }
-
-    if (
-      typeof this.engine.blobOpenQuery === 'function' &&
-      typeof this.engine.blobGetSegment === 'function' &&
-      typeof this.engine.blobClose === 'function'
-    ) {
-      const blobHandle = await this.engine.blobOpenQuery(
-        this.dbHandle,
-        this.txHandle,
-        statement.sql,
-        applySerializers(statement.params, this.types?.serializers),
-        colIndex,
-      );
-      return buildBlobReadableStream(
-        {
-          readSegment: async (maxBytes) => {
-            this.assertUsable();
-            return this.engine.blobGetSegment!(blobHandle, maxBytes);
-          },
-          close: async () => {
-            if (!this.finished) {
-              await this.engine.blobClose!(blobHandle, false);
-            }
-          },
-        },
-        options,
-      );
-    }
-
-    const res = await this.query(statement.sql, statement.params, {
-      rowMode: 'array',
-    });
-    if (res.rows.length === 0) {
-      throw new Error('openBlobStream: query returned no rows');
-    }
-    const cell = res.rows[0]![colIndex];
-    if (cell === null || cell === undefined) {
-      throw new Error('openBlobStream: BLOB column value is NULL');
-    }
-    const bytes =
-      cell instanceof Uint8Array
-        ? cell
-        : typeof cell === 'string'
-          ? new TextEncoder().encode(cell)
-          : new Uint8Array(0);
-    let offset = 0;
-    return buildBlobReadableStream(
-      {
-        readSegment: async (maxBytes) => {
-          this.assertUsable();
-          if (offset >= bytes.byteLength) return null;
-          const end = Math.min(offset + maxBytes, bytes.byteLength);
-          const slice = bytes.slice(offset, end);
-          offset = end;
-          return slice;
-        },
-        close: async () => undefined,
-      },
-      options,
     );
   }
 
@@ -1215,107 +1045,26 @@ export class FirebirdBrowserTransaction implements FirebirdTransactionClient {
     );
   }
 
-  private async *streamQuery<T>(
+  private streamQuery<T>(
     statement: Statement,
     rowMode: RowMode,
     batchSize: number,
     stmtHandle?: EngineHandle,
     execOptions: StatementExecutionOptions = {},
   ): AsyncIterableIterator<QueryResult<T>> {
-    this.assertUsable();
-    assertNotAborted(execOptions.signal);
-    const totalTimeoutMs = validateTimeoutMs(execOptions.timeoutMs);
-    const deadline =
-      totalTimeoutMs && totalTimeoutMs > 0
-        ? Date.now() + totalTimeoutMs
-        : undefined;
-    const stepOptions = (): StatementExecutionOptions => ({
-      signal: execOptions.signal,
-      timeoutMs:
-        deadline !== undefined ? Math.max(1, deadline - Date.now()) : undefined,
-    });
-
-    if (
-      typeof this.engine.cursorOpen !== 'function' ||
-      typeof this.engine.cursorFetch !== 'function' ||
-      typeof this.engine.cursorClose !== 'function'
-    ) {
-      const full = (await this.query(statement.sql, statement.params, {
-        rowMode,
-        signal: execOptions.signal,
-        timeoutMs: execOptions.timeoutMs,
-      })) as QueryResult<T>;
-      for (let i = 0; i < full.rows.length; i += batchSize) {
-        assertNotAborted(execOptions.signal);
-        if (deadline !== undefined && Date.now() >= deadline) {
-          throw createTimeoutError(totalTimeoutMs!);
-        }
-        yield {
-          rows: full.rows.slice(i, i + batchSize),
-          fields: full.fields.map((f) => ({ ...f })),
-        };
-      }
-      return;
-    }
-
-    const binaryBlobs = this.types?.binary === true;
-    const serialized = applySerializers(statement.params, this.types?.serializers);
-    let cursorHandle = await runWithCancellation(
-      async () => {
-        await this.applyOneShotTimeout(totalTimeoutMs);
-        return stmtHandle &&
-          stmtHandle > 0 &&
-          typeof this.engine.cursorOpenStmt === 'function'
-          ? this.engine.cursorOpenStmt(
-              this.dbHandle,
-              this.txHandle,
-              stmtHandle,
-              serialized,
-            )
-          : this.engine.cursorOpen!(
-              this.dbHandle,
-              this.txHandle,
-              statement.sql,
-              serialized,
-            );
+    const checkFinished = () => this.isFinished;
+    return streamBrowserTxQuery<T>(
+      {
+        ...this.txStreamHost,
+        get isFinished() {
+          return checkFinished();
+        },
       },
-      stepOptions(),
-      () => this.cancelOperation(),
+      statement,
+      rowMode,
+      batchSize,
+      stmtHandle,
+      execOptions,
     );
-
-    try {
-      while (true) {
-        this.assertUsable();
-        assertNotAborted(execOptions.signal);
-        if (deadline !== undefined && Date.now() >= deadline) {
-          throw createTimeoutError(totalTimeoutMs!);
-        }
-        const batch = await runWithCancellation(
-          () =>
-            this.engine.cursorFetch!<T>(
-              cursorHandle,
-              batchSize,
-              rowMode,
-              binaryBlobs,
-            ),
-          stepOptions(),
-          () => this.cancelOperation(),
-        );
-        if (batch.rows.length === 0) {
-          break;
-        }
-        yield applyTypes(batch, this.types, rowMode);
-      }
-
-      const toClose = cursorHandle;
-      cursorHandle = 0;
-      if (!this.isFinished) {
-        await this.engine.cursorClose(toClose);
-      }
-    } finally {
-      if (cursorHandle !== 0) {
-        await this.engine.cursorClose(cursorHandle).catch(() => undefined);
-      }
-    }
   }
 }

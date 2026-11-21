@@ -494,3 +494,71 @@ export class BrowserPersistScheduler {
     removeEventListener('pagehide', this.onPageHide);
   }
 }
+
+export async function reopenBrowserDatabaseAfterEngineChange(ctx: {
+  isClosed: () => boolean;
+  setDbHandle: (h: EngineHandle) => void;
+  engine: EngineTransport;
+  dbPath: string;
+  mayPersist: boolean;
+  exportStored: () => Promise<Uint8Array>;
+  options: FirebirdBrowserOptions;
+  onError: (err: Error) => void;
+}): Promise<void> {
+  if (ctx.isClosed()) return;
+  ctx.setDbHandle(0);
+  try {
+    const handle = await openBrowserDatabaseFile({
+      engine: ctx.engine,
+      dbPath: ctx.dbPath,
+      mayPersist: ctx.mayPersist,
+      exportStored: ctx.exportStored,
+      loadDataDir: ctx.options.loadDataDir,
+      loadDataStream: ctx.options.loadDataStream,
+      sharedReads: ctx.options.sharedReads,
+    });
+    ctx.setDbHandle(handle);
+  } catch (err) {
+    ctx.onError(
+      err instanceof Error
+        ? err
+        : new Error(`could not reopen after a leadership change: ${String(err)}`),
+    );
+  }
+}
+
+export async function closeBrowserDatabaseFull(ctx: {
+  cancelScheduledPersist: () => void;
+  detachLifecycle: () => void;
+  getPersistInFlight: () => Promise<void> | null;
+  preparedStatements: Set<PreparedStatement>;
+  liveQueries: Set<{ unsubscribe(): Promise<void> }>;
+  markClosedAndClear: () => void;
+  getDbHandle: () => EngineHandle;
+  resetDbHandle: () => void;
+  persist: () => Promise<void>;
+  engine: EngineTransport;
+  dbPath: string;
+  opfs: boolean;
+  ephemeral: boolean;
+  closeVfs: () => Promise<void>;
+  releaseLock: () => Promise<void>;
+}): Promise<void> {
+  return teardownBrowserDatabase({
+    cancelScheduledPersist: ctx.cancelScheduledPersist,
+    detachLifecycleListeners: ctx.detachLifecycle,
+    getPersistInFlight: ctx.getPersistInFlight,
+    preparedStatements: ctx.preparedStatements,
+    liveQueries: ctx.liveQueries,
+    markClosedAndClear: ctx.markClosedAndClear,
+    getDbHandle: ctx.getDbHandle,
+    resetDbHandle: ctx.resetDbHandle,
+    persist: ctx.persist,
+    engine: ctx.engine,
+    dbPath: ctx.dbPath,
+    opfs: ctx.opfs,
+    ephemeral: ctx.ephemeral,
+    closeVfs: ctx.closeVfs,
+    releaseLock: ctx.releaseLock,
+  });
+}

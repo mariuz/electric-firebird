@@ -2001,6 +2001,35 @@ Next-horizon improvements across **Replication**, **Speed & Performance**, **Int
 
 ---
 
+### M28 — Durable Transactional Job Queue & Workflows, Property Graph & GraphRAG Engine, Zero-Downtime Online Schema Migrations, Adaptive Index Advisor & Sub-1,200-Line Module Split
+
+- [x] **1. Durable Transactional Job Queue, Cron Scheduler & Crash-Safe Agent Workflows (`createJobQueue` & CLI `npx firebird-wasm worker`).**
+      Add a zero-dependency ACID background job queue & checkpointed workflow engine backed by `FB_JOB_QUEUE$`, `FB_JOB_DLQ$`,
+      `FB_JOB_SCHEDULES$`, and `FB_WORKFLOW_STEPS$` with atomic lease acquisition, `dedupeKey` idempotency, exponential backoff,
+      5-field cron + `@every` scheduling, instant `POST_EVENT` worker wakeups, crash-safe `runWorkflow()` step replay, and CLI
+      `npx firebird-wasm worker <uri>`.
+- [x] **2. Property Graph & Knowledge-GraphRAG Engine over Recursive CTEs + HNSW (`createKnowledgeGraph` & `graphRagSearch`).**
+      Add relational property graphs (`FB_GRAPH_NODES`, `FB_GRAPH_EDGES`) powered by Firebird `WITH RECURSIVE` cycle-safe SQL
+      traversal (`neighbors`, `shortestPath`, `pageRank`, Cypher-lite `matchPattern`), plus `graphRagSearch()` (and MCP
+      `graph_search`) expanding hybrid vector/BM25 seed entities across multi-hop graph edges into citation-packed `packRagContext`
+      output.
+- [x] **3. Zero-Downtime Online Schema Migrations (Expand / Backfill / Contract) (`createOnlineMigrator` & CLI `npx firebird-wasm migrate-online`).**
+      Add a declarative multi-phase online schema migration engine (`expand`, `backfill`, `verifyParity`, `contract`, `rollback`,
+      `runAll`) installing bidirectional Firebird PSQL dual-write triggers during live migrations, backfilling in throttled keyset
+      batches without stalling concurrent reads/sync, verifying parity, and exposing CLI `npx firebird-wasm migrate-online`.
+- [x] **4. Adaptive Index Advisor, Workload Analyzer & Slow-Query Diagnostics (`createWorkloadAdvisor` & CLI `npx firebird-wasm advise`).**
+      Combine `db.onQuery()` telemetry, `db.explain()` / `parseQueryPlan()`, and `RDB$INDICES` / foreign-key catalog inspection
+      to detect `NATURAL` full-table scans, unindexed foreign keys, redundant prefix indexes, and high fetch-to-row amplification,
+      emitting ranked `CREATE INDEX`, `DROP INDEX`, and `SET STATISTICS INDEX` recommendations via API, MCP (`advise_workload`),
+      and CLI `npx firebird-wasm advise <uri>`.
+- [x] **5. `<firebird-repl>` Index Advisor & Job Queue Inspector, Simulator Scenario 22 & Sub-1,200-Line Module Split.**
+      Surface 1-click **Index Advisor** DDL recommendations and live `FB_JOB_QUEUE$` telemetry inside `<firebird-repl>`
+      (`repl.adviseWorkload()`, `repl.jobQueueStats()`), add Simulator **Scenario 22** (`job-queue-graphrag-online-migrate-advisor`),
+      and decompose all 14 source files in the `1,200–1,333` line band so every non-test `.ts` source file across the repository
+      sits strictly under 1,200 lines.
+
+---
+
 ## 5. Test coverage added alongside this review
 
 `src/browser/` was excluded from Jest and had no browser tests.  It now has 73

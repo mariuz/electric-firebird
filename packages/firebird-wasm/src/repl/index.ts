@@ -1,26 +1,5 @@
 /**
- * firebird-wasm/repl – an interactive SQL console as a custom element.
- *
- * ```js
- * import { defineFirebirdRepl } from 'firebird-wasm/repl';
- *
- * defineFirebirdRepl();                       // registers <firebird-repl>
- * document.querySelector('firebird-repl').db = db;
- * ```
- *
- * A custom element, so it works the same in plain pages, React and Vue: give
- * it a database through its `db` property.  Type SQL, run it with
- * Ctrl+Enter (⌘+Enter on a Mac) or the Run button; a script runs statement by
- * statement (`SET TERM` included) and stops at the first error.  ArrowUp on
- * the first line and ArrowDown on the last walk the history.
- *
- * Every value is written as text, never as HTML, so a row cannot inject
- * markup into the page.  The element draws in its own shadow root; colours
- * follow `color-scheme` and can be set with `--firebird-repl-*` properties.
- *
- * Nothing runs on import: the class is made by {@link defineFirebirdRepl},
- * so importing this module where there is no DOM (Node, server rendering) is
- * harmless.
+ * firebird-wasm/repl – Interactive SQL console & database inspector custom element (`<firebird-repl>`).
  */
 
 import {
@@ -34,21 +13,15 @@ import {
 } from './plan-tree';
 import type {
   AppliedMigration,
-  ArrayRow,
-  DatabaseInfo,
   ExplainOptions,
-  FieldInfo,
   IntrospectOptions,
   MigrateOptions,
   MonitorStats,
-  QueryResult,
   SchemaIntrospection,
-  SweepResult,
 } from '../types';
 import type { ReplicationStats } from '../replication';
-import type { ColumnarQueryResult } from '../columnar';
 import type { SyncHandleLike } from '../frameworks/sync-store';
-import type { OptimisticMutationStore, OptimisticStoreSnapshot } from '../optimistic-store';
+import type { OptimisticMutationStore } from '../optimistic-store';
 import type { UndoRedoEntry, UndoRedoManager } from '../undo-redo';
 import type { MaterializedViewInfo } from '../materialized-view';
 import type { DeclarativeSchemaInput, SchemaSyncResult } from '../schema-sync';
@@ -56,7 +29,18 @@ import type { AuditChainVerificationResult, AuditSignAlgorithm } from '../audit-
 import type { McpToolDescriptor } from '../mcp-server';
 import type { PresenceRoom } from '../replication/presence';
 import type { ReplSearchIndexSummary } from './repl-actions';
+import type {
+  JobQueueStats,
+  ReplArrowInspectorInfo,
+  ReplDatabase,
+  ReplEditableTableConfig,
+  ReplEntry,
+  ReplInspectorTab,
+  ReplReplicationInfo,
+  WorkloadAdvisorReport,
+} from './repl-types';
 
+export * from './repl-types';
 export type { ReplSearchIndexSummary } from './repl-actions';
 export type { AuditChainVerificationResult } from '../audit-log';
 export type { McpToolDescriptor } from '../mcp-server';
@@ -70,170 +54,6 @@ export {
   type PlanTreeNode,
   type TableIoStats,
 };
-
-/** Active tab in the `<firebird-repl>` Schema Inspector, Migration Viewer, Profiler, Query Plan Explorer, Replication & Sync/Arrow Inspector sidebar. */
-export type ReplInspectorTab =
-  | 'schema'
-  | 'migrations'
-  | 'profiler'
-  | 'plan'
-  | 'replication'
-  | 'arrow'
-  | 'outbox';
-
-export interface ReplEditableTableConfig {
-  readonly table: string;
-  readonly primaryKey?: string;
-}
-
-/** Columnar vector & Apache Arrow IPC stream summary displayed in `<firebird-repl>` (`M20 Item 4`). */
-export interface ReplArrowInspectorInfo {
-  readonly sql: string;
-  readonly rowCount: number;
-  readonly arrowIpcBytes: number;
-  readonly vectors: ReadonlyArray<{
-    readonly name: string;
-    readonly kind: string;
-    readonly sqlType: string;
-    readonly nullCount: number;
-    readonly bufferBytes: number;
-  }>;
-  readonly syncState?: {
-    readonly state: string;
-    readonly mode: string;
-    readonly paused: boolean;
-    readonly lagEntries: number;
-    readonly replicaLsn: number;
-    readonly primaryLsn: number;
-  } | null;
-}
-
-/** Replication slot summary displayed in the `<firebird-repl>` Replication Inspector. */
-export interface ReplReplicationSlotInfo {
-  readonly slotName: string;
-  readonly nodeId: string;
-  readonly confirmedFlushLsn: number;
-  readonly updatedAt: string;
-}
-
-/** Subscriber watermark summary displayed in the `<firebird-repl>` Replication Inspector. */
-export interface ReplReplicationWatermarkInfo {
-  readonly peerId: string;
-  readonly lastLsn: number;
-  readonly updatedAt: string;
-}
-
-/** Recent journal entry summary displayed in the `<firebird-repl>` Replication Inspector. */
-export interface ReplReplicationJournalEntrySummary {
-  readonly lsn: number;
-  readonly originNode: string;
-  readonly tableName: string;
-  readonly op: string;
-  readonly pkJson: string;
-  readonly createdAt: string;
-}
-
-/** Quarantined Dead-Letter Queue (`FB_REPL_DLQ$`) entry summary displayed in the `<firebird-repl>` Replication Inspector. */
-export interface ReplReplicationDlqEntrySummary {
-  readonly lsn: number;
-  readonly subName: string;
-  readonly errorMessage: string;
-  readonly retryCount: number;
-  readonly quarantinedAt: string;
-}
-
-/** Native Firebird engine `RDB$PUBLICATIONS` / `RDB$PUBLICATION_TABLES` catalog summary displayed in `<firebird-repl>`. */
-export interface ReplEnginePublicationInfo {
-  readonly name: string;
-  readonly active: boolean;
-  readonly autoEnable: boolean;
-  readonly publishedTables: readonly string[];
-  readonly replicaMode: string | null;
-  readonly replicationSequence: number | null;
-}
-
-/** Structured replication state returned by `el.replication()` in `<firebird-repl>`. */
-export interface ReplReplicationInfo {
-  readonly journalTableExists: boolean;
-  readonly journalEntryCount: number;
-  readonly minJournalLsn: number;
-  readonly maxJournalLsn: number;
-  readonly slots: ReplReplicationSlotInfo[];
-  readonly watermarks: ReplReplicationWatermarkInfo[];
-  readonly recentEntries: ReplReplicationJournalEntrySummary[];
-  readonly dlqTableExists?: boolean;
-  readonly dlqEntryCount?: number;
-  readonly dlqEntries?: ReplReplicationDlqEntrySummary[];
-  readonly enginePublication?: ReplEnginePublicationInfo | null;
-  readonly liveStats?: ReplicationStats | null;
-}
-
-/** What the console needs of a database: `FirebirdBrowser` has it. */
-export interface ReplDatabase {
-  query(
-    sql: string,
-    params: unknown[],
-    options: { rowMode: 'array' },
-  ): Promise<QueryResult<ArrayRow>>;
-  /** Whether a statement yields rows, before running it. */
-  describeQuery(sql: string): Promise<{ hasResultSet: boolean }>;
-  /** Return the execution plan for `sql` without running it. */
-  explain?(sql: string, options?: ExplainOptions): Promise<string>;
-  /** Inspect database diagnostics and transaction counters. */
-  databaseInfo?(): Promise<DatabaseInfo>;
-  /** Trigger an immediate garbage-collection sweep and return before/after diagnostics. */
-  sweep?(): Promise<SweepResult>;
-  /** Introspect database tables, views, columns, keys, indexes, sequences, and triggers. */
-  introspect?(options?: IntrospectOptions): Promise<SchemaIntrospection>;
-  /** Inspect cumulative query telemetry, page I/O counters, and `MON$` state. */
-  monitorStats?(): Promise<MonitorStats>;
-  /** Reset cumulative query telemetry counters. */
-  resetMonitorStats?(): void;
-  /** Optional zero-copy columnar query execution (`M19 Item 2` / `M20 Item 4`). */
-  queryColumnar?(sql: string, params?: unknown[]): Promise<ColumnarQueryResult>;
-  /** Optional Apache Arrow IPC V5 query execution (`M19 Item 2` / `M20 Item 4`). */
-  queryArrow?(sql: string, params?: unknown[]): Promise<Uint8Array>;
-  /** Optional zero-copy Apache Arrow IPC V5 ingestion (`M22 Item 2` / `M22 Item 4`). */
-  loadArrowIpc?(
-    tableName: string,
-    source: ArrowIngestSource,
-    options?: LoadArrowIpcOptions,
-  ): Promise<ArrowIngestResult>;
-  execBatch?(sql: string, rows: unknown[][]): Promise<{ affectedRows: number } | void>;
-  execute?(sql: string, params?: unknown[]): Promise<{ affectedRows: number }>;
-  listMaterializedViews?(): Promise<MaterializedViewInfo[]>;
-  /**
-   * For a statement without rows: a transaction's `exec()` runs exactly one
-   * statement and reports what it changed.  (`FirebirdBrowser.exec()` would
-   * split the statement again, cutting a PSQL body at its semicolons.)
-   */
-  transaction<T>(
-    fn: (tx: { exec(sql: string): Promise<{ affectedRows: number }> }) => Promise<T>,
-  ): Promise<T>;
-}
-
-/** One statement the console ran, as it reports it in `firebird-repl-run`. */
-export interface ReplEntry {
-  sql: string;
-  /** 1-based line of the statement in what was run. */
-  line: number;
-  /** Milliseconds the statement took. */
-  ms: number;
-  fields?: FieldInfo[];
-  rows?: ArrayRow[];
-  affectedRows?: number;
-  plan?: string;
-  planTree?: ParsedQueryPlan;
-  info?: DatabaseInfo;
-  sweep?: SweepResult;
-  schema?: SchemaIntrospection;
-  migrations?: AppliedMigration[];
-  stats?: MonitorStats;
-  replication?: ReplReplicationInfo;
-  arrow?: ReplArrowInspectorInfo;
-  outbox?: OptimisticStoreSnapshot;
-  error?: Error;
-}
 
 /** The element's own API, beyond HTMLElement's. */
 export interface FirebirdReplElement extends HTMLElement {
@@ -322,6 +142,10 @@ export interface FirebirdReplElement extends HTMLElement {
   mcpTools(options?: { allowWrites?: boolean }): McpToolDescriptor[];
   /** Export OpenMetrics / Prometheus exposition text and render preview in the Profiler Inspector (`M27 Item 5`). */
   prometheusMetrics(): Promise<string>;
+  /** Analyze recent/explicit queries and catalog indexes, surfacing DDL recommendations in the Profiler Inspector (`M28 Item 5`). */
+  adviseWorkload(extraQueries?: readonly string[]): Promise<WorkloadAdvisorReport | null>;
+  /** Inspect durable `FB_JOB_QUEUE$` background job, DLQ, and cron schedule counts (`M28 Item 5`). */
+  jobQueueStats(): Promise<JobQueueStats | null>;
   /** Toggle (or switch to `tab` in) the interactive Schema Inspector, Migration Viewer, Profiler & Plan Explorer sidebar. */
   toggleInspector(tab?: ReplInspectorTab): Promise<void>;
   /** Refresh the interactive Schema Inspector, Migration Viewer, Profiler & Plan Explorer sidebar from the database. */
@@ -360,7 +184,9 @@ import {
 import { renderReplEntryBlock } from './repl-entry-renderer';
 import {
   executeReplVerifyAuditChain,
+  executeReplWorkloadAdvisor,
   exportReplPrometheusMetrics,
+  fetchReplJobQueueStats,
   getReplMcpTools,
   runReplBusyDiagnostic,
 } from './repl-presence-audit';
@@ -387,6 +213,8 @@ export function defineFirebirdRepl(
     private unsubPresence: (() => void) | null = null;
     private lastAuditReport: AuditChainVerificationResult | null = null;
     private lastPrometheusText: string | null = null;
+    private lastAdvisorReport: WorkloadAdvisorReport | null = null;
+    private lastJobQueueStats: JobQueueStats | null = null;
     private editableCfg: ReplEditableTableConfig | null = null;
     private readonly output: HTMLDivElement;
     private readonly inspector: HTMLDivElement;
@@ -730,6 +558,9 @@ export function defineFirebirdRepl(
           this.lastMigrations = await this.fetchMigrations();
         } else if (this.activeTab === 'profiler' || this.activeTab === 'plan') {
           this.lastStats = await this.fetchStats();
+          if (this.activeTab === 'profiler') {
+            this.lastJobQueueStats = await fetchReplJobQueueStats(this.db);
+          }
         } else if (this.activeTab === 'replication') {
           this.lastReplication = await this.fetchReplication();
           this.lastAuditReport = await executeReplVerifyAuditChain(this.db);
@@ -784,6 +615,8 @@ export function defineFirebirdRepl(
         lastAuditReport: this.lastAuditReport,
         mcpTools: getReplMcpTools(this.db),
         lastPrometheusText: this.lastPrometheusText,
+        lastAdvisorReport: this.lastAdvisorReport,
+        lastJobQueueStats: this.lastJobQueueStats,
         onResetProfiler: () => {
           if (this.db && typeof this.db.resetMonitorStats === "function") {
             this.db.resetMonitorStats();
@@ -795,6 +628,13 @@ export function defineFirebirdRepl(
         },
         onExportPrometheus: () => {
           void this.prometheusMetrics();
+        },
+        onRunAdvisor: () => {
+          void this.adviseWorkload();
+        },
+        onLoadAdvisorSql: (ddl) => {
+          this.editor.value = ddl;
+          this.editor.focus();
         },
         onFlushOutbox: () => {
           if (this.optStoreRef) {
@@ -1036,6 +876,7 @@ export function defineFirebirdRepl(
           entry.stats = stats;
           this.lastStats = stats;
         }
+        this.lastJobQueueStats = await fetchReplJobQueueStats(this.db!);
         this.activeTab = 'profiler';
         this.updateActiveTabButtons();
         this.inspectorOpen = true;
@@ -1286,6 +1127,35 @@ export function defineFirebirdRepl(
       this.inspectorOpen = true;
       await this.refreshInspector();
       return text;
+    }
+
+    async adviseWorkload(
+      extraQueries: readonly string[] = [],
+    ): Promise<WorkloadAdvisorReport | null> {
+      if (!this.db) return null;
+      const queries =
+        extraQueries.length > 0
+          ? extraQueries
+          : this.editor.value.trim()
+            ? [this.editor.value.trim()]
+            : [];
+      const report = await executeReplWorkloadAdvisor(this.db, queries);
+      this.lastAdvisorReport = report;
+      this.activeTab = 'profiler';
+      this.updateActiveTabButtons();
+      this.inspectorOpen = true;
+      await this.refreshInspector();
+      return report;
+    }
+
+    async jobQueueStats(): Promise<JobQueueStats | null> {
+      if (!this.db) return null;
+      const st = await fetchReplJobQueueStats(this.db);
+      this.lastJobQueueStats = st;
+      if (this.isInspectorOpen && this.activeTab === 'profiler') {
+        this.renderInspector();
+      }
+      return st;
     }
 
     private onKey(event: KeyboardEvent): void {

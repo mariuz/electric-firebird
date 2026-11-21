@@ -15,6 +15,8 @@ import {
   type AuditLogHandle,
 } from './audit-log';
 import { createFtsIndex, hybridSearch } from './fts';
+import { graphRagSearch } from './knowledge-graph';
+import { createWorkloadAdvisor } from './workload-advisor';
 import { runWithCancellation, validateTimeoutMs } from './database-core';
 import type {
   ExplainOptions,
@@ -94,6 +96,10 @@ export interface FirebirdMcpServerOptions {
   auditActor?: string;
   /** Optional Bearer API key enforced on HTTP `fetchHandler` requests. */
   apiKey?: string;
+  /** Advertise `graph_search` (GraphRAG over `FB_GRAPH_NODES` / `FB_GRAPH_EDGES`) in `tools/list` (`M28 Item 2`). @default false */
+  enableGraphRag?: boolean;
+  /** Advertise `advise_workload` (Adaptive Index & Workload Advisor) in `tools/list` (`M28 Item 4`). @default false */
+  enableAdvisor?: boolean;
 }
 
 /** Handle returned by {@link createFirebirdMcpServer} (`M27 Item 1`). */
@@ -329,6 +335,42 @@ export function createFirebirdMcpServer(
             },
           },
           required: ['sql'],
+        },
+      });
+    }
+
+    if (options.enableGraphRag) {
+      tools.push({
+        name: 'graph_search',
+        description:
+          'Run multi-hop Knowledge-GraphRAG search over FB_GRAPH_NODES and FB_GRAPH_EDGES via Firebird WITH RECURSIVE.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            query: { type: 'string', description: 'Natural-language or entity search query.' },
+            queryVector: { type: 'array', items: { type: 'number' } },
+            maxHops: { type: 'number', description: 'Maximum graph hops (default: 2).' },
+            tokenBudget: { type: 'number', description: 'Context token budget (default: 512).' },
+          },
+          required: ['query'],
+        },
+      });
+    }
+
+    if (options.enableAdvisor) {
+      tools.push({
+        name: 'advise_workload',
+        description:
+          'Analyze query plans, RDB$INDICES, and foreign keys to recommend CREATE/DROP/ALTER INDEX tuning DDL.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            queries: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Optional SQL queries to explain and analyze.',
+            },
+          },
         },
       });
     }
@@ -624,6 +666,35 @@ export function createFirebirdMcpServer(
           content: [
             { type: 'text', text: JSON.stringify({ hits: ftsHits }, jsonSafeReplacer, 2) },
           ],
+        };
+      }
+
+      if (name === 'graph_search') {
+        const query = String(args.query ?? '').trim();
+        if (!query) throw new Error('graph_search requires "query".');
+        const qVec = Array.isArray(args.queryVector)
+          ? (args.queryVector as unknown[]).map(Number)
+          : undefined;
+        const graphRes = await graphRagSearch(db, {
+          query,
+          queryVector: qVec,
+          maxHops: typeof args.maxHops === 'number' ? args.maxHops : 2,
+          tokenBudget: typeof args.tokenBudget === 'number' ? args.tokenBudget : 512,
+        });
+        return {
+          content: [{ type: 'text', text: JSON.stringify(graphRes, jsonSafeReplacer, 2) }],
+        };
+      }
+
+      if (name === 'advise_workload') {
+        const extraQueries = Array.isArray(args.queries)
+          ? (args.queries as unknown[]).map(String)
+          : [];
+        const advisor = createWorkloadAdvisor(db, { captureLiveQueries: false });
+        const report = await advisor.analyze(extraQueries);
+        advisor.dispose();
+        return {
+          content: [{ type: 'text', text: JSON.stringify(report, jsonSafeReplacer, 2) }],
         };
       }
 

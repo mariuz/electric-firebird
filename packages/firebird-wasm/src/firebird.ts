@@ -29,7 +29,6 @@ import type {
   RowMode,
   TransactionOptions,
 } from './types';
-import { buildSweepResult } from './browser/engine-transport';
 import { applySerializers } from './browser/value-types';
 import { buildCopyToStream } from './browser/copy-stream';
 import { introspect as introspectSchema, migrate as runMigrations } from './browser/schema';
@@ -57,10 +56,6 @@ import {
 } from './replication/presets';
 import type { ColumnarQueryResult } from './columnar';
 import type { TypedSqlFragment } from './schema-validation';
-import {
-  extractReferencedTables,
-  liveTableEventName,
-} from './browser/live-tables';
 import {
   executePipelineFallback,
   normalizePipelineOperations,
@@ -117,15 +112,19 @@ import {
   resolveColumnarQueryCall,
   runDriverApplyDiff,
   runDriverExportDiff,
-  scanUserTablesForSweep,
   type QueryArrowOptions,
 } from './shared-driver-ops';
 import {
   describeNodeQuery,
   executeNodeQuery,
   explainNodeQuery,
+  runNodeProfiledExec,
+  runNodeProfiledExecBatch,
+  runNodeProfiledExecute,
+  runNodeSweep,
   runSharedNodeRead,
   streamNodeQuery,
+  watchNodeLocalSqlEvents,
 } from './firebird-query-runner';
 import type {
   JsFunctionHandler,
@@ -137,7 +136,7 @@ import type {
   QueryProfileListener,
 } from './types';
 import type { TypeOptions } from './browser/value-types';
-import { toStatement, resolveQueryCall, resolveBatchSize } from './sql-tag';
+import { resolveQueryCall, resolveBatchSize } from './sql-tag';
 import type { SqlFragment, Statement as ParsedStatement } from './sql-tag';
 import {
   type ArrayModeOptions,
@@ -260,96 +259,34 @@ export class FirebirdLite implements FirebirdDatabase {
     await cancelAttachmentOperation(this.attachment);
   }
 
-  /**
-   * Execute a DDL or DML statement that does not return rows.
-   *
-   * The statement is executed in its own auto-committed transaction.
-   *
-   * Accepts a `` sql`…` `` fragment in place of a string, in which case its
-   * values are bound rather than interpolated.
-   */
   async exec(
     sql: string | SqlFragment,
     paramsOrOptions: QueryParams | StatementExecutionOptions = [],
     maybeOptions: StatementExecutionOptions = {},
   ): Promise<void> {
-    const params = Array.isArray(paramsOrOptions) ? paramsOrOptions : [];
-    const options = Array.isArray(paramsOrOptions)
-      ? maybeOptions
-      : (paramsOrOptions ?? {});
-    assertNotAborted(options.signal);
-    validateTimeoutMs(options.timeoutMs);
-    // Delegated rather than reimplemented: "parameters present → prepare,
-    // execute, dispose; otherwise execute directly" is a rule that belongs in
-    // one place, and `transaction()` already wraps it in the commit-or-roll-
-    // back this needs. Two copies would drift the first time either grows a
-    // case.
-    const script = toStatement(sql, params);
-    const startedAt = this.profiler.begin();
-    try {
-      await this.transaction((tx) => tx.exec(sql, params, options));
-      this.profiler.end({
-        startedAt,
-        sql: script.sql,
-        params: script.params,
-        kind: 'exec',
-        rowCount: 0,
-        cacheHit: false,
-      });
-    } catch (err) {
-      this.profiler.end({
-        startedAt,
-        sql: script.sql,
-        params: script.params,
-        kind: 'exec',
-        cacheHit: false,
-        error: err,
-      });
-      throw err;
-    }
+    return runNodeProfiledExec(
+      this.profiler,
+      (s, p, o) => this.transaction((tx) => tx.exec(s, p, o)),
+      sql,
+      paramsOrOptions,
+      maybeOptions,
+    );
   }
 
-  /**
-   * Execute a single DDL or DML statement and return `{ affectedRows, changes }` (`M18 Item 3`).
-   */
   async execute(
     sql: string | SqlFragment,
     params: QueryParams = [],
     options: StatementExecutionOptions = {},
   ): Promise<UnifiedExecuteResult> {
-    assertNotAborted(options.signal);
-    validateTimeoutMs(options.timeoutMs);
-    const script = toStatement(sql, params);
-    const startedAt = this.profiler.begin();
-    try {
-      const res = await this.transaction((tx) => tx.execute(sql, params, options));
-      this.profiler.end({
-        startedAt,
-        sql: script.sql,
-        params: script.params,
-        kind: 'exec',
-        rowCount: res.affectedRows,
-        cacheHit: false,
-      });
-      return res;
-    } catch (err) {
-      this.profiler.end({
-        startedAt,
-        sql: script.sql,
-        params: script.params,
-        kind: 'exec',
-        cacheHit: false,
-        error: err,
-      });
-      throw err;
-    }
+    return runNodeProfiledExecute(
+      this.profiler,
+      (s, p, o) => this.transaction((tx) => tx.execute(s, p, o)),
+      sql,
+      params,
+      options,
+    );
   }
 
-  /**
-   * One-liner synchronization with another `FirebirdBrowser`/`FirebirdLite`
-   * instance, WebRTC `RTCDataChannel`, `WebSocket`, HTTP(S) replication URL,
-   * `ws(s)://` URL, or `broadcast://<channel>` URI (`M18 Item 5` / `M19 Item 3`).
-   */
   async syncWith(
     peerOrUrl: ReplicableDatabase | string | RtcDataChannelLike | WebSocketLike,
     options: SyncWithOptions = {},
@@ -358,34 +295,13 @@ export class FirebirdLite implements FirebirdDatabase {
     return syncWithPeer(this, peerOrUrl, options);
   }
 
-  /**
-   * Execute one statement once per row of parameters: a batch, prepared once
-   * and executed per row in one transaction, all or nothing.  The same call
-   * as the browser backend's.
-   */
   async execBatch(sql: string, rows: QueryParams[]): Promise<void> {
-    const startedAt = this.profiler.begin();
-    try {
-      await this.transaction((tx) => tx.execBatch(sql, rows));
-      this.profiler.end({
-        startedAt,
-        sql,
-        params: rows[0] ?? [],
-        kind: 'execBatch',
-        rowCount: rows.length,
-        cacheHit: rows.length > 1,
-      });
-    } catch (err) {
-      this.profiler.end({
-        startedAt,
-        sql,
-        params: rows[0] ?? [],
-        kind: 'execBatch',
-        cacheHit: rows.length > 1,
-        error: err,
-      });
-      throw err;
-    }
+    return runNodeProfiledExecBatch(
+      this.profiler,
+      (s, r) => this.transaction((tx) => tx.execBatch(s, r)),
+      sql,
+      rows,
+    );
   }
 
   /**
@@ -441,45 +357,13 @@ export class FirebirdLite implements FirebirdDatabase {
     onWakeup: () => void,
     options: { pollIntervalMs?: number },
   ): () => Promise<void> {
-    const events: string[] =
-      explicitEvents !== undefined
-        ? [...explicitEvents]
-        : (() => {
-            const tables = extractReferencedTables(sqlText);
-            if (tables.length === 0) {
-              throw new RangeError(
-                'liveIncremental() / liveColumnar() could not infer any user tables from SQL; pass { events: [...] } explicitly',
-              );
-            }
-            return tables.map((t) => liveTableEventName(t));
-          })();
-
-    for (const ev of events) {
-      let set = this.liveEventListeners.get(ev);
-      if (!set) {
-        set = new Set();
-        this.liveEventListeners.set(ev, set);
-      }
-      set.add(onWakeup);
-    }
-
-    const intervalMs = options.pollIntervalMs ?? 250;
-    const pollTimer =
-      intervalMs > 0 ? setInterval(() => onWakeup(), intervalMs) : null;
-    if (pollTimer && typeof (pollTimer as { unref?: () => void }).unref === 'function') {
-      (pollTimer as { unref: () => void }).unref();
-    }
-
-    return async () => {
-      if (pollTimer) clearInterval(pollTimer);
-      for (const ev of events) {
-        const set = this.liveEventListeners.get(ev);
-        if (set) {
-          set.delete(onWakeup);
-          if (set.size === 0) this.liveEventListeners.delete(ev);
-        }
-      }
-    };
+    return watchNodeLocalSqlEvents(
+      this.liveEventListeners,
+      sqlText,
+      explicitEvents,
+      onWakeup,
+      options,
+    );
   }
 
   /**
@@ -1007,24 +891,14 @@ export class FirebirdLite implements FirebirdDatabase {
     };
   }
 
-  /**
-   * Trigger an immediate database garbage-collection sweep, scanning user
-   * tables to collect old record versions and advancing OIT/OAT counters.
-   */
   async sweep(): Promise<SweepResult> {
-    await this.ensureReady();
-    const started = performance.now();
-    await this.endReadTransaction();
-    const before = await this.databaseInfo();
-    const tablesScanned = await scanUserTablesForSweep((s) => this.query(s));
-
-    await this.endReadTransaction();
-    const attachment = this.attachment!;
-    const tx = await attachment.startTransaction();
-    await tx.commit().catch(() => tx.rollback().catch(() => undefined));
-
-    const after = await this.databaseInfo();
-    return buildSweepResult(before, after, tablesScanned, performance.now() - started);
+    return runNodeSweep({
+      ensureReady: () => this.ensureReady(),
+      endReadTransaction: () => this.endReadTransaction(),
+      databaseInfo: () => this.databaseInfo(),
+      query: (s) => this.query(s),
+      getAttachment: () => this.attachment!,
+    });
   }
 
   private get streamHost(): NodeStreamHost {

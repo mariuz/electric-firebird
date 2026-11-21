@@ -3889,4 +3889,41 @@ test.describe('FirebirdBrowser', () => {
     expect(result.verifiedOk).toBe(true);
     expect(result.restoredLen).toBe(4096);
   });
+
+  test('M28: parseCronExpression, compileGraphPatternSql & M28 exports in browser bundle', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      const w = window as any;
+      const cron = w.FB.parseCronExpression('*/15 9-17 * * 1-5');
+      const nextRun = w.FB.nextCronRunAfter(
+        '*/15 9-17 * * 1-5',
+        new Date('2026-06-01T09:02:00.000Z'),
+      );
+      const compiled = w.FB.compileGraphPatternSql(
+        "(u:Person {id: 'alice'})-[:WORKS_ON*1..3]->(p:Project)",
+      );
+      return {
+        hasMinutes: Boolean(cron.minutes?.has(0) && cron.minutes?.has(15) && cron.minutes?.has(45)),
+        nextIso: new Date(nextRun).toISOString(),
+        hasRecursiveCte: compiled.sql.includes('WITH RECURSIVE'),
+        minHops: compiled.minHops,
+        maxHops: compiled.maxHops,
+        hasJobQueueFn: typeof w.FB.createJobQueue === 'function',
+        hasGraphRagFn: typeof w.FB.graphRagSearch === 'function',
+        hasOnlineMigFn: typeof w.FB.createOnlineMigrator === 'function',
+        hasAdvisorFn: typeof w.FB.createWorkloadAdvisor === 'function',
+      };
+    });
+
+    expect(result.hasMinutes).toBe(true);
+    expect(result.nextIso).toBe('2026-06-01T09:15:00.000Z');
+    expect(result.hasRecursiveCte).toBe(true);
+    expect(result.minHops).toBe(1);
+    expect(result.maxHops).toBe(3);
+    expect(result.hasJobQueueFn).toBe(true);
+    expect(result.hasGraphRagFn).toBe(true);
+    expect(result.hasOnlineMigFn).toBe(true);
+    expect(result.hasAdvisorFn).toBe(true);
+  });
 });

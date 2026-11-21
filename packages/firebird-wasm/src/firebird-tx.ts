@@ -2,7 +2,6 @@
  * firebird-tx.ts – `FirebirdTransaction` implementation for Node.js `FirebirdLite` (`M20 Item 5`).
  */
 
-import { Blob as FbBlob } from 'node-firebird-driver';
 import type { Attachment, Statement, Transaction } from 'node-firebird-driver';
 import type {
   ArrayRow,
@@ -79,14 +78,11 @@ import {
   type QueryArrowOptions,
 } from './shared-driver-ops';
 import {
-  BLOB_INTERNAL_DATA,
-  type InternalBlobHandle,
-  buildBlobReadableStream,
-  buildBlobWritableStream,
-  createBlobHandle,
-  isBlobHandle,
-  resolveBlobSegmentSize,
-} from './browser/blob-stream';
+  createNodeTxBlobStream,
+  openNodeTxBlobStream,
+  streamNodeTxQuery,
+  type NodeTxStreamHost,
+} from './firebird-tx-streams';
 import { toStatement, resolveQueryCall, resolveBatchSize } from './sql-tag';
 import type { SqlFragment, Statement as ParsedStatement } from './sql-tag';
 import { blockParamType, buildBlock, placeholderOffsets } from './batch-block';
@@ -102,7 +98,6 @@ import {
   explainStatement,
   fetchRows,
   inputParams,
-  openNativeQueryBlobStream,
   outputFields,
   readAffectedRecords,
   shapeRows,
@@ -1057,83 +1052,24 @@ export class FirebirdTransaction implements FirebirdTransactionClient {
     return buildCopyToStream(this, tableOrQuery, paramsOrOptions, maybeOptions);
   }
 
-  /**
-    * Create a segmented writable BLOB stream (`WritableStream<Uint8Array>`)
-   */
+  private get txStreamHost(): NodeTxStreamHost {
+    return {
+      attachment: this.attachment,
+      transaction: this.transaction,
+      statements: this.statements,
+      types: this.types,
+      assertUsable: () => this.assertUsable(),
+      beforeStatement: () => this.beforeStatement(),
+      serialize: (p) => this.serialize(p),
+    };
+  }
+
   async createBlobStream(
     options: BlobStreamOptions = {},
   ): Promise<BlobWritableStream> {
-    this.assertUsable();
-    await this.beforeStatement();
-    resolveBlobSegmentSize(options.segmentSize, true);
-
-    if (typeof this.attachment.createBlob === 'function') {
-      const stream = await this.attachment.createBlob(this.transaction);
-      return buildBlobWritableStream(
-        {
-          writeSegment: async (segment) => {
-            this.assertUsable();
-            const buf = Buffer.from(
-              segment.buffer,
-              segment.byteOffset,
-              segment.byteLength,
-            );
-            await stream.write(buf);
-          },
-          close: async (totalBytes) => {
-            this.assertUsable();
-            await stream.close();
-            const nativeBlob = stream.blob;
-            const idBytes =
-              nativeBlob?.id instanceof Uint8Array
-                ? new Uint8Array(
-                    nativeBlob.id.buffer,
-                    nativeBlob.id.byteOffset,
-                    nativeBlob.id.byteLength,
-                  )
-                : new Uint8Array(8);
-            return createBlobHandle(idBytes, totalBytes, { nativeBlob });
-          },
-          abort: async () => {
-            await stream.cancel().catch(() => undefined);
-          },
-        },
-        options,
-      );
-    }
-
-    const chunks: Uint8Array[] = [];
-    return buildBlobWritableStream(
-      {
-        writeSegment: async (segment) => {
-          this.assertUsable();
-          chunks.push(segment.slice());
-        },
-        close: async (totalBytes) => {
-          this.assertUsable();
-          const stagedBytes = new Uint8Array(totalBytes);
-          let pos = 0;
-          for (const c of chunks) {
-            stagedBytes.set(c, pos);
-            pos += c.byteLength;
-          }
-          return createBlobHandle(new Uint8Array(8), totalBytes, {
-            stagedBytes,
-          });
-        },
-        abort: async () => {
-          chunks.length = 0;
-        },
-      },
-      options,
-    );
+    return createNodeTxBlobStream(this.txStreamHost, options);
   }
 
-  /**
-   * Open a Firebird `BLOB` column (from a `SELECT` query or a {@link BlobHandle})
-   * inside this transaction as a segmented Web `ReadableStream<Uint8Array>`
-   * backed by `IBlob::getSegment`.
-   */
   async openBlobStream(
     handle: BlobHandle,
     options?: BlobStreamOptions,
@@ -1152,75 +1088,14 @@ export class FirebirdTransaction implements FirebirdTransactionClient {
     paramsOrOptions: QueryParams | BlobStreamOptions = [],
     maybeOptions: BlobStreamOptions = {},
   ): Promise<ReadableStream<Uint8Array>> {
-    this.assertUsable();
-    await this.beforeStatement();
-
-    if (isBlobHandle(sqlOrHandle)) {
-      const opts = Array.isArray(paramsOrOptions) ? maybeOptions : paramsOrOptions;
-      resolveBlobSegmentSize(opts.segmentSize, false);
-      const staged = (sqlOrHandle as InternalBlobHandle)[BLOB_INTERNAL_DATA]?.stagedBytes;
-      if (staged) {
-        let offset = 0;
-        return buildBlobReadableStream(
-          {
-            readSegment: async (maxBytes) => {
-              this.assertUsable();
-              if (offset >= staged.byteLength) return null;
-              const end = Math.min(offset + maxBytes, staged.byteLength);
-              const slice = staged.slice(offset, end);
-              offset = end;
-              return slice;
-            },
-            close: async () => undefined,
-          },
-          opts,
-        );
-      }
-
-      const fbBlob =
-        ((sqlOrHandle as InternalBlobHandle)[BLOB_INTERNAL_DATA]?.nativeBlob as FbBlob | undefined) ??
-        new FbBlob(this.attachment, sqlOrHandle.blobId);
-      const stream = await this.attachment.openBlob(this.transaction, fbBlob);
-      return buildBlobReadableStream(
-        {
-          readSegment: async (maxBytes) => {
-            this.assertUsable();
-            const buf = Buffer.alloc(maxBytes);
-            const n = await stream.read(buf);
-            if (n < 0) return null;
-            return new Uint8Array(buf.buffer, buf.byteOffset, n);
-          },
-          close: async () => {
-            await stream.close().catch(() => undefined);
-          },
-        },
-        opts,
-      );
-    }
-
-    const { statement, options } = resolveQueryCall<BlobStreamOptions>(
+    return openNodeTxBlobStream(
+      this.txStreamHost,
       sqlOrHandle,
       paramsOrOptions,
       maybeOptions,
     );
-    resolveBlobSegmentSize(options.segmentSize, false);
-
-    return openNativeQueryBlobStream(
-      this.attachment,
-      this.transaction,
-      this.statements,
-      statement.sql,
-      this.serialize(statement.params),
-      options,
-      false,
-      () => this.assertUsable(),
-    );
   }
 
-  /**
-   * Return Firebird's execution plan for `sql` (`IStatement::getPlan`) inside
-   * this transaction without executing the statement.
-   */
   async explain(
     sql: string | SqlFragment,
     options: ExplainOptions = {},
@@ -1238,65 +1113,18 @@ export class FirebirdTransaction implements FirebirdTransactionClient {
     }
   }
 
-  private async *streamQuery<T>(
+  private streamQuery<T>(
     statement: ParsedStatement,
     rowMode: RowMode,
     batchSize: number,
     options: StatementExecutionOptions = {},
   ): AsyncIterableIterator<QueryResult<T>> {
-    this.assertUsable();
-    assertNotAborted(options.signal);
-    const totalTimeoutMs = validateTimeoutMs(options.timeoutMs);
-    const deadline =
-      totalTimeoutMs && totalTimeoutMs > 0
-        ? Date.now() + totalTimeoutMs
-        : undefined;
-    const checkStreamDeadline = (): void => {
-      assertNotAborted(options.signal);
-      if (deadline !== undefined && Date.now() >= deadline) {
-        throw createTimeoutError(totalTimeoutMs!);
-      }
-    };
-    await this.beforeStatement();
-
-    const serialized = this.serialize(statement.params);
-    let engineFailed = false;
-    const lease = await this.statements.acquire(this.transaction, statement.sql);
-    const stmt = lease.stmt;
-
-    try {
-      let fields: FieldInfo[];
-      try {
-        fields = await outputFields(stmt);
-        if (totalTimeoutMs !== undefined && totalTimeoutMs > 0) {
-          await applyStatementHandleTimeout(stmt, totalTimeoutMs);
-        }
-      } catch (err) {
-        engineFailed = true;
-        throw err;
-      }
-
-      for await (const batch of streamRows<T>(
-        stmt,
-        this.transaction,
-        serialized,
-        fields,
-        rowMode,
-        batchSize,
-        this.types,
-        () => {
-          engineFailed = true;
-        },
-      )) {
-        checkStreamDeadline();
-        yield batch;
-        checkStreamDeadline();
-      }
-    } finally {
-      if (totalTimeoutMs !== undefined && totalTimeoutMs > 0 && !engineFailed) {
-        await applyStatementHandleTimeout(stmt, 0).catch(() => undefined);
-      }
-      await lease.release(engineFailed);
-    }
+    return streamNodeTxQuery<T>(
+      this.txStreamHost,
+      statement,
+      rowMode,
+      batchSize,
+      options,
+    );
   }
 }

@@ -142,10 +142,10 @@ function classifyExplainedLine(text: string): {
   let accessMethod: PlanAccessMethod = null;
   let selfWeight = 1;
 
-  // Match `Table "USERS" as "U" Full Scan` or `Table "USERS" Access By ID`
+  // Match `Table "USERS" as "U" Full Scan`, `Table "PUBLIC"."USERS" Full Scan`, or `Table USERS Access By ID`
   const tableMatch =
-    /\bTable\s+"([^"]+)"(?:\s+as\s+"([^"]+)")?\s*(.*)$/i.exec(text) ??
-    /\bTable\s+([A-Za-z0-9_$]+)(?:\s+as\s+([A-Za-z0-9_$]+))?\s*(.*)$/i.exec(text);
+    /\bTable\s+(?:"[^"]+"\.)?"([^"]+)"(?:\s+as\s+"([^"]+)")?\s*(.*)$/i.exec(text) ??
+    /\bTable\s+(?:[A-Za-z0-9_$]+\.)?([A-Za-z0-9_$]+)(?:\s+as\s+([A-Za-z0-9_$]+))?\s*(.*)$/i.exec(text);
   if (tableMatch) {
     tableName = tableMatch[1].toUpperCase();
     if (tableMatch[2]) alias = tableMatch[2].toUpperCase();
@@ -163,10 +163,10 @@ function classifyExplainedLine(text: string): {
     return { kind, accessMethod, tableName, alias, indexNames, selfWeight, warnings };
   }
 
-  // Match `Index "IDX_USERS_EMAIL" Unique Scan` or `Index "IDX_1" Range Scan`
+  // Match `Index "IDX_USERS_EMAIL" Unique Scan`, `Index "PUBLIC"."IDX_1" Range Scan`, or `Index IDX_1`
   const indexMatch =
-    /\bIndex\s+"([^"]+)"\s*(.*)$/i.exec(text) ??
-    /\bIndex\s+([A-Za-z0-9_$]+)\s*(.*)$/i.exec(text);
+    /\bIndex\s+(?:"[^"]+"\.)?"([^"]+)"\s*(.*)$/i.exec(text) ??
+    /\bIndex\s+(?:[A-Za-z0-9_$]+\.)?([A-Za-z0-9_$]+)\s*(.*)$/i.exec(text);
   if (indexMatch) {
     const idxName = indexMatch[1].toUpperCase();
     indexNames.push(idxName);
@@ -324,7 +324,11 @@ function classifyLegacyLeaf(header: string): {
       .slice(0, accessKeywordIdx)
       .trim()
       .split(/\s+/)
-      .map((t) => t.replace(/^"+|"+$/g, '').toUpperCase())
+      .map((t) => {
+        const dotIdx = t.lastIndexOf('.');
+        const base = dotIdx >= 0 ? t.slice(dotIdx + 1) : t;
+        return base.replace(/^"+|"+$/g, '').toUpperCase();
+      })
       .filter(Boolean);
     if (relTokens.length === 1) {
       tableName = relTokens[0];

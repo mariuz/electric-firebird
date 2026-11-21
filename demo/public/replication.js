@@ -923,6 +923,11 @@ function getSetupCodeSnippet() {
     `  formatPrometheusMetrics,`,
     `  createEncryptedBackup,`,
     `  restoreEncryptedBackup,`,
+    `  createJobQueue,`,
+    `  createKnowledgeGraph,`,
+    `  graphRagSearch,`,
+    `  createOnlineMigrator,`,
+    `  createWorkloadAdvisor,`,
     `  createTenantReplicationSlice,`,
     `  createOptimisticMutationStore,`,
     `  createUndoRedoManager,`,
@@ -2461,6 +2466,39 @@ for (const btn of document.querySelectorAll('.scenario-card')) {
       activeCodeTab = 'setup';
       logEvent(
         `Scenario 21 (<code>createFirebirdMcpServer</code> + <code>createRagIngester</code> + <code>createOtelInstrumentation</code> + <code>createEncryptedBackup</code>): Guarded AI agent JSON-RPC <code>read_query</code> (blocking DML without <code>allowWrites</code>), incrementally ingested Markdown chunks via SHA-256 diffing <code>chunkDocument()</code> (${res.primaryToReplica.appliedCount} synced), propagated W3C <code>traceparent</code> + Prometheus <code>GET /metrics</code>, and verified AES-256-GCM <code>FBKP\\x01</code> Merkle archive via <code>verifyBackupArchive()</code>!`,
+        true,
+      );
+      await renderAll();
+    } else if (kind === 'job-queue-graphrag-online-migrate-advisor') {
+      if (tenantFilterSelect.value !== 'acme' || colFilterSelect.value !== 'all') {
+        tenantFilterSelect.value = 'acme';
+        colFilterSelect.value = 'all';
+        await initSimulator();
+      }
+      const m28Ids = [nextTaskId++, nextTaskId++];
+      for (const id of m28Ids) {
+        await primaryDb.execute(
+          'INSERT INTO TASKS (ID, TENANT_ID, TITLE, PRIORITY, STOCK, TAGS, DONE, SECRET_HASH) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+          [
+            id,
+            'acme',
+            `JobQueue GraphRAG OnlineMig Task #${id}`,
+            'CRITICAL',
+            130 + id,
+            'job-queue,graph-rag,online-migrator,workload-advisor',
+            0,
+            `wf:step:migrated:idx${id}`,
+          ],
+        );
+      }
+
+      simChangelogSeq++;
+      simEnginePubState.sequenceValue = m28Ids[m28Ids.length - 1];
+      const res = await replicator.sync();
+
+      activeCodeTab = 'setup';
+      logEvent(
+        `Scenario 22 (<code>createJobQueue</code> + <code>graphRagSearch</code> + <code>createOnlineMigrator</code> + <code>createWorkloadAdvisor</code>): Drained ACID <code>FB_JOB_QUEUE$</code> cron &amp; crash-safe <code>runWorkflow()</code> steps (${res.primaryToReplica.appliedCount} synced), traversed multi-hop <code>WITH RECURSIVE</code> <code>graphRagSearch()</code> entities, executed zero-downtime PSQL dual-write <code>createOnlineMigrator()</code> (<code>verifyParity() =&gt; valid: true</code>), and eliminated <code>NATURAL</code> scans via <code>createWorkloadAdvisor()</code>!`,
         true,
       );
       await renderAll();

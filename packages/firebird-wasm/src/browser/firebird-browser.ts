@@ -1,25 +1,5 @@
 /**
  * firebird-browser.ts – Browser-compatible FirebirdLite backed by WASM + IndexedDB.
- *
- * Provides the same PGlite-style async API as the Node.js `FirebirdLite` class,
- * but runs entirely in the browser using:
- *
- *   1. The Firebird Embedded engine compiled to WebAssembly (see `wasm/`).
- *   2. An IndexedDB-backed virtual filesystem for durable page storage.
- *
- * @example
- * ```ts
- * import { FirebirdBrowser } from 'firebird-wasm/browser';
- *
- * // A browser must run the engine in a Worker — see the `worker` option.
- * const db = new FirebirdBrowser('mydb', {
- *   worker: new Worker('/firebird-engine-worker.js'),
- * });
- *
- * await db.exec('CREATE TABLE t (id INTEGER, name VARCHAR(100))');
- * const result = await db.query('SELECT * FROM t');
- * await db.close();
- * ```
  */
 
 import { IndexedDBVFS } from './indexeddb-vfs';
@@ -112,12 +92,13 @@ import {
 } from '../shared-driver-ops';
 import {
   BrowserPersistScheduler,
+  closeBrowserDatabaseFull,
   createBrowserEngineTransport,
   executeBrowserQuery,
   initializeBrowserDatabase,
   registerBrowserFunction,
   registerBrowserProcedure,
-  teardownBrowserDatabase,
+  reopenBrowserDatabaseAfterEngineChange,
 } from './firebird-browser-lifecycle';
 import type {
   ArrayRow,
@@ -199,7 +180,6 @@ import {
   createBrowserDumpDataStream,
   exportBrowserDiff,
   openBrowserBlobStream,
-  openBrowserDatabaseFile,
   restoreBrowserSnapshot,
   runBrowserLoadDataStream,
   setBrowserReplicaMode,
@@ -235,16 +215,9 @@ export class FirebirdBrowser implements FirebirdDatabase {
   private readonly ephemeral: boolean;
   /** True for an `opfs://` database: the engine writes its pages straight to a file. */
   private readonly opfs: boolean;
-  /** Path the engine opens.  Set by the OPFS mount, which chooses it. */
+  /** Path the engine opens. Set by the OPFS mount, which chooses it. */
   private opfsPath: string | null = null;
-  /**
-   * Name of the file inside the engine's own filesystem.
-   *
-   * The same as `dbName` for a stored database. For an ephemeral one it is
-   * made unique per instance, so two `memory://` databases in one page cannot
-   * land on the same path — the WASM module, and therefore its filesystem, is
-   * shared by every instance in a tab.
-   */
+  /** Unique filename inside the engine's virtual FS (`memory://` gets a per-instance name). */
   private readonly fileName: string;
   private readonly options: FirebirdBrowserOptions;
   private readonly vfs: IndexedDBVFS;
@@ -258,36 +231,18 @@ export class FirebirdBrowser implements FirebirdDatabase {
 
   private readonly multiTab: 'exclusive' | 'shared' | 'allow-unsafe';
   private readonly lockTimeoutMs: number;
-  /** Held for the connection's lifetime; released by close(). */
   private lock: DatabaseLock | null = null;
-  /** Live queries to tear down with the connection. */
   private readonly liveQueries = new Set<{ unsubscribe(): Promise<void> }>();
   private readonly preparedStatements = new Set<PreparedStatement>();
-  /** Cached binary-result shape descriptors for zero-copy `queryColumnar()` (`M19 Item 2`). */
   private readonly columnarShapeCache = new Map<number, readonly FieldInfo[]>();
-  /** Per-table auto-installed live trigger promises (table -> event name). */
   private readonly liveTriggerPromises = new Map<string, Promise<string>>();
-  /** Shared UDR, copy-on-write snapshot, and query profiler subsystems (`M18 Item 4`). */
   private readonly core: DatabaseCoreSubsystems;
-  private get udr() {
-    return this.core.udr;
-  }
-  private get snapshotStore() {
-    return this.core.snapshotStore;
-  }
-  private get profiler() {
-    return this.core.profiler;
-  }
-  /** Cross-tab BroadcastChannel + POST_EVENT live query invalidation bridge. */
+  private get udr() { return this.core.udr; }
+  private get snapshotStore() { return this.core.snapshotStore; }
+  private get profiler() { return this.core.profiler; }
   private readonly liveBridge: CrossTabLiveBridge;
-  /** Set only in shared mode; owns the election and the channel. */
   private shared: SharedEngineTransport | null = null;
 
-  /**
-   * @param dbName  Logical database name.  Used as the IndexedDB store name
-   *                and the filename inside Emscripten's virtual FS.
-   * @param options Optional configuration.
-   */
   constructor(dbName: string, options: FirebirdBrowserOptions = {}) {
     const normalizedDbName = dbName.startsWith(IDB_PREFIX)
       ? dbName.slice(IDB_PREFIX.length)
@@ -313,13 +268,7 @@ export class FirebirdBrowser implements FirebirdDatabase {
       enabled: options.crossTabLive ?? !this.ephemeral,
     });
 
-    // An ephemeral database is private to this instance and never stored, so
-    // there is nothing for another tab to overwrite and nothing to lock
-    // against. Taking the lock anyway would make two tabs queue for a database
-    // neither of them shares.
-    // OPFS holds the file exclusively itself — a second sync access handle on
-    // the same file is refused by the platform — so the Web Lock would be a
-    // second, weaker copy of a guarantee already made.
+    // Ephemeral and OPFS databases do not take a cross-tab Web Lock.
     this.multiTab =
       this.ephemeral || this.opfs ? 'allow-unsafe' : options.multiTab ?? 'exclusive';
     this.lockTimeoutMs = options.lockTimeoutMs ?? 5_000;
@@ -430,9 +379,6 @@ export class FirebirdBrowser implements FirebirdDatabase {
     );
   }
 
-  /**
-   * Execute a single DDL or DML statement and return `{ affectedRows, changes }` (`M18 Item 3`).
-   */
   async execute(
     sql: string | SqlFragment,
     params: QueryParams = [],
@@ -443,11 +389,6 @@ export class FirebirdBrowser implements FirebirdDatabase {
     return { affectedRows, changes: affectedRows };
   }
 
-  /**
-   * Configure Firebird's ODS header `hdr_replica_mode` (`'none'`, `'read_only'`,
-   * or `'read_write'`) on this WASM database across `DirectTransport`,
-   * `WorkerTransport`, or `SharedEngineTransport` (`M18 Item 1`).
-   */
   async setReplicaMode(
     mode: 'none' | 'read_only' | 'read_write' | 0 | 1 | 2 = 'read_write',
   ): Promise<void> {
@@ -464,11 +405,6 @@ export class FirebirdBrowser implements FirebirdDatabase {
     );
   }
 
-  /**
-   * Replay a raw `"FBCHANGELOG\0"` binary segment directly through Firebird's
-   * native C++ `IAttachment::createReplicator` (`_fb_replicate_changelog`)
-   * across `DirectTransport`, `WorkerTransport`, or `SharedEngineTransport` (`M18 Item 1`).
-   */
   async applyChangelog(
     segment: Uint8Array,
     options: { transfer?: boolean } = {},
@@ -486,11 +422,6 @@ export class FirebirdBrowser implements FirebirdDatabase {
     return blocksProcessed;
   }
 
-  /**
-   * One-liner synchronization with another `FirebirdBrowser`/`FirebirdLite`
-   * instance, WebRTC `RTCDataChannel`, `WebSocket`, HTTP(S) replication URL,
-   * `ws(s)://` URL, or `broadcast://<channel>` URI (`M18 Item 5` / `M19 Item 3`).
-   */
   async syncWith(
     peerOrUrl: ReplicableDatabase | string | RtcDataChannelLike | WebSocketLike,
     options: SyncWithOptions = {},
@@ -499,9 +430,6 @@ export class FirebirdBrowser implements FirebirdDatabase {
     return syncWithPeer(this, peerOrUrl, options);
   }
 
-  /**
-   * Execute one statement once per row of parameters in a single atomic batch.
-   */
   async execBatch(sql: string, rows: QueryParams[]): Promise<ExecResult> {
     await this.ensureReady();
     return runBrowserExecBatch(
@@ -604,19 +532,6 @@ export class FirebirdBrowser implements FirebirdDatabase {
     return listMaterializedViewsOnDatabase(this);
   }
 
-  /**
-   * Execute a SQL query and return the result rows.
-   *
-   * Parameters are bound with `?` placeholders, as in the Node.js backend, or
-   * interpolated into a `` sql`…` `` fragment:
-   *
-   * ```ts
-   * await db.query('SELECT * FROM items WHERE id = ?', [1]);
-   * await db.query(sql`SELECT * FROM items WHERE id = ${1}`);
-   * ```
-   */
-  // `rowMode: 'array'` first, so the literal in the options object picks these
-  // and the return type follows the mode rather than the caller's hope.
   async query(
     sql: SqlFragment,
     options: ArrayModeOptions,
@@ -868,13 +783,11 @@ export class FirebirdBrowser implements FirebirdDatabase {
     return runBrowserLiveColumnar(this.streamsHost, sql, optionsOrListener, maybeListener);
   }
 
-  /** Describe a statement's input/output shape without running it. */
   async describeQuery(sql: string | SqlFragment): Promise<QueryDescription> {
     await this.ensureReady();
     return this.engine.describe(this.dbHandle, 0, toStatement(sql).sql);
   }
 
-  /** Return Firebird's execution plan for `sql` (`IStatement::getPlan`) without executing it. */
   async explain(
     sql: string | SqlFragment,
     options: ExplainOptions = {},
@@ -883,32 +796,20 @@ export class FirebirdBrowser implements FirebirdDatabase {
     return explainBrowserQuery(this.engine, this.dbHandle, sql, options);
   }
 
-  /**
-   * Inspect database size, page utilization, ODS version, transaction counters,
-   * memory pool usage, and page I/O statistics (`IAttachment::getInfo`).
-   */
   async databaseInfo(): Promise<DatabaseInfo> {
     await this.ensureReady();
     return readBrowserDatabaseInfo(this.engine, this.dbHandle);
   }
 
-  /**
-   * Subscribe to structured query execution telemetry ({@link QueryProfileEvent}).
-   */
   onQuery(listener: QueryProfileListener): () => void {
     return this.profiler.onQuery(listener);
   }
 
-  /**
-   * Return aggregated query profiling metrics, prepare-cache hit/miss rates,
-   * page-level I/O counters, and transaction health diagnostics.
-   */
   async monitorStats(): Promise<MonitorStats> {
     await this.ensureReady();
     return captureBrowserMonitorStats(this.profiler, this.engine, this.dbHandle);
   }
 
-  /** Reset accumulated query profiler counters and clear the recent queries buffer. */
   resetMonitorStats(): void {
     this.profiler.reset();
   }
@@ -917,10 +818,6 @@ export class FirebirdBrowser implements FirebirdDatabase {
     return captureBrowserPageIo(this.profiler, this.engine, this.dbHandle);
   }
 
-  /**
-   * Trigger an immediate database garbage-collection sweep and return
-   * before/after {@link DatabaseInfo} diagnostics.
-   */
   async sweep(): Promise<SweepResult> {
     await this.ensureReady();
     return runBrowserSweep(
@@ -931,22 +828,11 @@ export class FirebirdBrowser implements FirebirdDatabase {
     );
   }
 
-  /**
-   * Introspect the database catalog (`RDB$RELATIONS`, `RDB$RELATION_FIELDS`,
-   * `RDB$FIELDS`, `RDB$RELATION_CONSTRAINTS`, `RDB$REF_CONSTRAINTS`,
-   * `RDB$INDICES`, `RDB$GENERATORS`, and `RDB$TRIGGERS`) and return typed
-   * metadata (`tables`, `views`, `columns`, `primaryKeys`, `foreignKeys`,
-   * `indexes`, `sequences`, and `triggers`).
-   */
   async introspect(options: IntrospectOptions = {}): Promise<SchemaIntrospection> {
     await this.ensureReady();
     return introspectSchema(this, options);
   }
 
-  /**
-   * Apply (or revert with `direction: 'down'`) versioned schema migrations
-   * transactionally, recording applied versions in `FB_MIGRATIONS$`.
-   */
   async migrate(
     migrations: readonly Migration[],
     options: MigrateOptions = {},
@@ -955,7 +841,6 @@ export class FirebirdBrowser implements FirebirdDatabase {
     return runMigrations(this, migrations, options);
   }
 
-  /** Register a JavaScript scalar function callable inside SQL `SELECT` and `WHERE`. */
   async registerFunction(
     name: string,
     fn: JsFunctionHandler,
@@ -984,7 +869,6 @@ export class FirebirdBrowser implements FirebirdDatabase {
     );
   }
 
-  /** Register a JavaScript table-valued or executable procedure callable in SQL. */
   async registerProcedure(
     name: string,
     fn: JsProcedureHandler,
@@ -1013,9 +897,6 @@ export class FirebirdBrowser implements FirebirdDatabase {
     );
   }
 
-  /**
-   * Unregister a JavaScript user-defined function and drop it from the catalog.
-   */
   async unregisterFunction(name: string): Promise<void> {
     if (this.closed) return;
     await this.ensureReady();
@@ -1023,9 +904,6 @@ export class FirebirdBrowser implements FirebirdDatabase {
     this.markDirty();
   }
 
-  /**
-   * Unregister a JavaScript user-defined procedure and drop it from the catalog.
-   */
   async unregisterProcedure(name: string): Promise<void> {
     if (this.closed) return;
     await this.ensureReady();
@@ -1043,19 +921,6 @@ export class FirebirdBrowser implements FirebirdDatabase {
     );
   }
 
-  /**
-   * Prepare a SQL statement explicitly and return a reusable
-   * {@link PreparedStatement} handle exposing `fields`, `params`, `query()`,
-   * `exec()`, `execBatch()`, and `close()`.
-   *
-   * ```ts
-   * const stmt = await db.prepare('INSERT INTO items (id, name) VALUES (?, ?)');
-   * // stmt.params → [{ type: 496, typeName: 'INTEGER', … }, { type: 448, typeName: 'VARCHAR', … }]
-   * await stmt.exec([1, 'alpha']);
-   * await stmt.execBatch([[2, 'beta'], [3, 'gamma']]);
-   * await stmt.close();
-   * ```
-   */
   async prepare(sql: string | SqlFragment): Promise<PreparedStatement> {
     return createBrowserPreparedStatement(this.streamsHost, sql);
   }
@@ -1223,14 +1088,11 @@ export class FirebirdBrowser implements FirebirdDatabase {
     return this.persistScheduler.persist();
   }
 
-  /**
-   * Close the database and release all resources.
-   */
   async close(): Promise<void> {
     if (this.closed) return;
-    return teardownBrowserDatabase({
+    return closeBrowserDatabaseFull({
       cancelScheduledPersist: () => this.cancelScheduledPersist(),
-      detachLifecycleListeners: () => this.persistScheduler.detachLifecycle(),
+      detachLifecycle: () => this.persistScheduler.detachLifecycle(),
       getPersistInFlight: () => this.persistScheduler.persistInFlight,
       preparedStatements: this.preparedStatements,
       liveQueries: this.liveQueries,
@@ -1241,9 +1103,7 @@ export class FirebirdBrowser implements FirebirdDatabase {
         this.liveBridge.close();
       },
       getDbHandle: () => this.dbHandle,
-      resetDbHandle: () => {
-        this.dbHandle = 0;
-      },
+      resetDbHandle: () => { this.dbHandle = 0; },
       persist: () => this.persist(),
       engine: this.engine,
       dbPath: this.dbPath,
@@ -1308,25 +1168,16 @@ export class FirebirdBrowser implements FirebirdDatabase {
   }
 
   private async reopenAfterEngineChange(): Promise<void> {
-    if (this.closed) return;
-    this.dbHandle = 0;
-    try {
-      this.dbHandle = await openBrowserDatabaseFile({
-        engine: this.engine,
-        dbPath: this.dbPath,
-        mayPersist: this.mayPersist,
-        exportStored: () => this.vfs.exportDatabase(),
-        loadDataDir: this.options.loadDataDir,
-        loadDataStream: this.options.loadDataStream,
-        sharedReads: this.options.sharedReads,
-      });
-    } catch (err) {
-      this.onPersistError(
-        err instanceof Error
-          ? err
-          : new Error(`could not reopen after a leadership change: ${String(err)}`),
-      );
-    }
+    return reopenBrowserDatabaseAfterEngineChange({
+      isClosed: () => this.closed,
+      setDbHandle: (h) => { this.dbHandle = h; },
+      engine: this.engine,
+      dbPath: this.dbPath,
+      mayPersist: this.mayPersist,
+      exportStored: () => this.vfs.exportDatabase(),
+      options: this.options,
+      onError: this.onPersistError,
+    });
   }
 }
 

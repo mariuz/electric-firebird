@@ -19,13 +19,11 @@ import {
   type RegisterReplicationSlotOptions,
   type ReplicableDatabase,
   type ReplicationLogEntry,
-  type ReplicationOperation,
   type ReplicationPublication,
   type ReplicationSlot,
 } from './types';
 import {
   applyRowMutationToTable,
-  decodeJson,
   encodeJson,
   ensureTableSafe,
   execStatement,
@@ -38,7 +36,6 @@ import {
 } from './shared';
 import {
   createHlc,
-  formatHlc,
   matchesRowFilter,
   projectReplicatedRow,
 } from './hlc-crdt';
@@ -51,6 +48,7 @@ import { enableEnginePublication } from './native-changelog';
 import { compactJournal } from './dlq-compaction';
 import { exportPageDiff } from '../browser/snapshots';
 import { compressGzipBytes } from './bootstrap';
+import { fetchPublicationChangesSince } from './publication-fetch';
 
 interface NormalizedPublishedTableConfig extends Omit<PublishedTableConfig, 'primaryKey'> {
   table: string;
@@ -1015,204 +1013,11 @@ export async function createPublication(
       sinceLsn: number,
       fetchOpts = {},
     ): Promise<ReplicationLogEntry[]> {
-      let hasRowFilters = Boolean(options.transformRow);
-      if (!hasRowFilters) {
-        for (const cfg of tablesMap.values()) {
-          if (cfg.where || cfg.transformRow) {
-            hasRowFilters = true;
-            break;
-          }
-        }
-      }
-
-      const canPushdownLimit =
-        typeof db.execBatch === 'function' &&
-        !hasRowFilters &&
-        !fetchOpts.excludeOrigin &&
-        typeof fetchOpts.limit === 'number' &&
-        fetchOpts.limit > 0;
-
-      const res = canPushdownLimit
-        ? await db.query<Row>(
-            `SELECT LSN, TXID, ORIGIN, "PUBLICATION", TABLE_NAME, OP, KEY_JSON, AFTER_JSON, BEFORE_JSON, DDL_SQL, TS FROM ${journalTable} WHERE LSN > ? AND "PUBLICATION" = ? ORDER BY LSN ASC ROWS 1 TO ?`,
-            [sinceLsn, pubName, Math.trunc(fetchOpts.limit!)],
-          )
-        : await db.query<Row>(
-            `SELECT LSN, TXID, ORIGIN, "PUBLICATION", TABLE_NAME, OP, KEY_JSON, AFTER_JSON, BEFORE_JSON, DDL_SQL, TS FROM ${journalTable} WHERE LSN > ? ORDER BY LSN ASC`,
-            [sinceLsn],
-          );
-
-      const out: ReplicationLogEntry[] = [];
-      for (const row of res.rows) {
-        const origin = String(row.ORIGIN ?? row.origin ?? '');
-        const pub = String(row.PUBLICATION ?? row.publication ?? pubName);
-        if (pub !== pubName) continue;
-        if (fetchOpts.excludeOrigin && origin === fetchOpts.excludeOrigin) {
-          continue;
-        }
-        const tableUpper = String(row.TABLE_NAME ?? row.table_name ?? '');
-        let op = String(row.OP ?? row.op ?? 'INSERT') as ReplicationOperation;
-        const rawKeyJson = row.KEY_JSON ?? row.key_json;
-        const rawAfterJson = row.AFTER_JSON ?? row.after_json;
-        const rawBeforeJson = row.BEFORE_JSON ?? row.before_json;
-        const rawDdlSql =
-          row.DDL_SQL !== null && row.DDL_SQL !== undefined
-            ? String(row.DDL_SQL)
-            : row.ddl_sql !== null && row.ddl_sql !== undefined
-              ? String(row.ddl_sql)
-              : null;
-
-        const key = decodeJson(rawKeyJson) ?? {};
-        let after = decodeJson(rawAfterJson);
-        const cfg = tablesMap.get(tableUpper);
-
-        const canLazyDecodeBefore =
-          rawBeforeJson !== null &&
-          rawBeforeJson !== undefined &&
-          rawBeforeJson !== '' &&
-          !cfg?.where &&
-          !cfg?.columns &&
-          !cfg?.excludeColumns &&
-          !cfg?.transformRow &&
-          !options.transformRow;
-
-        let eagerBefore: Record<string, unknown> | null = canLazyDecodeBefore
-          ? null
-          : decodeJson(rawBeforeJson);
-
-        // Apply per-table row filter (`where`) and column projection (`columns` / `excludeColumns`)
-        if (cfg && op !== 'DDL') {
-          if (cfg.where) {
-            const afterMatches = after ? matchesRowFilter(after, cfg.where) : false;
-            const beforeMatches = eagerBefore ? matchesRowFilter(eagerBefore, cfg.where) : false;
-
-            if (op === 'INSERT' && !afterMatches) {
-              continue;
-            }
-            if (op === 'DELETE' && eagerBefore && !beforeMatches) {
-              continue;
-            }
-            if (op === 'UPDATE') {
-              if (!beforeMatches && !afterMatches) {
-                continue;
-              }
-              if (beforeMatches && !afterMatches) {
-                // Row moved out of this partial publication's scope -> emit synthetic DELETE
-                op = 'DELETE';
-                after = null;
-              } else if (!beforeMatches && afterMatches) {
-                // Row moved into this partial publication's scope -> emit synthetic INSERT
-                op = 'INSERT';
-                eagerBefore = null;
-              }
-            }
-          }
-
-          after = projectReplicatedRow(after, cfg.primaryKey, cfg.columns, cfg.excludeColumns);
-          if (!canLazyDecodeBefore) {
-            eagerBefore = projectReplicatedRow(
-              eagerBefore,
-              cfg.primaryKey,
-              cfg.columns,
-              cfg.excludeColumns,
-            );
-          }
-
-          const rowTx = cfg.transformRow ?? options.transformRow;
-          if (rowTx && op !== 'DELETE') {
-            if (after) {
-              after = await rowTx(after, {
-                table: tableUpper,
-                operation: op,
-                key,
-                origin,
-              });
-              if (!after) continue;
-            }
-            if (eagerBefore) {
-              eagerBefore = await rowTx(eagerBefore, {
-                table: tableUpper,
-                operation: op,
-                key,
-                origin,
-              });
-            }
-          }
-        } else if (options.transformRow && op !== 'DDL' && op !== 'DELETE') {
-          if (after) {
-            after = await options.transformRow(after, {
-              table: tableUpper,
-              operation: op,
-              key,
-              origin,
-            });
-            if (!after) continue;
-          }
-          if (eagerBefore) {
-            eagerBefore = await options.transformRow(eagerBefore, {
-              table: tableUpper,
-              operation: op,
-              key,
-              origin,
-            });
-          }
-        }
-
-        const lsnNum = Number(row.LSN ?? row.lsn ?? 0);
-        const tsNum = Number(row.TS ?? row.ts ?? 0);
-        const entryHlc =
-          hlcByLsn.get(lsnNum) ??
-          formatHlc({ wallMs: tsNum, counter: 0, nodeId: origin });
-
-        const approxBytes =
-          64 +
-          tableUpper.length +
-          (typeof rawKeyJson === 'string' ? rawKeyJson.length : 16) +
-          (typeof rawAfterJson === 'string' ? rawAfterJson.length : 0) +
-          (typeof rawBeforeJson === 'string' ? rawBeforeJson.length : 0) +
-          (rawDdlSql ? rawDdlSql.length : 0);
-
-        const entryObj: ReplicationLogEntry = {
-          lsn: lsnNum,
-          txid: String(row.TXID ?? row.txid ?? ''),
-          origin,
-          publication: pub,
-          table: tableUpper,
-          operation: op,
-          key,
-          after,
-          before: eagerBefore,
-          ddlSql: rawDdlSql,
-          timestamp: tsNum,
-          hlc: entryHlc,
-        };
-
-        if (canLazyDecodeBefore) {
-          let decodedBefore: Record<string, unknown> | null | undefined;
-          Object.defineProperty(entryObj, 'before', {
-            enumerable: true,
-            configurable: true,
-            get(): Record<string, unknown> | null {
-              if (decodedBefore === undefined) {
-                decodedBefore = decodeJson(rawBeforeJson);
-              }
-              return decodedBefore;
-            },
-          });
-        }
-
-        Object.defineProperty(entryObj, '_approxBytes', {
-          value: approxBytes,
-          enumerable: false,
-          configurable: true,
-        });
-
-        out.push(entryObj);
-        if (fetchOpts.limit && out.length >= fetchOpts.limit) {
-          break;
-        }
-      }
-      return out;
+      return fetchPublicationChangesSince(
+        { db, journalTable, pubName, tablesMap, options, hlcByLsn },
+        sinceLsn,
+        fetchOpts,
+      );
     },
 
     async pruneJournal(upToLsn: number): Promise<number> {

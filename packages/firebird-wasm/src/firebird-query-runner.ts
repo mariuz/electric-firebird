@@ -6,6 +6,7 @@
 import { TransactionIsolation } from 'node-firebird-driver';
 import type { Attachment, Transaction } from 'node-firebird-driver';
 import type {
+  DatabaseInfo,
   ExplainOptions,
   FieldInfo,
   QueryDescription,
@@ -15,6 +16,8 @@ import type {
   QueryStreamOptions,
   Row,
   RowMode,
+  StatementExecutionOptions,
+  SweepResult,
 } from './types';
 import { statementKind } from './statement-types';
 import { applyTypes, type TypeOptions } from './browser/value-types';
@@ -24,13 +27,20 @@ import {
   assertNotAborted,
   createTimeoutError,
   runWithCancellation,
+  type UnifiedExecuteResult,
   validateTimeoutMs,
 } from './database-core';
 import type { TypedSqlFragment } from './schema-validation';
 import {
   extractEffectiveQuerySchema,
   finalizeQueryResultWithSchema,
+  scanUserTablesForSweep,
 } from './shared-driver-ops';
+import { buildSweepResult } from './browser/engine-transport';
+import {
+  extractReferencedTables,
+  liveTableEventName,
+} from './browser/live-tables';
 import {
   resolveQueryCall,
   toStatement,
@@ -423,4 +433,177 @@ export async function explainNodeQuery(
   } finally {
     await transaction.commit().catch(() => undefined);
   }
+}
+
+export async function runNodeProfiledExec(
+  profiler: QueryProfiler,
+  runTxExec: (sql: string | SqlFragment, params: QueryParams, options: StatementExecutionOptions) => Promise<void>,
+  sql: string | SqlFragment,
+  paramsOrOptions: QueryParams | StatementExecutionOptions = [],
+  maybeOptions: StatementExecutionOptions = {},
+): Promise<void> {
+  const params = Array.isArray(paramsOrOptions) ? paramsOrOptions : [];
+  const options = Array.isArray(paramsOrOptions) ? maybeOptions : (paramsOrOptions ?? {});
+  assertNotAborted(options.signal);
+  validateTimeoutMs(options.timeoutMs);
+  const script = toStatement(sql, params);
+  const startedAt = profiler.begin();
+  try {
+    await runTxExec(sql, params, options);
+    profiler.end({
+      startedAt,
+      sql: script.sql,
+      params: script.params,
+      kind: 'exec',
+      rowCount: 0,
+      cacheHit: false,
+    });
+  } catch (err) {
+    profiler.end({
+      startedAt,
+      sql: script.sql,
+      params: script.params,
+      kind: 'exec',
+      cacheHit: false,
+      error: err,
+    });
+    throw err;
+  }
+}
+
+export async function runNodeProfiledExecute(
+  profiler: QueryProfiler,
+  runTxExecute: (
+    sql: string | SqlFragment,
+    params: QueryParams,
+    options: StatementExecutionOptions,
+  ) => Promise<UnifiedExecuteResult>,
+  sql: string | SqlFragment,
+  params: QueryParams = [],
+  options: StatementExecutionOptions = {},
+): Promise<UnifiedExecuteResult> {
+  assertNotAborted(options.signal);
+  validateTimeoutMs(options.timeoutMs);
+  const script = toStatement(sql, params);
+  const startedAt = profiler.begin();
+  try {
+    const res = await runTxExecute(sql, params, options);
+    profiler.end({
+      startedAt,
+      sql: script.sql,
+      params: script.params,
+      kind: 'exec',
+      rowCount: res.affectedRows,
+      cacheHit: false,
+    });
+    return res;
+  } catch (err) {
+    profiler.end({
+      startedAt,
+      sql: script.sql,
+      params: script.params,
+      kind: 'exec',
+      cacheHit: false,
+      error: err,
+    });
+    throw err;
+  }
+}
+
+export async function runNodeProfiledExecBatch(
+  profiler: QueryProfiler,
+  runTxBatch: (sql: string, rows: QueryParams[]) => Promise<void>,
+  sql: string,
+  rows: QueryParams[],
+): Promise<void> {
+  const startedAt = profiler.begin();
+  try {
+    await runTxBatch(sql, rows);
+    profiler.end({
+      startedAt,
+      sql,
+      params: rows[0] ?? [],
+      kind: 'execBatch',
+      rowCount: rows.length,
+      cacheHit: rows.length > 1,
+    });
+  } catch (err) {
+    profiler.end({
+      startedAt,
+      sql,
+      params: rows[0] ?? [],
+      kind: 'execBatch',
+      cacheHit: rows.length > 1,
+      error: err,
+    });
+    throw err;
+  }
+}
+
+export function watchNodeLocalSqlEvents(
+  liveEventListeners: Map<string, Set<() => void>>,
+  sqlText: string,
+  explicitEvents: readonly string[] | undefined,
+  onWakeup: () => void,
+  options: { pollIntervalMs?: number },
+): () => Promise<void> {
+  const events: string[] =
+    explicitEvents !== undefined
+      ? [...explicitEvents]
+      : (() => {
+          const tables = extractReferencedTables(sqlText);
+          if (tables.length === 0) {
+            throw new RangeError(
+              'liveIncremental() / liveColumnar() could not infer any user tables from SQL; pass { events: [...] } explicitly',
+            );
+          }
+          return tables.map((t) => liveTableEventName(t));
+        })();
+
+  for (const ev of events) {
+    let set = liveEventListeners.get(ev);
+    if (!set) {
+      set = new Set();
+      liveEventListeners.set(ev, set);
+    }
+    set.add(onWakeup);
+  }
+
+  const intervalMs = options.pollIntervalMs ?? 250;
+  const pollTimer = intervalMs > 0 ? setInterval(() => onWakeup(), intervalMs) : null;
+  if (pollTimer && typeof (pollTimer as { unref?: () => void }).unref === 'function') {
+    (pollTimer as { unref: () => void }).unref();
+  }
+
+  return async () => {
+    if (pollTimer) clearInterval(pollTimer);
+    for (const ev of events) {
+      const set = liveEventListeners.get(ev);
+      if (set) {
+        set.delete(onWakeup);
+        if (set.size === 0) liveEventListeners.delete(ev);
+      }
+    }
+  };
+}
+
+export async function runNodeSweep(host: {
+  ensureReady: () => Promise<void>;
+  endReadTransaction: () => Promise<void>;
+  databaseInfo: () => Promise<DatabaseInfo>;
+  query: (sql: string) => Promise<QueryResult<Row>>;
+  getAttachment: () => Attachment;
+}): Promise<SweepResult> {
+  await host.ensureReady();
+  const started = performance.now();
+  await host.endReadTransaction();
+  const before = await host.databaseInfo();
+  const tablesScanned = await scanUserTablesForSweep(host.query);
+
+  await host.endReadTransaction();
+  const tx = await host.getAttachment().startTransaction();
+  await tx.commit().catch(() => tx.rollback().catch(() => undefined));
+
+  const after = await host.databaseInfo();
+  return buildSweepResult(before, after, tablesScanned, performance.now() - started);
 }

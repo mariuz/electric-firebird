@@ -57,6 +57,7 @@ export {
   type PersistentVectorIndex,
 } from './hnsw';
 export * from './quantization';
+export * from '../knowledge-graph';
 export {
   DEFAULT_SEMANTIC_CACHE_TABLE,
   mmrRerank,

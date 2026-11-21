@@ -6,8 +6,19 @@
 import type { ParsedQueryPlan, PlanTreeNode } from './plan-tree';
 import type { OptimisticStoreSnapshot } from '../optimistic-store';
 import type { UndoRedoSnapshot } from '../undo-redo';
+import {
+  encodeArrowIpc,
+  rowsToColumnarResult,
+  type ColumnarQueryResult,
+} from '../columnar';
+import type { SyncHandleLike } from '../frameworks/sync-store';
+import {
+  DEFAULT_MATVIEWS_TABLE,
+  type MaterializedViewInfo,
+  type MaterializedViewRefreshStrategy,
+} from '../materialized-view';
 import { el } from './repl-styles';
-import type { ReplArrowInspectorInfo } from './index';
+import type { ReplArrowInspectorInfo, ReplDatabase } from './repl-types';
 
 export function renderArrowInspectorPanel(
   info: ReplArrowInspectorInfo | null,
@@ -90,6 +101,115 @@ export function renderArrowInspectorPanel(
   }
   panel.append(list);
   return panel;
+}
+
+export async function fetchReplArrowInspector(
+  db: ReplDatabase,
+  editorValue: string,
+  syncHandleRef: SyncHandleLike | null,
+  explicitSql?: string,
+): Promise<ReplArrowInspectorInfo> {
+  const sqlCandidate = (explicitSql ?? editorValue ?? '').trim();
+  const targetSql =
+    sqlCandidate.length > 0
+      ? sqlCandidate
+      : "SELECT 1 AS ID, CAST('firebird' AS VARCHAR(32)) AS ENGINE FROM RDB$DATABASE";
+
+  let col: ColumnarQueryResult;
+  if (typeof db.queryColumnar === 'function') {
+    col = await db.queryColumnar(targetSql, []);
+  } else {
+    const res = await db.query(targetSql, [], { rowMode: 'array' });
+    const objRows = res.rows.map((r) =>
+      Object.fromEntries(res.fields.map((f, i) => [f.name, r[i]])),
+    );
+    col = rowsToColumnarResult({ fields: res.fields, rows: objRows });
+  }
+
+  const arrowBytes =
+    typeof db.queryArrow === 'function'
+      ? await db.queryArrow(targetSql, [])
+      : encodeArrowIpc(col);
+
+  let syncState: ReplArrowInspectorInfo['syncState'] = null;
+  if (syncHandleRef) {
+    try {
+      const st = await syncHandleRef.stats();
+      syncState = {
+        state: syncHandleRef.paused
+          ? 'paused'
+          : (syncHandleRef.connectionState ?? 'online'),
+        mode: syncHandleRef.mode ?? 'logical',
+        paused: syncHandleRef.paused,
+        lagEntries: st.lagEntries,
+        replicaLsn: st.replicaWatermark,
+        primaryLsn: st.primaryLsn,
+      };
+    } catch {
+      syncState = null;
+    }
+  }
+
+  const vectors = col.vectors.map((v, idx) => {
+    const f = col.fields[idx];
+    const dataBytes = v.data.byteLength;
+    const offsetBytes =
+      v.kind === 'utf8' || v.kind === 'bytes' ? v.offsets.byteLength : 0;
+    return {
+      name: f?.name ?? `COL_${idx}`,
+      kind: v.kind,
+      sqlType: f?.typeName ?? String(f?.type ?? ''),
+      nullCount: v.nullCount,
+      bufferBytes: dataBytes + offsetBytes + v.validity.byteLength,
+    };
+  });
+
+  return {
+    sql: targetSql,
+    rowCount: col.rowCount,
+    arrowIpcBytes: arrowBytes.byteLength,
+    vectors,
+    syncState,
+  };
+}
+
+export async function fetchReplMaterializedViews(
+  db: ReplDatabase,
+): Promise<MaterializedViewInfo[]> {
+  if (typeof db.listMaterializedViews === 'function') {
+    return db.listMaterializedViews();
+  }
+  try {
+    const rel = await db.query(
+      `SELECT 1 FROM RDB$RELATIONS WHERE TRIM(RDB$RELATION_NAME) = ?`,
+      [DEFAULT_MATVIEWS_TABLE],
+      { rowMode: 'array' },
+    );
+    if (rel.rows.length === 0) return [];
+    const res = await db.query(
+      `SELECT "VIEW_NAME", "SELECT_SQL", "PRIMARY_KEY_JSON", "INDEXES_JSON", ` +
+        `"REFRESH_STRATEGY", "WATCH_TABLES_JSON", "INTERVAL_MS", "ROW_COUNT", ` +
+        `"LAST_REFRESHED_AT", "LAST_DURATION_MS" ` +
+        `FROM "${DEFAULT_MATVIEWS_TABLE}" ORDER BY "VIEW_NAME"`,
+      [],
+      { rowMode: 'array' },
+    );
+    return res.rows.map((r) => ({
+      name: String(r[0] ?? '').trim(),
+      selectSql: String(r[1] ?? ''),
+      primaryKey: JSON.parse(String(r[2] ?? '[]')) as string[],
+      indexes: JSON.parse(String(r[3] ?? '[]')) as string[][],
+      refreshStrategy: (String(r[4] ?? 'manual').trim() ||
+        'manual') as MaterializedViewRefreshStrategy,
+      watchTables: JSON.parse(String(r[5] ?? '[]')) as string[],
+      intervalMs: r[6] === null || r[6] === undefined ? null : Number(r[6]),
+      rowCount: Number(r[7] ?? 0),
+      lastRefreshedAt: Number(r[8] ?? 0),
+      lastDurationMs: Number(r[9] ?? 0),
+    }));
+  } catch {
+    return [];
+  }
 }
 
 export function renderPlanTreeNode(node: PlanTreeNode): HTMLElement {

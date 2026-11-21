@@ -557,6 +557,58 @@ test.describe('<firebird-repl>', () => {
     expect(outcome.inspectorText).toContain('OpenTelemetry & Prometheus /metrics');
   });
 
+  test('M28: runs Adaptive Index Advisor & inspects Durable Job Queue (FB_JOB_QUEUE$) in <firebird-repl>', async ({
+    page,
+  }) => {
+    await page.goto('/no-isolation/browser-harness-frameworks-st');
+    await page.waitForFunction(() => Boolean((window as any).FB && (window as any).Frameworks));
+
+    const outcome = await page.evaluate(async () => {
+      const w = window as any;
+      w.Frameworks.FBRepl.defineFirebirdRepl();
+      const repl = document.createElement('firebird-repl') as any;
+      const db = new w.FB.FirebirdBrowser('memory://repl-m28');
+      repl.db = db;
+      document.getElementById('app')!.replaceChildren(repl);
+
+      await repl.run('CREATE TABLE TENANTS (ID INTEGER NOT NULL PRIMARY KEY)');
+      await repl.run(
+        'CREATE TABLE M28_ORDERS (ID INTEGER NOT NULL PRIMARY KEY, CUSTOMER_EMAIL VARCHAR(80), TENANT_ID INTEGER)',
+      );
+      await repl.run("INSERT INTO M28_ORDERS VALUES (1, 'ada@acme.io', 42)");
+
+      const emptyJq = await repl.jobQueueStats();
+      const queue = w.FB.createJobQueue(db);
+      await queue.enqueue('email.send', { to: 'ada@acme.io' });
+      const activeJq = await repl.jobQueueStats();
+
+      const report = await repl.adviseWorkload([
+        "SELECT * FROM M28_ORDERS WHERE CUSTOMER_EMAIL = 'ada@acme.io'",
+      ]);
+      const inspectorText = repl.shadowRoot?.querySelector('.inspector')?.textContent ?? '';
+      const ddlBtn = repl.shadowRoot?.querySelector('.advisor-load-ddl-btn') as HTMLButtonElement | null;
+      ddlBtn?.click();
+      const loadedEditorVal = repl.value;
+
+      await db.close();
+      return {
+        emptyPending: emptyJq?.pending ?? -1,
+        activePending: activeJq?.pending ?? -1,
+        recKinds: (report?.recommendations ?? []).map((r: any) => r.kind),
+        inspectorText,
+        loadedEditorVal,
+      };
+    });
+
+    expect(outcome.emptyPending).toBe(0);
+    expect(outcome.activePending).toBe(1);
+    expect(outcome.recKinds).toContain('MISSING_FILTER_INDEX');
+    expect(outcome.recKinds).toContain('UNINDEXED_FOREIGN_KEY');
+    expect(outcome.inspectorText).toContain('Adaptive Index & Workload Advisor');
+    expect(outcome.inspectorText).toContain('Durable Job Queue (FB_JOB_QUEUE$)');
+    expect(outcome.loadedEditorVal).toContain('CREATE INDEX');
+  });
+
   test('takes a db property set before it was defined, and reports runs', async ({ page }) => {
     await page.goto('/no-isolation/browser-harness-frameworks-st');
     await page.waitForFunction(() => Boolean((window as any).FB && (window as any).Frameworks));

@@ -1083,3 +1083,7 @@ export type {
   CreatedEncryptedBackup,
   BackupVerificationResult,
 } from '../encrypted-backup';
+export * from '../job-queue';
+export * from '../knowledge-graph';
+export * from '../online-migrator';
+export * from '../workload-advisor';
