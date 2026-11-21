@@ -1970,6 +1970,37 @@ Next-horizon improvements across **Replication**, **Speed & Performance**, **Int
 
 ---
 
+### M27 — Model Context Protocol (MCP) Server & Guarded Agent Tooling, Markdown/Code RAG Chunker & Ingester, OpenTelemetry & Prometheus `/metrics`, Authenticated Encrypted `.fbkp` Backups & Sub-1,350-Line Module Split
+
+- [x] **1. Model Context Protocol (MCP) Server & Guarded Agent SQL/RAG Tooling (`createFirebirdMcpServer` & CLI `npx firebird-wasm mcp`).**
+      Add a zero-dependency JSON-RPC 2.0 MCP server (`stdio` + Web Fetch HTTP `POST /mcp`) exposing embedded WASM or
+      native Firebird databases to AI agents with `list_tables`, `describe_table`, `read_query` (`READ ONLY` transaction +
+      row cap + timeout), opt-in `write_query` (`allowWrites` + optional `FB_AUDIT_LOG$` attestation), `explain_query`,
+      and `hybrid_search` tools, plus `firebird://schema`, `firebird://table/{name}/sample`, and `firebird://audit/head`
+      resources and CLI `npx firebird-wasm mcp <uri> [--allow-writes] [--audit] [--port <n>]`.
+- [x] **2. Markdown/Code-Aware Document Chunker & Incremental RAG Ingestion Pipeline (`chunkDocument` & `createRagIngester`).**
+      Add `chunkDocument(text, { maxTokens, overlapTokens?, strategy?: 'markdown' | 'recursive' | 'sentence' })` preserving
+      heading breadcrumbs, character/line offsets, and SHA-256 content hashes, plus `createRagIngester(db, { table, embed, chunkOptions?, quantization? })`
+      (`ingestDocument`, `ingestMany`, `deleteDocument`, `askContext`) skipping unchanged chunks via SHA-256 diffing,
+      bulk-upserting via `IBatch`, maintaining HNSW + BM25 indexes, and pairing with `packRagContext` & `createSemanticCache`.
+- [x] **3. OpenTelemetry Tracing, W3C `traceparent` Propagation & Prometheus `/metrics` Exporter (`createOtelInstrumentation` & `formatPrometheusMetrics`).**
+      Add a zero-dependency OpenTelemetry-compatible span & metric bridge (`createOtelInstrumentation({ db, replicator?, tracer?, meter?, redactParams? })`)
+      emitting structured spans (`db.system = 'firebird'`, page I/O counters, prepare-cache hits, replication lag/conflicts)
+      with W3C `traceparent` propagation across HTTP/SSE/WS sync requests and OpenMetrics/Prometheus text exposition
+      (`formatPrometheusMetrics` + `GET /metrics` on `createHttpReplicationHandler` and `npx firebird-wasm serve-sync`).
+- [x] **4. Authenticated Encrypted Backup Archives, Incremental Chains & CLI `backup` / `verify-backup` (`createEncryptedBackup` & `restoreEncryptedBackup`).**
+      Add a portable `.fbkp` backup container combining gzip compression, WebCrypto PBKDF2/HKDF AES-256-GCM authenticated
+      encryption, per-block SHA-256 Merkle manifest, optional incremental page-diff base chains, and `FB_AUDIT_LOG$`
+      Merkle root attestation (`createEncryptedBackup`, `verifyBackupArchive`, `restoreEncryptedBackup`), plus CLI
+      `npx firebird-wasm backup <uri> --out <file.fbkp>` and `npx firebird-wasm verify-backup <file.fbkp>`.
+- [x] **5. `<firebird-repl>` MCP & OpenMetrics Inspector, Simulator Scenario 21 & Sub-1,350-Line Module Split.**
+      Surface MCP tool/resource inspection and OpenMetrics/Prometheus telemetry export inside `<firebird-repl>`, add
+      Simulator **Scenario 21** (`mcp-agent-rag-ingest-otel-backup`), and decompose `firebird.ts`, `firebird-browser.ts`,
+      `repl-inspectors.ts`, `engine-transport.ts`, `repl/index.ts`, and `cli.ts` so every non-test `.ts` source file
+      across the repository sits strictly under 1,350 lines.
+
+---
+
 ## 5. Test coverage added alongside this review
 
 `src/browser/` was excluded from Jest and had no browser tests.  It now has 73

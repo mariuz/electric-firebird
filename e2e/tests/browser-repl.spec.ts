@@ -516,6 +516,47 @@ test.describe('<firebird-repl>', () => {
     expect(outcome.tamperedInspectorText).toContain('TAMPERED at SEQ #1');
   });
 
+  test('M27: inspects MCP Agent tools & exports OpenMetrics / Prometheus telemetry in <firebird-repl>', async ({
+    page,
+  }) => {
+    await page.goto('/no-isolation/browser-harness-frameworks-st');
+    await page.waitForFunction(() => Boolean((window as any).FB && (window as any).Frameworks));
+
+    const outcome = await page.evaluate(async () => {
+      const w = window as any;
+      w.Frameworks.FBRepl.defineFirebirdRepl();
+      const repl = document.createElement('firebird-repl') as any;
+      const db = new w.FB.FirebirdBrowser('memory://repl-m27');
+      repl.db = db;
+      document.getElementById('app')!.replaceChildren(repl);
+
+      await repl.run('CREATE TABLE M27_ITEMS (ID INTEGER NOT NULL PRIMARY KEY, NAME VARCHAR(40))');
+      await repl.run("INSERT INTO M27_ITEMS VALUES (1, 'mcp-otel')");
+
+      const roTools = repl.mcpTools().map((t: any) => t.name);
+      const rwTools = repl.mcpTools({ allowWrites: true }).map((t: any) => t.name);
+      const promText = await repl.prometheusMetrics();
+      const inspectorText = repl.shadowRoot?.querySelector('.inspector')?.textContent ?? '';
+      const badgeCount = repl.shadowRoot?.querySelectorAll('.mcp-tool-badge').length ?? 0;
+
+      await db.close();
+      return { roTools, rwTools, promText, inspectorText, badgeCount };
+    });
+
+    expect(outcome.roTools).toEqual([
+      'list_tables',
+      'describe_table',
+      'read_query',
+      'explain_query',
+      'hybrid_search',
+    ]);
+    expect(outcome.rwTools).toContain('write_query');
+    expect(outcome.badgeCount).toBe(5);
+    expect(outcome.promText).toContain('firebird_queries_total');
+    expect(outcome.inspectorText).toContain('MCP Agent Tools');
+    expect(outcome.inspectorText).toContain('OpenTelemetry & Prometheus /metrics');
+  });
+
   test('takes a db property set before it was defined, and reports runs', async ({ page }) => {
     await page.goto('/no-isolation/browser-harness-frameworks-st');
     await page.waitForFunction(() => Boolean((window as any).FB && (window as any).Frameworks));

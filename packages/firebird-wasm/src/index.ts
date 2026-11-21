@@ -977,3 +977,67 @@ export type {
   SeedDatabaseOptions,
   SeedDatabaseResult,
 } from './data-seeder';
+export {
+  MCP_PROTOCOL_VERSION,
+  createFirebirdMcpServer,
+} from './mcp-server';
+export type {
+  McpDatabaseExecutor,
+  JsonRpcRequest,
+  JsonRpcResponse,
+  McpToolDescriptor,
+  McpResourceDescriptor,
+  FirebirdMcpServerOptions,
+  FirebirdMcpServer,
+} from './mcp-server';
+export {
+  DEFAULT_RAG_CHUNKS_TABLE,
+  sha256HexSync,
+  chunkDocument,
+  createRagIngester,
+} from './rag-ingester';
+export type {
+  ChunkingStrategy,
+  ChunkDocumentOptions,
+  DocumentChunk,
+  RagIngesterDatabaseExecutor,
+  RagDocumentInput,
+  RagIngestResult,
+  RagIngesterOptions,
+  RagIngesterHandle,
+} from './rag-ingester';
+export {
+  parseTraceparent,
+  generateTraceparent,
+  formatPrometheusMetrics,
+  createOtelInstrumentation,
+} from './otel-metrics';
+export type {
+  ParsedTraceparent,
+  OtelAttributeValue,
+  OtelSpanLike,
+  OtelTracerLike,
+  OtelMeterLike,
+  RecordedOtelSpan,
+  OtelObservableDatabase,
+  FirebirdPrometheusInput,
+  OtelInstrumentationOptions,
+  OtelInstrumentationHandle,
+} from './otel-metrics';
+export {
+  FBKP_ARCHIVE_MAGIC,
+  isEncryptedBackupArchive,
+  createEncryptedBackup,
+  verifyBackupArchive,
+  restoreEncryptedBackup,
+} from './encrypted-backup';
+export type {
+  BackupKeyMaterial,
+  BackupAuditAttestation,
+  BackupArchiveHeader,
+  BackupSourceDatabase,
+  BackupTargetDatabase,
+  CreateEncryptedBackupOptions,
+  CreatedEncryptedBackup,
+  BackupVerificationResult,
+} from './encrypted-backup';

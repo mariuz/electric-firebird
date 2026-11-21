@@ -77,10 +77,17 @@ import {
   type EncodedColumn,
 } from './result-decoder';
 import {
+  runDirectCursorOpenStmt,
+  runDirectExecuteBatchStmt,
+  runDirectExecuteStmt,
   runDirectPipeline,
+  runDirectQueryStmt,
+  runDirectQueryStmtBinary,
   runDirectReplicateChangelog,
   runDirectSetReplicaMode,
+  runDirectStmtSetTimeout,
   runDirectSweep,
+  type DirectStmtOpsHost,
 } from './engine-direct-ops';
 
 export {
@@ -801,16 +808,19 @@ export class DirectTransport implements EngineTransport {
     }
   }
 
-  private lookupPreparedEntry(
-    dbHandle: EngineHandle,
-    stmtHandle: EngineHandle,
-    context: string,
-  ): { dbHandle: EngineHandle; sql: string; native: boolean } {
-    const entry = this.preparedStatements.get(stmtHandle);
-    if (!entry || entry.dbHandle !== dbHandle) {
-      throw new Error(`Firebird ${context} failed: unknown statement handle (${stmtHandle})`);
-    }
-    return entry;
+  private get stmtOpsHost(): DirectStmtOpsHost {
+    return {
+      module: this.module,
+      preparedStatements: this.preparedStatements,
+      shapeColumns: this.shapeColumns,
+      withParams: (p, fn) => this.withParams(p, fn),
+      resolveStagedBlobParams: (p) => this.resolveStagedBlobParams(p),
+      extractBinaryPayload: (m, b, l) => this.extractBinaryPayload(m, b, l),
+      execute: (db, tx, s, p) => this.execute(db, tx, s, p),
+      executeBatch: (db, tx, s, r) => this.executeBatch(db, tx, s, r),
+      query: (db, tx, s, p, rm, bb) => this.query(db, tx, s, p, rm, bb),
+      cursorOpen: (db, tx, s, p) => this.cursorOpen(db, tx, s, p),
+    };
   }
 
   async executeStmt(
@@ -819,39 +829,7 @@ export class DirectTransport implements EngineTransport {
     stmtHandle: EngineHandle,
     params: QueryParams | Uint8Array = [],
   ): Promise<number> {
-    const mod = this.module;
-    const entry = this.preparedStatements.get(stmtHandle);
-    if (
-      typeof mod._fb_execute_stmt === 'function' &&
-      (!entry || entry.native)
-    ) {
-      const executeStmtFn = mod._fb_execute_stmt;
-      const rc = this.withParams(params, (paramPtr, paramLen) =>
-        executeStmtFn.call(
-          mod,
-          dbHandle,
-          txHandle,
-          stmtHandle,
-          paramPtr,
-          paramLen,
-        ),
-      );
-      if (rc !== 0) {
-        throw engineError(
-          mod,
-          `Firebird executeStmt failed for statement #${stmtHandle}`,
-          rc,
-        );
-      }
-      return mod._fb_last_affected_rows();
-    }
-
-    const fallback = this.lookupPreparedEntry(
-      dbHandle,
-      stmtHandle,
-      'executeStmt',
-    );
-    return this.execute(dbHandle, txHandle, fallback.sql, params);
+    return runDirectExecuteStmt(this.stmtOpsHost, dbHandle, txHandle, stmtHandle, params);
   }
 
   async executeBatchStmt(
@@ -860,54 +838,7 @@ export class DirectTransport implements EngineTransport {
     stmtHandle: EngineHandle,
     rows: QueryParams[] | Uint8Array,
   ): Promise<number> {
-    const mod = this.module;
-    const entry = this.preparedStatements.get(stmtHandle);
-    if (
-      typeof mod._fb_execute_batch_stmt === 'function' &&
-      (!entry || entry.native)
-    ) {
-      const executeBatchStmtFn = mod._fb_execute_batch_stmt;
-      let packed: Uint8Array;
-      if (isWireParamRowsBuffer(rows)) {
-        const view = new DataView(rows.buffer, rows.byteOffset, rows.byteLength);
-        if (view.getUint32(4, true) === 0) return 0;
-        packed = wireParamRowsToCAbi(rows);
-      } else {
-        if (rows.length === 0) return 0;
-        const resolvedRows = rows.map((row) => this.resolveStagedBlobParams(row));
-        packed = encodeParamRows(resolvedRows);
-      }
-      const ptr = mod._malloc(packed.length);
-      let rc: number;
-      try {
-        mod.HEAPU8.set(packed, ptr);
-        rc = executeBatchStmtFn.call(
-          mod,
-          dbHandle,
-          txHandle,
-          stmtHandle,
-          ptr,
-          packed.length,
-        );
-      } finally {
-        mod._free(ptr);
-      }
-      if (rc !== 0) {
-        throw engineError(
-          mod,
-          `Firebird executeBatchStmt failed for statement #${stmtHandle}`,
-          rc,
-        );
-      }
-      return mod._fb_last_affected_rows();
-    }
-
-    const fallback = this.lookupPreparedEntry(
-      dbHandle,
-      stmtHandle,
-      'executeBatchStmt',
-    );
-    return this.executeBatch(dbHandle, txHandle, fallback.sql, rows);
+    return runDirectExecuteBatchStmt(this.stmtOpsHost, dbHandle, txHandle, stmtHandle, rows);
   }
 
   async queryStmt<T = Row>(
@@ -918,95 +849,11 @@ export class DirectTransport implements EngineTransport {
     rowMode: RowMode = 'object',
     binaryBlobs = false,
   ): Promise<QueryResult<T>> {
-    const mod = this.module;
-    const entry = this.preparedStatements.get(stmtHandle);
-    const flags = (binaryBlobs ? BLOB_SIDE_CHANNEL : 0) | SHAPE_IDS;
-
-    if (
-      typeof mod._fb_query_stmt_binary === 'function' &&
-      (!entry || entry.native)
-    ) {
-      const queryStmtBinaryFn = mod._fb_query_stmt_binary;
-      return this.withParams(params, (paramPtr, paramLen) => {
-        const lenPtr = mod._malloc(4);
-        let binPtr = 0;
-        try {
-          binPtr = queryStmtBinaryFn.call(
-            mod,
-            dbHandle,
-            txHandle,
-            stmtHandle,
-            paramPtr,
-            paramLen,
-            flags,
-            lenPtr,
-          );
-          if (binPtr === 0) {
-            throw engineError(
-              mod,
-              `Firebird queryStmt failed for statement #${stmtHandle}`,
-            );
-          }
-          const lenView = new DataView(
-            mod.HEAPU8.buffer,
-            mod.HEAPU8.byteOffset + lenPtr,
-            4,
-          );
-          const byteLen = lenView.getUint32(0, true);
-          const view = mod.HEAPU8.subarray(binPtr, binPtr + byteLen);
-          return decodeBinaryResultSet<T>(
-            view,
-            rowMode,
-            binaryBlobs,
-            this.shapeColumns,
-          );
-        } finally {
-          if (binPtr !== 0) {
-            mod._fb_free_result(binPtr);
-          }
-          mod._free(lenPtr);
-        }
-      });
-    }
-
-    if (
-      typeof mod._fb_query_stmt === 'function' &&
-      (!entry || entry.native)
-    ) {
-      const queryStmtFn = mod._fb_query_stmt;
-      return this.withParams(params, (paramPtr, paramLen) => {
-        const resultPtr = queryStmtFn.call(
-          mod,
-          dbHandle,
-          txHandle,
-          stmtHandle,
-          paramPtr,
-          paramLen,
-          flags,
-        );
-        if (resultPtr === 0) {
-          throw engineError(
-            mod,
-            `Firebird queryStmt failed for statement #${stmtHandle}`,
-          );
-        }
-        const json = mod.UTF8ToString(resultPtr);
-        mod._fb_free_result(resultPtr);
-        const blobs = binaryBlobs ? readBlobs(mod) : null;
-        const result = decodeResultSet<T>(json, rowMode, this.shapeColumns);
-        return blobs ? attachBlobs(result, blobs, rowMode) : result;
-      });
-    }
-
-    const fallback = this.lookupPreparedEntry(
-      dbHandle,
-      stmtHandle,
-      'queryStmt',
-    );
-    return this.query<T>(
+    return runDirectQueryStmt<T>(
+      this.stmtOpsHost,
       dbHandle,
       txHandle,
-      fallback.sql,
+      stmtHandle,
       params,
       rowMode,
       binaryBlobs,
@@ -1020,61 +867,14 @@ export class DirectTransport implements EngineTransport {
     params: QueryParams | Uint8Array = [],
     binaryBlobs = false,
   ): Promise<BinaryResultPayload> {
-    const mod = this.module;
-    const entry = this.preparedStatements.get(stmtHandle);
-    if (
-      typeof mod._fb_query_stmt_binary === 'function' &&
-      (!entry || entry.native)
-    ) {
-      const queryStmtBinaryFn = mod._fb_query_stmt_binary;
-      const flags = (binaryBlobs ? BLOB_SIDE_CHANNEL : 0) | SHAPE_IDS;
-      return this.withParams(params, (paramPtr, paramLen) => {
-        const lenPtr = mod._malloc(4);
-        let binPtr = 0;
-        try {
-          binPtr = queryStmtBinaryFn.call(
-            mod,
-            dbHandle,
-            txHandle,
-            stmtHandle,
-            paramPtr,
-            paramLen,
-            flags,
-            lenPtr,
-          );
-          if (binPtr === 0) {
-            throw engineError(
-              mod,
-              `Firebird queryStmt failed for statement #${stmtHandle}`,
-            );
-          }
-          const lenView = new DataView(
-            mod.HEAPU8.buffer,
-            mod.HEAPU8.byteOffset + lenPtr,
-            4,
-          );
-          const byteLen = lenView.getUint32(0, true);
-          return this.extractBinaryPayload(mod, binPtr, byteLen);
-        } finally {
-          if (binPtr !== 0) {
-            mod._fb_free_result(binPtr);
-          }
-          mod._free(lenPtr);
-        }
-      });
-    }
-
-    const decoded = await this.queryStmt<unknown[]>(
+    return runDirectQueryStmtBinary(
+      this.stmtOpsHost,
       dbHandle,
       txHandle,
       stmtHandle,
       params,
-      'array',
       binaryBlobs,
     );
-    return {
-      binaryResult: encodeBinaryResultSet(decoded, { rowMode: 'array' }),
-    };
   }
 
   async cursorOpenStmt(
@@ -1083,65 +883,14 @@ export class DirectTransport implements EngineTransport {
     stmtHandle: EngineHandle,
     params: QueryParams | Uint8Array = [],
   ): Promise<EngineHandle> {
-    const mod = this.module;
-    const entry = this.preparedStatements.get(stmtHandle);
-    if (
-      typeof mod._fb_cursor_open_stmt === 'function' &&
-      (!entry || entry.native)
-    ) {
-      const openStmtFn = mod._fb_cursor_open_stmt;
-      const handle = this.withParams(params, (paramPtr, paramLen) =>
-        openStmtFn.call(
-          mod,
-          dbHandle,
-          txHandle,
-          stmtHandle,
-          paramPtr,
-          paramLen,
-        ),
-      );
-      if (handle === 0) {
-        throw engineError(
-          mod,
-          `Firebird cursorOpenStmt failed for statement #${stmtHandle}`,
-        );
-      }
-      return handle;
-    }
-
-    const fallback = this.lookupPreparedEntry(
-      dbHandle,
-      stmtHandle,
-      'cursorOpenStmt',
-    );
-    return this.cursorOpen(dbHandle, txHandle, fallback.sql, params);
+    return runDirectCursorOpenStmt(this.stmtOpsHost, dbHandle, txHandle, stmtHandle, params);
   }
 
   async stmtSetTimeout(
     stmtHandle: EngineHandle,
     timeoutMs: number,
   ): Promise<void> {
-    if (
-      typeof timeoutMs !== 'number' ||
-      !Number.isFinite(timeoutMs) ||
-      timeoutMs < 0
-    ) {
-      throw new RangeError('timeoutMs must be a non-negative finite number');
-    }
-    const mod = this.module;
-    if (typeof mod._fb_stmt_set_timeout === 'function') {
-      const rc = mod._fb_stmt_set_timeout(
-        stmtHandle,
-        Math.floor(timeoutMs) >>> 0,
-      );
-      if (rc !== 0) {
-        throw engineError(
-          mod,
-          `Firebird stmtSetTimeout failed for statement #${stmtHandle}`,
-          rc,
-        );
-      }
-    }
+    runDirectStmtSetTimeout(this.module, stmtHandle, timeoutMs);
   }
 
   async cancelOperation(

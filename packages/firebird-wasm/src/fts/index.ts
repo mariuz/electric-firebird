@@ -41,6 +41,20 @@ export {
   type SemanticCacheStats,
   type SemanticCacheHandle,
 } from '../rag-cache';
+export {
+  DEFAULT_RAG_CHUNKS_TABLE,
+  sha256HexSync,
+  chunkDocument,
+  createRagIngester,
+  type ChunkingStrategy,
+  type ChunkDocumentOptions,
+  type DocumentChunk,
+  type RagIngesterDatabaseExecutor,
+  type RagDocumentInput,
+  type RagIngestResult,
+  type RagIngesterOptions,
+  type RagIngesterHandle,
+} from '../rag-ingester';
 
 // ---------------------------------------------------------------------------
 // Stopwords & Porter Stemmer

@@ -19,3 +19,4 @@ export * from './jwt-auth';
 export * from './arrow-snapshot';
 export * from './column-encryption';
 export * from './presence';
+export * from '../otel-metrics';

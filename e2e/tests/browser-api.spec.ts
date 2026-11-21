@@ -3840,4 +3840,53 @@ test.describe('FirebirdBrowser', () => {
     expect(result.dupCount).toBe(1);
     expect(result.withinBudget).toBe(true);
   });
+
+  test('M27: chunkDocument, parseTraceparent/formatPrometheusMetrics & WebCrypto .fbkp encrypted backup in browser bundle', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      const w = window as any;
+      const chunks = w.FB.chunkDocument(
+        '# Guide\n\n## Storage\nOPFS page cache persists 8 KB blocks.\n\n## Sync\nCRDT HLC merges offline edits.',
+        { maxTokens: 20, overlapTokens: 2 },
+      );
+
+      const tp = w.FB.generateTraceparent({
+        parent: '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',
+      });
+      const parsedTp = w.FB.parseTraceparent(tp.traceparent);
+      const prom = w.FB.formatPrometheusMetrics({ sseSubscribers: 2, presencePeers: 4 });
+
+      const sampleBytes = new Uint8Array(4096);
+      for (let i = 0; i < sampleBytes.length; i++) sampleBytes[i] = i & 0xff;
+      const bkp = await w.FB.createEncryptedBackup(sampleBytes, {
+        key: 'browser-passphrase',
+        pbkdf2Iterations: 2_000,
+      });
+      const verified = await w.FB.verifyBackupArchive(bkp.archiveBytes, {
+        key: 'browser-passphrase',
+      });
+      const restored = await w.FB.restoreEncryptedBackup(bkp.archiveBytes, null, {
+        key: 'browser-passphrase',
+      });
+
+      return {
+        chunkCount: chunks.length,
+        firstHeadings: chunks[0]?.headingPath ?? [],
+        sameTraceId: parsedTp?.traceId === '4bf92f3577b34da6a3ce929d0e0e4736',
+        hasPromGauge: prom.includes('firebird_presence_online_peers 4'),
+        isFbkp: w.FB.isEncryptedBackupArchive(bkp.archiveBytes),
+        verifiedOk: verified.valid && verified.decrypted,
+        restoredLen: restored.databaseBytes.byteLength,
+      };
+    });
+
+    expect(result.chunkCount).toBeGreaterThanOrEqual(2);
+    expect(result.firstHeadings).toEqual(['Guide', 'Storage']);
+    expect(result.sameTraceId).toBe(true);
+    expect(result.hasPromGauge).toBe(true);
+    expect(result.isFbkp).toBe(true);
+    expect(result.verifiedOk).toBe(true);
+    expect(result.restoredLen).toBe(4096);
+  });
 });

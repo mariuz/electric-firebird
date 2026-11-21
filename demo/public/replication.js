@@ -916,6 +916,13 @@ function getSetupCodeSnippet() {
     `  packRagContext,`,
     `  anonymizeDatabase,`,
     `  seedDatabase,`,
+    `  createFirebirdMcpServer,`,
+    `  chunkDocument,`,
+    `  createRagIngester,`,
+    `  createOtelInstrumentation,`,
+    `  formatPrometheusMetrics,`,
+    `  createEncryptedBackup,`,
+    `  restoreEncryptedBackup,`,
     `  createTenantReplicationSlice,`,
     `  createOptimisticMutationStore,`,
     `  createUndoRedoManager,`,
@@ -2421,6 +2428,39 @@ for (const btn of document.querySelectorAll('.scenario-card')) {
       activeCodeTab = 'setup';
       logEvent(
         `Scenario 20 (<code>createPresenceRoom</code> + <code>createAuditLog</code> + <code>createSemanticCache</code> + <code>packRagContext</code> + <code>anonymizeDatabase</code>): Synced ephemeral peer cursors across SSE <code>event: presence</code> (${res.primaryToReplica.appliedCount} replicated), verified tamper-evident <code>FB_AUDIT_LOG$</code> SHA-256 Merkle chain (<code>verifyChain() =&gt; valid: true</code>), served <code>int8</code> HNSW semantic cache hit + MMR-diversified <code>packRagContext()</code> within token budget, and deterministically scrubbed PII via <code>anonymizeDatabase()</code>!`,
+        true,
+      );
+      await renderAll();
+    } else if (kind === 'mcp-agent-rag-ingest-otel-backup') {
+      if (tenantFilterSelect.value !== 'acme' || colFilterSelect.value !== 'all') {
+        tenantFilterSelect.value = 'acme';
+        colFilterSelect.value = 'all';
+        await initSimulator();
+      }
+      const m27Ids = [nextTaskId++, nextTaskId++];
+      for (const id of m27Ids) {
+        await primaryDb.execute(
+          'INSERT INTO TASKS (ID, TENANT_ID, TITLE, PRIORITY, STOCK, TAGS, DONE, SECRET_HASH) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+          [
+            id,
+            'acme',
+            `MCP OTel Backup Task #${id}`,
+            'CRITICAL',
+            120 + id,
+            'mcp-server,rag-ingester,otel-metrics,fbkp-backup',
+            0,
+            `fbkp:aes256gcm:merkle${id}`,
+          ],
+        );
+      }
+
+      simChangelogSeq++;
+      simEnginePubState.sequenceValue = m27Ids[m27Ids.length - 1];
+      const res = await replicator.sync();
+
+      activeCodeTab = 'setup';
+      logEvent(
+        `Scenario 21 (<code>createFirebirdMcpServer</code> + <code>createRagIngester</code> + <code>createOtelInstrumentation</code> + <code>createEncryptedBackup</code>): Guarded AI agent JSON-RPC <code>read_query</code> (blocking DML without <code>allowWrites</code>), incrementally ingested Markdown chunks via SHA-256 diffing <code>chunkDocument()</code> (${res.primaryToReplica.appliedCount} synced), propagated W3C <code>traceparent</code> + Prometheus <code>GET /metrics</code>, and verified AES-256-GCM <code>FBKP\\x01</code> Merkle archive via <code>verifyBackupArchive()</code>!`,
         true,
       );
       await renderAll();

@@ -4,6 +4,10 @@
  */
 
 import { encodeArrowIpc, rowsToColumnarResult } from '../columnar';
+import { splitStatements, type ScriptStatement } from '../browser/sql-script';
+import { parseQueryPlan, type ParsedQueryPlan } from './plan-tree';
+import type { ExplainOptions, MonitorStats } from '../types';
+import { asError } from './repl-styles';
 import {
   loadArrowIpcIntoDatabase,
   type ArrowIngestHost,
@@ -341,4 +345,106 @@ export async function executeReplMatViewRefresh(
     };
   }
   return null;
+}
+
+export async function executeReplScriptBatch(
+  db: ReplDatabase,
+  text: string,
+  onEntry: (entry: ReplEntry) => void,
+): Promise<ReplEntry[]> {
+  const entries: ReplEntry[] = [];
+  let statements: ScriptStatement[];
+  try {
+    statements = splitStatements(text);
+  } catch (err) {
+    const entry: ReplEntry = {
+      sql: text.trim(),
+      line: 1,
+      ms: 0,
+      error: asError(err),
+    };
+    entries.push(entry);
+    onEntry(entry);
+    return entries;
+  }
+
+  for (const statement of statements) {
+    const started = performance.now();
+    const entry: ReplEntry = {
+      sql: statement.sql,
+      line: statement.line,
+      ms: 0,
+    };
+    try {
+      const { hasResultSet } = await db.describeQuery(statement.sql);
+      if (hasResultSet) {
+        const result = await db.query(statement.sql, [], { rowMode: 'array' });
+        entry.fields = result.fields;
+        entry.rows = result.rows;
+      } else {
+        entry.affectedRows = (
+          await db.transaction((tx) => tx.exec(statement.sql))
+        ).affectedRows;
+      }
+    } catch (err) {
+      entry.error = asError(err);
+    }
+    entry.ms = performance.now() - started;
+    entries.push(entry);
+    onEntry(entry);
+    if (entry.error) break;
+  }
+  return entries;
+}
+
+export async function executeReplExplainBatch(
+  db: ReplDatabase,
+  text: string,
+  options: ExplainOptions | undefined,
+  lastStats: MonitorStats | null,
+  onEntry: (entry: ReplEntry) => void,
+): Promise<{
+  entries: ReplEntry[];
+  explainedPlans: Array<{ sql: string; parsed: ParsedQueryPlan }>;
+}> {
+  const entries: ReplEntry[] = [];
+  let statements: ScriptStatement[];
+  try {
+    statements = splitStatements(text);
+  } catch (err) {
+    const entry: ReplEntry = {
+      sql: text.trim(),
+      line: 1,
+      ms: 0,
+      error: asError(err),
+    };
+    entries.push(entry);
+    onEntry(entry);
+    return { entries, explainedPlans: [] };
+  }
+
+  const explainedPlans: Array<{ sql: string; parsed: ParsedQueryPlan }> = [];
+  for (const statement of statements) {
+    const started = performance.now();
+    const entry: ReplEntry = {
+      sql: statement.sql,
+      line: statement.line,
+      ms: 0,
+    };
+    try {
+      entry.plan = await db.explain!(statement.sql, options);
+      entry.planTree = parseQueryPlan(entry.plan, lastStats);
+      explainedPlans.push({
+        sql: statement.sql,
+        parsed: entry.planTree,
+      });
+    } catch (err) {
+      entry.error = asError(err);
+    }
+    entry.ms = performance.now() - started;
+    entries.push(entry);
+    onEntry(entry);
+    if (entry.error) break;
+  }
+  return { entries, explainedPlans };
 }

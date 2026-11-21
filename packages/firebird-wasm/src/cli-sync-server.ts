@@ -71,7 +71,9 @@ const CORS_HEADERS: Readonly<Record<string, string>> = {
   'access-control-allow-origin': '*',
   'access-control-allow-methods': 'GET, POST, OPTIONS',
   'access-control-allow-headers':
-    'content-type, authorization, x-replication-key, x-tenant-id, x-fb-changelog-encoding, last-event-id',
+    'content-type, authorization, x-replication-key, x-tenant-id, x-fb-changelog-encoding, last-event-id, traceparent',
+  'access-control-expose-headers':
+    'traceparent, x-fb-snapshot-lsn, x-fb-changelog-sequence',
 };
 
 function readIncomingBody(req: http.IncomingMessage): Promise<Uint8Array> {
@@ -183,6 +185,7 @@ export async function startCliReplicationServer(
     tenantGuard,
     jwtAuth: jwtResolver,
     sseHub,
+    metricsDb: options.db as Partial<FirebirdDatabase>,
   });
 
   // Auto-fanout local DML executed directly on `options.db` to connected SSE subscribers (`M25 Item 1`)

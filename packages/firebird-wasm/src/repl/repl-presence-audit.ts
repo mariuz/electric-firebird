@@ -8,10 +8,94 @@ import {
   type AuditChainVerificationResult,
   type AuditSignAlgorithm,
 } from '../audit-log';
+import {
+  createFirebirdMcpServer,
+  type McpToolDescriptor,
+} from '../mcp-server';
+import { formatPrometheusMetrics } from '../otel-metrics';
+import type { ReplicationStats } from '../replication';
 import type { PresenceRoom } from '../replication/presence';
 import type { Row } from '../types';
 import { asError, el } from './repl-styles';
 import type { ReplDatabase, ReplEntry } from './index';
+
+export function getReplMcpTools(
+  db: ReplDatabase | null,
+  allowWrites = false,
+): McpToolDescriptor[] {
+  const srv = createFirebirdMcpServer(
+    {
+      query: async <T extends Row = Row>(sqlText: string, params: unknown[] = []) => {
+        if (!db) return { fields: [], rows: [] as T[] };
+        const res = await db.query(sqlText, params, { rowMode: 'array' });
+        const rows = res.rows.map((cols) =>
+          Object.fromEntries(res.fields.map((f, idx) => [f.name, cols[idx]])),
+        ) as unknown as T[];
+        return { fields: res.fields, rows };
+      },
+    },
+    { allowWrites },
+  );
+  return srv.listTools();
+}
+
+export async function exportReplPrometheusMetrics(
+  db: ReplDatabase | null,
+  replicator?: { stats(): Promise<ReplicationStats> } | null,
+): Promise<string> {
+  const [monitor, dbInfo, replication] = await Promise.all([
+    db?.monitorStats ? db.monitorStats().catch(() => null) : null,
+    db?.databaseInfo ? db.databaseInfo().catch(() => null) : null,
+    replicator ? replicator.stats().catch(() => null) : null,
+  ]);
+  return formatPrometheusMetrics({ monitor, dbInfo, replication });
+}
+
+export function appendMcpAndPrometheusSections(
+  panel: HTMLElement,
+  opts: {
+    mcpTools?: readonly McpToolDescriptor[];
+    prometheusText?: string | null;
+    onExportPrometheus?: () => void;
+  },
+): void {
+  if (opts.mcpTools && opts.mcpTools.length > 0) {
+    const mcpBox = el('div', 'schema-sub mcp-tools-panel');
+    const title = el('div', 'schema-group-title');
+    title.textContent = `MCP Agent Tools (${opts.mcpTools.length} active · firebird://schema, firebird://audit/head)`;
+    mcpBox.append(title);
+    const badgeWrap = el('div', 'schema-sub mcp-tool-badges');
+    for (const t of opts.mcpTools) {
+      const b = el('span', 'schema-badge mcp-tool-badge');
+      b.textContent = t.name;
+      b.title = t.description;
+      badgeWrap.append(b);
+    }
+    mcpBox.append(badgeWrap);
+    panel.append(mcpBox);
+  }
+
+  if (opts.onExportPrometheus || opts.prometheusText) {
+    const promBox = el('div', 'schema-sub otel-prometheus-panel');
+    const title = el('div', 'schema-group-title');
+    title.textContent = 'OpenTelemetry & Prometheus /metrics';
+    promBox.append(title);
+    if (opts.onExportPrometheus) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'prometheus-export-btn';
+      btn.textContent = 'Export /metrics';
+      btn.addEventListener('click', () => opts.onExportPrometheus?.());
+      promBox.append(btn);
+    }
+    if (opts.prometheusText) {
+      const pre = el('pre', 'schema-view-source prometheus-metrics-output');
+      pre.textContent = opts.prometheusText;
+      promBox.append(pre);
+    }
+    panel.append(promBox);
+  }
+}
 
 export async function executeReplVerifyAuditChain(
   db: ReplDatabase,

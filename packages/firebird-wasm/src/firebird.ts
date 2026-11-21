@@ -1,5 +1,4 @@
 import * as fs from 'fs';
-import { TransactionIsolation } from 'node-firebird-driver';
 import type { Client, Attachment, Transaction } from 'node-firebird-driver';
 import type {
   ArrayRow,
@@ -29,11 +28,9 @@ import type {
   QueryParams,
   RowMode,
   TransactionOptions,
-  FieldInfo,
 } from './types';
-import { statementKind } from './statement-types';
 import { buildSweepResult } from './browser/engine-transport';
-import { applyTypes, applySerializers } from './browser/value-types';
+import { applySerializers } from './browser/value-types';
 import { buildCopyToStream } from './browser/copy-stream';
 import { introspect as introspectSchema, migrate as runMigrations } from './browser/schema';
 import {
@@ -45,7 +42,6 @@ import {
 } from './browser/snapshots';
 import {
   assertNotAborted,
-  createTimeoutError,
   DatabaseCoreSubsystems,
   type FirebirdDatabase,
   type UnifiedExecuteResult,
@@ -124,7 +120,13 @@ import {
   scanUserTablesForSweep,
   type QueryArrowOptions,
 } from './shared-driver-ops';
-import { executeNodeQuery } from './firebird-query-runner';
+import {
+  describeNodeQuery,
+  executeNodeQuery,
+  explainNodeQuery,
+  runSharedNodeRead,
+  streamNodeQuery,
+} from './firebird-query-runner';
 import type {
   JsFunctionHandler,
   JsProcedureHandler,
@@ -142,19 +144,9 @@ import {
   type ArrayStreamOptions,
 } from './database-core';
 import {
-  STMT_SELECT,
   StatementCache,
-  type StatementLease,
-  applyStatementHandleTimeout,
-  buildTransactionOptions,
   cancelAttachmentOperation,
-  describeInputFields,
-  explainStatement,
-  fetchRows,
   loadNativeDriver,
-  outputFields,
-  shapeRows,
-  streamRows,
 } from './node-native-bindings';
 import { FirebirdTransaction } from './firebird-tx';
 export { FirebirdTransaction } from './firebird-tx';
@@ -788,162 +780,48 @@ export class FirebirdLite implements FirebirdDatabase {
     return this.streamQuery<T>(statement, options, batchSize);
   }
 
-  private async *streamQuery<T>(
+  private streamQuery<T>(
     statement: ParsedStatement,
     options: QueryStreamOptions,
     batchSize: number,
   ): AsyncIterableIterator<QueryResult<T>> {
-    assertNotAborted(options.signal);
-    const totalTimeoutMs = validateTimeoutMs(options.timeoutMs);
-    const deadline =
-      totalTimeoutMs && totalTimeoutMs > 0
-        ? Date.now() + totalTimeoutMs
-        : undefined;
-    const checkStreamDeadline = (): void => {
-      assertNotAborted(options.signal);
-      if (deadline !== undefined && Date.now() >= deadline) {
-        throw createTimeoutError(totalTimeoutMs!);
-      }
-    };
-
-    await this.ensureReady();
-    const rowMode: RowMode = options.rowMode ?? 'object';
-    const attachment = this.attachment!;
-    await this.endReadTransaction();
-
-    const serializedParams = this.serialize(statement.params);
-    const txOptions = buildTransactionOptions(options);
-    const transaction = await attachment.startTransaction(txOptions);
-
-    let engineFailed = false;
-    let lease: StatementLease | undefined;
-    let txFinished = false;
-
-    try {
-      try {
-        lease = await this.statements!.acquire(transaction, statement.sql);
-      } catch (err) {
-        engineFailed = true;
-        throw err;
-      }
-      const stmt = lease.stmt;
-
-      let fields: FieldInfo[];
-      try {
-        fields = await outputFields(stmt);
-        if (totalTimeoutMs !== undefined && totalTimeoutMs > 0) {
-          await applyStatementHandleTimeout(stmt, totalTimeoutMs);
-        }
-      } catch (err) {
-        engineFailed = true;
-        throw err;
-      }
-
-      for await (const batch of streamRows<T>(
-        stmt,
-        transaction,
-        serializedParams,
-        fields,
-        rowMode,
-        batchSize,
-        this.types,
-        () => {
-          engineFailed = true;
-        },
-      )) {
-        checkStreamDeadline();
-        yield batch;
-        checkStreamDeadline();
-      }
-
-      if (totalTimeoutMs !== undefined && totalTimeoutMs > 0) {
-        await applyStatementHandleTimeout(stmt, 0).catch(() => undefined);
-      }
-      const toRelease = lease;
-      lease = undefined;
-      await toRelease.release(false);
-
-      txFinished = true;
-      try {
-      await transaction.commit();
-    } catch (err) {
-      await transaction.rollback().catch(() => undefined);
-      throw err;
-    }
-    } finally {
-      if (lease) {
-        await lease.release(engineFailed);
-      }
-      if (!txFinished) {
-        if (engineFailed) {
-          await transaction.rollback().catch(() => undefined);
-        } else {
-          await transaction
-            .commit()
-            .catch(() => transaction.rollback().catch(() => undefined));
-        }
-      }
-    }
+    return streamNodeQuery<T>(
+      {
+        ensureReady: () => this.ensureReady(),
+        getAttachment: () => this.attachment!,
+        getStatements: () => this.statements!,
+        endReadTransaction: () => this.endReadTransaction(),
+        serialize: (p) => this.serialize(p),
+        types: this.types,
+      },
+      statement,
+      options,
+      batchSize,
+    );
   }
 
-  /**
-   * Run a SELECT in the shared read-only transaction, starting it if need be.
-   *
-   * `undefined` means "run it in a transaction of its own": the statement is
-   * not a SELECT, or it tried to write ("attempted update during read-only
-   * transaction"). Either way its text is remembered, so the next call goes
-   * there directly. Any other failure ends the shared transaction, so the
-   * next read starts afresh, and is thrown.
-   */
-  private async sharedRead<T>(
+  private sharedRead<T>(
     sql: string,
     params: QueryParams,
     rowMode: RowMode,
   ): Promise<{ result: QueryResult<T>; cacheHit: boolean } | undefined> {
-    const serializedParams = this.serialize(params);
-    const attachment = this.attachment!;
-    this.readTransaction ??= await attachment.startTransaction({
-      isolation: TransactionIsolation.READ_COMMITTED,
-      readCommittedMode: 'RECORD_VERSION',
-      accessMode: 'READ_ONLY',
-    });
-    const transaction = this.readTransaction;
-
-    let lease: StatementLease;
-    try {
-      lease = await this.statements!.acquire(transaction, sql);
-    } catch (err) {
-      await this.endReadTransaction();
-      throw err;
-    }
-    const stmt = lease.stmt;
-    // A writing SELECT stays kept: only the transaction was wrong for it.
-    let failed = false;
-    let fields: FieldInfo[];
-    let rawRows: unknown[][];
-    try {
-      if ((await stmt.type) !== STMT_SELECT) {
-        this.remember(sql);
-        return undefined;
-      }
-      fields = await outputFields(stmt);
-      rawRows = await fetchRows(stmt, transaction, serializedParams, fields, this.types);
-    } catch (err) {
-      // The native driver's errors carry only the message text.
-      if (/attempted update during read-only transaction/.test(String((err as Error)?.message))) {
-        this.remember(sql);
-        return undefined;
-      }
-      failed = true;
-      await this.endReadTransaction();
-      throw err;
-    } finally {
-      await lease.release(failed);
-    }
-    return {
-      result: applyTypes({ rows: shapeRows<T>(rawRows, fields, rowMode), fields }, this.types, rowMode),
-      cacheHit: lease.cacheHit,
-    };
+    return runSharedNodeRead<T>(
+      {
+        getAttachment: () => this.attachment!,
+        getStatements: () => this.statements!,
+        getReadTransaction: () => this.readTransaction,
+        setReadTransaction: (tx) => {
+          this.readTransaction = tx;
+        },
+        endReadTransaction: () => this.endReadTransaction(),
+        rememberOwnTx: (s) => this.remember(s),
+        serialize: (p) => this.serialize(p),
+        types: this.types,
+      },
+      sql,
+      params,
+      rowMode,
+    );
   }
 
   private remember(sql: string): void {
@@ -966,78 +844,17 @@ export class FirebirdLite implements FirebirdDatabase {
     if (transaction) await transaction.commit().catch(() => transaction.rollback().catch(() => undefined));
   }
 
-  /**
-   * Describe a statement's shape without running it.
-   *
-   * ```ts
-   * const shape = await db.describeQuery('SELECT id, name FROM items WHERE id = ?');
-   * // shape.params        → [{ name: '', type: 496, typeName: 'INTEGER', ... }]
-   * // shape.fields        → [{ name: 'ID', type: 496, typeName: 'INTEGER', ... }, ...]
-   * // shape.statementType → 'SELECT'
-   * ```
-   *
-   * The statement is prepared and disposed, so nothing runs: describing an
-   * `INSERT` inserts nothing. Both `params` and `fields` carry the full
-   * {@link FieldInfo} from Firebird's prepared input and output metadata.
-   */
   async describeQuery(sql: string | SqlFragment): Promise<QueryDescription> {
     await this.ensureReady();
-    const attachment = this.attachment!;
-    const text = toStatement(sql).sql;
-
-    const transaction = await attachment.startTransaction();
-    try {
-      const stmt = await attachment.prepare(transaction, text);
-      try {
-        const params = await describeInputFields(stmt);
-        const fields = await outputFields(stmt);
-        const type = await stmt.type;
-
-        return {
-          params,
-          fields,
-          statementType: statementKind(type),
-          hasResultSet: stmt.hasResultSet,
-        };
-      } finally {
-        await stmt.dispose().catch(() => undefined);
-      }
-    } finally {
-      // Nothing ran, so there is nothing to commit — but the transaction still
-      // has to be finished.
-      await transaction.commit().catch(() => undefined);
-    }
+    return describeNodeQuery(this.attachment!, sql);
   }
 
-  /**
-   * Return Firebird's execution plan for `sql` (`IStatement::getPlan`) without
-   * executing the statement.
-   *
-   * By default (`{ detailed: false }`), returns the compact `PLAN (...)` string.
-   * With `{ detailed: true }`, returns Firebird 5/6's structured multi-line
-   * explained plan tree (`Select Expression\n    -> ...`). Statements that carry
-   * no execution plan (such as DDL) return `""`.
-   */
   async explain(
     sql: string | SqlFragment,
     options: ExplainOptions = {},
   ): Promise<string> {
     await this.ensureReady();
-    const attachment = this.attachment!;
-    const text = toStatement(sql).sql;
-    const detailed = options.detailed === true;
-
-    const transaction = await attachment.startTransaction();
-    try {
-      const stmt = await attachment.prepare(transaction, text);
-      try {
-        return await explainStatement(stmt, detailed);
-      } finally {
-        await stmt.dispose().catch(() => undefined);
-      }
-    } finally {
-      await transaction.commit().catch(() => undefined);
-    }
+    return explainNodeQuery(this.attachment!, sql, options);
   }
 
   /**

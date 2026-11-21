@@ -23,8 +23,6 @@
  * harmless.
  */
 
-import { splitStatements } from '../browser/sql-script';
-import type { ScriptStatement } from '../browser/sql-script';
 import {
   computeTableIoBreakdown,
   parseQueryPlan,
@@ -55,11 +53,13 @@ import type { UndoRedoEntry, UndoRedoManager } from '../undo-redo';
 import type { MaterializedViewInfo } from '../materialized-view';
 import type { DeclarativeSchemaInput, SchemaSyncResult } from '../schema-sync';
 import type { AuditChainVerificationResult, AuditSignAlgorithm } from '../audit-log';
+import type { McpToolDescriptor } from '../mcp-server';
 import type { PresenceRoom } from '../replication/presence';
 import type { ReplSearchIndexSummary } from './repl-actions';
 
 export type { ReplSearchIndexSummary } from './repl-actions';
 export type { AuditChainVerificationResult } from '../audit-log';
+export type { McpToolDescriptor } from '../mcp-server';
 
 export {
   computeTableIoBreakdown,
@@ -318,6 +318,10 @@ export interface FirebirdReplElement extends HTMLElement {
     verifyKey?: CryptoKey | string | Uint8Array;
     signAlgorithm?: AuditSignAlgorithm;
   }): Promise<AuditChainVerificationResult | null>;
+  /** List active Model Context Protocol (MCP) tools exposed for this database (`M27 Item 5`). */
+  mcpTools(options?: { allowWrites?: boolean }): McpToolDescriptor[];
+  /** Export OpenMetrics / Prometheus exposition text and render preview in the Profiler Inspector (`M27 Item 5`). */
+  prometheusMetrics(): Promise<string>;
   /** Toggle (or switch to `tab` in) the interactive Schema Inspector, Migration Viewer, Profiler & Plan Explorer sidebar. */
   toggleInspector(tab?: ReplInspectorTab): Promise<void>;
   /** Refresh the interactive Schema Inspector, Migration Viewer, Profiler & Plan Explorer sidebar from the database. */
@@ -326,7 +330,6 @@ export interface FirebirdReplElement extends HTMLElement {
   clear(): void;
 }
 
-import { asError } from './repl-styles';
 import { createReplDomElements } from './repl-dom';
 import type {
   ArrowIngestResult,
@@ -346,8 +349,10 @@ import {
   executeReplArrowExport,
   executeReplArrowImport,
   executeReplCellEdit,
+  executeReplExplainBatch,
   executeReplMatViewRefresh,
   executeReplSchemaDiff,
+  executeReplScriptBatch,
   fetchReplSearchIndexes,
   stepReplHistoryKey,
   triggerArrowBrowserDownload,
@@ -355,6 +360,8 @@ import {
 import { renderReplEntryBlock } from './repl-entry-renderer';
 import {
   executeReplVerifyAuditChain,
+  exportReplPrometheusMetrics,
+  getReplMcpTools,
   runReplBusyDiagnostic,
 } from './repl-presence-audit';
 
@@ -379,6 +386,7 @@ export function defineFirebirdRepl(
     private presenceRoomRef: PresenceRoom | null = null;
     private unsubPresence: (() => void) | null = null;
     private lastAuditReport: AuditChainVerificationResult | null = null;
+    private lastPrometheusText: string | null = null;
     private editableCfg: ReplEditableTableConfig | null = null;
     private readonly output: HTMLDivElement;
     private readonly inspector: HTMLDivElement;
@@ -774,6 +782,8 @@ export function defineFirebirdRepl(
         undoRedoSnapshot: this.undoRedoRef ? this.undoRedoRef.getSnapshot() : null,
         presenceRoom: this.presenceRoomRef,
         lastAuditReport: this.lastAuditReport,
+        mcpTools: getReplMcpTools(this.db),
+        lastPrometheusText: this.lastPrometheusText,
         onResetProfiler: () => {
           if (this.db && typeof this.db.resetMonitorStats === "function") {
             this.db.resetMonitorStats();
@@ -782,6 +792,9 @@ export function defineFirebirdRepl(
         },
         onVerifyAudit: () => {
           void this.verifyAuditChain();
+        },
+        onExportPrometheus: () => {
+          void this.prometheusMetrics();
         },
         onFlushOutbox: () => {
           if (this.optStoreRef) {
@@ -849,51 +862,9 @@ export function defineFirebirdRepl(
       this.draft = '';
       if (script === undefined) this.editor.value = '';
 
-      const entries: ReplEntry[] = [];
+      let entries: ReplEntry[] = [];
       try {
-        let statements: ScriptStatement[];
-        try {
-          statements = splitStatements(text);
-        } catch (err) {
-          statements = [];
-          const entry: ReplEntry = {
-            sql: text.trim(),
-            line: 1,
-            ms: 0,
-            error: asError(err),
-          };
-          entries.push(entry);
-          this.show(entry);
-        }
-        for (const statement of statements) {
-          const started = performance.now();
-          const entry: ReplEntry = {
-            sql: statement.sql,
-            line: statement.line,
-            ms: 0,
-          };
-          try {
-            const db = this.db;
-            const { hasResultSet } = await db.describeQuery(statement.sql);
-            if (hasResultSet) {
-              const result = await db.query(statement.sql, [], {
-                rowMode: 'array',
-              });
-              entry.fields = result.fields;
-              entry.rows = result.rows;
-            } else {
-              entry.affectedRows = (
-                await db.transaction((tx) => tx.exec(statement.sql))
-              ).affectedRows;
-            }
-          } catch (err) {
-            entry.error = asError(err);
-          }
-          entry.ms = performance.now() - started;
-          entries.push(entry);
-          this.show(entry);
-          if (entry.error) break;
-        }
+        entries = await executeReplScriptBatch(this.db, text, (entry) => this.show(entry));
         if (this.isInspectorOpen) {
           await this.refreshInspector();
         }
@@ -937,56 +908,23 @@ export function defineFirebirdRepl(
       if (this.history[this.history.length - 1] !== text) this.history.push(text);
       this.cursor = this.history.length;
 
-      const entries: ReplEntry[] = [];
+      let entries: ReplEntry[] = [];
       try {
-        let statements: ScriptStatement[];
-        try {
-          statements = splitStatements(text);
-        } catch (err) {
-          statements = [];
-          const entry: ReplEntry = {
-            sql: text.trim(),
-            line: 1,
-            ms: 0,
-            error: asError(err),
-          };
-          entries.push(entry);
-          this.show(entry);
-        }
-
-        // Refresh stats if available so table I/O can be attributed to plan nodes
         try {
           this.lastStats = await this.fetchStats();
         } catch {
           // Ignore if monitorStats is unavailable
         }
-
-        const explainedPlans: Array<{ sql: string; parsed: ParsedQueryPlan }> = [];
-        for (const statement of statements) {
-          const started = performance.now();
-          const entry: ReplEntry = {
-            sql: statement.sql,
-            line: statement.line,
-            ms: 0,
-          };
-          try {
-            entry.plan = await this.db.explain(statement.sql, options);
-            entry.planTree = parseQueryPlan(entry.plan, this.lastStats);
-            explainedPlans.push({
-              sql: statement.sql,
-              parsed: entry.planTree,
-            });
-          } catch (err) {
-            entry.error = asError(err);
-          }
-          entry.ms = performance.now() - started;
-          entries.push(entry);
-          this.show(entry);
-          if (entry.error) break;
-        }
-
-        if (explainedPlans.length > 0) {
-          this.lastPlans = explainedPlans;
+        const res = await executeReplExplainBatch(
+          this.db,
+          text,
+          options,
+          this.lastStats,
+          (entry) => this.show(entry),
+        );
+        entries = res.entries;
+        if (res.explainedPlans.length > 0) {
+          this.lastPlans = res.explainedPlans;
           this.activeTab = 'plan';
           this.updateActiveTabButtons();
           this.inspectorOpen = true;
@@ -1334,6 +1272,20 @@ export function defineFirebirdRepl(
         }),
       );
       return report;
+    }
+
+    mcpTools(options: { allowWrites?: boolean } = {}): McpToolDescriptor[] {
+      return getReplMcpTools(this.db, Boolean(options.allowWrites));
+    }
+
+    async prometheusMetrics(): Promise<string> {
+      const text = await exportReplPrometheusMetrics(this.db, this.replicatorHandle);
+      this.lastPrometheusText = text;
+      this.activeTab = 'profiler';
+      this.updateActiveTabButtons();
+      this.inspectorOpen = true;
+      await this.refreshInspector();
+      return text;
     }
 
     private onKey(event: KeyboardEvent): void {

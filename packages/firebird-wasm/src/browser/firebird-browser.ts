@@ -23,7 +23,6 @@
  */
 
 import { IndexedDBVFS } from './indexeddb-vfs';
-import { DirectTransport } from './engine-transport';
 import type { EngineHandle, EngineTransport } from './engine-transport';
 import { WorkerTransport } from './worker-transport';
 import { CrossTabLiveBridge } from './live-tables';
@@ -37,7 +36,6 @@ import {
 import { introspect as introspectSchema, migrate as runMigrations } from './schema';
 import { buildCopyToStream } from './copy-stream';
 import { applySerializers } from './value-types';
-import { acquireDatabaseLock } from './db-lock';
 import { SharedEngineTransport } from './shared-transport';
 import type { DatabaseLock } from './db-lock';
 import { toStatement, resolveQueryCall, resolveBatchSize } from '../sql-tag';
@@ -108,13 +106,17 @@ import {
   type LiveIncrementalQuery,
 } from '../live-incremental';
 import {
-  assertUdrCallback,
   executeArrowFromColumnar,
   resolveColumnarQueryCall,
   type QueryArrowOptions,
 } from '../shared-driver-ops';
 import {
+  BrowserPersistScheduler,
+  createBrowserEngineTransport,
   executeBrowserQuery,
+  initializeBrowserDatabase,
+  registerBrowserFunction,
+  registerBrowserProcedure,
   teardownBrowserDatabase,
 } from './firebird-browser-lifecycle';
 import type {
@@ -251,15 +253,8 @@ export class FirebirdBrowser implements FirebirdDatabase {
   private closed = false;
   private initPromise: Promise<void> | null = null;
 
-  private readonly autoPersist: boolean;
-  private readonly autoPersistDebounceMs: number;
   private readonly onPersistError: (error: Error) => void;
-  private persistTimer: ReturnType<typeof setTimeout> | null = null;
-  /** In-flight persist, so two never overlap. */
-  private persistInFlight: Promise<void> | null = null;
-  /** A write arrived while a persist was running; persist again after it. */
-  private persistAgain = false;
-  private lifecycleAttached = false;
+  private readonly persistScheduler: BrowserPersistScheduler;
 
   private readonly multiTab: 'exclusive' | 'shared' | 'allow-unsafe';
   private readonly lockTimeoutMs: number;
@@ -329,64 +324,42 @@ export class FirebirdBrowser implements FirebirdDatabase {
       this.ephemeral || this.opfs ? 'allow-unsafe' : options.multiTab ?? 'exclusive';
     this.lockTimeoutMs = options.lockTimeoutMs ?? 5_000;
 
-    this.autoPersist = options.autoPersist ?? true;
-    this.autoPersistDebounceMs = options.autoPersistDebounceMs ?? 500;
+    const autoPersist = options.autoPersist ?? true;
+    const autoPersistDebounceMs = options.autoPersistDebounceMs ?? 500;
     this.onPersistError =
       options.onPersistError ??
       ((error) => console.error('[firebird-wasm] background persist failed', error));
+    this.persistScheduler = new BrowserPersistScheduler({
+      autoPersist,
+      debounceMs: autoPersistDebounceMs,
+      onError: this.onPersistError,
+      isClosed: () => this.closed,
+      canPersistNow: () => Boolean(this.dbHandle) && this.mayPersist,
+      readAndImport: async () => {
+        const image = await this.engine.readFile(this.dbPath);
+        await this.vfs.importDatabase(image);
+      },
+    });
 
-    this.engine = options.transport ?? this.createEngine();
-    // Refused here, before anything is opened, rather than after an attach.
+    if (options.transport) {
+      this.engine = options.transport;
+    } else {
+      const built = createBrowserEngineTransport({
+        multiTab: this.multiTab,
+        dbName: this.dbName,
+        options: this.options,
+        onServedMutation: () => this.markDirty(),
+        onEngineReplaced: () => this.reopenAfterEngineChange(),
+      });
+      this.engine = built.engine;
+      this.shared = built.shared;
+    }
     if (options.sharedReads && !this.engine.setSharedReads) {
       throw new Error('sharedReads needs a transport with setSharedReads; this one has none');
     }
   }
 
-  /** Build the real engine for this tab: a Worker if given one, else direct. */
-  private createLocalEngine(): EngineTransport {
-    const worker = this.options.worker;
-    if (worker) {
-      return new WorkerTransport(typeof worker === 'function' ? worker() : worker);
-    }
-    return new DirectTransport({
-      wasmBinary: this.options.wasmBinary,
-      locateFile: this.options.locateFile,
-      threads: this.options.threads,
-    });
-  }
-
-  private createEngine(): EngineTransport {
-    if (this.multiTab !== 'shared') {
-      return this.createLocalEngine();
-    }
-
-    if (typeof BroadcastChannel === 'undefined') {
-      throw new Error(
-        "multiTab: 'shared' needs BroadcastChannel, which this environment " +
-          "does not have. Use 'exclusive' instead.",
-      );
-    }
-
-    const shared = new SharedEngineTransport({
-      dbName: this.dbName,
-      createEngine: () => this.createLocalEngine(),
-      // A follower's writes run on the leader's engine, so the leader is the
-      // only one that can know its image went stale.
-      onServedMutation: () => this.markDirty(),
-      onEngineReplaced: () => this.reopenAfterEngineChange(),
-    });
-    this.shared = shared;
-    return shared;
-  }
-
-  /**
-   * Whether this tab is the one actually running the engine.
-   *
-   * Always true unless `multiTab: 'shared'`, where exactly one tab owns the
-   * engine and the rest are served by it. Useful for deciding which tab should
-   * do work that must happen once — an import, a migration, a scheduled
-   * cleanup — rather than once per open tab.
-   */
+  /** Whether this tab is the one actually running the engine. */
   get isLeader(): boolean {
     return this.shared === null || this.shared.isLeader;
   }
@@ -982,19 +955,7 @@ export class FirebirdBrowser implements FirebirdDatabase {
     return runMigrations(this, migrations, options);
   }
 
-  /**
-   * Register a JavaScript scalar function callable inside SQL `SELECT`,
-   * `WHERE`, and `COMPUTED BY` expressions.
-   *
-   * ```ts
-   * await db.registerFunction(
-   *   'SLUGIFY',
-   *   { args: ['VARCHAR(200)'], returns: 'VARCHAR(200)' },
-   *   (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, ''),
-   * );
-   * const res = await db.query("SELECT SLUGIFY('Hello World!') AS SLUG FROM RDB$DATABASE");
-   * ```
-   */
+  /** Register a JavaScript scalar function callable inside SQL `SELECT` and `WHERE`. */
   async registerFunction(
     name: string,
     fn: JsFunctionHandler,
@@ -1009,25 +970,21 @@ export class FirebirdBrowser implements FirebirdDatabase {
     optionsOrFn: RegisterFunctionOptions | JsFunctionHandler,
     maybeFn?: JsFunctionHandler,
   ): Promise<RegisteredRoutine> {
-    if (this.closed) {
-      throw new Error('FirebirdBrowser instance has been closed');
-    }
-    assertUdrCallback('registerFunction', optionsOrFn, maybeFn);
-    await this.ensureReady();
-    const handle = await this.udr.registerFunction(
+    return registerBrowserFunction(
+      {
+        isClosed: () => this.closed,
+        ensureReady: () => this.ensureReady(),
+        udr: this.udr,
+        createUdrExecutor: (tx) => this.createUdrExecutor(tx),
+        markDirty: () => this.markDirty(),
+      },
       name,
       optionsOrFn,
       maybeFn,
-      this.createUdrExecutor(0),
     );
-    this.markDirty();
-    return handle;
   }
 
-  /**
-   * Register a JavaScript table-valued or executable procedure callable inside
-   * SQL `SELECT * FROM <name>(...)` and `EXECUTE PROCEDURE <name>(...)`.
-   */
+  /** Register a JavaScript table-valued or executable procedure callable in SQL. */
   async registerProcedure(
     name: string,
     fn: JsProcedureHandler,
@@ -1042,19 +999,18 @@ export class FirebirdBrowser implements FirebirdDatabase {
     optionsOrFn: RegisterProcedureOptions | JsProcedureHandler,
     maybeFn?: JsProcedureHandler,
   ): Promise<RegisteredRoutine> {
-    if (this.closed) {
-      throw new Error('FirebirdBrowser instance has been closed');
-    }
-    assertUdrCallback('registerProcedure', optionsOrFn, maybeFn);
-    await this.ensureReady();
-    const handle = await this.udr.registerProcedure(
+    return registerBrowserProcedure(
+      {
+        isClosed: () => this.closed,
+        ensureReady: () => this.ensureReady(),
+        udr: this.udr,
+        createUdrExecutor: (tx) => this.createUdrExecutor(tx),
+        markDirty: () => this.markDirty(),
+      },
       name,
       optionsOrFn,
       maybeFn,
-      this.createUdrExecutor(0),
     );
-    this.markDirty();
-    return handle;
   }
 
   /**
@@ -1264,37 +1220,7 @@ export class FirebirdBrowser implements FirebirdDatabase {
   }
 
   async persist(): Promise<void> {
-    if (!this.dbHandle || !this.mayPersist) return;
-
-    // Two persists must not interleave: both read the image and write the
-    // same store, and the later one could finish first and roll the database
-    // back to an older state.
-    if (this.persistInFlight) {
-      this.persistAgain = true;
-      await this.persistInFlight;
-      return;
-    }
-
-    this.cancelScheduledPersist();
-
-    const run = (async () => {
-      const image = await this.engine.readFile(this.dbPath);
-      await this.vfs.importDatabase(image);
-    })();
-
-    this.persistInFlight = run;
-    try {
-      await run;
-    } finally {
-      this.persistInFlight = null;
-    }
-
-    // Writes that arrived mid-persist are not covered by the image just
-    // written, so go again.
-    if (this.persistAgain) {
-      this.persistAgain = false;
-      await this.persist();
-    }
+    return this.persistScheduler.persist();
   }
 
   /**
@@ -1304,8 +1230,8 @@ export class FirebirdBrowser implements FirebirdDatabase {
     if (this.closed) return;
     return teardownBrowserDatabase({
       cancelScheduledPersist: () => this.cancelScheduledPersist(),
-      detachLifecycleListeners: () => this.detachLifecycleListeners(),
-      getPersistInFlight: () => this.persistInFlight,
+      detachLifecycleListeners: () => this.persistScheduler.detachLifecycle(),
+      getPersistInFlight: () => this.persistScheduler.persistInFlight,
       preparedStatements: this.preparedStatements,
       liveQueries: this.liveQueries,
       markClosedAndClear: () => {
@@ -1345,109 +1271,39 @@ export class FirebirdBrowser implements FirebirdDatabase {
   }
 
   private markDirty(): void {
-    if (!this.autoPersist || this.closed || !this.mayPersist) return;
-    if (this.persistTimer !== null) {
-      clearTimeout(this.persistTimer);
-    }
-    this.persistTimer = setTimeout(() => {
-      this.persistTimer = null;
-      void this.persistInBackground();
-    }, this.autoPersistDebounceMs);
+    this.persistScheduler.markDirty();
   }
 
   private cancelScheduledPersist(): void {
-    if (this.persistTimer !== null) {
-      clearTimeout(this.persistTimer);
-      this.persistTimer = null;
-    }
+    this.persistScheduler.cancelScheduled();
   }
-
-  private async persistInBackground(): Promise<void> {
-    if (this.closed) return;
-    try {
-      await this.persist();
-    } catch (err) {
-      this.onPersistError(err instanceof Error ? err : new Error(String(err)));
-    }
-  }
-
-  private attachLifecycleListeners(): void {
-    if (this.lifecycleAttached || !this.autoPersist) return;
-    if (typeof document === 'undefined' || typeof addEventListener !== 'function') {
-      return;
-    }
-    this.lifecycleAttached = true;
-    document.addEventListener('visibilitychange', this.onVisibilityChange);
-    addEventListener('pagehide', this.onPageHide);
-  }
-
-  private detachLifecycleListeners(): void {
-    if (!this.lifecycleAttached) return;
-    this.lifecycleAttached = false;
-    document.removeEventListener('visibilitychange', this.onVisibilityChange);
-    removeEventListener('pagehide', this.onPageHide);
-  }
-
-  private readonly onVisibilityChange = (): void => {
-    if (document.visibilityState === 'hidden') {
-      this.cancelScheduledPersist();
-      void this.persistInBackground();
-    }
-  };
-
-  private readonly onPageHide = (): void => {
-    this.cancelScheduledPersist();
-    void this.persistInBackground();
-  };
 
   private async ensureReady(): Promise<void> {
     if (this.dbHandle) return;
-    if (this.closed) {
-      throw new Error('FirebirdBrowser instance has been closed');
-    }
-    if (!this.initPromise) {
-      this.initPromise = this.init();
-    }
+    if (this.closed) throw new Error('FirebirdBrowser instance has been closed');
+    if (!this.initPromise) this.initPromise = this.init();
     await this.initPromise;
   }
 
   private async init(): Promise<void> {
-    if (this.multiTab === 'exclusive') {
-      this.lock = await acquireDatabaseLock(this.dbName, {
-        timeoutMs: this.lockTimeoutMs,
-      });
-    }
-    try {
-      await this.engine.init();
-      if (this.options.icuLocaleData) {
-        const localeBytes =
-          typeof this.options.icuLocaleData === 'function'
-            ? await this.options.icuLocaleData()
-            : this.options.icuLocaleData;
-        await this.applyIcuLocaleData(localeBytes);
-      }
-      if (this.opfs) {
-        this.opfsPath = await this.engine.mountOpfs(this.fileName);
-      } else if (!this.ephemeral) {
-        await this.vfs.open(this.dbName);
-      }
-      await this.openDatabase();
-    } catch (err) {
-      await this.releaseLock();
-      throw err;
-    }
-    this.attachLifecycleListeners();
-  }
-
-  private async openDatabase(): Promise<void> {
-    this.dbHandle = await openBrowserDatabaseFile({
+    return initializeBrowserDatabase({
+      multiTab: this.multiTab,
+      dbName: this.dbName,
+      fileName: this.fileName,
+      lockTimeoutMs: this.lockTimeoutMs,
+      opfs: this.opfs,
+      ephemeral: this.ephemeral,
+      options: this.options,
       engine: this.engine,
-      dbPath: this.dbPath,
-      mayPersist: this.mayPersist,
-      exportStored: () => this.vfs.exportDatabase(),
-      loadDataDir: this.options.loadDataDir,
-      loadDataStream: this.options.loadDataStream,
-      sharedReads: this.options.sharedReads,
+      vfs: this.vfs,
+      getDbPath: () => this.dbPath,
+      getMayPersist: () => this.mayPersist,
+      setLock: (l) => { this.lock = l; },
+      releaseLock: () => this.releaseLock(),
+      setOpfsPath: (p) => { this.opfsPath = p; },
+      setDbHandle: (h) => { this.dbHandle = h; },
+      applyIcuLocaleData: (d) => this.applyIcuLocaleData(d),
+      attachLifecycleListeners: () => this.persistScheduler.attachLifecycle(),
     });
   }
 
@@ -1455,7 +1311,15 @@ export class FirebirdBrowser implements FirebirdDatabase {
     if (this.closed) return;
     this.dbHandle = 0;
     try {
-      await this.openDatabase();
+      this.dbHandle = await openBrowserDatabaseFile({
+        engine: this.engine,
+        dbPath: this.dbPath,
+        mayPersist: this.mayPersist,
+        exportStored: () => this.vfs.exportDatabase(),
+        loadDataDir: this.options.loadDataDir,
+        loadDataStream: this.options.loadDataStream,
+        sharedReads: this.options.sharedReads,
+      });
     } catch (err) {
       this.onPersistError(
         err instanceof Error

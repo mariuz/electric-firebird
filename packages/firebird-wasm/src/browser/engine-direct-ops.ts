@@ -6,9 +6,11 @@
 import type { FirebirdWasmModule } from '../wasm-loader';
 import type {
   DatabaseInfo,
+  FieldInfo,
   QueryParams,
   QueryResult,
   Row,
+  RowMode,
   SweepResult,
   TransactionOptions,
 } from '../types';
@@ -17,9 +19,23 @@ import type {
   EnginePipelineStepResponse,
   EnginePipelineWireOptions,
 } from '../pipeline';
-import type { BinaryResultPayload } from './binary-result';
+import {
+  decodeBinaryResultSet,
+  encodeBinaryResultSet,
+  type BinaryResultPayload,
+} from './binary-result';
+import { encodeParamRows } from './params';
+import { isWireParamRowsBuffer, wireParamRowsToCAbi } from './wire-params';
 import type { EngineHandle } from './wasm-abi-types';
-import { buildSweepResult, engineError } from './result-decoder';
+import {
+  BLOB_SIDE_CHANNEL,
+  SHAPE_IDS,
+  attachBlobs,
+  buildSweepResult,
+  decodeResultSet,
+  engineError,
+  readBlobs,
+} from './result-decoder';
 
 export async function runDirectSweep(
   mod: FirebirdWasmModule,
@@ -237,5 +253,288 @@ export async function runDirectPipeline(
       await driver.rollback(activeTx).catch(() => undefined);
     }
     throw err;
+  }
+}
+
+export interface DirectStmtOpsHost {
+  readonly module: FirebirdWasmModule;
+  readonly preparedStatements: Map<
+    EngineHandle,
+    { dbHandle: EngineHandle; sql: string; native: boolean }
+  >;
+  readonly shapeColumns: (id: number) => readonly FieldInfo[];
+  withParams<R>(params: QueryParams | Uint8Array, fn: (ptr: number, len: number) => R): R;
+  resolveStagedBlobParams(params: QueryParams): QueryParams;
+  extractBinaryPayload(mod: FirebirdWasmModule, binPtr: number, byteLen: number): BinaryResultPayload;
+  execute(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    sql: string,
+    params?: QueryParams | Uint8Array,
+  ): Promise<number>;
+  executeBatch(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    sql: string,
+    rows: QueryParams[] | Uint8Array,
+  ): Promise<number>;
+  query<T = Row>(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    sql: string,
+    params?: QueryParams | Uint8Array,
+    rowMode?: RowMode,
+    binaryBlobs?: boolean,
+  ): Promise<QueryResult<T>>;
+  cursorOpen(
+    dbHandle: EngineHandle,
+    txHandle: EngineHandle,
+    sql: string,
+    params?: QueryParams | Uint8Array,
+  ): Promise<EngineHandle>;
+}
+
+function lookupPreparedEntry(
+  host: DirectStmtOpsHost,
+  dbHandle: EngineHandle,
+  stmtHandle: EngineHandle,
+  context: string,
+): { dbHandle: EngineHandle; sql: string; native: boolean } {
+  const entry = host.preparedStatements.get(stmtHandle);
+  if (!entry || entry.dbHandle !== dbHandle) {
+    throw new Error(`Firebird ${context} failed: unknown statement handle (${stmtHandle})`);
+  }
+  return entry;
+}
+
+export async function runDirectExecuteStmt(
+  host: DirectStmtOpsHost,
+  dbHandle: EngineHandle,
+  txHandle: EngineHandle,
+  stmtHandle: EngineHandle,
+  params: QueryParams | Uint8Array = [],
+): Promise<number> {
+  const mod = host.module;
+  const entry = host.preparedStatements.get(stmtHandle);
+  if (typeof mod._fb_execute_stmt === 'function' && (!entry || entry.native)) {
+    const executeStmtFn = mod._fb_execute_stmt;
+    const rc = host.withParams(params, (paramPtr, paramLen) =>
+      executeStmtFn.call(mod, dbHandle, txHandle, stmtHandle, paramPtr, paramLen),
+    );
+    if (rc !== 0) {
+      throw engineError(mod, `Firebird executeStmt failed for statement #${stmtHandle}`, rc);
+    }
+    return mod._fb_last_affected_rows();
+  }
+  const fallback = lookupPreparedEntry(host, dbHandle, stmtHandle, 'executeStmt');
+  return host.execute(dbHandle, txHandle, fallback.sql, params);
+}
+
+export async function runDirectExecuteBatchStmt(
+  host: DirectStmtOpsHost,
+  dbHandle: EngineHandle,
+  txHandle: EngineHandle,
+  stmtHandle: EngineHandle,
+  rows: QueryParams[] | Uint8Array,
+): Promise<number> {
+  const mod = host.module;
+  const entry = host.preparedStatements.get(stmtHandle);
+  if (typeof mod._fb_execute_batch_stmt === 'function' && (!entry || entry.native)) {
+    const executeBatchStmtFn = mod._fb_execute_batch_stmt;
+    let packed: Uint8Array;
+    if (isWireParamRowsBuffer(rows)) {
+      const view = new DataView(rows.buffer, rows.byteOffset, rows.byteLength);
+      if (view.getUint32(4, true) === 0) return 0;
+      packed = wireParamRowsToCAbi(rows);
+    } else {
+      if (rows.length === 0) return 0;
+      const resolvedRows = rows.map((row) => host.resolveStagedBlobParams(row));
+      packed = encodeParamRows(resolvedRows);
+    }
+    const ptr = mod._malloc(packed.length);
+    let rc: number;
+    try {
+      mod.HEAPU8.set(packed, ptr);
+      rc = executeBatchStmtFn.call(mod, dbHandle, txHandle, stmtHandle, ptr, packed.length);
+    } finally {
+      mod._free(ptr);
+    }
+    if (rc !== 0) {
+      throw engineError(mod, `Firebird executeBatchStmt failed for statement #${stmtHandle}`, rc);
+    }
+    return mod._fb_last_affected_rows();
+  }
+  const fallback = lookupPreparedEntry(host, dbHandle, stmtHandle, 'executeBatchStmt');
+  return host.executeBatch(dbHandle, txHandle, fallback.sql, rows);
+}
+
+export async function runDirectQueryStmt<T = Row>(
+  host: DirectStmtOpsHost,
+  dbHandle: EngineHandle,
+  txHandle: EngineHandle,
+  stmtHandle: EngineHandle,
+  params: QueryParams | Uint8Array = [],
+  rowMode: RowMode = 'object',
+  binaryBlobs = false,
+): Promise<QueryResult<T>> {
+  const mod = host.module;
+  const entry = host.preparedStatements.get(stmtHandle);
+  const flags = (binaryBlobs ? BLOB_SIDE_CHANNEL : 0) | SHAPE_IDS;
+
+  if (typeof mod._fb_query_stmt_binary === 'function' && (!entry || entry.native)) {
+    const queryStmtBinaryFn = mod._fb_query_stmt_binary;
+    return host.withParams(params, (paramPtr, paramLen) => {
+      const lenPtr = mod._malloc(4);
+      let binPtr = 0;
+      try {
+        binPtr = queryStmtBinaryFn.call(
+          mod,
+          dbHandle,
+          txHandle,
+          stmtHandle,
+          paramPtr,
+          paramLen,
+          flags,
+          lenPtr,
+        );
+        if (binPtr === 0) {
+          throw engineError(mod, `Firebird queryStmt failed for statement #${stmtHandle}`);
+        }
+        const lenView = new DataView(
+          mod.HEAPU8.buffer,
+          mod.HEAPU8.byteOffset + lenPtr,
+          4,
+        );
+        const byteLen = lenView.getUint32(0, true);
+        const view = mod.HEAPU8.subarray(binPtr, binPtr + byteLen);
+        return decodeBinaryResultSet<T>(view, rowMode, binaryBlobs, host.shapeColumns);
+      } finally {
+        if (binPtr !== 0) mod._fb_free_result(binPtr);
+        mod._free(lenPtr);
+      }
+    });
+  }
+
+  if (typeof mod._fb_query_stmt === 'function' && (!entry || entry.native)) {
+    const queryStmtFn = mod._fb_query_stmt;
+    return host.withParams(params, (paramPtr, paramLen) => {
+      const resultPtr = queryStmtFn.call(
+        mod,
+        dbHandle,
+        txHandle,
+        stmtHandle,
+        paramPtr,
+        paramLen,
+        flags,
+      );
+      if (resultPtr === 0) {
+        throw engineError(mod, `Firebird queryStmt failed for statement #${stmtHandle}`);
+      }
+      const json = mod.UTF8ToString(resultPtr);
+      mod._fb_free_result(resultPtr);
+      const blobs = binaryBlobs ? readBlobs(mod) : null;
+      const result = decodeResultSet<T>(json, rowMode, host.shapeColumns);
+      return blobs ? attachBlobs(result, blobs, rowMode) : result;
+    });
+  }
+
+  const fallback = lookupPreparedEntry(host, dbHandle, stmtHandle, 'queryStmt');
+  return host.query<T>(dbHandle, txHandle, fallback.sql, params, rowMode, binaryBlobs);
+}
+
+export async function runDirectQueryStmtBinary(
+  host: DirectStmtOpsHost,
+  dbHandle: EngineHandle,
+  txHandle: EngineHandle,
+  stmtHandle: EngineHandle,
+  params: QueryParams | Uint8Array = [],
+  binaryBlobs = false,
+): Promise<BinaryResultPayload> {
+  const mod = host.module;
+  const entry = host.preparedStatements.get(stmtHandle);
+  if (typeof mod._fb_query_stmt_binary === 'function' && (!entry || entry.native)) {
+    const queryStmtBinaryFn = mod._fb_query_stmt_binary;
+    const flags = (binaryBlobs ? BLOB_SIDE_CHANNEL : 0) | SHAPE_IDS;
+    return host.withParams(params, (paramPtr, paramLen) => {
+      const lenPtr = mod._malloc(4);
+      let binPtr = 0;
+      try {
+        binPtr = queryStmtBinaryFn.call(
+          mod,
+          dbHandle,
+          txHandle,
+          stmtHandle,
+          paramPtr,
+          paramLen,
+          flags,
+          lenPtr,
+        );
+        if (binPtr === 0) {
+          throw engineError(mod, `Firebird queryStmt failed for statement #${stmtHandle}`);
+        }
+        const lenView = new DataView(
+          mod.HEAPU8.buffer,
+          mod.HEAPU8.byteOffset + lenPtr,
+          4,
+        );
+        const byteLen = lenView.getUint32(0, true);
+        return host.extractBinaryPayload(mod, binPtr, byteLen);
+      } finally {
+        if (binPtr !== 0) mod._fb_free_result(binPtr);
+        mod._free(lenPtr);
+      }
+    });
+  }
+
+  const decoded = await runDirectQueryStmt<unknown[]>(
+    host,
+    dbHandle,
+    txHandle,
+    stmtHandle,
+    params,
+    'array',
+    binaryBlobs,
+  );
+  return {
+    binaryResult: encodeBinaryResultSet(decoded, { rowMode: 'array' }),
+  };
+}
+
+export async function runDirectCursorOpenStmt(
+  host: DirectStmtOpsHost,
+  dbHandle: EngineHandle,
+  txHandle: EngineHandle,
+  stmtHandle: EngineHandle,
+  params: QueryParams | Uint8Array = [],
+): Promise<EngineHandle> {
+  const mod = host.module;
+  const entry = host.preparedStatements.get(stmtHandle);
+  if (typeof mod._fb_cursor_open_stmt === 'function' && (!entry || entry.native)) {
+    const openStmtFn = mod._fb_cursor_open_stmt;
+    const handle = host.withParams(params, (paramPtr, paramLen) =>
+      openStmtFn.call(mod, dbHandle, txHandle, stmtHandle, paramPtr, paramLen),
+    );
+    if (handle === 0) {
+      throw engineError(mod, `Firebird cursorOpenStmt failed for statement #${stmtHandle}`);
+    }
+    return handle;
+  }
+  const fallback = lookupPreparedEntry(host, dbHandle, stmtHandle, 'cursorOpenStmt');
+  return host.cursorOpen(dbHandle, txHandle, fallback.sql, params);
+}
+
+export function runDirectStmtSetTimeout(
+  mod: FirebirdWasmModule,
+  stmtHandle: EngineHandle,
+  timeoutMs: number,
+): void {
+  if (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs) || timeoutMs < 0) {
+    throw new RangeError('timeoutMs must be a non-negative finite number');
+  }
+  if (typeof mod._fb_stmt_set_timeout === 'function') {
+    const rc = mod._fb_stmt_set_timeout(stmtHandle, Math.floor(timeoutMs) >>> 0);
+    if (rc !== 0) {
+      throw engineError(mod, `Firebird stmtSetTimeout failed for statement #${stmtHandle}`, rc);
+    }
   }
 }

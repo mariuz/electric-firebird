@@ -58,6 +58,12 @@ import {
   type PresenceCursor,
   type PresenceHub,
 } from './presence';
+import {
+  formatPrometheusMetrics,
+  generateTraceparent,
+  type OtelInstrumentationHandle,
+  type OtelObservableDatabase,
+} from '../otel-metrics';
 
 export * from './webrtc-resilient';
 export * from './broadcast-transport';
@@ -134,6 +140,10 @@ export interface HttpReplicationHandlerOptions {
   sseHeartbeatIntervalMs?: number;
   /** Optional ephemeral collaborative presence hub (`M26 Item 1`). */
   presenceHub?: PresenceHub;
+  /** Optional database handle providing `monitorStats()` / `databaseInfo()` for `GET /metrics` (`M27 Item 3`). */
+  metricsDb?: OtelObservableDatabase;
+  /** Optional OpenTelemetry instrumentation handle linked to this replication handler (`M27 Item 3`). */
+  otel?: OtelInstrumentationHandle;
 }
 
 export type ReplicationTokenProvider =
@@ -152,6 +162,8 @@ export interface HttpReplicationClientOptions {
   apiKey?: ReplicationTokenProvider;
   /** Optional alias for `apiKey` accepting a static JWT or dynamic async token provider (`M24 Item 1`). */
   authToken?: ReplicationTokenProvider;
+  /** Optional W3C `traceparent` header string or dynamic provider propagated on outbound HTTP requests (`M27 Item 3`). */
+  traceparent?: string | (() => string | undefined);
   /** Optional exponential backoff + jitter retry policy for transient network / 5xx / 429 failures (`M19 Item 3`). */
   retry?: BackoffRetryOptions;
   /** Optional connection lifecycle callback (`'connecting' | 'online' | 'backoff' | 'offline'`) (`M19 Item 3`). */
@@ -302,7 +314,10 @@ export function createHttpReplicationHandler(
     });
   const presenceHub: PresenceHub = options.presenceHub ?? createPresenceHub();
 
-  return async (request: Request): Promise<Response> => {
+  const innerHandle = async (
+    request: Request,
+    activeTraceparent: string,
+  ): Promise<Response> => {
     if (apiKey && !jwtResolver) {
       const auth = request.headers.get('authorization') ?? '';
       const keyHeader = request.headers.get('x-replication-key') ?? '';
@@ -313,6 +328,41 @@ export function createHttpReplicationHandler(
 
     const url = new URL(request.url, 'http://localhost');
     const path = url.pathname.replace(/\/+$/, '');
+
+    if (request.method === 'GET' && path.endsWith('/metrics')) {
+      const [monitor, dbInfo, primaryLsn, replicaWatermark] = await Promise.all([
+        options.metricsDb?.monitorStats
+          ? options.metricsDb.monitorStats().catch(() => null)
+          : null,
+        options.metricsDb?.databaseInfo
+          ? options.metricsDb.databaseInfo().catch(() => null)
+          : null,
+        publication ? publication.currentLsn().catch(() => undefined) : undefined,
+        subscription ? subscription.getWatermark().catch(() => undefined) : undefined,
+      ]);
+      const lagEntries =
+        typeof primaryLsn === 'number' && typeof replicaWatermark === 'number'
+          ? Math.max(0, primaryLsn - replicaWatermark)
+          : undefined;
+      const bodyText = formatPrometheusMetrics({
+        monitor,
+        dbInfo,
+        replication:
+          primaryLsn !== undefined || replicaWatermark !== undefined
+            ? { primaryLsn, replicaWatermark, lagEntries }
+            : null,
+        sseSubscribers: sseHub.subscriberCount,
+        presencePeers: presenceHub.listPeers().length,
+      });
+      return new Response(bodyText, {
+        status: 200,
+        headers: {
+          'content-type': 'text/plain; version=0.0.4; charset=utf-8',
+          traceparent: activeTraceparent,
+        },
+      });
+    }
+
     const explicitRequestedTenant =
       request.headers.get('x-tenant-id') ?? url.searchParams.get('tenantId');
 
@@ -826,6 +876,32 @@ export function createHttpReplicationHandler(
 
     return jsonResponse({ error: `Not Found: ${request.method} ${url.pathname}` }, 404);
   };
+
+  return async (request: Request): Promise<Response> => {
+    const incomingTp = request.headers.get('traceparent');
+    const runReq = async (tp: string): Promise<Response> => {
+      const res = await innerHandle(request, tp);
+      try {
+        if (!res.headers.has('traceparent')) {
+          res.headers.set('traceparent', tp);
+        }
+      } catch {
+        // Ignore immutable response headers
+      }
+      return res;
+    };
+    if (options.otel) {
+      const u = new URL(request.url, 'http://localhost');
+      return options.otel.withSpan(
+        `firebird.replication.http.${request.method.toLowerCase()}`,
+        { 'http.request.method': request.method, 'url.path': u.pathname },
+        ({ traceparent }) => runReq(traceparent),
+        incomingTp,
+      );
+    }
+    const { traceparent } = generateTraceparent({ parent: incomingTp });
+    return runReq(traceparent);
+  };
 }
 
 /**
@@ -913,6 +989,13 @@ export function createHttpReplicationClient(
     if (tok) {
       h.authorization = `Bearer ${tok}`;
       h['x-replication-key'] = tok;
+    }
+    const tp =
+      typeof options.traceparent === 'function'
+        ? options.traceparent()
+        : options.traceparent;
+    if (tp && !h.traceparent) {
+      h.traceparent = tp;
     }
     return h;
   };

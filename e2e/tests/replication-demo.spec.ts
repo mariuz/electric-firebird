@@ -344,4 +344,24 @@ test.describe('Replication Simulator v2 (replication.html)', () => {
     await expect(page.locator('#event-feed')).toContainText('packRagContext()');
     await expect(page.locator('#event-feed')).toContainText('anonymizeDatabase()');
   });
+
+  test('Scenario 21: Guarded MCP Agent Server + Incremental RAG Ingester, OTel /metrics & Encrypted .fbkp Backup', async ({
+    page,
+  }) => {
+    await openReplicationSim(page);
+
+    await page.locator('.scenario-card[data-scenario="mcp-agent-rag-ingest-otel-backup"]').click();
+
+    await expect(page.locator('#primary-rows')).toContainText('MCP OTel Backup Task #4');
+    await expect(page.locator('#replica-rows')).toContainText('MCP OTel Backup Task #5');
+    await expect(page.locator('#code-inspector')).toContainText('createFirebirdMcpServer');
+    await expect(page.locator('#code-inspector')).toContainText('createRagIngester');
+    await expect(page.locator('#code-inspector')).toContainText('createOtelInstrumentation');
+    await expect(page.locator('#code-inspector')).toContainText('createEncryptedBackup');
+    await expect(page.locator('#event-feed')).toContainText('Scenario 21');
+    await expect(page.locator('#event-feed')).toContainText('read_query');
+    await expect(page.locator('#event-feed')).toContainText('chunkDocument()');
+    await expect(page.locator('#event-feed')).toContainText('traceparent');
+    await expect(page.locator('#event-feed')).toContainText('verifyBackupArchive()');
+  });
 });
