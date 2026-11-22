@@ -26,8 +26,18 @@ import type {
 } from '../arrow-ingest';
 import type { WorkloadAdvisorReport } from '../workload-advisor';
 import type { JobQueueStats } from '../job-queue';
+import type { TimeSeriesPolicyInfo } from '../timeseries';
 
-export type { WorkloadAdvisorReport, JobQueueStats };
+export type { WorkloadAdvisorReport, JobQueueStats, TimeSeriesPolicyInfo };
+
+/** Persisted 2D Spatial R-Tree index summary (`FB_SPATIAL_INDEX$`) displayed in `<firebird-repl>` (`M29 Item 5`). */
+export interface ReplSpatialIndexSummary {
+  readonly name: string;
+  readonly table: string;
+  readonly column: string;
+  readonly keyColumn: string;
+  readonly itemCount: number;
+}
 
 /** Active tab in the `<firebird-repl>` Schema Inspector, Migration Viewer, Profiler, Query Plan Explorer, Replication & Sync/Arrow Inspector sidebar. */
 export type ReplInspectorTab =

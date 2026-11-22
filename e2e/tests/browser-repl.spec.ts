@@ -609,6 +609,68 @@ test.describe('<firebird-repl>', () => {
     expect(outcome.loadedEditorVal).toContain('CREATE INDEX');
   });
 
+  test('M29: inspects Spatial R-Tree Indexes (FB_SPATIAL_INDEX$) & Time-Series Policies (FB_TS_POLICIES$) in <firebird-repl>', async ({
+    page,
+  }) => {
+    await page.goto('/no-isolation/browser-harness-frameworks-st');
+    await page.waitForFunction(() => Boolean((window as any).FB && (window as any).Frameworks));
+
+    const outcome = await page.evaluate(async () => {
+      const w = window as any;
+      w.Frameworks.FBRepl.defineFirebirdRepl();
+      const repl = document.createElement('firebird-repl') as any;
+      const db = new w.FB.FirebirdBrowser('memory://repl-m29');
+      repl.db = db;
+      document.getElementById('app')!.replaceChildren(repl);
+
+      await repl.run(
+        'CREATE TABLE SENSORS (ID INTEGER NOT NULL PRIMARY KEY, TS_MS BIGINT NOT NULL, TEMP DOUBLE PRECISION NOT NULL, GEOM VARCHAR(128))',
+      );
+      await repl.run("INSERT INTO SENSORS VALUES (1, 1000, 22.5, 'POINT(26.1025 44.4268)')");
+
+      const emptySpatial = await repl.spatialIndexes();
+      const emptyTs = await repl.timeSeriesPolicies();
+
+      const spIdx = await w.FB.createSpatialIndex(db, {
+        table: 'SENSORS',
+        column: 'GEOM',
+        keyColumn: 'ID',
+      });
+      spIdx.dispose();
+
+      const tsStore = w.FB.createTimeSeriesStore(db);
+      await tsStore.registerPolicy({
+        name: 'sensor_1m_rollup',
+        table: 'SENSORS',
+        timeColumn: 'TS_MS',
+        valueColumn: 'TEMP',
+        bucketInterval: '1m',
+        retention: '7d',
+      });
+
+      await repl.schema();
+      const activeSpatial = await repl.spatialIndexes();
+      const activeTs = await repl.timeSeriesPolicies();
+      const inspectorText = repl.shadowRoot?.querySelector('.inspector')?.textContent ?? '';
+
+      await db.close();
+      return {
+        emptySpatialLen: emptySpatial.length,
+        emptyTsLen: emptyTs.length,
+        activeSpatialCount: activeSpatial[0]?.itemCount ?? 0,
+        activeTsName: activeTs[0]?.name ?? '',
+        inspectorText,
+      };
+    });
+
+    expect(outcome.emptySpatialLen).toBe(0);
+    expect(outcome.emptyTsLen).toBe(0);
+    expect(outcome.activeSpatialCount).toBe(1);
+    expect(outcome.activeTsName).toBe('sensor_1m_rollup');
+    expect(outcome.inspectorText).toContain('Spatial R-Tree Indexes (FB_SPATIAL_INDEX$)');
+    expect(outcome.inspectorText).toContain('Time-Series Policies (FB_TS_POLICIES$)');
+  });
+
   test('takes a db property set before it was defined, and reports runs', async ({ page }) => {
     await page.goto('/no-isolation/browser-harness-frameworks-st');
     await page.waitForFunction(() => Boolean((window as any).FB && (window as any).Frameworks));

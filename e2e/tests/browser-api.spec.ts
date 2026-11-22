@@ -3926,4 +3926,62 @@ test.describe('FirebirdBrowser', () => {
     expect(result.hasOnlineMigFn).toBe(true);
     expect(result.hasAdvisorFn).toBe(true);
   });
+
+  test('M29: lttbDownsample, RTreeIndex/haversine, CloudEvents HMAC signature & KeyValuePageVFS in browser bundle', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      const w = window as any;
+      const pts = Array.from({ length: 50 }, (_, i) => ({
+        timestamp: i * 1000,
+        value: i === 25 ? 999 : Math.sin(i / 5) * 10,
+      }));
+      const sampled = w.FB.lttbDownsample(pts, 10);
+
+      const rtree = new w.FB.RTreeIndex();
+      rtree.insert('bucharest', w.FB.parseGeoGeometry('POINT(26.1025 44.4268)'));
+      rtree.insert('cluj', w.FB.parseGeoGeometry('POINT(23.6236 46.7712)'));
+      const nearest = rtree.knn(26.09, 44.43, 1);
+
+      const sig = await w.FB.signWebhookPayload('{"specversion":"1.0"}', 'm29-secret', 1700000000);
+      const sigOk = await w.FB.verifyWebhookSignature(
+        '{"specversion":"1.0"}',
+        sig.signatureHeader,
+        'm29-secret',
+        { nowSec: 1700000010 },
+      );
+
+      const kv = new Map<string, Uint8Array>();
+      const vfs = new w.FB.KeyValuePageVFS({
+        get: async (k: string) => kv.get(k) ?? null,
+        put: async (k: string, v: Uint8Array) => {
+          kv.set(k, v);
+        },
+        delete: async (k: string) => kv.delete(k),
+      });
+      const page0 = new Uint8Array(8192);
+      page0[0] = 0x42;
+      await vfs.writePage(0, page0);
+      await vfs.flushDirtyPages();
+      const readBack = await vfs.readPage(0);
+
+      return {
+        sampledLen: sampled.length,
+        preservedSpike: sampled.some((p: any) => p.value === 999),
+        nearestId: nearest[0]?.id ?? null,
+        sigOk,
+        chunkKeys: kv.size,
+        readBackByte: readBack[0],
+        hasEdgeGateway: typeof w.FB.createEdgeSqlGateway === 'function',
+      };
+    });
+
+    expect(result.sampledLen).toBe(10);
+    expect(result.preservedSpike).toBe(true);
+    expect(result.nearestId).toBe('bucharest');
+    expect(result.sigOk).toBe(true);
+    expect(result.chunkKeys).toBeGreaterThanOrEqual(2);
+    expect(result.readBackByte).toBe(0x42);
+    expect(result.hasEdgeGateway).toBe(true);
+  });
 });

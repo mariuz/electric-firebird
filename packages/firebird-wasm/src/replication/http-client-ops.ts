@@ -3,7 +3,13 @@
  * Operations for `HttpReplicationClient` (`M28 Item 5`).
  */
 
-import type { PublicationSnapshot, ReplicableDatabase } from './types';
+import type {
+  PublicationSnapshot,
+  ReplicableDatabase,
+  ReplicationLogEntry,
+  ReplicationSlot,
+  SubscriptionPullResult,
+} from './types';
 import {
   base64ToBytes,
   bytesToBase64,
@@ -16,8 +22,17 @@ import {
   type ApplyFbChangelogResult,
   type JrdColumnDescriptor,
 } from './native-changelog';
+import {
+  computeBackoffDelayMs,
+  type ConnectionLifecycleState,
+  type ConnectionStateChangeInfo,
+} from './webrtc-resilient';
+import { decodeArrowSnapshotBundle } from './arrow-snapshot';
 import type {
   FetchSnapshotResumableOptions,
+  HttpReplicationClient,
+  HttpReplicationClientOptions,
+  ReplicationTokenProvider,
   ResumableSnapshotCheckpoint,
   ResumableSnapshotManifest,
 } from './transports';
@@ -241,4 +256,237 @@ export async function runHttpPullAndApplyChangelog(
     );
   }
   return results;
+}
+
+export function createHttpReplicationClient(
+  options: HttpReplicationClientOptions,
+): HttpReplicationClient {
+  const baseUrl = options.baseUrl.replace(/\/+$/, '');
+  const rawFetchFn = options.fetch ?? globalThis.fetch;
+  const pubName = (options.name ?? 'default').trim();
+  let clientState: ConnectionLifecycleState = 'online';
+
+  const setClientState = (
+    next: ConnectionLifecycleState,
+    info?: ConnectionStateChangeInfo,
+  ): void => {
+    if (clientState === next && !info) return;
+    clientState = next;
+    options.onStateChange?.(next, info);
+  };
+
+  const fetchFn = async (
+    input: string | URL | Request,
+    init?: RequestInit,
+  ): Promise<Response> => {
+    const maxRetries = options.retry ? (options.retry.maxRetries ?? 4) : 0;
+    let attempt = 0;
+    for (;;) {
+      try {
+        if (attempt > 0) {
+          setClientState('connecting', { attempt });
+        }
+        const res = await rawFetchFn(input, init);
+        if ((res.status === 429 || res.status >= 500) && attempt < maxRetries) {
+          const delayMs = computeBackoffDelayMs(attempt, options.retry);
+          attempt++;
+          setClientState('backoff', {
+            attempt,
+            delayMs,
+            error: new Error(`HTTP ${res.status}`),
+          });
+          await new Promise((r) => setTimeout(r, delayMs));
+          continue;
+        }
+        if (res.ok) {
+          setClientState('online');
+        }
+        return res;
+      } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        if (attempt < maxRetries) {
+          const delayMs = computeBackoffDelayMs(attempt, options.retry);
+          attempt++;
+          setClientState('backoff', { attempt, delayMs, error });
+          await new Promise((r) => setTimeout(r, delayMs));
+          continue;
+        }
+        setClientState('offline', { attempt, error });
+        throw error;
+      }
+    }
+  };
+
+  let activeTokenSource: ReplicationTokenProvider | undefined =
+    options.authToken ?? options.apiKey;
+
+  const resolveCurrentToken = async (): Promise<string | undefined> => {
+    if (typeof activeTokenSource === 'function') {
+      return activeTokenSource();
+    }
+    return activeTokenSource;
+  };
+
+  const buildHeaders = async (
+    extra?: Record<string, string>,
+  ): Promise<Record<string, string>> => {
+    const h: Record<string, string> = {
+      accept: 'application/json',
+      ...extra,
+    };
+    const tok = await resolveCurrentToken();
+    if (tok) {
+      h.authorization = `Bearer ${tok}`;
+      h['x-replication-key'] = tok;
+    }
+    const tp =
+      typeof options.traceparent === 'function'
+        ? options.traceparent()
+        : options.traceparent;
+    if (tp && !h.traceparent) {
+      h.traceparent = tp;
+    }
+    return h;
+  };
+
+  return {
+    name: pubName,
+    get state() {
+      return clientState;
+    },
+    setAuthToken(tokenOrProvider) {
+      activeTokenSource = tokenOrProvider;
+    },
+
+    async fetchChangesSince(sinceLsn, fetchOpts = {}) {
+      const params = new URLSearchParams({ sinceLsn: String(sinceLsn) });
+      if (fetchOpts.limit !== undefined) {
+        params.set('limit', String(fetchOpts.limit));
+      }
+      if (fetchOpts.excludeOrigin) {
+        params.set('excludeOrigin', fetchOpts.excludeOrigin);
+      }
+      const res = await fetchFn(`${baseUrl}/changes?${params.toString()}`, {
+        method: 'GET',
+        headers: await buildHeaders(),
+      });
+      if (!res.ok) {
+        throw new Error(`HTTP replication fetchChangesSince failed with status ${res.status}`);
+      }
+      const data = (await res.json()) as { entries?: ReplicationLogEntry[] };
+      return data.entries ?? [];
+    },
+
+    async ackSlot(slotName, confirmedLsn, slotOpts = {}) {
+      const res = await fetchFn(`${baseUrl}/ack`, {
+        method: 'POST',
+        headers: await buildHeaders({ 'content-type': 'application/json' }),
+        body: JSON.stringify({
+          slotName,
+          confirmedLsn,
+          ...slotOpts,
+        }),
+      });
+      if (!res.ok) {
+        throw new Error(`HTTP replication ackSlot failed with status ${res.status}`);
+      }
+      const data = (await res.json()) as { slot: ReplicationSlot };
+      return data.slot;
+    },
+
+    async heartbeatSlot(slotName, hbOpts = {}) {
+      const res = await fetchFn(`${baseUrl}/heartbeat`, {
+        method: 'POST',
+        headers: await buildHeaders({ 'content-type': 'application/json' }),
+        body: JSON.stringify({
+          slotName,
+          ...hbOpts,
+        }),
+      });
+      if (!res.ok) {
+        throw new Error(`HTTP replication heartbeatSlot failed with status ${res.status}`);
+      }
+      const data = (await res.json()) as { slot: ReplicationSlot | null };
+      return data.slot;
+    },
+
+    async fetchSnapshot() {
+      const res = await fetchFn(`${baseUrl}/snapshot`, {
+        method: 'GET',
+        headers: await buildHeaders(),
+      });
+      if (!res.ok) {
+        throw new Error(`HTTP replication fetchSnapshot failed with status ${res.status}`);
+      }
+      const data = (await res.json()) as { snapshot: PublicationSnapshot };
+      return data.snapshot;
+    },
+
+    async fetchArrowSnapshot(arrowOpts = {}) {
+      const params = new URLSearchParams({ format: 'arrow' });
+      if (arrowOpts.compressGzip) {
+        params.set('compress', 'gzip');
+      }
+      const res = await fetchFn(`${baseUrl}/snapshot?${params.toString()}`, {
+        method: 'GET',
+        headers: await buildHeaders({
+          accept: 'application/x-firebird-arrow-snapshot, application/vnd.apache.arrow.stream',
+        }),
+      });
+      if (!res.ok) {
+        throw new Error(
+          `HTTP replication fetchArrowSnapshot failed with status ${res.status}`,
+        );
+      }
+      const raw = new Uint8Array(await res.arrayBuffer());
+      return decodeArrowSnapshotBundle(raw);
+    },
+
+    async fetchSnapshotResumable(resumableOpts = {}) {
+      return runHttpFetchSnapshotResumable(
+        { baseUrl, fetchFn, buildHeaders },
+        resumableOpts,
+      );
+    },
+
+    async pushChanges(entries) {
+      const res = await fetchFn(`${baseUrl}/push`, {
+        method: 'POST',
+        headers: await buildHeaders({ 'content-type': 'application/json' }),
+        body: JSON.stringify({ entries }),
+      });
+      if (!res.ok) {
+        throw new Error(`HTTP replication pushChanges failed with status ${res.status}`);
+      }
+      const data = (await res.json()) as {
+        result: SubscriptionPullResult | { appliedCount: number };
+      };
+      return data.result;
+    },
+
+    async fetchChangelogSegments(sinceSequence = 0, fetchOpts = {}) {
+      return runHttpFetchChangelogSegments(
+        { baseUrl, fetchFn, buildHeaders },
+        sinceSequence,
+        fetchOpts,
+      );
+    },
+
+    async pushChangelogSegment(segments, pushOpts = {}) {
+      return runHttpPushChangelogSegment(
+        { baseUrl, fetchFn, buildHeaders },
+        segments,
+        pushOpts,
+      );
+    },
+
+    async pullAndApplyChangelog(targetDb, sinceSequence = 0, pullOpts = {}) {
+      return runHttpPullAndApplyChangelog(
+        { baseUrl, fetchFn, buildHeaders },
+        targetDb,
+        sinceSequence,
+        pullOpts,
+      );
+    },
+  };
 }

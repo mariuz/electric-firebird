@@ -1017,82 +1017,32 @@ export class SharedEngineTransport implements EngineTransport {
     );
   }
 
-  loadIcuLocaleData(data: Uint8Array): Promise<void> {
-    return this.call<void>('loadIcuLocaleData', data);
-  }
-
-  startTransaction(
-    dbHandle: EngineHandle,
-    options: TransactionOptions = {},
-  ): Promise<EngineHandle> {
+  loadIcuLocaleData(data: Uint8Array): Promise<void> { return this.call<void>('loadIcuLocaleData', data); }
+  startTransaction(dbHandle: EngineHandle, options: TransactionOptions = {}): Promise<EngineHandle> {
     return this.call<EngineHandle>('startTransaction', dbHandle, options);
   }
-
-  commit(txHandle: EngineHandle): Promise<void> {
-    return this.call<void>('commit', txHandle);
-  }
-
-  rollback(txHandle: EngineHandle): Promise<void> {
-    return this.call<void>('rollback', txHandle);
-  }
-
-  mkdir(path: string): Promise<void> {
-    return this.call<void>('mkdir', path);
-  }
-
-  exists(path: string): Promise<boolean> {
-    return this.call<boolean>('exists', path);
-  }
-
-  readFile(path: string): Promise<Uint8Array> {
-    return this.call<Uint8Array>('readFile', path);
-  }
-
-  writeFile(path: string, data: Uint8Array): Promise<void> {
-    return this.call<void>('writeFile', path, data);
-  }
-
-  fileSize(path: string): Promise<number> {
-    return this.call<number>('fileSize', path);
-  }
-
-  readFileChunk(
-    path: string,
-    offset: number,
-    length: number,
-  ): Promise<Uint8Array> {
+  commit(txHandle: EngineHandle): Promise<void> { return this.call<void>('commit', txHandle); }
+  rollback(txHandle: EngineHandle): Promise<void> { return this.call<void>('rollback', txHandle); }
+  mkdir(path: string): Promise<void> { return this.call<void>('mkdir', path); }
+  exists(path: string): Promise<boolean> { return this.call<boolean>('exists', path); }
+  readFile(path: string): Promise<Uint8Array> { return this.call<Uint8Array>('readFile', path); }
+  writeFile(path: string, data: Uint8Array): Promise<void> { return this.call<void>('writeFile', path, data); }
+  fileSize(path: string): Promise<number> { return this.call<number>('fileSize', path); }
+  readFileChunk(path: string, offset: number, length: number): Promise<Uint8Array> {
     return this.call<Uint8Array>('readFileChunk', path, offset, length);
   }
-
-  writeFileChunk(
-    path: string,
-    data: Uint8Array,
-    offset: number,
-    truncate = false,
-  ): Promise<void> {
+  writeFileChunk(path: string, data: Uint8Array, offset: number, truncate = false): Promise<void> {
     return this.call<void>('writeFileChunk', path, data, offset, truncate);
   }
-
-  unlink(path: string): Promise<void> {
-    return this.call<void>('unlink', path);
-  }
-
+  unlink(path: string): Promise<void> { return this.call<void>('unlink', path); }
   eventsSubscribe(dbHandle: EngineHandle, names: string[]): Promise<number> {
     return this.call<number>('eventsSubscribe', dbHandle, names);
   }
-
   eventsPoll(subscription: number): Promise<Record<string, number>> {
     return this.call<Record<string, number>>('eventsPoll', subscription);
   }
-
-  eventsCancel(subscription: number): Promise<void> {
-    return this.call<void>('eventsCancel', subscription);
-  }
-
-  mountOpfs(dbName: string): Promise<string> {
-    // The mount happens on the far side; only the resulting path comes back.
-    return this.call<string>('mountOpfs', dbName);
-  }
+  eventsCancel(subscription: number): Promise<void> { return this.call<void>('eventsCancel', subscription); }
+  mountOpfs(dbName: string): Promise<string> { return this.call<string>('mountOpfs', dbName); }
 
   async dispose(): Promise<void> {
     if (this.disposed) return;

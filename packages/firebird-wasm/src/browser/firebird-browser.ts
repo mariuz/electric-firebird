@@ -532,36 +532,12 @@ export class FirebirdBrowser implements FirebirdDatabase {
     return listMaterializedViewsOnDatabase(this);
   }
 
-  async query(
-    sql: SqlFragment,
-    options: ArrayModeOptions,
-  ): Promise<QueryResult<ArrayRow>>;
-  async query(
-    sql: string | SqlFragment,
-    params: QueryParams | undefined,
-    options: ArrayModeOptions,
-  ): Promise<QueryResult<ArrayRow>>;
-  async query<T extends Row = Row>(
-    sql: TypedSqlFragment<T>,
-    options?: QueryOptions<T>,
-  ): Promise<QueryResult<T>>;
-  async query<T extends Row = Row>(
-    sql: SqlFragment,
-    options?: QueryOptions<T>,
-  ): Promise<QueryResult<T>>;
-  async query<T extends Row = Row>(
-    sql: string,
-    params?: QueryParams,
-    options?: QueryOptions<T>,
-  ): Promise<QueryResult<T>>;
-  // Both shapes at once, so a caller holding a `string | SqlFragment` — one
-  // built conditionally — can call this without casting. Last, so the two
-  // specific overloads still win where they apply.
-  async query<T extends Row = Row>(
-    sql: string | SqlFragment,
-    params?: QueryParams,
-    options?: QueryOptions<T>,
-  ): Promise<QueryResult<T>>;
+  async query(sql: SqlFragment, options: ArrayModeOptions): Promise<QueryResult<ArrayRow>>;
+  async query(sql: string | SqlFragment, params: QueryParams | undefined, options: ArrayModeOptions): Promise<QueryResult<ArrayRow>>;
+  async query<T extends Row = Row>(sql: TypedSqlFragment<T>, options?: QueryOptions<T>): Promise<QueryResult<T>>;
+  async query<T extends Row = Row>(sql: SqlFragment, options?: QueryOptions<T>): Promise<QueryResult<T>>;
+  async query<T extends Row = Row>(sql: string, params?: QueryParams, options?: QueryOptions<T>): Promise<QueryResult<T>>;
+  async query<T extends Row = Row>(sql: string | SqlFragment, params?: QueryParams, options?: QueryOptions<T>): Promise<QueryResult<T>>;
   async query<T = Row>(
     sql: string | SqlFragment | TypedSqlFragment<T>,
     paramsOrOptions: QueryParams | QueryOptions<T> = [],
@@ -692,69 +668,32 @@ export class FirebirdBrowser implements FirebirdDatabase {
     };
   }
 
-  queryStream(
-    sql: SqlFragment,
-    options: ArrayStreamOptions,
-  ): AsyncIterableIterator<QueryResult<ArrayRow>>;
-  queryStream(
-    sql: string | SqlFragment,
-    params: QueryParams | undefined,
-    options: ArrayStreamOptions,
-  ): AsyncIterableIterator<QueryResult<ArrayRow>>;
-  queryStream<T extends Row = Row>(
-    sql: SqlFragment,
-    options?: QueryStreamOptions,
-  ): AsyncIterableIterator<QueryResult<T>>;
-  queryStream<T extends Row = Row>(
-    sql: string,
-    params?: QueryParams,
-    options?: QueryStreamOptions,
-  ): AsyncIterableIterator<QueryResult<T>>;
-  queryStream<T extends Row = Row>(
-    sql: string | SqlFragment,
-    params?: QueryParams,
-    options?: QueryStreamOptions,
-  ): AsyncIterableIterator<QueryResult<T>>;
+  queryStream(sql: SqlFragment, options: ArrayStreamOptions): AsyncIterableIterator<QueryResult<ArrayRow>>;
+  queryStream(sql: string | SqlFragment, params: QueryParams | undefined, options: ArrayStreamOptions): AsyncIterableIterator<QueryResult<ArrayRow>>;
+  queryStream<T extends Row = Row>(sql: SqlFragment, options?: QueryStreamOptions): AsyncIterableIterator<QueryResult<T>>;
+  queryStream<T extends Row = Row>(sql: string, params?: QueryParams, options?: QueryStreamOptions): AsyncIterableIterator<QueryResult<T>>;
+  queryStream<T extends Row = Row>(sql: string | SqlFragment, params?: QueryParams, options?: QueryStreamOptions): AsyncIterableIterator<QueryResult<T>>;
   queryStream<T = Row>(
     sql: string | SqlFragment,
     paramsOrOptions: QueryParams | QueryStreamOptions = [],
     maybeOptions: QueryStreamOptions = {},
   ): AsyncIterableIterator<QueryResult<T>> {
-    const { statement, options } = resolveQueryCall<QueryStreamOptions>(
-      sql,
-      paramsOrOptions,
-      maybeOptions,
-    );
+    const { statement, options } = resolveQueryCall<QueryStreamOptions>(sql, paramsOrOptions, maybeOptions);
     validateTimeoutMs(options.timeoutMs);
-    const batchSize = resolveBatchSize(options.batchSize);
-    return streamBrowserQuery<T>(this.streamsHost, statement, options, batchSize);
+    return streamBrowserQuery<T>(this.streamsHost, statement, options, resolveBatchSize(options.batchSize));
   }
 
-  async listen(
-    names: string | string[],
-    onEvent: (counts: Record<string, number>) => void,
-    options: ListenOptions = {},
-  ): Promise<EventSubscription> {
+  async listen(names: string | string[], onEvent: (counts: Record<string, number>) => void, options: ListenOptions = {}): Promise<EventSubscription> {
     return listenBrowserEvents(this.streamsHost, names, onEvent, options);
   }
 
   async notify(name: string): Promise<void> {
-    await this.query(
-      'EXECUTE BLOCK (event_name VARCHAR(31) = ?) AS BEGIN POST_EVENT :event_name; END',
-      [name],
-    );
+    await this.query('EXECUTE BLOCK (event_name VARCHAR(31) = ?) AS BEGIN POST_EVENT :event_name; END', [name]);
     this.liveBridge.broadcastEvents({ [name]: 1 });
   }
 
-  async live<T extends Row = Row>(
-    sql: string | SqlFragment,
-    onChange: (rows: T[], result: QueryResult<T>) => void,
-  ): Promise<LiveQuery<T>>;
-  async live<T extends Row = Row>(
-    sql: string | SqlFragment,
-    options: LiveQueryOptions,
-    onChange: (rows: T[], result: QueryResult<T>) => void,
-  ): Promise<LiveQuery<T>>;
+  async live<T extends Row = Row>(sql: string | SqlFragment, onChange: (rows: T[], result: QueryResult<T>) => void): Promise<LiveQuery<T>>;
+  async live<T extends Row = Row>(sql: string | SqlFragment, options: LiveQueryOptions, onChange: (rows: T[], result: QueryResult<T>) => void): Promise<LiveQuery<T>>;
   async live<T extends Row = Row>(
     sql: string | SqlFragment,
     optionsOrOnChange: LiveQueryOptions | ((rows: T[], result: QueryResult<T>) => void),
@@ -765,9 +704,7 @@ export class FirebirdBrowser implements FirebirdDatabase {
 
   async liveIncremental<T extends Row = Row>(
     sql: string | SqlFragment,
-    optionsOrListener?:
-      | LiveIncrementalOptions<T>
-      | ((snapshot: IncrementalLiveSnapshot<T>) => void),
+    optionsOrListener?: LiveIncrementalOptions<T> | ((snapshot: IncrementalLiveSnapshot<T>) => void),
     maybeListener?: (snapshot: IncrementalLiveSnapshot<T>) => void,
   ): Promise<LiveIncrementalQuery<T>> {
     return runBrowserLiveIncremental<T>(this.streamsHost, sql, optionsOrListener, maybeListener);
@@ -775,9 +712,7 @@ export class FirebirdBrowser implements FirebirdDatabase {
 
   async liveColumnar(
     sql: string | SqlFragment,
-    optionsOrListener?:
-      | LiveColumnarOptions
-      | ((result: ColumnarQueryResult, version: number) => void),
+    optionsOrListener?: LiveColumnarOptions | ((result: ColumnarQueryResult, version: number) => void),
     maybeListener?: (result: ColumnarQueryResult, version: number) => void,
   ): Promise<LiveColumnarQuery> {
     return runBrowserLiveColumnar(this.streamsHost, sql, optionsOrListener, maybeListener);
@@ -788,10 +723,7 @@ export class FirebirdBrowser implements FirebirdDatabase {
     return this.engine.describe(this.dbHandle, 0, toStatement(sql).sql);
   }
 
-  async explain(
-    sql: string | SqlFragment,
-    options: ExplainOptions = {},
-  ): Promise<string> {
+  async explain(sql: string | SqlFragment, options: ExplainOptions = {}): Promise<string> {
     await this.ensureReady();
     return explainBrowserQuery(this.engine, this.dbHandle, sql, options);
   }
@@ -801,31 +733,19 @@ export class FirebirdBrowser implements FirebirdDatabase {
     return readBrowserDatabaseInfo(this.engine, this.dbHandle);
   }
 
-  onQuery(listener: QueryProfileListener): () => void {
-    return this.profiler.onQuery(listener);
-  }
-
+  onQuery(listener: QueryProfileListener): () => void { return this.profiler.onQuery(listener); }
   async monitorStats(): Promise<MonitorStats> {
     await this.ensureReady();
     return captureBrowserMonitorStats(this.profiler, this.engine, this.dbHandle);
   }
-
-  resetMonitorStats(): void {
-    this.profiler.reset();
-  }
-
+  resetMonitorStats(): void { this.profiler.reset(); }
   private async captureIoIfListening(): Promise<PageIoCounters | null> {
     return captureBrowserPageIo(this.profiler, this.engine, this.dbHandle);
   }
 
   async sweep(): Promise<SweepResult> {
     await this.ensureReady();
-    return runBrowserSweep(
-      this.engine,
-      this.dbHandle,
-      (s) => this.query(s),
-      () => this.markDirty(),
-    );
+    return runBrowserSweep(this.engine, this.dbHandle, (s) => this.query(s), () => this.markDirty());
   }
 
   async introspect(options: IntrospectOptions = {}): Promise<SchemaIntrospection> {
@@ -833,64 +753,27 @@ export class FirebirdBrowser implements FirebirdDatabase {
     return introspectSchema(this, options);
   }
 
-  async migrate(
-    migrations: readonly Migration[],
-    options: MigrateOptions = {},
-  ): Promise<MigrateResult> {
+  async migrate(migrations: readonly Migration[], options: MigrateOptions = {}): Promise<MigrateResult> {
     await this.ensureReady();
     return runMigrations(this, migrations, options);
   }
 
-  async registerFunction(
-    name: string,
-    fn: JsFunctionHandler,
-  ): Promise<RegisteredRoutine>;
-  async registerFunction(
-    name: string,
-    options: RegisterFunctionOptions,
-    fn: JsFunctionHandler,
-  ): Promise<RegisteredRoutine>;
-  async registerFunction(
-    name: string,
-    optionsOrFn: RegisterFunctionOptions | JsFunctionHandler,
-    maybeFn?: JsFunctionHandler,
-  ): Promise<RegisteredRoutine> {
+  async registerFunction(name: string, fn: JsFunctionHandler): Promise<RegisteredRoutine>;
+  async registerFunction(name: string, options: RegisterFunctionOptions, fn: JsFunctionHandler): Promise<RegisteredRoutine>;
+  async registerFunction(name: string, optionsOrFn: RegisterFunctionOptions | JsFunctionHandler, maybeFn?: JsFunctionHandler): Promise<RegisteredRoutine> {
     return registerBrowserFunction(
-      {
-        isClosed: () => this.closed,
-        ensureReady: () => this.ensureReady(),
-        udr: this.udr,
-        createUdrExecutor: (tx) => this.createUdrExecutor(tx),
-        markDirty: () => this.markDirty(),
-      },
+      { isClosed: () => this.closed, ensureReady: () => this.ensureReady(), udr: this.udr, createUdrExecutor: (tx) => this.createUdrExecutor(tx), markDirty: () => this.markDirty() },
       name,
       optionsOrFn,
       maybeFn,
     );
   }
 
-  async registerProcedure(
-    name: string,
-    fn: JsProcedureHandler,
-  ): Promise<RegisteredRoutine>;
-  async registerProcedure(
-    name: string,
-    options: RegisterProcedureOptions,
-    fn: JsProcedureHandler,
-  ): Promise<RegisteredRoutine>;
-  async registerProcedure(
-    name: string,
-    optionsOrFn: RegisterProcedureOptions | JsProcedureHandler,
-    maybeFn?: JsProcedureHandler,
-  ): Promise<RegisteredRoutine> {
+  async registerProcedure(name: string, fn: JsProcedureHandler): Promise<RegisteredRoutine>;
+  async registerProcedure(name: string, options: RegisterProcedureOptions, fn: JsProcedureHandler): Promise<RegisteredRoutine>;
+  async registerProcedure(name: string, optionsOrFn: RegisterProcedureOptions | JsProcedureHandler, maybeFn?: JsProcedureHandler): Promise<RegisteredRoutine> {
     return registerBrowserProcedure(
-      {
-        isClosed: () => this.closed,
-        ensureReady: () => this.ensureReady(),
-        udr: this.udr,
-        createUdrExecutor: (tx) => this.createUdrExecutor(tx),
-        markDirty: () => this.markDirty(),
-      },
+      { isClosed: () => this.closed, ensureReady: () => this.ensureReady(), udr: this.udr, createUdrExecutor: (tx) => this.createUdrExecutor(tx), markDirty: () => this.markDirty() },
       name,
       optionsOrFn,
       maybeFn,

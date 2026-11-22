@@ -9,12 +9,15 @@ import type {
   BlobHandle,
   BlobStreamOptions,
   BlobWritableStream,
+  ExplainOptions,
   FieldInfo,
+  QueryDescription,
   QueryParams,
   QueryResult,
   RowMode,
   StatementExecutionOptions,
 } from './types';
+import { statementKind } from './statement-types';
 import type { TypeOptions } from './browser/value-types';
 import {
   assertNotAborted,
@@ -30,10 +33,17 @@ import {
   isBlobHandle,
   resolveBlobSegmentSize,
 } from './browser/blob-stream';
-import { resolveQueryCall, type SqlFragment, type Statement as ParsedStatement } from './sql-tag';
+import {
+  resolveQueryCall,
+  toStatement,
+  type SqlFragment,
+  type Statement as ParsedStatement,
+} from './sql-tag';
 import {
   StatementCache,
   applyStatementHandleTimeout,
+  describeInputFields,
+  explainStatement,
   openNativeQueryBlobStream,
   outputFields,
   streamRows,
@@ -246,5 +256,45 @@ export async function* streamNodeTxQuery<T>(
       await applyStatementHandleTimeout(stmt, 0).catch(() => undefined);
     }
     await lease.release(engineFailed);
+  }
+}
+
+export async function describeNodeTxQuery(
+  host: NodeTxStreamHost,
+  sql: string | SqlFragment,
+): Promise<QueryDescription> {
+  host.assertUsable();
+  await host.beforeStatement();
+  const text = toStatement(sql).sql;
+  const stmt = await host.attachment.prepare(host.transaction, text);
+  try {
+    const params = await describeInputFields(stmt);
+    const fields = await outputFields(stmt);
+    const type = await stmt.type;
+    return {
+      params,
+      fields,
+      statementType: statementKind(type),
+      hasResultSet: stmt.hasResultSet,
+    };
+  } finally {
+    await stmt.dispose().catch(() => undefined);
+  }
+}
+
+export async function explainNodeTxQuery(
+  host: NodeTxStreamHost,
+  sql: string | SqlFragment,
+  options: ExplainOptions = {},
+): Promise<string> {
+  host.assertUsable();
+  await host.beforeStatement();
+  const text = toStatement(sql).sql;
+  const detailed = options.detailed === true;
+  const stmt = await host.attachment.prepare(host.transaction, text);
+  try {
+    return await explainStatement(stmt, detailed);
+  } finally {
+    await stmt.dispose().catch(() => undefined);
   }
 }

@@ -23,11 +23,22 @@ import {
   createJobQueue,
   type JobQueueStats,
 } from '../job-queue';
+import { DEFAULT_SPATIAL_INDEX_TABLE } from '../spatial';
+import {
+  createTimeSeriesStore,
+  type TimeSeriesPolicyInfo,
+} from '../timeseries';
+import type { OptimisticMutationStore } from '../optimistic-store';
+import type { UndoRedoEntry, UndoRedoManager } from '../undo-redo';
 import type { ReplicationStats } from '../replication';
 import type { PresenceRoom } from '../replication/presence';
 import type { Row } from '../types';
 import { asError, el } from './repl-styles';
-import type { ReplDatabase, ReplEntry } from './repl-types';
+import type {
+  ReplDatabase,
+  ReplEntry,
+  ReplSpatialIndexSummary,
+} from './repl-types';
 
 function createReplObjectQueryAdapter(db: ReplDatabase) {
   return {
@@ -310,6 +321,136 @@ export function appendPresenceAndAuditSections(
     }
     panel.append(auditBox);
   }
+}
+
+export async function fetchReplSpatialIndexes(
+  db: ReplDatabase,
+): Promise<ReplSpatialIndexSummary[]> {
+  try {
+    const check = await db.query(
+      `SELECT 1 FROM RDB$RELATIONS WHERE TRIM(RDB$RELATION_NAME) = ?`,
+      [DEFAULT_SPATIAL_INDEX_TABLE],
+      { rowMode: 'array' },
+    );
+    if (check.rows.length === 0) return [];
+    const res = await db.query(
+      `SELECT TRIM(INDEX_NAME), TRIM(TABLE_NAME), TRIM(COLUMN_NAME), TRIM(KEY_COLUMN), ITEM_COUNT ` +
+        `FROM "${DEFAULT_SPATIAL_INDEX_TABLE}" ORDER BY INDEX_NAME`,
+      [],
+      { rowMode: 'array' },
+    );
+    return res.rows.map((r) => ({
+      name: String(r[0] ?? '').trim(),
+      table: String(r[1] ?? '').trim(),
+      column: String(r[2] ?? '').trim(),
+      keyColumn: String(r[3] ?? 'ID').trim(),
+      itemCount: Number(r[4] ?? 0),
+    }));
+  } catch {
+    return [];
+  }
+}
+
+export async function fetchReplTimeSeriesPolicies(
+  db: ReplDatabase,
+): Promise<TimeSeriesPolicyInfo[]> {
+  try {
+    const ts = createTimeSeriesStore(createReplObjectQueryAdapter(db));
+    return await ts.listPolicies();
+  } catch {
+    return [];
+  }
+}
+
+export function appendSpatialAndTimeSeriesSections(
+  panel: HTMLElement,
+  opts: {
+    spatialIndexes?: readonly ReplSpatialIndexSummary[];
+    timeSeriesPolicies?: readonly TimeSeriesPolicyInfo[];
+  },
+): void {
+  if (opts.spatialIndexes && opts.spatialIndexes.length > 0) {
+    const spBox = el('div', 'schema-sub spatial-indexes-panel');
+    const title = el('div', 'schema-group-title');
+    title.textContent = 'Spatial R-Tree Indexes (FB_SPATIAL_INDEX$)';
+    spBox.append(title);
+    const spList = el('ul', 'schema-list spatial-index-list');
+    for (const s of opts.spatialIndexes) {
+      const li = el('li', 'schema-meta-item spatial-index-item');
+      const nameSpan = el('span', 'col-name');
+      nameSpan.textContent = `${s.name} → ${s.table}.${s.column}`;
+      const badge = el('span', 'schema-badge');
+      badge.textContent = `${s.itemCount} ${s.itemCount === 1 ? 'geometry' : 'geometries'} · key:${s.keyColumn}`;
+      li.append(nameSpan, badge);
+      spList.append(li);
+    }
+    spBox.append(spList);
+    panel.append(spBox);
+  }
+
+  if (opts.timeSeriesPolicies && opts.timeSeriesPolicies.length > 0) {
+    const tsBox = el('div', 'schema-sub timeseries-policies-panel');
+    const title = el('div', 'schema-group-title');
+    title.textContent = 'Time-Series Policies (FB_TS_POLICIES$)';
+    tsBox.append(title);
+    const tsList = el('ul', 'schema-list timeseries-policy-list');
+    for (const p of opts.timeSeriesPolicies) {
+      const li = el('li', 'schema-meta-item timeseries-policy-item');
+      const nameSpan = el('span', 'col-name');
+      nameSpan.textContent = `${p.name} (${p.table} → ${p.rollupTable})`;
+      const badge = el('span', 'schema-badge');
+      const ret = p.retentionMs !== null ? ` · retain:${p.retentionMs}ms` : '';
+      badge.textContent = `bucket:${p.bucketMs}ms · col:${p.valueColumn}${ret}`;
+      li.append(nameSpan, badge);
+      tsList.append(li);
+    }
+    tsBox.append(tsList);
+    panel.append(tsBox);
+  }
+}
+
+export async function executeReplOutboxInspect(
+  optStore: OptimisticMutationStore | null,
+  activateOutboxTab: () => void,
+  show: (entry: ReplEntry) => void,
+): Promise<ReplEntry | undefined> {
+  if (!optStore) {
+    activateOutboxTab();
+    return undefined;
+  }
+  const started = performance.now();
+  await optStore.hydrate();
+  const snap = optStore.getSnapshot();
+  activateOutboxTab();
+  const entry: ReplEntry = {
+    sql: 'INSPECT OUTBOX',
+    line: 1,
+    ms: performance.now() - started,
+    outbox: snap,
+  };
+  show(entry);
+  return entry;
+}
+
+export async function executeReplUndoRedo(
+  mgr: UndoRedoManager | null,
+  dir: 'undo' | 'redo',
+  show: (entry: ReplEntry) => void,
+  onAfterChange: () => Promise<void>,
+): Promise<UndoRedoEntry | null> {
+  if (!mgr) return null;
+  const started = performance.now();
+  const res = dir === 'undo' ? await mgr.undo() : await mgr.redo();
+  if (res) {
+    show({
+      sql: `${dir.toUpperCase()} (${res.label})`,
+      line: 1,
+      ms: performance.now() - started,
+      affectedRows: res.operations.length,
+    });
+    await onAfterChange();
+  }
+  return res;
 }
 
 export async function runReplBusyDiagnostic(ctx: {

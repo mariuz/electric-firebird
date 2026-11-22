@@ -387,4 +387,26 @@ test.describe('Replication Simulator v2 (replication.html)', () => {
     await expect(page.locator('#event-feed')).toContainText('verifyParity()');
     await expect(page.locator('#event-feed')).toContainText('createWorkloadAdvisor()');
   });
+
+  test('Scenario 23: Time-Series LTTB + 2D Spatial R-Tree, CloudEvents v1.0 CDC Sink & WinterCG Edge SQL Gateway', async ({
+    page,
+  }) => {
+    await openReplicationSim(page);
+
+    await page
+      .locator('.scenario-card[data-scenario="timeseries-spatial-cdc-edge-gateway"]')
+      .click();
+
+    await expect(page.locator('#primary-rows')).toContainText('TimeSeries Spatial CDC Edge Task #4');
+    await expect(page.locator('#replica-rows')).toContainText('TimeSeries Spatial CDC Edge Task #5');
+    await expect(page.locator('#code-inspector')).toContainText('createTimeSeriesStore');
+    await expect(page.locator('#code-inspector')).toContainText('createSpatialIndex');
+    await expect(page.locator('#code-inspector')).toContainText('createChangeStreamSink');
+    await expect(page.locator('#code-inspector')).toContainText('createEdgeSqlGateway');
+    await expect(page.locator('#event-feed')).toContainText('Scenario 23');
+    await expect(page.locator('#event-feed')).toContainText('lttbDownsample()');
+    await expect(page.locator('#event-feed')).toContainText('FB_SPATIAL_INDEX$');
+    await expect(page.locator('#event-feed')).toContainText('FB_CDC_OFFSETS$');
+    await expect(page.locator('#event-feed')).toContainText('KeyValuePageVFS');
+  });
 });

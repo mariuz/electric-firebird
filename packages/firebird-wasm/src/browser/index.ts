@@ -984,106 +984,17 @@ export type {
   AuditLogOptions,
   AuditLogHandle,
 } from '../audit-log';
-export {
-  DEFAULT_SEMANTIC_CACHE_TABLE,
-  mmrRerank,
-  packRagContext,
-  createSemanticCache,
-} from '../rag-cache';
-export type {
-  MmrRerankOptions,
-  PackRagContextOptions,
-  PackedRagChunk,
-  PackedRagContext,
-  SemanticCacheDatabaseExecutor,
-  SemanticCacheOptions,
-  SemanticCacheHit,
-  SemanticCacheStats,
-  SemanticCacheHandle,
-} from '../rag-cache';
-export {
-  sortTablesByForeignKeys,
-  anonymizeDatabase,
-  seedDatabase,
-} from '../data-seeder';
-export type {
-  SeederDatabaseExecutor,
-  BuiltinAnonymizeKind,
-  AnonymizeRuleContext,
-  AnonymizeColumnRule,
-  AnonymizeRulesMap,
-  AnonymizeDatabaseOptions,
-  AnonymizeDatabaseResult,
-  SeedColumnContext,
-  SeedColumnOverride,
-  SeedDatabaseOptions,
-  SeedDatabaseResult,
-} from '../data-seeder';
-export {
-  MCP_PROTOCOL_VERSION,
-  createFirebirdMcpServer,
-} from '../mcp-server';
-export type {
-  McpDatabaseExecutor,
-  JsonRpcRequest,
-  JsonRpcResponse,
-  McpToolDescriptor,
-  McpResourceDescriptor,
-  FirebirdMcpServerOptions,
-  FirebirdMcpServer,
-} from '../mcp-server';
-export {
-  DEFAULT_RAG_CHUNKS_TABLE,
-  sha256HexSync,
-  chunkDocument,
-  createRagIngester,
-} from '../rag-ingester';
-export type {
-  ChunkingStrategy,
-  ChunkDocumentOptions,
-  DocumentChunk,
-  RagIngesterDatabaseExecutor,
-  RagDocumentInput,
-  RagIngestResult,
-  RagIngesterOptions,
-  RagIngesterHandle,
-} from '../rag-ingester';
-export {
-  parseTraceparent,
-  generateTraceparent,
-  formatPrometheusMetrics,
-  createOtelInstrumentation,
-} from '../otel-metrics';
-export type {
-  ParsedTraceparent,
-  OtelAttributeValue,
-  OtelSpanLike,
-  OtelTracerLike,
-  OtelMeterLike,
-  RecordedOtelSpan,
-  OtelObservableDatabase,
-  FirebirdPrometheusInput,
-  OtelInstrumentationOptions,
-  OtelInstrumentationHandle,
-} from '../otel-metrics';
-export {
-  FBKP_ARCHIVE_MAGIC,
-  isEncryptedBackupArchive,
-  createEncryptedBackup,
-  verifyBackupArchive,
-  restoreEncryptedBackup,
-} from '../encrypted-backup';
-export type {
-  BackupKeyMaterial,
-  BackupAuditAttestation,
-  BackupArchiveHeader,
-  BackupSourceDatabase,
-  BackupTargetDatabase,
-  CreateEncryptedBackupOptions,
-  CreatedEncryptedBackup,
-  BackupVerificationResult,
-} from '../encrypted-backup';
+export * from '../rag-cache';
+export * from '../data-seeder';
+export * from '../mcp-server';
+export * from '../rag-ingester';
+export * from '../otel-metrics';
+export * from '../encrypted-backup';
 export * from '../job-queue';
 export * from '../knowledge-graph';
 export * from '../online-migrator';
 export * from '../workload-advisor';
+export * from '../timeseries';
+export * from '../spatial';
+export * from '../cdc-sink';
+export * from '../edge-gateway';

@@ -479,51 +479,12 @@ export class FirebirdLite implements FirebirdDatabase {
     return listMaterializedViewsOnDatabase(this);
   }
 
-  /**
-   * Execute a (parameterised) SQL statement and return the result rows.
-   *
-   * For SELECT queries the rows are returned as plain objects keyed by the
-   * column name as Firebird reports it, mirroring the PGlite convention: an
-   * unquoted name in upper case (`SELECT title` gives `TITLE`), a quoted alias
-   * as written (`SELECT title AS "title"` gives `title`).
-   *
-   * ```ts
-   * await db.query('SELECT * FROM items WHERE id = ?', [id]);
-   * await db.query(sql`SELECT * FROM items WHERE id = ${id}`);
-   * ```
-   */
-  // `rowMode: 'array'` first, so the literal in the options object picks these
-  // and the return type follows the mode rather than the caller's hope.
-  async query(
-    sql: SqlFragment,
-    options: ArrayModeOptions,
-  ): Promise<QueryResult<ArrayRow>>;
-  async query(
-    sql: string | SqlFragment,
-    params: QueryParams | undefined,
-    options: ArrayModeOptions,
-  ): Promise<QueryResult<ArrayRow>>;
-  async query<T extends Row = Row>(
-    sql: TypedSqlFragment<T>,
-    options?: QueryOptions<T>,
-  ): Promise<QueryResult<T>>;
-  async query<T extends Row = Row>(
-    sql: SqlFragment,
-    options?: QueryOptions<T>,
-  ): Promise<QueryResult<T>>;
-  async query<T extends Row = Row>(
-    sql: string,
-    params?: QueryParams,
-    options?: QueryOptions<T>,
-  ): Promise<QueryResult<T>>;
-  // Both shapes at once, so a caller holding a `string | SqlFragment` — one
-  // built conditionally — can call this without casting. Last, so the two
-  // specific overloads still win where they apply.
-  async query<T extends Row = Row>(
-    sql: string | SqlFragment,
-    params?: QueryParams,
-    options?: QueryOptions<T>,
-  ): Promise<QueryResult<T>>;
+  async query(sql: SqlFragment, options: ArrayModeOptions): Promise<QueryResult<ArrayRow>>;
+  async query(sql: string | SqlFragment, params: QueryParams | undefined, options: ArrayModeOptions): Promise<QueryResult<ArrayRow>>;
+  async query<T extends Row = Row>(sql: TypedSqlFragment<T>, options?: QueryOptions<T>): Promise<QueryResult<T>>;
+  async query<T extends Row = Row>(sql: SqlFragment, options?: QueryOptions<T>): Promise<QueryResult<T>>;
+  async query<T extends Row = Row>(sql: string, params?: QueryParams, options?: QueryOptions<T>): Promise<QueryResult<T>>;
+  async query<T extends Row = Row>(sql: string | SqlFragment, params?: QueryParams, options?: QueryOptions<T>): Promise<QueryResult<T>>;
   async query<T = Row>(
     sql: string | SqlFragment | TypedSqlFragment<T>,
     paramsOrOptions: QueryParams | QueryOptions<T> = [],
@@ -741,64 +702,29 @@ export class FirebirdLite implements FirebirdDatabase {
     return explainNodeQuery(this.attachment!, sql, options);
   }
 
-  /**
-   * Inspect database size, page utilization, ODS version, transaction counters
-   * (OIT/OAT/OST/Next), memory pool usage, and page I/O statistics
-   * (`IAttachment::getInfo`).
-   *
-   * ```ts
-   * const info = await db.databaseInfo();
-   * // info.pageSize          → 8192
-   * // info.allocatedPages    → 280
-   * // info.databaseSizeBytes → 2293760
-   * // info.transactionGap    → info.nextTransaction - info.oldestActive
-   * ```
-   */
   async databaseInfo(): Promise<DatabaseInfo> {
     await this.ensureReady();
     return readNodeDatabaseInfo(this.attachment, (sql) => this.query(sql));
   }
 
-  /**
-   * Subscribe to structured query execution telemetry ({@link QueryProfileEvent}).
-   * Returns an unsubscribe callback.
-   */
   onQuery(listener: QueryProfileListener): () => void {
     return this.profiler.onQuery(listener);
   }
 
-  /**
-   * Return aggregated query profiling metrics, prepare-cache hit/miss rates,
-   * page-level I/O counters, and transaction health diagnostics.
-   */
   async monitorStats(): Promise<MonitorStats> {
     await this.ensureReady();
     return this.profiler.snapshot(() => this.databaseInfo());
   }
 
-  /**
-   * Reset accumulated query profiler counters and clear the recent queries buffer.
-   */
   resetMonitorStats(): void {
     this.profiler.reset();
   }
 
-  /**
-   * Introspect the database catalog (`RDB$RELATIONS`, `RDB$RELATION_FIELDS`,
-   * `RDB$FIELDS`, `RDB$RELATION_CONSTRAINTS`, `RDB$REF_CONSTRAINTS`,
-   * `RDB$INDICES`, `RDB$GENERATORS`, and `RDB$TRIGGERS`) and return typed
-   * metadata (`tables`, `views`, `columns`, `primaryKeys`, `foreignKeys`,
-   * `indexes`, `sequences`, and `triggers`).
-   */
   async introspect(options: IntrospectOptions = {}): Promise<SchemaIntrospection> {
     await this.ensureReady();
     return introspectSchema(this, options);
   }
 
-  /**
-   * Apply (or revert with `direction: 'down'`) versioned schema migrations
-   * transactionally, recording applied versions in `FB_MIGRATIONS$`.
-   */
   async migrate(
     migrations: readonly Migration[],
     options: MigrateOptions = {},
@@ -807,18 +733,8 @@ export class FirebirdLite implements FirebirdDatabase {
     return runMigrations(this, migrations, options);
   }
 
-  /**
-   * Register a JavaScript scalar User-Defined Function (UDF) in Firebird.
-   */
-  registerFunction(
-    name: string,
-    fn: JsFunctionHandler,
-  ): Promise<RegisteredRoutine>;
-  registerFunction(
-    name: string,
-    options: RegisterFunctionOptions,
-    fn: JsFunctionHandler,
-  ): Promise<RegisteredRoutine>;
+  registerFunction(name: string, fn: JsFunctionHandler): Promise<RegisteredRoutine>;
+  registerFunction(name: string, options: RegisterFunctionOptions, fn: JsFunctionHandler): Promise<RegisteredRoutine>;
   async registerFunction(
     name: string,
     optionsOrFn: RegisterFunctionOptions | JsFunctionHandler,
@@ -826,35 +742,17 @@ export class FirebirdLite implements FirebirdDatabase {
   ): Promise<RegisteredRoutine> {
     await this.ensureReady();
     assertUdrCallback('registerFunction', optionsOrFn, maybeFn);
-    return this.udr.registerFunction(
-      name,
-      optionsOrFn,
-      maybeFn,
-      this.createUdrExecutor(),
-    );
+    return this.udr.registerFunction(name, optionsOrFn, maybeFn, this.createUdrExecutor());
   }
 
-  /**
-   * Unregister a previously registered JavaScript scalar function.
-   */
   async unregisterFunction(name: string): Promise<void> {
     if (this.closed) return;
     await this.ensureReady();
     await this.udr.unregisterFunction(name, this.createUdrExecutor());
   }
 
-  /**
-   * Register a JavaScript User-Defined Procedure (UDP) in Firebird.
-   */
-  registerProcedure(
-    name: string,
-    fn: JsProcedureHandler,
-  ): Promise<RegisteredRoutine>;
-  registerProcedure(
-    name: string,
-    options: RegisterProcedureOptions,
-    fn: JsProcedureHandler,
-  ): Promise<RegisteredRoutine>;
+  registerProcedure(name: string, fn: JsProcedureHandler): Promise<RegisteredRoutine>;
+  registerProcedure(name: string, options: RegisterProcedureOptions, fn: JsProcedureHandler): Promise<RegisteredRoutine>;
   async registerProcedure(
     name: string,
     optionsOrFn: RegisterProcedureOptions | JsProcedureHandler,
@@ -862,17 +760,9 @@ export class FirebirdLite implements FirebirdDatabase {
   ): Promise<RegisteredRoutine> {
     await this.ensureReady();
     assertUdrCallback('registerProcedure', optionsOrFn, maybeFn);
-    return this.udr.registerProcedure(
-      name,
-      optionsOrFn,
-      maybeFn,
-      this.createUdrExecutor(),
-    );
+    return this.udr.registerProcedure(name, optionsOrFn, maybeFn, this.createUdrExecutor());
   }
 
-  /**
-   * Unregister a previously registered JavaScript stored procedure.
-   */
   async unregisterProcedure(name: string): Promise<void> {
     if (this.closed) return;
     await this.ensureReady();
@@ -961,36 +851,13 @@ export class FirebirdLite implements FirebirdDatabase {
     );
   }
 
-  /**
-   * Read the database file as a `Uint8Array`.
-   */
-  /**
-   * Create a segmented writable BLOB stream (`WritableStream<Uint8Array>`)
-   * backed by Firebird `IBlob::putSegment`.
-   */
-  async createBlobStream(
-    options: BlobStreamOptions = {},
-  ): Promise<BlobWritableStream> {
+  async createBlobStream(options: BlobStreamOptions = {}): Promise<BlobWritableStream> {
     return createNodeBlobStream(() => this.ensureReady(), options);
   }
 
-  /**
-   * Open a Firebird `BLOB` column (from a `SELECT` query or a {@link BlobHandle})
-   * as a segmented Web `ReadableStream<Uint8Array>` backed by `IBlob::getSegment`.
-   */
-  async openBlobStream(
-    handle: BlobHandle,
-    options?: BlobStreamOptions,
-  ): Promise<ReadableStream<Uint8Array>>;
-  async openBlobStream(
-    sql: SqlFragment,
-    options?: BlobStreamOptions,
-  ): Promise<ReadableStream<Uint8Array>>;
-  async openBlobStream(
-    sql: string | SqlFragment,
-    params?: QueryParams | BlobStreamOptions,
-    options?: BlobStreamOptions,
-  ): Promise<ReadableStream<Uint8Array>>;
+  async openBlobStream(handle: BlobHandle, options?: BlobStreamOptions): Promise<ReadableStream<Uint8Array>>;
+  async openBlobStream(sql: SqlFragment, options?: BlobStreamOptions): Promise<ReadableStream<Uint8Array>>;
+  async openBlobStream(sql: string | SqlFragment, params?: QueryParams | BlobStreamOptions, options?: BlobStreamOptions): Promise<ReadableStream<Uint8Array>>;
   async openBlobStream(
     sqlOrHandle: string | SqlFragment | BlobHandle,
     paramsOrOptions: QueryParams | BlobStreamOptions = [],
@@ -999,81 +866,35 @@ export class FirebirdLite implements FirebirdDatabase {
     return openNodeBlobStream(this.streamHost, sqlOrHandle, paramsOrOptions, maybeOptions);
   }
 
-  /**
-   * Capture a lightweight copy-on-write point-in-time page snapshot of the
-   * database file.
-   */
-  async snapshot(
-    labelOrOptions?: string | SnapshotOptions,
-  ): Promise<DatabaseSnapshot> {
+  async snapshot(labelOrOptions?: string | SnapshotOptions): Promise<DatabaseSnapshot> {
     return captureNodeSnapshot(this.streamHost, labelOrOptions);
   }
 
-  /**
-   * Restore the database file to a previously captured {@link DatabaseSnapshot}
-   * (by snapshot object, `id`, `label`, or raw `.fdb` bytes).
-   */
-  async restoreSnapshot(
-    snapshotOrId: DatabaseSnapshot | string | Uint8Array,
-  ): Promise<void> {
+  async restoreSnapshot(snapshotOrId: DatabaseSnapshot | string | Uint8Array): Promise<void> {
     return restoreNodeSnapshot(this.streamHost, snapshotOrId);
   }
 
-  /** List metadata for all copy-on-write snapshots captured on this database. */
-  listSnapshots(): DatabaseSnapshotInfo[] {
-    return this.snapshotStore.listSnapshots();
-  }
+  listSnapshots(): DatabaseSnapshotInfo[] { return this.snapshotStore.listSnapshots(); }
+  deleteSnapshot(snapshotOrId: DatabaseSnapshot | string): boolean { return this.snapshotStore.deleteSnapshot(snapshotOrId); }
 
-  /** Delete a stored copy-on-write snapshot by `id`, `label`, or reference. */
-  deleteSnapshot(snapshotOrId: DatabaseSnapshot | string): boolean {
-    return this.snapshotStore.deleteSnapshot(snapshotOrId);
-  }
-
-  /**
-   * Export a compact binary page diff (`FBDF\x01`) between `fromSnapshot` (or
-   * `null` for an initial full checkpoint) and `toSnapshot` (defaults to the
-   * current live database file).
-   */
   async exportDiff(
     fromSnapshot?: DatabaseSnapshot | string | Uint8Array | null,
     toSnapshot?: DatabaseSnapshot | string | Uint8Array,
     options?: PageDiffOptions,
   ): Promise<Uint8Array> {
-    if (this.closed) {
-      throw new Error('FirebirdLite instance has been closed');
-    }
+    if (this.closed) throw new Error('FirebirdLite instance has been closed');
     await this.ensureReady();
-    return runDriverExportDiff(
-      this.snapshotStore,
-      () => this.dumpDataDir(),
-      fromSnapshot,
-      toSnapshot,
-      options,
-    );
+    return runDriverExportDiff(this.snapshotStore, () => this.dumpDataDir(), fromSnapshot, toSnapshot, options);
   }
 
-  /**
-   * Apply a compact binary page diff (`FBDF\x01`) onto `baseSnapshot` (or the
-   * current database file when `baseSnapshot` is omitted) and restore the
-   * database file to the resulting state.
-   */
   async applyDiff(
     diffBytes: Uint8Array,
     baseSnapshot?: DatabaseSnapshot | string | Uint8Array | null,
     options: ApplyPageDiffOptions = {},
   ): Promise<Uint8Array> {
-    if (this.closed) {
-      throw new Error('FirebirdLite instance has been closed');
-    }
+    if (this.closed) throw new Error('FirebirdLite instance has been closed');
     await this.ensureReady();
-    return runDriverApplyDiff(
-      this.snapshotStore,
-      () => this.dumpDataDir(),
-      (bytes) => this.restoreSnapshot(bytes),
-      diffBytes,
-      baseSnapshot,
-      options,
-    );
+    return runDriverApplyDiff(this.snapshotStore, () => this.dumpDataDir(), (bytes) => this.restoreSnapshot(bytes), diffBytes, baseSnapshot, options);
   }
 
   async dumpDataDir(): Promise<Uint8Array> {
@@ -1082,56 +903,24 @@ export class FirebirdLite implements FirebirdDatabase {
     return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
   }
 
-  /**
-   * Stream the database file in fixed-size chunks
-   * (`ReadableStream<Uint8Array>`) without allocating a single contiguous
-   * `Uint8Array` of the entire database in memory.
-   *
-   * Pass `{ compression: 'gzip' }` to compress on the fly via
-   * `CompressionStream('gzip')`.
-   */
   dumpDataStream(options: DataStreamOptions = {}): ReadableStream<Uint8Array> {
     return createNodeDumpDataStream(() => this.ensureReady(), this.dbPath, options);
   }
 
-  /**
-   * Bulk-import CSV or JSONLines (`'jsonl'` / `'ndjson'`) records from a
-   * `ReadableStream` or `AsyncIterable` into `tableName` in bounded-memory
-   * batches of `options.batchSize` (default 500) inside a single transaction.
-   */
   async copyFromStream(
     tableName: string,
-    stream:
-      | ReadableStream<Uint8Array | string>
-      | AsyncIterable<Uint8Array | string>,
+    stream: ReadableStream<Uint8Array | string> | AsyncIterable<Uint8Array | string>,
     options: CopyFromOptions = {},
   ): Promise<CopyResult> {
     assertNotAborted(options.signal);
     validateTimeoutMs(options.timeoutMs);
     await this.ensureReady();
-    return this.transaction((tx) =>
-      tx.copyFromStream(tableName, stream, options),
-    );
+    return this.transaction((tx) => tx.copyFromStream(tableName, stream, options));
   }
 
-  /**
-   * Stream a table or `SELECT` query as UTF-8 CSV or JSONLines (`'jsonl'` /
-   * `'ndjson'`) in bounded-memory cursor batches of `options.batchSize`
-   * (default 500).
-   */
-  copyToStream(
-    sql: SqlFragment,
-    options?: CopyToOptions,
-  ): ReadableStream<Uint8Array>;
-  copyToStream(
-    tableOrQuery: string,
-    options?: CopyToOptions,
-  ): ReadableStream<Uint8Array>;
-  copyToStream(
-    sql: string | SqlFragment,
-    params?: QueryParams,
-    options?: CopyToOptions,
-  ): ReadableStream<Uint8Array>;
+  copyToStream(sql: SqlFragment, options?: CopyToOptions): ReadableStream<Uint8Array>;
+  copyToStream(tableOrQuery: string, options?: CopyToOptions): ReadableStream<Uint8Array>;
+  copyToStream(sql: string | SqlFragment, params?: QueryParams, options?: CopyToOptions): ReadableStream<Uint8Array>;
   copyToStream(
     tableOrQuery: string | SqlFragment,
     paramsOrOptions: QueryParams | CopyToOptions = [],
@@ -1140,11 +929,6 @@ export class FirebirdLite implements FirebirdDatabase {
     return buildCopyToStream(this, tableOrQuery, paramsOrOptions, maybeOptions);
   }
 
-  /**
-   * Replace the database file with a raw or gzip-compressed `.fdb` byte stream
-   * produced by {@link dumpDataStream} without buffering the entire database
-   * in a single `Uint8Array`.
-   */
   async loadDataStream(
     stream: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array>,
     options: DataStreamOptions = {},

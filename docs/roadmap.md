@@ -2030,6 +2030,34 @@ Next-horizon improvements across **Replication**, **Speed & Performance**, **Int
 
 ---
 
+### M29 — Time-Series Rollups & LTTB Downsampling, Spatial R-Tree & GeoJSON Engine, CloudEvents CDC / Webhook Sink, WinterCG Edge SQL Gateway & Sub-1,100-Line Module Split
+
+- [x] **1. Time-Series Hypertable Policies, Gap-Filling & LTTB Downsampling (`createTimeSeriesStore`, `lttbDownsample` & `registerTimeSeriesFunctions`).**
+      Add time-series analytics over Firebird tables (`FB_TS_POLICIES$`): epoch/interval `bucketQuery()` with `locf`
+      (Last-Observation-Carried-Forward) and linear-interpolation gap-filling, Largest-Triangle-Three-Buckets (`lttbDownsample`)
+      peak-preserving visual downsampling, incremental continuous-aggregate rollups (`refreshRollup`), sliding-window retention
+      compaction (`applyRetention`), and `TS_BUCKET` SQL UDR registration.
+- [x] **2. 2D Spatial R-Tree Index, GeoJSON / WKT & Geodesic Search (`createSpatialIndex`, `RTreeIndex` & `registerSpatialFunctions`).**
+      Add zero-dependency WKT & GeoJSON geometry parsing (`Point`, `LineString`, `Polygon`, `BBox`), a persistent R-Tree spatial
+      index (`FB_SPATIAL_INDEX$` with `autoSync` & `asReplicationIndexHook()`), `bboxSearch()`, Haversine `knnSearch()` /
+      `withinRadius()`, ray-casting `pointInPolygon()`, and Firebird SQL UDRs (`ST_DISTANCE_M`, `ST_DWITHIN`, `ST_CONTAINS`,
+      `ST_INTERSECTS`, `ST_AREA_M2`, `ST_ASGEOJSON`).
+- [x] **3. CloudEvents v1.0 Change-Data-Capture (CDC) & Signed Webhook Sink (`createChangeStreamSink` & CLI `npx firebird-wasm cdc-sink`).**
+      Stream committed `FB_REPL_JOURNAL$` mutations as CNCF **CloudEvents v1.0** JSON/NDJSON or Apache Arrow IPC micro-batches to
+      external HTTP webhooks (with WebCrypto `HMAC-SHA256` `X-Firebird-Signature` headers, retry backoff, and `FB_CDC_DLQ$`
+      quarantine) or pluggable sink adapters, persisted via `FB_CDC_OFFSETS$` LSN checkpoints and CLI `npx firebird-wasm cdc-sink`.
+- [x] **4. WinterCG Edge SQL Gateway & Key-Value Page VFS (`createEdgeSqlGateway` & `KeyValuePageVFS`).**
+      Add a WinterCG-standard `fetch(request): Promise<Response>` HTTP SQL & transactional batch-pipeline gateway (Cloudflare
+      Workers / Durable Objects, Deno, Bun, Node) with Bearer / JWT auth, read-only & table allow-list SQL firewall, `ETag`
+      conditional caching, Arrow IPC response streaming, and `KeyValuePageVFS` mapping Firebird pages onto chunked KV stores.
+- [x] **5. `<firebird-repl>` Spatial & Time-Series Inspector, Simulator Scenario 23 & Sub-1,100-Line Module Split.**
+      Surface R-Tree spatial index & time-series rollup policy inspection inside `<firebird-repl>` (`repl.spatialIndexes()`,
+      `repl.timeSeriesPolicies()`), add Simulator **Scenario 23** (`timeseries-spatial-cdc-edge-gateway`), and decompose all 16
+      source files in the `1,100–1,194` line band so every non-test `.ts` source file across `packages/firebird-wasm/src` sits
+      strictly under 1,100 lines.
+
+---
+
 ## 5. Test coverage added alongside this review
 
 `src/browser/` was excluded from Jest and had no browser tests.  It now has 73

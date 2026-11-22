@@ -538,3 +538,31 @@ export function runDirectStmtSetTimeout(
     }
   }
 }
+
+export function runDirectEventsSubscribe(
+  mod: FirebirdWasmModule,
+  withString: <T>(s: string, fn: (ptr: number) => T) => T,
+  dbHandle: EngineHandle,
+  names: string[],
+): number {
+  return withString(names.join(','), (namesPtr) => {
+    const handle = mod._fb_events_subscribe(dbHandle, namesPtr);
+    if (handle === 0) {
+      throw engineError(mod, `Could not subscribe to events: ${names.join(', ')}`);
+    }
+    return handle;
+  });
+}
+
+export function runDirectEventsPoll(
+  mod: FirebirdWasmModule,
+  subscription: number,
+): Record<string, number> {
+  const ptr = mod._fb_events_poll(subscription);
+  if (ptr === 0) {
+    throw engineError(mod, 'Could not poll events');
+  }
+  const json = mod.UTF8ToString(ptr);
+  mod._free(ptr);
+  return JSON.parse(json) as Record<string, number>;
+}

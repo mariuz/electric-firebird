@@ -37,6 +37,8 @@ import type {
   ReplEntry,
   ReplInspectorTab,
   ReplReplicationInfo,
+  ReplSpatialIndexSummary,
+  TimeSeriesPolicyInfo,
   WorkloadAdvisorReport,
 } from './repl-types';
 
@@ -44,7 +46,6 @@ export * from './repl-types';
 export type { ReplSearchIndexSummary } from './repl-actions';
 export type { AuditChainVerificationResult } from '../audit-log';
 export type { McpToolDescriptor } from '../mcp-server';
-
 export {
   computeTableIoBreakdown,
   parseQueryPlan,
@@ -57,57 +58,32 @@ export {
 
 /** The element's own API, beyond HTMLElement's. */
 export interface FirebirdReplElement extends HTMLElement {
-  /** The database statements run against. */
   db: ReplDatabase | null;
-  /** Optional `DatabaseReplicator` or `ReplicationSubscription` providing live `stats()` telemetry. */
   replicator?: { stats(): Promise<ReplicationStats> } | null;
-  /** Optional `SyncHandle` (`syncDatabases()` / `db.syncWith()`) inspected in the Sync & Arrow panel (`M20 Item 4`). */
   syncHandle?: SyncHandleLike | null;
-  /** Optional `OptimisticMutationStore` enabling optimistic cell edits, pending row badges, and the `Outbox` inspector (`M23 Item 5`). */
   optimisticStore?: OptimisticMutationStore | null;
-  /** Optional `UndoRedoManager` enabling local-first `Undo` / `Redo` toolbar & Outbox controls (`M24 Item 5`). */
   undoRedoManager?: UndoRedoManager | null;
-  /** Optional collaborative `PresenceRoom` displaying live peer awareness badges in the Replication Inspector (`M26 Item 5`). */
   presenceRoom?: PresenceRoom | null;
-  /** Optional target table config enabling inline double-click cell editing in result grids (`M23 Item 5`). */
   editableTable?: ReplEditableTableConfig | null;
-  /** The editor's text. */
   value: string;
-  /** Whether the Schema Inspector & Migration Viewer sidebar is open. */
   inspectorOpen: boolean;
-  /** Currently active sidebar tab (`'schema'`, `'migrations'`, `'profiler'`, `'plan'`, or `'replication'`). */
   inspectorTab: ReplInspectorTab;
-  /** Run `script` (default: the editor's text); resolves with what each statement did. */
   run(script?: string): Promise<ReplEntry[]>;
-  /** Explain `script` (default: the editor's text) without executing it; resolves with each statement's plan. */
   explain(script?: string, options?: ExplainOptions): Promise<ReplEntry[]>;
-  /** Inspect database diagnostics and OIT/OAT transaction health; resolves with the info entry. */
   info(): Promise<ReplEntry | undefined>;
-  /** Run an immediate garbage-collection sweep and display before/after OIT/OAT counters. */
   sweep(): Promise<ReplEntry | undefined>;
-  /** Introspect the database catalog, open/update the Schema Inspector, and log a schema summary entry. */
   schema(options?: IntrospectOptions): Promise<ReplEntry | undefined>;
-  /** Read applied migrations from `FB_MIGRATIONS$`, open/update the Migration Viewer, and log a migrations entry. */
-  migrations(
-    options?: Pick<MigrateOptions, 'tableName'>,
-  ): Promise<ReplEntry | undefined>;
-  /** Inspect query telemetry and `MON$` monitoring counters, open/update the Profiler tab, and log a profiler entry. */
+  migrations(options?: Pick<MigrateOptions, 'tableName'>): Promise<ReplEntry | undefined>;
   profiler(): Promise<ReplEntry | undefined>;
-  /** Inspect replication journal (`FB_REPL_JOURNAL$`), slots (`FB_REPL_SLOTS$`), watermarks (`FB_REPL_WATERMARKS$`), and live lag telemetry. */
   replication(): Promise<ReplEntry | undefined>;
-  /** Execute `sql` (default: editor text) as columnar vectors + Apache Arrow IPC stream and open the Sync & Arrow Inspector (`M20 Item 4`). */
   inspectArrow(sql?: string): Promise<ReplEntry | undefined>;
-  /** Export `sql` (default: editor text) as an Apache Arrow IPC V5 `Uint8Array` (`M22 Item 4`). */
   exportArrow(sql?: string): Promise<Uint8Array>;
-  /** Import an Apache Arrow IPC V5 stream/buffer into `tableName` (`M22 Item 4`). */
   importArrow(
     tableName: string,
     source: ArrowIngestSource,
     options?: LoadArrowIpcOptions,
   ): Promise<ArrowIngestResult>;
-  /** Open the Optimistic Outbox inspector and log an outbox summary entry (`M23 Item 5`). */
   inspectOutbox(): Promise<ReplEntry | undefined>;
-  /** Programmatically or interactively edit a single cell value via `optimisticStore` or `db.execute` (`M23 Item 5`). */
   editCell(
     tableName: string,
     keyValue: unknown,
@@ -115,46 +91,35 @@ export interface FirebirdReplElement extends HTMLElement {
     newValue: unknown,
     primaryKey?: string,
   ): Promise<void>;
-  /** Undo the most recent user action recorded in `undoRedoManager` (`M24 Item 5`). */
   undo(): Promise<UndoRedoEntry | null>;
-  /** Redo the most recently undone user action recorded in `undoRedoManager` (`M24 Item 5`). */
   redo(): Promise<UndoRedoEntry | null>;
-  /** List persistent materialized views recorded in `"FB_MATVIEWS$"` (`M24 Item 5`). */
   materializedViews(): Promise<MaterializedViewInfo[]>;
-  /** Re-populate a persistent materialized view recorded in `"FB_MATVIEWS$"` (`M24 Item 5`). */
   refreshMaterializedView(name: string): Promise<void>;
-  /** List persisted Vector HNSW (`FB_VECTOR_INDEX$`) and BM25 FTS (`FB_FTS_INDEX$`) indexes (`M25 Item 5`). */
   searchIndexes(): Promise<ReplSearchIndexSummary[]>;
-  /** Preview declarative DDL schema diff against `desiredSource` without mutating the database (`M25 Item 5`). */
+  /** List persisted 2D Spatial R-Tree indexes recorded in `FB_SPATIAL_INDEX$` (`M29 Item 5`). */
+  spatialIndexes(): Promise<ReplSpatialIndexSummary[]>;
+  /** List registered time-series rollup & retention policies in `FB_TS_POLICIES$` (`M29 Item 5`). */
+  timeSeriesPolicies(): Promise<TimeSeriesPolicyInfo[]>;
   previewSchemaDiff(desiredSource: DeclarativeSchemaInput): Promise<SchemaSyncResult | null>;
-  /** Push declarative schema changes from `desiredSource` onto the database (`M25 Item 5`). */
   applySchemaPush(
     desiredSource: DeclarativeSchemaInput,
     options?: { allowDestructive?: boolean },
   ): Promise<SchemaSyncResult | null>;
-  /** Verify `"FB_AUDIT_LOG$"` SHA-256 hash chain & Merkle root integrity and render status in the Replication Inspector (`M26 Item 5`). */
   verifyAuditChain(options?: {
     tableName?: string;
     verifyKey?: CryptoKey | string | Uint8Array;
     signAlgorithm?: AuditSignAlgorithm;
   }): Promise<AuditChainVerificationResult | null>;
-  /** List active Model Context Protocol (MCP) tools exposed for this database (`M27 Item 5`). */
   mcpTools(options?: { allowWrites?: boolean }): McpToolDescriptor[];
-  /** Export OpenMetrics / Prometheus exposition text and render preview in the Profiler Inspector (`M27 Item 5`). */
   prometheusMetrics(): Promise<string>;
-  /** Analyze recent/explicit queries and catalog indexes, surfacing DDL recommendations in the Profiler Inspector (`M28 Item 5`). */
   adviseWorkload(extraQueries?: readonly string[]): Promise<WorkloadAdvisorReport | null>;
-  /** Inspect durable `FB_JOB_QUEUE$` background job, DLQ, and cron schedule counts (`M28 Item 5`). */
   jobQueueStats(): Promise<JobQueueStats | null>;
-  /** Toggle (or switch to `tab` in) the interactive Schema Inspector, Migration Viewer, Profiler & Plan Explorer sidebar. */
   toggleInspector(tab?: ReplInspectorTab): Promise<void>;
-  /** Refresh the interactive Schema Inspector, Migration Viewer, Profiler & Plan Explorer sidebar from the database. */
   refreshInspector(): Promise<void>;
-  /** Empty the output. */
   clear(): void;
 }
 
-import { createReplDomElements } from './repl-dom';
+import { createReplDomElements, type ReplDomHandles } from './repl-dom';
 import type {
   ArrowIngestResult,
   ArrowIngestSource,
@@ -183,17 +148,21 @@ import {
 } from './repl-actions';
 import { renderReplEntryBlock } from './repl-entry-renderer';
 import {
+  executeReplOutboxInspect,
+  executeReplUndoRedo,
   executeReplVerifyAuditChain,
   executeReplWorkloadAdvisor,
   exportReplPrometheusMetrics,
   fetchReplJobQueueStats,
+  fetchReplSpatialIndexes,
+  fetchReplTimeSeriesPolicies,
   getReplMcpTools,
   runReplBusyDiagnostic,
 } from './repl-presence-audit';
 
 /**
  * Register the element under `tag` (default `firebird-repl`) and return its
- * class.  Calling it again returns the class already registered.
+ * class. Calling it again returns the class already registered.
  */
 export function defineFirebirdRepl(
   tag = 'firebird-repl',
@@ -216,33 +185,8 @@ export function defineFirebirdRepl(
     private lastAdvisorReport: WorkloadAdvisorReport | null = null;
     private lastJobQueueStats: JobQueueStats | null = null;
     private editableCfg: ReplEditableTableConfig | null = null;
-    private readonly output: HTMLDivElement;
-    private readonly inspector: HTMLDivElement;
-    private readonly inspectorBody: HTMLDivElement;
-    private readonly tabSchemaBtn: HTMLButtonElement;
-    private readonly tabMigrationsBtn: HTMLButtonElement;
-    private readonly tabProfilerBtn: HTMLButtonElement;
-    private readonly tabPlanBtn: HTMLButtonElement;
-    private readonly tabReplicationBtn: HTMLButtonElement;
-    private readonly tabArrowBtn: HTMLButtonElement;
-    private readonly tabOutboxBtn: HTMLButtonElement;
-    private readonly inspectorRefreshBtn: HTMLButtonElement;
-    private readonly inspectorCloseBtn: HTMLButtonElement;
-    private readonly editor: HTMLTextAreaElement;
-    private readonly button: HTMLButtonElement;
-    private readonly explainButton: HTMLButtonElement;
-    private readonly infoButton: HTMLButtonElement;
-    private readonly sweepButton: HTMLButtonElement;
-    private readonly schemaButton: HTMLButtonElement;
-    private readonly migrationsButton: HTMLButtonElement;
-    private readonly profilerButton: HTMLButtonElement;
-    private readonly replicationButton: HTMLButtonElement;
-    private readonly arrowButton: HTMLButtonElement;
-    private readonly outboxButton: HTMLButtonElement;
-    private readonly undoButton: HTMLButtonElement;
-    private readonly redoButton: HTMLButtonElement;
+    private readonly dom: ReplDomHandles;
     private readonly history: string[] = [];
-    /** Position in `history` while walking it; `history.length` is the draft. */
     private cursor = 0;
     private draft = '';
     private busy = false;
@@ -251,6 +195,8 @@ export function defineFirebirdRepl(
     private lastSchema: SchemaIntrospection | null = null;
     private lastMatViews: MaterializedViewInfo[] = [];
     private lastSearchIndexes: ReplSearchIndexSummary[] = [];
+    private lastSpatialIndexes: ReplSpatialIndexSummary[] = [];
+    private lastTimeSeriesPolicies: TimeSeriesPolicyInfo[] = [];
     private lastSchemaDiff: SchemaSyncResult | null = null;
     private schemaDiffDraft = '';
     private lastMigrations: AppliedMigration[] = [];
@@ -263,87 +209,55 @@ export function defineFirebirdRepl(
       super();
       const root = this.attachShadow({ mode: 'open' });
       const dom = createReplDomElements(root);
-      this.output = dom.output;
-      this.inspector = dom.inspector;
-      this.inspectorBody = dom.inspectorBody;
-      this.tabSchemaBtn = dom.tabSchemaBtn;
-      this.tabMigrationsBtn = dom.tabMigrationsBtn;
-      this.tabProfilerBtn = dom.tabProfilerBtn;
-      this.tabPlanBtn = dom.tabPlanBtn;
-      this.tabReplicationBtn = dom.tabReplicationBtn;
-      this.tabArrowBtn = dom.tabArrowBtn;
-      this.tabOutboxBtn = dom.tabOutboxBtn;
-      this.inspectorRefreshBtn = dom.inspectorRefreshBtn;
-      this.inspectorCloseBtn = dom.inspectorCloseBtn;
-      this.editor = dom.editor;
-      this.button = dom.button;
-      this.explainButton = dom.explainButton;
-      this.infoButton = dom.infoButton;
-      this.sweepButton = dom.sweepButton;
-      this.schemaButton = dom.schemaButton;
-      this.migrationsButton = dom.migrationsButton;
-      this.profilerButton = dom.profilerButton;
-      this.replicationButton = dom.replicationButton;
-      this.arrowButton = dom.arrowButton;
-      this.outboxButton = dom.outboxButton;
-      this.undoButton = dom.undoButton;
-      this.redoButton = dom.redoButton;
+      this.dom = dom;
 
-      this.button.addEventListener('click', () => void this.run());
-      this.explainButton.addEventListener('click', (event) =>
-        void this.explain(undefined, { detailed: event.shiftKey }),
+      dom.button.addEventListener('click', () => void this.run());
+      dom.explainButton.addEventListener('click', (ev) =>
+        void this.explain(undefined, { detailed: ev.shiftKey }),
       );
-      this.infoButton.addEventListener('click', () => void this.info());
-      this.sweepButton.addEventListener('click', () => void this.sweep());
-      this.schemaButton.addEventListener('click', () => void this.schema());
-      this.migrationsButton.addEventListener('click', () => void this.migrations());
-      this.profilerButton.addEventListener('click', () => void this.profiler());
-      this.replicationButton.addEventListener('click', () => void this.replication());
-      this.arrowButton.addEventListener('click', () => void this.inspectArrow());
-      this.outboxButton.addEventListener('click', () => void this.inspectOutbox());
-      this.undoButton.addEventListener('click', () => void this.undo());
-      this.redoButton.addEventListener('click', () => void this.redo());
-      this.tabSchemaBtn.addEventListener('click', () => {
-        this.inspectorTab = 'schema';
-        void this.refreshInspector();
-      });
-      this.tabMigrationsBtn.addEventListener('click', () => {
-        this.inspectorTab = 'migrations';
-        void this.refreshInspector();
-      });
-      this.tabProfilerBtn.addEventListener('click', () => {
-        this.inspectorTab = 'profiler';
-        void this.refreshInspector();
-      });
-      this.tabPlanBtn.addEventListener('click', () => {
-        this.inspectorTab = 'plan';
-        void this.refreshInspector();
-      });
-      this.tabReplicationBtn.addEventListener('click', () => {
-        this.inspectorTab = 'replication';
-        void this.refreshInspector();
-      });
-      this.tabArrowBtn.addEventListener('click', () => {
-        this.inspectorTab = 'arrow';
-        void this.refreshInspector();
-      });
-      this.tabOutboxBtn.addEventListener('click', () => {
-        this.inspectorTab = 'outbox';
-        void this.refreshInspector();
-      });
-      this.inspectorRefreshBtn.addEventListener(
-        'click',
-        () => void this.refreshInspector(),
-      );
-      this.inspectorCloseBtn.addEventListener('click', () => {
+      dom.infoButton.addEventListener('click', () => void this.info());
+      dom.sweepButton.addEventListener('click', () => void this.sweep());
+      dom.schemaButton.addEventListener('click', () => void this.schema());
+      dom.migrationsButton.addEventListener('click', () => void this.migrations());
+      dom.profilerButton.addEventListener('click', () => void this.profiler());
+      dom.replicationButton.addEventListener('click', () => void this.replication());
+      dom.arrowButton.addEventListener('click', () => void this.inspectArrow());
+      dom.outboxButton.addEventListener('click', () => void this.inspectOutbox());
+      dom.undoButton.addEventListener('click', () => void this.undo());
+      dom.redoButton.addEventListener('click', () => void this.redo());
+
+      const bindTab = (btn: HTMLButtonElement, tab: ReplInspectorTab) => {
+        btn.addEventListener('click', () => {
+          this.inspectorTab = tab;
+          void this.refreshInspector();
+        });
+      };
+      bindTab(dom.tabSchemaBtn, 'schema');
+      bindTab(dom.tabMigrationsBtn, 'migrations');
+      bindTab(dom.tabProfilerBtn, 'profiler');
+      bindTab(dom.tabPlanBtn, 'plan');
+      bindTab(dom.tabReplicationBtn, 'replication');
+      bindTab(dom.tabArrowBtn, 'arrow');
+      bindTab(dom.tabOutboxBtn, 'outbox');
+
+      dom.inspectorRefreshBtn.addEventListener('click', () => void this.refreshInspector());
+      dom.inspectorCloseBtn.addEventListener('click', () => {
         this.inspectorOpen = false;
       });
-      this.editor.addEventListener('keydown', (event) => this.onKey(event));
+      dom.editor.addEventListener('keydown', (event) => this.onKey(event));
 
-      // A property set before the element was defined (React and Vue both
-      // set properties as they render) sits on the instance and would hide
-      // the accessor: take it over.
-      for (const name of ['db', 'replicator', 'syncHandle', 'optimisticStore', 'undoRedoManager', 'presenceRoom', 'editableTable', 'value', 'inspectorOpen', 'inspectorTab'] as const) {
+      for (const name of [
+        'db',
+        'replicator',
+        'syncHandle',
+        'optimisticStore',
+        'undoRedoManager',
+        'presenceRoom',
+        'editableTable',
+        'value',
+        'inspectorOpen',
+        'inspectorTab',
+      ] as const) {
         if (Object.prototype.hasOwnProperty.call(this, name)) {
           const early = (this as Record<string, unknown>)[name];
           delete (this as Record<string, unknown>)[name];
@@ -414,8 +328,8 @@ export function defineFirebirdRepl(
 
     private syncUndoRedoButtons(): void {
       const snap = this.undoRedoRef?.getSnapshot();
-      this.undoButton.disabled = this.busy || !snap?.canUndo;
-      this.redoButton.disabled = this.busy || !snap?.canRedo;
+      this.dom.undoButton.disabled = this.busy || !snap?.canUndo;
+      this.dom.redoButton.disabled = this.busy || !snap?.canRedo;
     }
 
     get presenceRoom(): PresenceRoom | null {
@@ -447,11 +361,11 @@ export function defineFirebirdRepl(
     }
 
     get value(): string {
-      return this.editor.value;
+      return this.dom.editor.value;
     }
 
     set value(text: string) {
-      this.editor.value = text;
+      this.dom.editor.value = text;
     }
 
     get inspectorOpen(): boolean {
@@ -460,7 +374,7 @@ export function defineFirebirdRepl(
 
     set inspectorOpen(open: boolean) {
       this.isInspectorOpen = Boolean(open);
-      this.inspector.hidden = !this.isInspectorOpen;
+      this.dom.inspector.hidden = !this.isInspectorOpen;
     }
 
     get inspectorTab(): ReplInspectorTab {
@@ -469,59 +383,45 @@ export function defineFirebirdRepl(
 
     set inspectorTab(tab: ReplInspectorTab) {
       this.activeTab =
-        tab === 'migrations'
-          ? 'migrations'
-          : tab === 'profiler'
-            ? 'profiler'
-            : tab === 'plan'
-              ? 'plan'
-              : tab === 'replication'
-                ? 'replication'
-                : tab === 'arrow'
-                  ? 'arrow'
-                  : tab === 'outbox'
-                    ? 'outbox'
-                    : 'schema';
+        tab === 'migrations' ||
+        tab === 'profiler' ||
+        tab === 'plan' ||
+        tab === 'replication' ||
+        tab === 'arrow' ||
+        tab === 'outbox'
+          ? tab
+          : 'schema';
       this.updateActiveTabButtons();
       this.renderInspector();
     }
 
     private updateActiveTabButtons(): void {
-      this.tabSchemaBtn.classList.toggle('active', this.activeTab === 'schema');
-      this.tabMigrationsBtn.classList.toggle(
-        'active',
-        this.activeTab === 'migrations',
-      );
-      this.tabProfilerBtn.classList.toggle(
-        'active',
-        this.activeTab === 'profiler',
-      );
-      this.tabPlanBtn.classList.toggle('active', this.activeTab === 'plan');
-      this.tabReplicationBtn.classList.toggle(
-        'active',
-        this.activeTab === 'replication',
-      );
-      this.tabArrowBtn.classList.toggle('active', this.activeTab === 'arrow');
-      this.tabOutboxBtn.classList.toggle('active', this.activeTab === 'outbox');
+      this.dom.tabSchemaBtn.classList.toggle('active', this.activeTab === 'schema');
+      this.dom.tabMigrationsBtn.classList.toggle('active', this.activeTab === 'migrations');
+      this.dom.tabProfilerBtn.classList.toggle('active', this.activeTab === 'profiler');
+      this.dom.tabPlanBtn.classList.toggle('active', this.activeTab === 'plan');
+      this.dom.tabReplicationBtn.classList.toggle('active', this.activeTab === 'replication');
+      this.dom.tabArrowBtn.classList.toggle('active', this.activeTab === 'arrow');
+      this.dom.tabOutboxBtn.classList.toggle('active', this.activeTab === 'outbox');
     }
 
     private setButtonsDisabled(disabled: boolean): void {
-      this.button.disabled = disabled;
-      this.explainButton.disabled = disabled;
-      this.infoButton.disabled = disabled;
-      this.sweepButton.disabled = disabled;
-      this.schemaButton.disabled = disabled;
-      this.migrationsButton.disabled = disabled;
-      this.profilerButton.disabled = disabled;
-      this.replicationButton.disabled = disabled;
-      this.arrowButton.disabled = disabled;
-      this.outboxButton.disabled = disabled;
-      this.inspectorRefreshBtn.disabled = disabled;
+      this.dom.button.disabled = disabled;
+      this.dom.explainButton.disabled = disabled;
+      this.dom.infoButton.disabled = disabled;
+      this.dom.sweepButton.disabled = disabled;
+      this.dom.schemaButton.disabled = disabled;
+      this.dom.migrationsButton.disabled = disabled;
+      this.dom.profilerButton.disabled = disabled;
+      this.dom.replicationButton.disabled = disabled;
+      this.dom.arrowButton.disabled = disabled;
+      this.dom.outboxButton.disabled = disabled;
+      this.dom.inspectorRefreshBtn.disabled = disabled;
       this.syncUndoRedoButtons();
     }
 
     clear(): void {
-      this.output.replaceChildren();
+      this.dom.output.replaceChildren();
     }
 
     async toggleInspector(tab?: ReplInspectorTab): Promise<void> {
@@ -551,9 +451,18 @@ export function defineFirebirdRepl(
       }
       try {
         if (this.activeTab === 'schema') {
-          this.lastSchema = await this.fetchSchema();
-          this.lastMatViews = await fetchReplMaterializedViews(this.db);
-          this.lastSearchIndexes = await fetchReplSearchIndexes(this.db);
+          const [schema, mvs, searchIdxs, spatialIdxs, tsPolicies] = await Promise.all([
+            this.fetchSchema(),
+            fetchReplMaterializedViews(this.db),
+            fetchReplSearchIndexes(this.db),
+            fetchReplSpatialIndexes(this.db),
+            fetchReplTimeSeriesPolicies(this.db),
+          ]);
+          this.lastSchema = schema;
+          this.lastMatViews = mvs;
+          this.lastSearchIndexes = searchIdxs;
+          this.lastSpatialIndexes = spatialIdxs;
+          this.lastTimeSeriesPolicies = tsPolicies;
         } else if (this.activeTab === 'migrations') {
           this.lastMigrations = await this.fetchMigrations();
         } else if (this.activeTab === 'profiler' || this.activeTab === 'plan') {
@@ -577,7 +486,9 @@ export function defineFirebirdRepl(
       return fetchReplSchema(this.db!, options);
     }
 
-    private fetchMigrations(options: Pick<MigrateOptions, 'tableName'> = {}): Promise<AppliedMigration[]> {
+    private fetchMigrations(
+      options: Pick<MigrateOptions, 'tableName'> = {},
+    ): Promise<AppliedMigration[]> {
       return fetchReplMigrations(this.db!, options);
     }
 
@@ -590,18 +501,25 @@ export function defineFirebirdRepl(
     }
 
     private fetchArrowInspector(explicitSql?: string): Promise<ReplArrowInspectorInfo> {
-      return fetchReplArrowInspector(this.db!, this.editor.value, this.syncHandleRef, explicitSql);
+      return fetchReplArrowInspector(
+        this.db!,
+        this.dom.editor.value,
+        this.syncHandleRef,
+        explicitSql,
+      );
     }
 
     private renderInspector(): void {
       renderReplInspector({
         db: this.db,
-        inspectorBody: this.inspectorBody,
-        editor: this.editor,
+        inspectorBody: this.dom.inspectorBody,
+        editor: this.dom.editor,
         activeTab: this.activeTab,
         lastSchema: this.lastSchema,
         lastMatViews: this.lastMatViews,
         lastSearchIndexes: this.lastSearchIndexes,
+        lastSpatialIndexes: this.lastSpatialIndexes,
+        lastTimeSeriesPolicies: this.lastTimeSeriesPolicies,
         lastSchemaDiff: this.lastSchemaDiff,
         schemaDiffDraft: this.schemaDiffDraft,
         lastMigrations: this.lastMigrations,
@@ -618,48 +536,32 @@ export function defineFirebirdRepl(
         lastAdvisorReport: this.lastAdvisorReport,
         lastJobQueueStats: this.lastJobQueueStats,
         onResetProfiler: () => {
-          if (this.db && typeof this.db.resetMonitorStats === "function") {
+          if (this.db && typeof this.db.resetMonitorStats === 'function') {
             this.db.resetMonitorStats();
             void this.refreshInspector();
           }
         },
-        onVerifyAudit: () => {
-          void this.verifyAuditChain();
-        },
-        onExportPrometheus: () => {
-          void this.prometheusMetrics();
-        },
-        onRunAdvisor: () => {
-          void this.adviseWorkload();
-        },
+        onVerifyAudit: () => void this.verifyAuditChain(),
+        onExportPrometheus: () => void this.prometheusMetrics(),
+        onRunAdvisor: () => void this.adviseWorkload(),
         onLoadAdvisorSql: (ddl) => {
-          this.editor.value = ddl;
-          this.editor.focus();
+          this.dom.editor.value = ddl;
+          this.dom.editor.focus();
         },
         onFlushOutbox: () => {
-          if (this.optStoreRef) {
-            void this.optStoreRef.flush().then(() => this.refreshInspector());
-          }
+          if (this.optStoreRef) void this.optStoreRef.flush().then(() => this.refreshInspector());
         },
         onRevertMutation: (id) => {
-          if (this.optStoreRef) {
-            void this.optStoreRef.revert(id).then(() => this.refreshInspector());
-          }
+          if (this.optStoreRef) void this.optStoreRef.revert(id).then(() => this.refreshInspector());
         },
         onRevertAllOutbox: () => {
           if (this.optStoreRef) {
             void this.optStoreRef.revertAll().then(() => this.refreshInspector());
           }
         },
-        onUndo: () => {
-          void this.undo();
-        },
-        onRedo: () => {
-          void this.redo();
-        },
-        onRefreshMaterializedView: (mvName) => {
-          void this.refreshMaterializedView(mvName);
-        },
+        onUndo: () => void this.undo(),
+        onRedo: () => void this.redo(),
+        onRefreshMaterializedView: (mvName) => void this.refreshMaterializedView(mvName),
         onPreviewSchemaDiff: (ddlSql) => {
           this.schemaDiffDraft = ddlSql;
           void this.previewSchemaDiff(ddlSql);
@@ -668,21 +570,20 @@ export function defineFirebirdRepl(
           this.schemaDiffDraft = ddlSql;
           void this.applySchemaPush(ddlSql);
         },
-        onExportArrow: () => {
-          void this.exportArrow().then(triggerArrowBrowserDownload);
-        },
+        onExportArrow: () => void this.exportArrow().then(triggerArrowBrowserDownload),
         onImportArrowFile: (fileName, bytes) => {
-          const base = fileName
-            .replace(/\.(arrow|ipc)$/i, '')
-            .replace(/[^A-Za-z0-9_]/g, '_')
-            .toUpperCase() || 'IMPORTED_ARROW';
+          const base =
+            fileName
+              .replace(/\.(arrow|ipc)$/i, '')
+              .replace(/[^A-Za-z0-9_]/g, '_')
+              .toUpperCase() || 'IMPORTED_ARROW';
           void this.importArrow(base, bytes, { createTable: true });
         },
       });
     }
 
     async run(script?: string): Promise<ReplEntry[]> {
-      const text = script ?? this.editor.value;
+      const text = script ?? this.dom.editor.value;
       if (this.busy || text.trim() === '') return [];
       if (!this.db) {
         const entry: ReplEntry = {
@@ -700,7 +601,7 @@ export function defineFirebirdRepl(
       if (this.history[this.history.length - 1] !== text) this.history.push(text);
       this.cursor = this.history.length;
       this.draft = '';
-      if (script === undefined) this.editor.value = '';
+      if (script === undefined) this.dom.editor.value = '';
 
       let entries: ReplEntry[] = [];
       try {
@@ -722,11 +623,8 @@ export function defineFirebirdRepl(
       return entries;
     }
 
-    async explain(
-      script?: string,
-      options?: ExplainOptions,
-    ): Promise<ReplEntry[]> {
-      const text = script ?? this.editor.value;
+    async explain(script?: string, options?: ExplainOptions): Promise<ReplEntry[]> {
+      const text = script ?? this.dom.editor.value;
       if (this.busy || text.trim() === '') return [];
       if (!this.db || typeof this.db.explain !== 'function') {
         const entry: ReplEntry = {
@@ -806,24 +704,22 @@ export function defineFirebirdRepl(
     }
 
     async info(): Promise<ReplEntry | undefined> {
-      const err =
-        !this.db
-          ? new Error('No database: set the element’s db property first')
-          : typeof this.db.databaseInfo !== 'function'
-            ? new Error('Database does not support databaseInfo()')
-            : null;
+      const err = !this.db
+        ? new Error('No database: set the element’s db property first')
+        : typeof this.db.databaseInfo !== 'function'
+          ? new Error('Database does not support databaseInfo()')
+          : null;
       return this.runDiagnostic('DATABASE INFO', 'firebird-repl-info', err, async (entry) => {
         entry.info = await this.db!.databaseInfo!();
       });
     }
 
     async sweep(): Promise<ReplEntry | undefined> {
-      const err =
-        !this.db
-          ? new Error('No database: set the element’s db property first')
-          : typeof this.db.sweep !== 'function'
-            ? new Error('Database does not support sweep()')
-            : null;
+      const err = !this.db
+        ? new Error('No database: set the element’s db property first')
+        : typeof this.db.sweep !== 'function'
+          ? new Error('Database does not support sweep()')
+          : null;
       return this.runDiagnostic('SWEEP DATABASE', 'firebird-repl-sweep', err, async (entry) => {
         entry.sweep = await this.db!.sweep!();
       });
@@ -832,9 +728,17 @@ export function defineFirebirdRepl(
     async schema(options?: IntrospectOptions): Promise<ReplEntry | undefined> {
       const err = !this.db ? new Error('No database: set the element’s db property first') : null;
       return this.runDiagnostic('INSPECT SCHEMA', 'firebird-repl-schema', err, async (entry) => {
-        const result = await this.fetchSchema(options);
-        this.lastMatViews = await fetchReplMaterializedViews(this.db!);
-        this.lastSearchIndexes = await fetchReplSearchIndexes(this.db!);
+        const [result, mvs, searchIdxs, spatialIdxs, tsPolicies] = await Promise.all([
+          this.fetchSchema(options),
+          fetchReplMaterializedViews(this.db!),
+          fetchReplSearchIndexes(this.db!),
+          fetchReplSpatialIndexes(this.db!),
+          fetchReplTimeSeriesPolicies(this.db!),
+        ]);
+        this.lastMatViews = mvs;
+        this.lastSearchIndexes = searchIdxs;
+        this.lastSpatialIndexes = spatialIdxs;
+        this.lastTimeSeriesPolicies = tsPolicies;
         entry.schema = result;
         this.lastSchema = result;
         this.activeTab = 'schema';
@@ -904,7 +808,7 @@ export function defineFirebirdRepl(
     }
 
     async inspectArrow(sql?: string): Promise<ReplEntry | undefined> {
-      const sqlLabel = (sql ?? this.editor.value ?? '').trim() || 'INSPECT ARROW';
+      const sqlLabel = (sql ?? this.dom.editor.value ?? '').trim() || 'INSPECT ARROW';
       const err = !this.db ? new Error('No database: set the element’s db property first') : null;
       return this.runDiagnostic(sqlLabel, 'firebird-repl-arrow', err, async (entry) => {
         const info = await this.fetchArrowInspector(sql);
@@ -918,10 +822,12 @@ export function defineFirebirdRepl(
     }
 
     async exportArrow(sql?: string): Promise<Uint8Array> {
-      if (!this.db) {
-        throw new Error('No database: set the element’s db property first');
-      }
-      const { targetSql, bytes } = await executeReplArrowExport(this.db, this.editor.value, sql);
+      if (!this.db) throw new Error('No database: set the element’s db property first');
+      const { targetSql, bytes } = await executeReplArrowExport(
+        this.db,
+        this.dom.editor.value,
+        sql,
+      );
       await this.inspectArrow(targetSql);
       this.dispatchEvent(
         new CustomEvent('firebird-repl-arrow-export', {
@@ -938,14 +844,10 @@ export function defineFirebirdRepl(
       source: ArrowIngestSource,
       options: LoadArrowIpcOptions = {},
     ): Promise<ArrowIngestResult> {
-      if (!this.db) {
-        throw new Error('No database: set the element’s db property first');
-      }
+      if (!this.db) throw new Error('No database: set the element’s db property first');
       const { result, entry } = await executeReplArrowImport(this.db, tableName, source, options);
       this.show(entry);
-      if (this.isInspectorOpen) {
-        await this.refreshInspector();
-      }
+      if (this.isInspectorOpen) await this.refreshInspector();
       this.dispatchEvent(
         new CustomEvent('firebird-repl-arrow-import', {
           detail: result,
@@ -956,27 +858,16 @@ export function defineFirebirdRepl(
       return result;
     }
 
-    async inspectOutbox(): Promise<ReplEntry | undefined> {
-      if (!this.optStoreRef) {
-        this.inspectorTab = 'outbox';
-        this.inspectorOpen = true;
-        this.renderInspector();
-        return undefined;
-      }
-      const started = performance.now();
-      await this.optStoreRef.hydrate();
-      const snap = this.optStoreRef.getSnapshot();
-      this.inspectorTab = 'outbox';
-      this.inspectorOpen = true;
-      this.renderInspector();
-      const entry: ReplEntry = {
-        sql: 'INSPECT OUTBOX',
-        line: 1,
-        ms: performance.now() - started,
-        outbox: snap,
-      };
-      this.show(entry);
-      return entry;
+    inspectOutbox(): Promise<ReplEntry | undefined> {
+      return executeReplOutboxInspect(
+        this.optStoreRef,
+        () => {
+          this.inspectorTab = 'outbox';
+          this.inspectorOpen = true;
+          this.renderInspector();
+        },
+        (e) => this.show(e),
+      );
     }
 
     async editCell(
@@ -986,9 +877,7 @@ export function defineFirebirdRepl(
       newValue: unknown,
       primaryKey = 'ID',
     ): Promise<void> {
-      if (!this.db) {
-        throw new Error('No database: set the element’s db property first');
-      }
+      if (!this.db) throw new Error('No database: set the element’s db property first');
       const detail = await executeReplCellEdit(
         this.db,
         this.undoRedoRef,
@@ -999,9 +888,7 @@ export function defineFirebirdRepl(
         newValue,
         primaryKey,
       );
-      if (this.isInspectorOpen) {
-        await this.refreshInspector();
-      }
+      if (this.isInspectorOpen) await this.refreshInspector();
       this.dispatchEvent(
         new CustomEvent('firebird-repl-cell-edit', {
           detail,
@@ -1011,36 +898,26 @@ export function defineFirebirdRepl(
       );
     }
 
-    async undo(): Promise<UndoRedoEntry | null> {
-      if (!this.undoRedoRef) return null;
-      const started = performance.now();
-      const undone = await this.undoRedoRef.undo();
-      if (undone) {
-        this.show({
-          sql: `UNDO (${undone.label})`,
-          line: 1,
-          ms: performance.now() - started,
-          affectedRows: undone.operations.length,
-        });
-        if (this.isInspectorOpen) await this.refreshInspector();
-      }
-      return undone;
+    undo(): Promise<UndoRedoEntry | null> {
+      return executeReplUndoRedo(
+        this.undoRedoRef,
+        'undo',
+        (e) => this.show(e),
+        async () => {
+          if (this.isInspectorOpen) await this.refreshInspector();
+        },
+      );
     }
 
-    async redo(): Promise<UndoRedoEntry | null> {
-      if (!this.undoRedoRef) return null;
-      const started = performance.now();
-      const redone = await this.undoRedoRef.redo();
-      if (redone) {
-        this.show({
-          sql: `REDO (${redone.label})`,
-          line: 1,
-          ms: performance.now() - started,
-          affectedRows: redone.operations.length,
-        });
-        if (this.isInspectorOpen) await this.refreshInspector();
-      }
-      return redone;
+    redo(): Promise<UndoRedoEntry | null> {
+      return executeReplUndoRedo(
+        this.undoRedoRef,
+        'redo',
+        (e) => this.show(e),
+        async () => {
+          if (this.isInspectorOpen) await this.refreshInspector();
+        },
+      );
     }
 
     async materializedViews(): Promise<MaterializedViewInfo[]> {
@@ -1054,9 +931,7 @@ export function defineFirebirdRepl(
       if (!this.db) return;
       const entry = await executeReplMatViewRefresh(this.db, name);
       if (entry) this.show(entry);
-      if (this.isInspectorOpen) {
-        await this.refreshInspector();
-      }
+      if (this.isInspectorOpen) await this.refreshInspector();
     }
 
     async searchIndexes(): Promise<ReplSearchIndexSummary[]> {
@@ -1065,7 +940,23 @@ export function defineFirebirdRepl(
       return this.lastSearchIndexes;
     }
 
-    async previewSchemaDiff(desiredSource: DeclarativeSchemaInput): Promise<SchemaSyncResult | null> {
+    async spatialIndexes(): Promise<ReplSpatialIndexSummary[]> {
+      if (!this.db) return [];
+      this.lastSpatialIndexes = await fetchReplSpatialIndexes(this.db);
+      if (this.isInspectorOpen && this.activeTab === 'schema') this.renderInspector();
+      return this.lastSpatialIndexes;
+    }
+
+    async timeSeriesPolicies(): Promise<TimeSeriesPolicyInfo[]> {
+      if (!this.db) return [];
+      this.lastTimeSeriesPolicies = await fetchReplTimeSeriesPolicies(this.db);
+      if (this.isInspectorOpen && this.activeTab === 'schema') this.renderInspector();
+      return this.lastTimeSeriesPolicies;
+    }
+
+    async previewSchemaDiff(
+      desiredSource: DeclarativeSchemaInput,
+    ): Promise<SchemaSyncResult | null> {
       if (!this.db) return null;
       if (typeof desiredSource === 'string') this.schemaDiffDraft = desiredSource;
       this.lastSchemaDiff = await executeReplSchemaDiff(this.db, desiredSource, { dryRun: true });
@@ -1136,8 +1027,8 @@ export function defineFirebirdRepl(
       const queries =
         extraQueries.length > 0
           ? extraQueries
-          : this.editor.value.trim()
-            ? [this.editor.value.trim()]
+          : this.dom.editor.value.trim()
+            ? [this.dom.editor.value.trim()]
             : [];
       const report = await executeReplWorkloadAdvisor(this.db, queries);
       this.lastAdvisorReport = report;
@@ -1165,7 +1056,7 @@ export function defineFirebirdRepl(
         return;
       }
       const state = { cursor: this.cursor, draft: this.draft };
-      stepReplHistoryKey(event, this.editor, this.history, state, () => {
+      stepReplHistoryKey(event, this.dom.editor, this.history, state, () => {
         void this.run();
       });
       this.cursor = state.cursor;
@@ -1179,8 +1070,8 @@ export function defineFirebirdRepl(
         onEditCell: (tbl, keyVal, colName, nextVal, pkName) =>
           this.editCell(tbl, keyVal, colName, nextVal, pkName),
       });
-      this.output.append(block);
-      this.output.scrollTop = this.output.scrollHeight;
+      this.dom.output.append(block);
+      this.dom.output.scrollTop = this.dom.output.scrollHeight;
     }
   }
 

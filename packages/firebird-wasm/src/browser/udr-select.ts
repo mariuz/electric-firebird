@@ -9,15 +9,212 @@ import {
   normalizeProcedureRowsAsync,
   normalizeRoutineIdentifier,
   parseFunctionCallExpr,
-  parseSimpleSelectStatement,
   quoteIdent,
-  splitSelectAlias,
   splitTopLevelCommaList,
   sqlTypeToFieldInfo,
   type ParsedSelectStatement,
   type RegisteredFunctionRecord,
   type RegisteredProcedureRecord,
 } from './udr-parser';
+
+export function findTopLevelKeyword(
+  sql: string,
+  keyword: string,
+  startFrom = 0,
+): { start: number; end: number } | null {
+  let depth = 0;
+  let inSingle = false;
+  let inDouble = false;
+  const upper = sql.toUpperCase();
+  const kw = keyword.toUpperCase();
+
+  for (let i = startFrom; i <= sql.length - kw.length; i++) {
+    const ch = sql[i]!;
+    if (inSingle) {
+      if (ch === "'") {
+        if (sql[i + 1] === "'") i++;
+        else inSingle = false;
+      }
+      continue;
+    }
+    if (inDouble) {
+      if (ch === '"') {
+        if (sql[i + 1] === '"') i++;
+        else inDouble = false;
+      }
+      continue;
+    }
+    if (ch === "'") {
+      inSingle = true;
+      continue;
+    }
+    if (ch === '"') {
+      inDouble = true;
+      continue;
+    }
+    if (ch === '(') {
+      depth++;
+      continue;
+    }
+    if (ch === ')') {
+      if (depth > 0) depth--;
+      continue;
+    }
+    if (
+      depth === 0 &&
+      upper.slice(i, i + kw.length) === kw &&
+      (i === 0 || /[\s)]/.test(sql[i - 1]!)) &&
+      (i + kw.length === sql.length || /[\s(]/.test(sql[i + kw.length]!))
+    ) {
+      return { start: i, end: i + kw.length };
+    }
+  }
+  return null;
+}
+
+export function parseSimpleSelectStatement(sql: string): ParsedSelectStatement | null {
+  const cleaned = sql.trim().replace(/;\s*$/, '');
+  const selectMatch = /^\s*SELECT\s+/i.exec(cleaned);
+  if (!selectMatch) return null;
+
+  const afterSelectIdx = selectMatch[0].length;
+  const fromLoc = findTopLevelKeyword(cleaned, 'FROM', afterSelectIdx);
+  if (!fromLoc) return null;
+
+  const selectRaw = cleaned.slice(afterSelectIdx, fromLoc.start).trim();
+  const afterFrom = cleaned.slice(fromLoc.end).trim();
+
+  const whereLoc = findTopLevelKeyword(afterFrom, 'WHERE', 0);
+  const orderLoc = findTopLevelKeyword(
+    afterFrom,
+    'ORDER BY',
+    whereLoc ? whereLoc.end : 0,
+  );
+
+  const fromEnd = whereLoc
+    ? whereLoc.start
+    : orderLoc
+      ? orderLoc.start
+      : afterFrom.length;
+  const fromClause = afterFrom.slice(0, fromEnd).trim();
+
+  if (findTopLevelKeyword(fromClause, 'JOIN', 0)) {
+    return null;
+  }
+
+  let whereRaw: string | undefined;
+  let orderByRaw: string | undefined;
+
+  if (whereLoc) {
+    const whereEnd = orderLoc ? orderLoc.start : afterFrom.length;
+    whereRaw = afterFrom.slice(whereLoc.end, whereEnd).trim();
+  }
+  if (orderLoc) {
+    orderByRaw = afterFrom.slice(orderLoc.end).trim();
+  }
+
+  const procMatch =
+    /^("?[A-Za-z_][A-Za-z0-9_$]*"?)\s*\(([\s\S]*)\)(?:\s+(?:AS\s+)?[A-Za-z_][A-Za-z0-9_$]*)?$/i.exec(
+      fromClause,
+    );
+  if (procMatch) {
+    return {
+      selectRaw,
+      fromName: procMatch[1]!,
+      fromIsCall: true,
+      fromArgsRaw: procMatch[2]!,
+      whereRaw,
+      orderByRaw,
+    };
+  }
+
+  const tableMatch =
+    /^("?[A-Za-z_][A-Za-z0-9_$]*"?)(?:\s+(?:AS\s+)?[A-Za-z_][A-Za-z0-9_$]*)?$/i.exec(
+      fromClause,
+    );
+  if (tableMatch) {
+    return {
+      selectRaw,
+      fromName: tableMatch[1]!,
+      fromIsCall: false,
+      fromArgsRaw: '',
+      whereRaw,
+      orderByRaw,
+    };
+  }
+
+  return null;
+}
+
+export function splitSelectAlias(item: string): { expr: string; alias: string } {
+  let depth = 0;
+  let inSingle = false;
+  let inDouble = false;
+  const upper = item.toUpperCase();
+
+  for (let i = 0; i < item.length; i++) {
+    const ch = item[i]!;
+    if (inSingle) {
+      if (ch === "'") {
+        if (item[i + 1] === "'") i++;
+        else inSingle = false;
+      }
+      continue;
+    }
+    if (inDouble) {
+      if (ch === '"') {
+        if (item[i + 1] === '"') i++;
+        else inDouble = false;
+      }
+      continue;
+    }
+    if (ch === "'") inSingle = true;
+    else if (ch === '"') inDouble = true;
+    else if (ch === '(') depth++;
+    else if (ch === ')' && depth > 0) depth--;
+    else if (
+      depth === 0 &&
+      upper.slice(i, i + 4) === ' AS ' &&
+      i > 0 &&
+      i + 4 < item.length
+    ) {
+      const expr = item.slice(0, i).trim();
+      const rawAlias = item.slice(i + 4).trim();
+      const alias = rawAlias.startsWith('"')
+        ? rawAlias.slice(1, -1).replace(/""/g, '"')
+        : rawAlias.toUpperCase();
+      return { expr, alias };
+    }
+  }
+
+  const trailingMatch = /^([\s\S]+\))\s+("?[A-Za-z_][A-Za-z0-9_$]*"?)$/.exec(
+    item,
+  );
+  if (trailingMatch) {
+    const rawAlias = trailingMatch[2]!;
+    const alias = rawAlias.startsWith('"')
+      ? rawAlias.slice(1, -1).replace(/""/g, '"')
+      : rawAlias.toUpperCase();
+    return { expr: trailingMatch[1]!.trim(), alias };
+  }
+
+  const fnCall = parseFunctionCallExpr(item);
+  if (fnCall) {
+    return { expr: item, alias: fnCall.funcName };
+  }
+
+  const colMatch =
+    /^(?:[A-Za-z_][A-Za-z0-9_$]*\.)?("?[A-Za-z_][A-Za-z0-9_$]*"?)$/.exec(item);
+  if (colMatch) {
+    const rawCol = colMatch[1]!;
+    const alias = rawCol.startsWith('"')
+      ? rawCol.slice(1, -1).replace(/""/g, '"')
+      : rawCol.toUpperCase();
+    return { expr: item, alias };
+  }
+
+  return { expr: item, alias: 'CONSTANT' };
+}
 
 export interface UdrSelectEvalHost {
   readonly functions: ReadonlyMap<string, RegisteredFunctionRecord>;

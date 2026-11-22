@@ -63,6 +63,7 @@ import {
 } from './cli-mcp-backup-commands';
 import {
   runCliAdvise,
+  runCliCdcSink,
   runCliMigrateOnline,
   runCliWorker,
 } from './cli-m28-commands';
@@ -134,6 +135,7 @@ Commands:
   worker [uri]                   Drain durable FB_JOB_QUEUE$ background jobs & due cron schedules ([--queue <name>] [--max-jobs <n>])
   migrate-online <uri>           Run zero-downtime Expand/Backfill/Contract online migration (--plan <fileOrJson> [--drop-source])
   advise [uri]                   Inspect query plans & catalog for missing/redundant/FK indexes ([--sql <queries>] [--apply] [--json])
+  cdc-sink <uri> --webhook <url> Stream FB_REPL_JOURNAL$ as CloudEvents v1.0 / Arrow IPC ([--secret <k>] [--sink-id <id>] [--json])
   bench [uri]                    Benchmark IBatch, row query, columnar, Arrow IPC stream & preparePipeline [--rows <n>]
 
 Global Options:
@@ -665,7 +667,10 @@ function parseCliArgs(argv: readonly string[]): ParsedFlags {
             key === 'queue' ||
             key === 'max-jobs' ||
             key === 'sql' ||
-            key === 'query')
+            key === 'query' ||
+            key === 'webhook' ||
+            key === 'secret' ||
+            key === 'sink-id')
         ) {
           flags.set(key, next);
           i += 1;
@@ -713,10 +718,28 @@ export async function runCli(
   }
 
   const backendFlag = flags.get('backend');
-  const backend =
+  const backend: 'auto' | 'wasm' | 'native' =
     backendFlag === 'wasm' || backendFlag === 'native' || backendFlag === 'auto'
       ? backendFlag
       : 'auto';
+
+  const devCtx = {
+    positional,
+    flags,
+    cwd,
+    backend,
+    io,
+    out,
+    err,
+    formatCliTable,
+    isSelectLike,
+    isMutatingStatement,
+    loadMigrationsFromDirectory,
+    openCliDatabase,
+  };
+  const tableCtx = { positional, flags, cwd, backend, out, err, formatCliTable, openCliDatabase };
+  const dbCtx = { positional, flags, cwd, backend, out, err, openCliDatabase };
+  const ioDbCtx = { positional, flags, cwd, backend, io, out, err, openCliDatabase };
 
   try {
     switch (cmd) {
@@ -764,36 +787,10 @@ export async function runCli(
       }
 
       case 'codegen':
-        return runCliCodegen({
-          positional,
-          flags,
-          cwd,
-          backend,
-          io,
-          out,
-          err,
-          formatCliTable,
-          isSelectLike,
-          isMutatingStatement,
-          loadMigrationsFromDirectory,
-          openCliDatabase,
-        });
+        return runCliCodegen(devCtx);
 
       case 'migrate':
-        return runCliMigrate({
-          positional,
-          flags,
-          cwd,
-          backend,
-          io,
-          out,
-          err,
-          formatCliTable,
-          isSelectLike,
-          isMutatingStatement,
-          loadMigrationsFromDirectory,
-          openCliDatabase,
-        });
+        return runCliMigrate(devCtx);
 
       case 'dump': {
         const uri = positional[1];
@@ -910,233 +907,45 @@ export async function runCli(
       }
 
       case 'repl':
-        return runCliInteractiveRepl({
-          positional,
-          flags,
-          cwd,
-          backend,
-          io,
-          out,
-          err,
-          formatCliTable,
-          isSelectLike,
-          isMutatingStatement,
-          loadMigrationsFromDirectory,
-          openCliDatabase,
-        });
-
+        return runCliInteractiveRepl(devCtx);
       case 'sync':
-        return runCliSync({
-          positional,
-          flags,
-          cwd,
-          backend,
-          io,
-          out,
-          err,
-          formatCliTable,
-          isSelectLike,
-          isMutatingStatement,
-          loadMigrationsFromDirectory,
-          openCliDatabase,
-        });
-
+        return runCliSync(devCtx);
       case 'wal-ship':
-        return runCliWalShip(
-          { positional, flags, cwd, backend, out, err, formatCliTable, openCliDatabase },
-          resolveCliObjectStore,
-        );
-
+        return runCliWalShip(tableCtx, resolveCliObjectStore);
       case 'pitr-restore':
-        return runCliPitrRestore(
-          { positional, flags, cwd, backend, out, err, formatCliTable, openCliDatabase },
-          resolveCliObjectStore,
-        );
-
+        return runCliPitrRestore(tableCtx, resolveCliObjectStore);
       case 'serve-sync':
-        return runCliServeSync({
-          positional,
-          flags,
-          cwd,
-          backend,
-          out,
-          err,
-          formatCliTable,
-          openCliDatabase,
-        });
-
+        return runCliServeSync(tableCtx);
       case 'export-arrow':
-        return runCliExportArrow({
-          positional,
-          flags,
-          cwd,
-          backend,
-          io,
-          out,
-          err,
-          formatCliTable,
-          isSelectLike,
-          isMutatingStatement,
-          loadMigrationsFromDirectory,
-          openCliDatabase,
-        });
-
+        return runCliExportArrow(devCtx);
       case 'import-arrow':
-        return runCliImportArrow({
-          positional,
-          flags,
-          cwd,
-          backend,
-          io,
-          out,
-          err,
-          formatCliTable,
-          isSelectLike,
-          isMutatingStatement,
-          loadMigrationsFromDirectory,
-          openCliDatabase,
-        });
-
+        return runCliImportArrow(devCtx);
       case 'schema-diff':
-        return runCliSchemaDiff({
-          positional,
-          flags,
-          cwd,
-          backend,
-          out,
-          err,
-          formatCliTable,
-          openCliDatabase,
-        });
-
+        return runCliSchemaDiff(tableCtx);
       case 'schema-push':
-        return runCliSchemaPush({
-          positional,
-          flags,
-          cwd,
-          backend,
-          out,
-          err,
-          formatCliTable,
-          openCliDatabase,
-        });
-
+        return runCliSchemaPush(tableCtx);
       case 'bench':
-        return runCliBench({
-          positional,
-          flags,
-          cwd,
-          backend,
-          out,
-          err,
-          formatCliTable,
-          openCliDatabase,
-        });
-
+        return runCliBench(tableCtx);
       case 'verify-audit':
-        return runCliVerifyAudit({
-          positional,
-          flags,
-          cwd,
-          backend,
-          out,
-          err,
-          openCliDatabase,
-        });
-
+        return runCliVerifyAudit(dbCtx);
       case 'anonymize':
-        return runCliAnonymize({
-          positional,
-          flags,
-          cwd,
-          backend,
-          out,
-          err,
-          openCliDatabase,
-        });
-
+        return runCliAnonymize(dbCtx);
       case 'seed':
-        return runCliSeed({
-          positional,
-          flags,
-          cwd,
-          backend,
-          out,
-          err,
-          openCliDatabase,
-        });
-
+        return runCliSeed(dbCtx);
       case 'mcp':
-        return runCliMcp({
-          positional,
-          flags,
-          cwd,
-          backend,
-          io,
-          out,
-          err,
-          openCliDatabase,
-        });
-
+        return runCliMcp(ioDbCtx);
       case 'backup':
-        return runCliBackup({
-          positional,
-          flags,
-          cwd,
-          backend,
-          io,
-          out,
-          err,
-          openCliDatabase,
-        });
-
+        return runCliBackup(ioDbCtx);
       case 'verify-backup':
-        return runCliVerifyBackup({
-          positional,
-          flags,
-          cwd,
-          backend,
-          io,
-          out,
-          err,
-          openCliDatabase,
-        });
-
+        return runCliVerifyBackup(ioDbCtx);
       case 'worker':
-        return runCliWorker({
-          positional,
-          flags,
-          cwd,
-          backend,
-          out,
-          err,
-          formatCliTable,
-          openCliDatabase,
-        });
-
+        return runCliWorker(tableCtx);
       case 'migrate-online':
-        return runCliMigrateOnline({
-          positional,
-          flags,
-          cwd,
-          backend,
-          out,
-          err,
-          formatCliTable,
-          openCliDatabase,
-        });
-
+        return runCliMigrateOnline(tableCtx);
       case 'advise':
-        return runCliAdvise({
-          positional,
-          flags,
-          cwd,
-          backend,
-          out,
-          err,
-          formatCliTable,
-          openCliDatabase,
-        });
+        return runCliAdvise(tableCtx);
+      case 'cdc-sink':
+        return runCliCdcSink(tableCtx);
 
       default: {
         err(`Unknown command "${cmd}". Run "firebird-wasm --help" for usage.\n`);

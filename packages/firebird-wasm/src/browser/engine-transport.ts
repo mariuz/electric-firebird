@@ -78,6 +78,8 @@ import {
 } from './result-decoder';
 import {
   runDirectCursorOpenStmt,
+  runDirectEventsPoll,
+  runDirectEventsSubscribe,
   runDirectExecuteBatchStmt,
   runDirectExecuteStmt,
   runDirectPipeline,
@@ -1039,72 +1041,27 @@ export class DirectTransport implements EngineTransport {
     return runDirectPipeline(this, dbHandle, txHandle, steps, options);
   }
 
-  // ── Filesystem ─────────────────────────────────────────────────────────
+  // ── Filesystem & Events ────────────────────────────────────────────────
 
-  async mkdir(path: string): Promise<void> {
-    fsMkdir(this.module, path);
-  }
-
-  async exists(path: string): Promise<boolean> {
-    return fsExists(this.module, this.opfsHandle, path);
-  }
-
-  async readFile(path: string): Promise<Uint8Array> {
-    return fsReadFile(this.module, this.opfsHandle, path);
-  }
-
-  async writeFile(path: string, data: Uint8Array): Promise<void> {
-    fsWriteFile(this.module, this.opfsHandle, path, data);
-  }
-
-  async fileSize(path: string): Promise<number> {
-    return fsFileSize(this.module, this.opfsHandle, path);
-  }
-
-  async readFileChunk(
-    path: string,
-    offset: number,
-    length: number,
-  ): Promise<Uint8Array> {
+  async mkdir(path: string): Promise<void> { fsMkdir(this.module, path); }
+  async exists(path: string): Promise<boolean> { return fsExists(this.module, this.opfsHandle, path); }
+  async readFile(path: string): Promise<Uint8Array> { return fsReadFile(this.module, this.opfsHandle, path); }
+  async writeFile(path: string, data: Uint8Array): Promise<void> { fsWriteFile(this.module, this.opfsHandle, path, data); }
+  async fileSize(path: string): Promise<number> { return fsFileSize(this.module, this.opfsHandle, path); }
+  async readFileChunk(path: string, offset: number, length: number): Promise<Uint8Array> {
     return fsReadFileChunk(this.module, this.opfsHandle, path, offset, length);
   }
-
-  async writeFileChunk(
-    path: string,
-    data: Uint8Array,
-    offset: number,
-    truncate = false,
-  ): Promise<void> {
+  async writeFileChunk(path: string, data: Uint8Array, offset: number, truncate = false): Promise<void> {
     fsWriteFileChunk(this.module, this.opfsHandle, path, data, offset, truncate);
   }
-
-  async unlink(path: string): Promise<void> {
-    fsUnlink(this.module, this.opfsHandle, path);
-  }
+  async unlink(path: string): Promise<void> { fsUnlink(this.module, this.opfsHandle, path); }
 
   async eventsSubscribe(dbHandle: EngineHandle, names: string[]): Promise<number> {
-    const mod = this.module;
-    return this.withString(names.join(','), (namesPtr) => {
-      const handle = mod._fb_events_subscribe(dbHandle, namesPtr);
-      if (handle === 0) {
-        throw engineError(mod, `Could not subscribe to events: ${names.join(', ')}`);
-      }
-      return handle;
-    });
+    return runDirectEventsSubscribe(this.module, (s, fn) => this.withString(s, fn), dbHandle, names);
   }
-
   async eventsPoll(subscription: number): Promise<Record<string, number>> {
-    const mod = this.module;
-    const ptr = mod._fb_events_poll(subscription);
-    if (ptr === 0) {
-      throw engineError(mod, 'Could not poll events');
-    }
-
-    const json = mod.UTF8ToString(ptr);
-    mod._free(ptr);
-    return JSON.parse(json) as Record<string, number>;
+    return runDirectEventsPoll(this.module, subscription);
   }
-
   async eventsCancel(subscription: number): Promise<void> {
     this.module._fb_events_cancel(subscription);
   }

@@ -17,8 +17,44 @@ import {
   type MaterializedViewInfo,
   type MaterializedViewRefreshStrategy,
 } from '../materialized-view';
+import type { AppliedMigration } from '../types';
 import { el } from './repl-styles';
 import type { ReplArrowInspectorInfo, ReplDatabase } from './repl-types';
+
+export function renderMigrationsInspectorPanel(
+  list: readonly AppliedMigration[],
+): HTMLElement {
+  const panel = el('div', 'inspector-migrations');
+  const latest = list.length > 0 ? list[list.length - 1]!.version : 'none';
+  const summaryEl = el('p', 'inspector-summary');
+  summaryEl.textContent = `Current version: ${latest} · ${list.length} applied`;
+  panel.append(summaryEl);
+
+  if (list.length === 0) {
+    const empty = el('p', 'inspector-empty');
+    empty.textContent = 'No applied migrations in FB_MIGRATIONS$.';
+    panel.append(empty);
+  } else {
+    const ol = el('ol', 'migrations-list');
+    for (const m of list) {
+      const li = el('li', 'migration-item');
+      const ver = el('span', 'migration-version');
+      ver.textContent = m.version;
+      li.append(ver);
+      if (m.name) {
+        const nameEl = el('span', 'migration-name');
+        nameEl.textContent = m.name;
+        li.append(nameEl);
+      }
+      const dateEl = el('span', 'schema-badge migration-date');
+      dateEl.textContent = m.appliedAt;
+      li.append(dateEl);
+      ol.append(li);
+    }
+    panel.append(ol);
+  }
+  return panel;
+}
 
 export function renderArrowInspectorPanel(
   info: ReplArrowInspectorInfo | null,

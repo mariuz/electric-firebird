@@ -36,11 +36,13 @@ import type { ReplSearchIndexSummary } from './repl-actions';
 import {
   appendMcpAndPrometheusSections,
   appendPresenceAndAuditSections,
+  appendSpatialAndTimeSeriesSections,
 } from './repl-presence-audit';
 import {
   fetchReplArrowInspector,
   fetchReplMaterializedViews,
   renderArrowInspectorPanel,
+  renderMigrationsInspectorPanel,
   renderOutboxInspectorPanel,
   renderPlanExplorerPanel,
   renderPlanTreeNode,
@@ -51,6 +53,7 @@ export {
   fetchReplArrowInspector,
   fetchReplMaterializedViews,
   renderArrowInspectorPanel,
+  renderMigrationsInspectorPanel,
   renderOutboxInspectorPanel,
   renderPlanExplorerPanel,
   renderPlanTreeNode,
@@ -65,6 +68,8 @@ import type {
   ReplReplicationJournalEntrySummary,
   ReplReplicationSlotInfo,
   ReplReplicationWatermarkInfo,
+  ReplSpatialIndexSummary,
+  TimeSeriesPolicyInfo,
 } from './repl-types';
 
 export async function fetchReplSchema(db: ReplDatabase, options?: IntrospectOptions): Promise<SchemaIntrospection> {
@@ -374,6 +379,8 @@ export interface ReplInspectorRenderContext {
   readonly lastSchema: SchemaIntrospection | null;
   readonly lastMatViews?: readonly MaterializedViewInfo[];
   readonly lastSearchIndexes?: readonly ReplSearchIndexSummary[];
+  readonly lastSpatialIndexes?: readonly ReplSpatialIndexSummary[];
+  readonly lastTimeSeriesPolicies?: readonly TimeSeriesPolicyInfo[];
   readonly lastSchemaDiff?: SchemaSyncResult | null;
   readonly schemaDiffDraft?: string;
   readonly lastMigrations: AppliedMigration[];
@@ -574,37 +581,7 @@ export function renderReplInspector(ctx: ReplInspectorRenderContext): void {
       }
 
       if (ctx.activeTab === 'migrations') {
-        const panel = el('div', 'inspector-migrations');
-        const list = ctx.lastMigrations;
-        const latest = list.length > 0 ? list[list.length - 1]!.version : 'none';
-        const summaryEl = el('p', 'inspector-summary');
-        summaryEl.textContent = `Current version: ${latest} · ${list.length} applied`;
-        panel.append(summaryEl);
-
-        if (list.length === 0) {
-          const empty = el('p', 'inspector-empty');
-          empty.textContent = 'No applied migrations in FB_MIGRATIONS$.';
-          panel.append(empty);
-        } else {
-          const ol = el('ol', 'migrations-list');
-          for (const m of list) {
-            const li = el('li', 'migration-item');
-            const ver = el('span', 'migration-version');
-            ver.textContent = m.version;
-            li.append(ver);
-            if (m.name) {
-              const nameEl = el('span', 'migration-name');
-              nameEl.textContent = m.name;
-              li.append(nameEl);
-            }
-            const dateEl = el('span', 'schema-badge migration-date');
-            dateEl.textContent = m.appliedAt;
-            li.append(dateEl);
-            ol.append(li);
-          }
-          panel.append(ol);
-        }
-        ctx.inspectorBody.append(panel);
+        ctx.inspectorBody.append(renderMigrationsInspectorPanel(ctx.lastMigrations));
         return;
       }
 
@@ -1032,6 +1009,11 @@ export function renderReplInspector(ctx: ReplInspectorRenderContext): void {
         }
         panel.append(siList);
       }
+
+      appendSpatialAndTimeSeriesSections(panel, {
+        spatialIndexes: ctx.lastSpatialIndexes,
+        timeSeriesPolicies: ctx.lastTimeSeriesPolicies,
+      });
 
       if (ctx.onPreviewSchemaDiff || ctx.lastSchemaDiff) {
         const diffBox = el('div', 'schema-sub schema-diff-preview');

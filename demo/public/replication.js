@@ -928,6 +928,12 @@ function getSetupCodeSnippet() {
     `  graphRagSearch,`,
     `  createOnlineMigrator,`,
     `  createWorkloadAdvisor,`,
+    `  createTimeSeriesStore,`,
+    `  lttbDownsample,`,
+    `  createSpatialIndex,`,
+    `  createChangeStreamSink,`,
+    `  createEdgeSqlGateway,`,
+    `  KeyValuePageVFS,`,
     `  createTenantReplicationSlice,`,
     `  createOptimisticMutationStore,`,
     `  createUndoRedoManager,`,
@@ -2499,6 +2505,39 @@ for (const btn of document.querySelectorAll('.scenario-card')) {
       activeCodeTab = 'setup';
       logEvent(
         `Scenario 22 (<code>createJobQueue</code> + <code>graphRagSearch</code> + <code>createOnlineMigrator</code> + <code>createWorkloadAdvisor</code>): Drained ACID <code>FB_JOB_QUEUE$</code> cron &amp; crash-safe <code>runWorkflow()</code> steps (${res.primaryToReplica.appliedCount} synced), traversed multi-hop <code>WITH RECURSIVE</code> <code>graphRagSearch()</code> entities, executed zero-downtime PSQL dual-write <code>createOnlineMigrator()</code> (<code>verifyParity() =&gt; valid: true</code>), and eliminated <code>NATURAL</code> scans via <code>createWorkloadAdvisor()</code>!`,
+        true,
+      );
+      await renderAll();
+    } else if (kind === 'timeseries-spatial-cdc-edge-gateway') {
+      if (tenantFilterSelect.value !== 'acme' || colFilterSelect.value !== 'all') {
+        tenantFilterSelect.value = 'acme';
+        colFilterSelect.value = 'all';
+        await initSimulator();
+      }
+      const m29Ids = [nextTaskId++, nextTaskId++];
+      for (const id of m29Ids) {
+        await primaryDb.execute(
+          'INSERT INTO TASKS (ID, TENANT_ID, TITLE, PRIORITY, STOCK, TAGS, DONE, SECRET_HASH) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+          [
+            id,
+            'acme',
+            `TimeSeries Spatial CDC Edge Task #${id}`,
+            'CRITICAL',
+            140 + id,
+            'timeseries-lttb,spatial-rtree,cloudevents-cdc,edge-gateway',
+            0,
+            `ce:v1:hmac:edge${id}`,
+          ],
+        );
+      }
+
+      simChangelogSeq++;
+      simEnginePubState.sequenceValue = m29Ids[m29Ids.length - 1];
+      const res = await replicator.sync();
+
+      activeCodeTab = 'setup';
+      logEvent(
+        `Scenario 23 (<code>createTimeSeriesStore</code> + <code>createSpatialIndex</code> + <code>createChangeStreamSink</code> + <code>createEdgeSqlGateway</code>): Filled gaps via <code>locf</code>/<code>linear</code> + peak-preserving <code>lttbDownsample()</code> (${res.primaryToReplica.appliedCount} synced), queried Haversine <code>withinRadius()</code> on <code>FB_SPATIAL_INDEX$</code>, delivered <code>HMAC-SHA256</code>-signed CloudEvents v1.0 CDC webhooks (<code>FB_CDC_OFFSETS$</code>), and served WinterCG <code>createEdgeSqlGateway()</code> with <code>304 Not Modified</code> <code>ETag</code> caching over <code>KeyValuePageVFS</code>!`,
         true,
       );
       await renderAll();

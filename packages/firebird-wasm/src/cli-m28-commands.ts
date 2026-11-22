@@ -14,6 +14,11 @@ import {
   type OnlineMigrationPlan,
 } from './online-migrator';
 import { createWorkloadAdvisor } from './workload-advisor';
+import {
+  createChangeStreamSink,
+  createHttpWebhookSink,
+  type CdcDeliveryFormat,
+} from './cdc-sink';
 
 export interface CliM28Context {
   positional: readonly string[];
@@ -155,5 +160,47 @@ export async function runCliAdvise(ctx: CliM28Context): Promise<number> {
     return 0;
   } finally {
     await managed.flushAndClose(applyFlag);
+  }
+}
+
+export async function runCliCdcSink(ctx: CliM28Context): Promise<number> {
+  const { positional, flags, cwd, backend, out, err, openCliDatabase } = ctx;
+  const uri = positional[1];
+  const webhookUrl = flags.get('webhook') ?? flags.get('url');
+  if (!uri || typeof webhookUrl !== 'string' || !webhookUrl.trim()) {
+    err(
+      'Usage: firebird-wasm cdc-sink <uri> --webhook <url> [--secret <hmacKey>] [--sink-id <id>] [--format cloudevents-json|cloudevents-ndjson|arrow-ipc] [--batch-size <n>] [--json]\n',
+    );
+    return 1;
+  }
+  const sinkId =
+    typeof flags.get('sink-id') === 'string' ? String(flags.get('sink-id')) : 'cli-cdc';
+  const secret =
+    typeof flags.get('secret') === 'string' ? String(flags.get('secret')) : undefined;
+  const fmtRaw = String(flags.get('format') ?? 'cloudevents-json').toLowerCase();
+  const format: CdcDeliveryFormat =
+    fmtRaw === 'cloudevents-ndjson' || fmtRaw === 'arrow-ipc' ? fmtRaw : 'cloudevents-json';
+  const batchSize =
+    typeof flags.get('batch-size') === 'string' ? Number(flags.get('batch-size')) : 100;
+
+  const managed = await openCliDatabase(uri, { cwd, backend, allowMissing: false });
+  try {
+    const sink = createChangeStreamSink(managed.db, {
+      sinkId,
+      batchSize,
+      sink: createHttpWebhookSink({ url: webhookUrl.trim(), secret, format }),
+    });
+    const res = await sink.flushOnce();
+    const offset = await sink.getOffset();
+    if (flags.get('json') === true) {
+      out(`${JSON.stringify({ ...res, offset, sinkId, format }, null, 2)}\n`);
+    } else {
+      out(
+        `CDC sink "${sinkId}" flushed ${res.deliveredEvents} event(s) (offset=${offset}, quarantined=${res.quarantined})\n`,
+      );
+    }
+    return 0;
+  } finally {
+    await managed.flushAndClose(true);
   }
 }

@@ -13,7 +13,7 @@ function sqlMutatesTargetTable(sql: string, cleanTableUpper: string): boolean {
   const trimmed = sql.trim();
   if (!trimmed) return false;
   if (/^\s*(SELECT|WITH)\b/i.test(trimmed)) return false;
-  if (/\b(FB_VECTOR_INDEX\$|FB_FTS_INDEX\$|FB_REPL_)/i.test(trimmed)) return false;
+  if (/\b(FB_VECTOR_INDEX\$|FB_FTS_INDEX\$|FB_SPATIAL_INDEX\$|FB_REPL_)/i.test(trimmed)) return false;
   if (
     !/^\s*(INSERT|UPDATE|DELETE|MERGE|TRUNCATE|EXECUTE\s+BLOCK)\b/i.test(trimmed)
   ) {

@@ -79,6 +79,8 @@ import {
 } from './shared-driver-ops';
 import {
   createNodeTxBlobStream,
+  describeNodeTxQuery,
+  explainNodeTxQuery,
   openNodeTxBlobStream,
   streamNodeTxQuery,
   type NodeTxStreamHost,
@@ -95,7 +97,6 @@ import {
   cancelAttachmentOperation,
   characterSets,
   describeInputFields,
-  explainStatement,
   fetchRows,
   inputParams,
   outputFields,
@@ -984,40 +985,13 @@ export class FirebirdTransaction implements FirebirdTransactionClient {
     return stmt;
   }
 
-  /**
-   * Describe a statement's shape inside this transaction without running it.
-   */
   async describeQuery(sql: string | SqlFragment): Promise<QueryDescription> {
-    this.assertUsable();
-    await this.beforeStatement();
-    const text = toStatement(sql).sql;
-
-    const stmt = await this.attachment.prepare(this.transaction, text);
-    try {
-      const params = await describeInputFields(stmt);
-      const fields = await outputFields(stmt);
-      const type = await stmt.type;
-
-      return {
-        params,
-        fields,
-        statementType: statementKind(type),
-        hasResultSet: stmt.hasResultSet,
-      };
-    } finally {
-      await stmt.dispose().catch(() => undefined);
-    }
+    return describeNodeTxQuery(this.txStreamHost, sql);
   }
 
-  /**
-   * Bulk-import CSV or JSONLines (`'jsonl'` / `'ndjson'`) records from a
-   * `ReadableStream` or `AsyncIterable` into `tableName` inside this transaction.
-   */
   async copyFromStream(
     tableName: string,
-    stream:
-      | ReadableStream<Uint8Array | string>
-      | AsyncIterable<Uint8Array | string>,
+    stream: ReadableStream<Uint8Array | string> | AsyncIterable<Uint8Array | string>,
     options: CopyFromOptions = {},
   ): Promise<CopyResult> {
     this.assertUsable();
@@ -1026,23 +1000,9 @@ export class FirebirdTransaction implements FirebirdTransactionClient {
     return executeCopyFromStream(this, tableName, stream, options);
   }
 
-  /**
-   * Stream a table or `SELECT` query inside this transaction as UTF-8 CSV or
-   * JSONLines (`'jsonl'` / `'ndjson'`).
-   */
-  copyToStream(
-    sql: SqlFragment,
-    options?: CopyToOptions,
-  ): ReadableStream<Uint8Array>;
-  copyToStream(
-    tableOrQuery: string,
-    options?: CopyToOptions,
-  ): ReadableStream<Uint8Array>;
-  copyToStream(
-    sql: string | SqlFragment,
-    params?: QueryParams,
-    options?: CopyToOptions,
-  ): ReadableStream<Uint8Array>;
+  copyToStream(sql: SqlFragment, options?: CopyToOptions): ReadableStream<Uint8Array>;
+  copyToStream(tableOrQuery: string, options?: CopyToOptions): ReadableStream<Uint8Array>;
+  copyToStream(sql: string | SqlFragment, params?: QueryParams, options?: CopyToOptions): ReadableStream<Uint8Array>;
   copyToStream(
     tableOrQuery: string | SqlFragment,
     paramsOrOptions: QueryParams | CopyToOptions = [],
@@ -1064,53 +1024,23 @@ export class FirebirdTransaction implements FirebirdTransactionClient {
     };
   }
 
-  async createBlobStream(
-    options: BlobStreamOptions = {},
-  ): Promise<BlobWritableStream> {
+  async createBlobStream(options: BlobStreamOptions = {}): Promise<BlobWritableStream> {
     return createNodeTxBlobStream(this.txStreamHost, options);
   }
 
-  async openBlobStream(
-    handle: BlobHandle,
-    options?: BlobStreamOptions,
-  ): Promise<ReadableStream<Uint8Array>>;
-  async openBlobStream(
-    sql: SqlFragment,
-    options?: BlobStreamOptions,
-  ): Promise<ReadableStream<Uint8Array>>;
-  async openBlobStream(
-    sql: string | SqlFragment,
-    params?: QueryParams | BlobStreamOptions,
-    options?: BlobStreamOptions,
-  ): Promise<ReadableStream<Uint8Array>>;
+  async openBlobStream(handle: BlobHandle, options?: BlobStreamOptions): Promise<ReadableStream<Uint8Array>>;
+  async openBlobStream(sql: SqlFragment, options?: BlobStreamOptions): Promise<ReadableStream<Uint8Array>>;
+  async openBlobStream(sql: string | SqlFragment, params?: QueryParams | BlobStreamOptions, options?: BlobStreamOptions): Promise<ReadableStream<Uint8Array>>;
   async openBlobStream(
     sqlOrHandle: string | SqlFragment | BlobHandle,
     paramsOrOptions: QueryParams | BlobStreamOptions = [],
     maybeOptions: BlobStreamOptions = {},
   ): Promise<ReadableStream<Uint8Array>> {
-    return openNodeTxBlobStream(
-      this.txStreamHost,
-      sqlOrHandle,
-      paramsOrOptions,
-      maybeOptions,
-    );
+    return openNodeTxBlobStream(this.txStreamHost, sqlOrHandle, paramsOrOptions, maybeOptions);
   }
 
-  async explain(
-    sql: string | SqlFragment,
-    options: ExplainOptions = {},
-  ): Promise<string> {
-    this.assertUsable();
-    await this.beforeStatement();
-    const text = toStatement(sql).sql;
-    const detailed = options.detailed === true;
-
-    const stmt = await this.attachment.prepare(this.transaction, text);
-    try {
-      return await explainStatement(stmt, detailed);
-    } finally {
-      await stmt.dispose().catch(() => undefined);
-    }
+  async explain(sql: string | SqlFragment, options: ExplainOptions = {}): Promise<string> {
+    return explainNodeTxQuery(this.txStreamHost, sql, options);
   }
 
   private streamQuery<T>(
@@ -1119,12 +1049,6 @@ export class FirebirdTransaction implements FirebirdTransactionClient {
     batchSize: number,
     options: StatementExecutionOptions = {},
   ): AsyncIterableIterator<QueryResult<T>> {
-    return streamNodeTxQuery<T>(
-      this.txStreamHost,
-      statement,
-      rowMode,
-      batchSize,
-      options,
-    );
+    return streamNodeTxQuery<T>(this.txStreamHost, statement, rowMode, batchSize, options);
   }
 }
