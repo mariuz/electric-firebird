@@ -960,3 +960,16 @@ export * from './temporal-table';
 export * from './event-store';
 export * from './auto-api-gateway';
 export * from './federation';
+export * from './jsonb-gin';
+export * from './trigram';
+export * from './prisma';
+export {
+  WASM_SHAPE_CHANGES_TABLE,
+  WASM_SHAPE_META_TABLE,
+  computeElectricCursor,
+  computeShapeEtag,
+  createWasmShapeServer,
+  type WasmShapeDatabase,
+  type WasmShapeServer,
+  type WasmShapeServerOptions,
+} from './electric-server/wasm-shape-server';

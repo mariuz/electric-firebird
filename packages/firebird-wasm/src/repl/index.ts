@@ -32,6 +32,7 @@ import type { ReplSearchIndexSummary } from './repl-actions';
 import type {
   EventProjectionStatus,
   JobQueueStats,
+  JsonGinIndexInfo,
   ReplArrowInspectorInfo,
   ReplDatabase,
   ReplEditableTableConfig,
@@ -41,6 +42,7 @@ import type {
   ReplSpatialIndexSummary,
   TemporalTableInfo,
   TimeSeriesPolicyInfo,
+  TrigramIndexInfo,
   WorkloadAdvisorReport,
 } from './repl-types';
 
@@ -103,6 +105,10 @@ export interface FirebirdReplElement extends HTMLElement {
   temporalTables(): Promise<TemporalTableInfo[]>;
   /** List persisted CQRS event projections recorded in `FB_EVENT_PROJECTIONS$` (`M30 Item 5`). */
   eventProjections(): Promise<EventProjectionStatus[]>;
+  /** List persisted JSONB GIN indexes recorded in `FB_JSON_GIN$` (`M31 Item 5`). */
+  jsonGinIndexes(): Promise<JsonGinIndexInfo[]>;
+  /** List persisted fuzzy trigram indexes recorded in `FB_TRGM_INDEX$` (`M31 Item 5`). */
+  trigramIndexes(): Promise<TrigramIndexInfo[]>;
   previewSchemaDiff(desiredSource: DeclarativeSchemaInput): Promise<SchemaSyncResult | null>;
   applySchemaPush(
     desiredSource: DeclarativeSchemaInput,
@@ -158,9 +164,11 @@ import {
   exportReplPrometheusMetrics,
   fetchReplEventProjections,
   fetchReplJobQueueStats,
+  fetchReplJsonGinIndexes,
   fetchReplSpatialIndexes,
   fetchReplTemporalTables,
   fetchReplTimeSeriesPolicies,
+  fetchReplTrigramIndexes,
   getReplMcpTools,
   runReplBusyDiagnostic,
 } from './repl-presence-audit';
@@ -202,6 +210,8 @@ export function defineFirebirdRepl(
     private lastTimeSeriesPolicies: TimeSeriesPolicyInfo[] = [];
     private lastTemporalTables: TemporalTableInfo[] = [];
     private lastEventProjections: EventProjectionStatus[] = [];
+    private lastJsonGinIndexes: JsonGinIndexInfo[] = [];
+    private lastTrigramIndexes: TrigramIndexInfo[] = [];
     private lastSchemaDiff: SchemaSyncResult | null = null;
     private schemaDiffDraft = '';
     private lastMigrations: AppliedMigration[] = [];
@@ -393,7 +403,7 @@ export function defineFirebirdRepl(
     }
 
     private async loadSchemaTabData(options?: IntrospectOptions): Promise<SchemaIntrospection> {
-      const [schema, mvs, searchIdxs, spatialIdxs, tsPolicies, tmpTables, evProjs] =
+      const [schema, mvs, searchIdxs, spatialIdxs, tsPolicies, tmpTables, evProjs, ginIdxs, trgmIdxs] =
         await Promise.all([
           fetchReplSchema(this.db!, options),
           fetchReplMaterializedViews(this.db!),
@@ -402,6 +412,8 @@ export function defineFirebirdRepl(
           fetchReplTimeSeriesPolicies(this.db!),
           fetchReplTemporalTables(this.db!),
           fetchReplEventProjections(this.db!),
+          fetchReplJsonGinIndexes(this.db!),
+          fetchReplTrigramIndexes(this.db!),
         ]);
       this.lastSchema = schema;
       this.lastMatViews = mvs;
@@ -410,6 +422,8 @@ export function defineFirebirdRepl(
       this.lastTimeSeriesPolicies = tsPolicies;
       this.lastTemporalTables = tmpTables;
       this.lastEventProjections = evProjs;
+      this.lastJsonGinIndexes = ginIdxs;
+      this.lastTrigramIndexes = trgmIdxs;
       return schema;
     }
 
@@ -462,6 +476,8 @@ export function defineFirebirdRepl(
         lastTimeSeriesPolicies: this.lastTimeSeriesPolicies,
         lastTemporalTables: this.lastTemporalTables,
         lastEventProjections: this.lastEventProjections,
+        lastJsonGinIndexes: this.lastJsonGinIndexes,
+        lastTrigramIndexes: this.lastTrigramIndexes,
         lastSchemaDiff: this.lastSchemaDiff,
         schemaDiffDraft: this.schemaDiffDraft,
         lastMigrations: this.lastMigrations,
@@ -777,6 +793,20 @@ export function defineFirebirdRepl(
       this.lastEventProjections = await fetchReplEventProjections(this.db);
       if (this.isInspectorOpen && this.activeTab === 'schema') this.renderInspector();
       return this.lastEventProjections;
+    }
+
+    async jsonGinIndexes(): Promise<JsonGinIndexInfo[]> {
+      if (!this.db) return [];
+      this.lastJsonGinIndexes = await fetchReplJsonGinIndexes(this.db);
+      if (this.isInspectorOpen && this.activeTab === 'schema') this.renderInspector();
+      return this.lastJsonGinIndexes;
+    }
+
+    async trigramIndexes(): Promise<TrigramIndexInfo[]> {
+      if (!this.db) return [];
+      this.lastTrigramIndexes = await fetchReplTrigramIndexes(this.db);
+      if (this.isInspectorOpen && this.activeTab === 'schema') this.renderInspector();
+      return this.lastTrigramIndexes;
     }
 
     async previewSchemaDiff(desiredSource: DeclarativeSchemaInput): Promise<SchemaSyncResult | null> {

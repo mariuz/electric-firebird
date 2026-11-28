@@ -36,6 +36,14 @@ import {
   fetchPersistedEventProjections,
   type EventProjectionStatus,
 } from '../event-store';
+import {
+  fetchPersistedJsonGinIndexes,
+  type JsonGinIndexInfo,
+} from '../jsonb-gin';
+import {
+  fetchPersistedTrigramIndexes,
+  type TrigramIndexInfo,
+} from '../trigram';
 import type { OptimisticMutationStore } from '../optimistic-store';
 import type { UndoRedoEntry, UndoRedoManager } from '../undo-redo';
 import type { ReplicationStats } from '../replication';
@@ -377,6 +385,8 @@ export function appendSpatialAndTimeSeriesSections(
     timeSeriesPolicies?: readonly TimeSeriesPolicyInfo[];
     temporalTables?: readonly TemporalTableInfo[];
     eventProjections?: readonly EventProjectionStatus[];
+    jsonGinIndexes?: readonly JsonGinIndexInfo[];
+    trigramIndexes?: readonly TrigramIndexInfo[];
   },
 ): void {
   if (opts.spatialIndexes && opts.spatialIndexes.length > 0) {
@@ -454,6 +464,60 @@ export function appendSpatialAndTimeSeriesSections(
     }
     evBox.append(evList);
     panel.append(evBox);
+  }
+
+  if (opts.jsonGinIndexes && opts.jsonGinIndexes.length > 0) {
+    const ginBox = el('div', 'schema-sub json-gin-indexes-panel');
+    const title = el('div', 'schema-group-title');
+    title.textContent = 'JSONB GIN Indexes (FB_JSON_GIN$)';
+    ginBox.append(title);
+    const ginList = el('ul', 'schema-list json-gin-index-list');
+    for (const g of opts.jsonGinIndexes) {
+      const li = el('li', 'schema-meta-item json-gin-index-item');
+      const nameSpan = el('span', 'col-name');
+      nameSpan.textContent = `${g.indexName} → ${g.tableName}.${g.columnName}`;
+      const badge = el('span', 'schema-badge');
+      badge.textContent = `docs:${g.docCount} · tokens:${g.tokenCount}`;
+      li.append(nameSpan, badge);
+      ginList.append(li);
+    }
+    ginBox.append(ginList);
+    panel.append(ginBox);
+  }
+
+  if (opts.trigramIndexes && opts.trigramIndexes.length > 0) {
+    const trgmBox = el('div', 'schema-sub trigram-indexes-panel');
+    const title = el('div', 'schema-group-title');
+    title.textContent = 'Fuzzy Trigram Indexes (FB_TRGM_INDEX$)';
+    trgmBox.append(title);
+    const trgmList = el('ul', 'schema-list trigram-index-list');
+    for (const tr of opts.trigramIndexes) {
+      const li = el('li', 'schema-meta-item trigram-index-item');
+      const nameSpan = el('span', 'col-name');
+      nameSpan.textContent = `${tr.indexName} → ${tr.tableName}.${tr.columnName}`;
+      const badge = el('span', 'schema-badge');
+      badge.textContent = `docs:${tr.docCount} · trigrams:${tr.trigramCount}`;
+      li.append(nameSpan, badge);
+      trgmList.append(li);
+    }
+    trgmBox.append(trgmList);
+    panel.append(trgmBox);
+  }
+}
+
+export async function fetchReplJsonGinIndexes(db: ReplDatabase): Promise<JsonGinIndexInfo[]> {
+  try {
+    return await fetchPersistedJsonGinIndexes(createReplObjectQueryAdapter(db));
+  } catch {
+    return [];
+  }
+}
+
+export async function fetchReplTrigramIndexes(db: ReplDatabase): Promise<TrigramIndexInfo[]> {
+  try {
+    return await fetchPersistedTrigramIndexes(createReplObjectQueryAdapter(db));
+  } catch {
+    return [];
   }
 }
 

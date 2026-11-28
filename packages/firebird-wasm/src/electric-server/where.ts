@@ -15,10 +15,22 @@
 /** Thrown for a `where` this server does not take; the server answers 400. */
 export class WhereError extends Error {}
 
+/** Metadata for a relational `IN (SELECT ...)` subquery inside a shape `where` (`M31 Item 3`). */
+export interface SubqueryDependency {
+  readonly childColumnSql: string;
+  readonly childColumnName?: string;
+  readonly parentTable: string;
+  readonly parentColumn: string;
+  readonly parentColumnSql: string;
+  readonly negated: boolean;
+  readonly parentWhere?: FirebirdWhere;
+}
+
 /** A `where`, as Firebird SQL over the table's own columns, and its values. */
 export interface FirebirdWhere {
   sql: string;
   params: unknown[];
+  subqueries?: SubqueryDependency[];
 }
 
 /** Options for {@link translateWhere}. */
@@ -29,6 +41,18 @@ export interface TranslateWhereOptions {
    * `ELECTRIC_CHANGES` / base-table joins.
    */
   tableAlias?: string;
+  /**
+   * Opt-in safe scalar functions (`LOWER`, `UPPER`, `TRIM`, `COALESCE`, `ABS`,
+   * `CHAR_LENGTH`, `CHARACTER_LENGTH`). Defaults to `false` so strict single-table
+   * callers keep refusing all functions unless opted in (`M31 Item 3`).
+   */
+  allowFunctions?: boolean;
+  /**
+   * Served tables map (`UPPER_TABLE_NAME` -> `(shapeColName -> quotedFirebirdCol)`)
+   * enabling validated `col [NOT] IN (SELECT parent_col FROM parent_table [WHERE ...])`
+   * relational subqueries (`M31 Item 3`).
+   */
+  servedTables?: ReadonlyMap<string, ReadonlyMap<string, string>>;
 }
 
 type Token =
@@ -88,7 +112,32 @@ function tokenize(text: string): Token[] {
   return tokens;
 }
 
-const KEYWORDS = new Set(['AND', 'OR', 'NOT', 'IS', 'NULL', 'IN', 'LIKE', 'ILIKE', 'BETWEEN', 'TRUE', 'FALSE']);
+const KEYWORDS = new Set([
+  'AND',
+  'OR',
+  'NOT',
+  'IS',
+  'NULL',
+  'IN',
+  'LIKE',
+  'ILIKE',
+  'BETWEEN',
+  'TRUE',
+  'FALSE',
+  'SELECT',
+  'FROM',
+  'WHERE',
+]);
+
+const SAFE_FUNCTIONS = new Set([
+  'LOWER',
+  'UPPER',
+  'TRIM',
+  'COALESCE',
+  'ABS',
+  'CHAR_LENGTH',
+  'CHARACTER_LENGTH',
+]);
 
 /**
  * Translate `text` into Firebird SQL.
@@ -105,7 +154,9 @@ export function translateWhere(
 ): FirebirdWhere {
   const tokens = tokenize(text);
   const bound: unknown[] = [];
+  const subqueries: SubqueryDependency[] = [];
   let pos = 0;
+  let lastColumnShapeName: string | undefined;
 
   const peek = () => tokens[pos];
   const isWord = (t: Token | undefined, word: string) => t?.kind === 'word' && t.text.toUpperCase() === word;
@@ -116,10 +167,10 @@ export function translateWhere(
   };
 
   const column = (name: string, quoted: boolean): string => {
-    // Unquoted, Postgres folds to lower case, and the shape's names are lower
-    // case where Firebird's were upper.
-    const found = columns.get(quoted ? name : name.toLowerCase()) ?? columns.get(name);
+    const key = quoted ? name : name.toLowerCase();
+    const found = columns.get(key) ?? columns.get(name);
     if (!found) throw new WhereError(`where: ${name} is not a column of this shape's table`);
+    lastColumnShapeName = columns.has(key) ? key : name;
     return options.tableAlias ? `${options.tableAlias}.${found}` : found;
   };
 
@@ -128,7 +179,7 @@ export function translateWhere(
     return '?';
   };
 
-  // operand := column | literal | $n | '(' expr ')' | '-' number
+  // operand := column | safe_func(...) | literal | $n | '(' expr ')' | '-' number
   const operand = (): string => {
     const t = peek();
     if (!t) throw new WhereError('where: ends too soon');
@@ -159,7 +210,19 @@ export function translateWhere(
         const upper = t.text.toUpperCase();
         if (upper === 'TRUE' || upper === 'FALSE') return upper;
         if (upper === 'NULL') return 'NULL';
-        if (isOp(peek(), '(')) throw new WhereError(`where: functions (${t.text}) are not supported`);
+        if (isOp(peek(), '(')) {
+          if (!options.allowFunctions || !SAFE_FUNCTIONS.has(upper)) {
+            throw new WhereError(`where: functions (${t.text}) are not supported`);
+          }
+          expectOp('(');
+          const args = [operand()];
+          while (isOp(peek(), ',')) {
+            pos++;
+            args.push(operand());
+          }
+          expectOp(')');
+          return `${upper === 'CHAR_LENGTH' ? 'CHAR_LENGTH' : upper}(${args.join(', ')})`;
+        }
         if (KEYWORDS.has(upper)) throw new WhereError(`where: ${t.text} is out of place`);
         return column(t.text, false);
       }
@@ -199,8 +262,89 @@ export function translateWhere(
     if (not) pos++;
     const neg = not ? 'NOT ' : '';
     if (isWord(peek(), 'IN')) {
+      const childColShape = lastColumnShapeName;
       pos++;
       expectOp('(');
+      if (isWord(peek(), 'SELECT')) {
+        if (!options.servedTables) {
+          throw new WhereError('where: subqueries require servedTables configuration');
+        }
+        pos++; // consume SELECT
+        const selColTok = peek();
+        if (!selColTok || (selColTok.kind !== 'word' && selColTok.kind !== 'quoted')) {
+          throw new WhereError('where: subquery SELECT must name a single column');
+        }
+        pos++;
+        if (!isWord(peek(), 'FROM')) {
+          throw new WhereError('where: subquery expected FROM after column');
+        }
+        pos++;
+        const tblTok = peek();
+        if (!tblTok || (tblTok.kind !== 'word' && tblTok.kind !== 'quoted')) {
+          throw new WhereError('where: subquery expected table name after FROM');
+        }
+        pos++;
+        const parentTableKey = tblTok.kind === 'quoted' ? tblTok.text : tblTok.text.toUpperCase();
+        const parentCols =
+          options.servedTables.get(parentTableKey) ??
+          options.servedTables.get(tblTok.text.toUpperCase());
+        if (!parentCols) {
+          throw new WhereError(`where: subquery table ${tblTok.text} is not served`);
+        }
+        const parentColKey = selColTok.kind === 'quoted' ? selColTok.text : selColTok.text.toLowerCase();
+        const parentColSql = parentCols.get(parentColKey) ?? parentCols.get(selColTok.text);
+        if (!parentColSql) {
+          throw new WhereError(
+            `where: ${selColTok.text} is not a column of subquery table ${tblTok.text}`,
+          );
+        }
+
+        let subWhere: FirebirdWhere | undefined;
+        if (isWord(peek(), 'WHERE')) {
+          pos++;
+          let depth = 1;
+          const startIdx = pos;
+          while (pos < tokens.length) {
+            if (isOp(tokens[pos], '(')) depth++;
+            else if (isOp(tokens[pos], ')')) {
+              depth--;
+              if (depth === 0) break;
+            }
+            pos++;
+          }
+          if (depth !== 0) throw new WhereError('where: unterminated subquery');
+          const subTokens = tokens.slice(startIdx, pos);
+          const subText = subTokens
+            .map((tk) => {
+              if (tk.kind === 'string') return `'${tk.text.replace(/'/g, "''")}'`;
+              if (tk.kind === 'quoted') return `"${tk.text.replace(/"/g, '""')}"`;
+              if (tk.kind === 'param') return `$${tk.index}`;
+              return tk.text;
+            })
+            .join(' ');
+          subWhere = translateWhere(subText, parentCols, params, {
+            allowFunctions: options.allowFunctions,
+            servedTables: options.servedTables,
+          });
+          bound.push(...subWhere.params);
+        }
+        expectOp(')');
+        const quotedParentTbl = `"${parentTableKey.replace(/"/g, '""')}"`;
+        const subSql =
+          `SELECT ${parentColSql} FROM ${quotedParentTbl}` +
+          (subWhere ? ` WHERE ${subWhere.sql}` : '');
+        subqueries.push({
+          childColumnSql: left,
+          childColumnName: childColShape,
+          parentTable: parentTableKey,
+          parentColumn: parentColKey,
+          parentColumnSql: parentColSql,
+          negated: not,
+          parentWhere: subWhere,
+        });
+        return `${left} ${neg}IN (${subSql})`;
+      }
+
       const items = [operand()];
       while (isOp(peek(), ',')) {
         pos++;
@@ -261,5 +405,5 @@ export function translateWhere(
     const t = tokens[pos]!;
     throw new WhereError(`where: ${'text' in t ? t.text : `$${(t as { index: number }).index}`} is out of place`);
   }
-  return { sql, params: bound };
+  return subqueries.length > 0 ? { sql, params: bound, subqueries } : { sql, params: bound };
 }

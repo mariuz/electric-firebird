@@ -2087,6 +2087,36 @@ Next-horizon improvements across **Replication**, **Speed & Performance**, **Int
 
 ---
 
+### M31 — Electric Postgres Full Parity: CDN-Cacheable `/v1/shape` + SSE, On-Demand `subset__*` & Auto-DDL, Subquery `move-in`/`move-out` Shapes, `JSONB` GIN + `pg_trgm` Fuzzy Search & Prisma Adapter
+
+- [x] **1. CDN-Cacheable Electric `/v1/shape` Protocol, `live_sse=true`, `DELETE /v1/shape` & Embedded WASM Shape Server (`createWasmShapeServer`).**
+      Add deterministic CDN request-collapsing headers (`Cache-Control: public, max-age=..., immutable` on historical chunks, `ETag` /
+      `304 Not Modified`, stateless snapshot page offsets, and deterministic `electric-cursor` live-poll bucketing), `live_sse=true`
+      Server-Sent Events streaming on `/v1/shape`, `DELETE /v1/shape` handle rotation, and an isomorphic WinterCG `createWasmShapeServer(db)`
+      serving Electric shapes directly from `FirebirdBrowser` or `FirebirdLite`.
+- [x] **2. On-Demand `subset__*` Snapshots, Progressive Sync (`syncMode`) & Automatic Schema DDL (`autoCreateTable`).**
+      Support Electric v1.1+ subset snapshot queries (`subset__where`, `subset__params`, `subset__order_by`, `subset__limit`,
+      `subset__offset` + `POST` JSON body) on `/v1/shape`, client `syncMode: 'full' | 'progressive' | 'on-demand'` + `sync.requestSubset(...)`
+      for instant partial hydration without downloading entire tables upfront, and `autoCreateTable: true | { migrateColumns?: boolean }` in
+      `syncShapeToTable` / `syncShapesToTables` driven by `electric-schema`.
+- [x] **3. Relational Subquery `WHERE` Shapes (`move-in` / `move-out`) & Exact `replica=full` `old_value` Capture.**
+      Extend `translateWhere` and shape capture to support parameterized `IN (SELECT col FROM parent WHERE ...)` subqueries plus scalar
+      functions (`LOWER`, `UPPER`, `COALESCE`, `TRIM`, `ABS`), automatically emitting synthetic `insert` (`move-in`) and `delete` (`move-out`)
+      shape events when parent rows enter or leave the subquery filter, and capturing exact before-images for `replica=full` `old_value`
+      on `UPDATE` and `DELETE`.
+- [x] **4. Postgres `JSONB` SQL UDR & Inverted `GIN` Path Index (`createJsonGinIndex`) + `pg_trgm` Fuzzy Trigram Search (`createTrigramIndex`).**
+      Add `registerJsonbFunctions(db)` (`JSON_VALUE`, `JSON_QUERY`, `JSON_CONTAINS` `@>`, `JSON_HAS_KEY` `?`, `JSON_SET`,
+      `JSON_STRIP_NULLS`, `JSON_TYPEOF`) + persistent inverted `FB_JSON_GIN$` path-value index (`createJsonGinIndex`), alongside
+      Postgres `pg_trgm`-compatible trigram similarity & Levenshtein fuzzy search (`createTrigramIndex`, `FB_TRGM_INDEX$`,
+      `registerTrigramFunctions`: `SIMILARITY`, `WORD_SIMILARITY`, `LEVENSHTEIN`).
+- [x] **5. Prisma Driver Adapter (`firebird-wasm/prisma`), `UUIDv7` / `ULID` SQL Pack, `<firebird-repl>` GIN/Trigram Inspector & Scenario 25.**
+      Ship a `@prisma/driver-adapter-utils`-compatible `createFirebirdPrismaAdapter(db)` + monotonic `uuidv7()` / `ulid()` (`GEN_UUID_V7`,
+      `GEN_ULID` SQL UDRs), surface `FB_JSON_GIN$` & `FB_TRGM_INDEX$` inspection inside `<firebird-repl>` (`repl.jsonGinIndexes()`,
+      `repl.trigramIndexes()`), add Simulator **Scenario 25** (`electric-cdn-subset-subquery-jsonb-trgm`), and preserve the strict
+      `< 1,000`-line modularity invariant across every non-test `.ts` source file in `packages/firebird-wasm/src`.
+
+---
+
 ## 5. Test coverage added alongside this review
 
 `src/browser/` was excluded from Jest and had no browser tests.  It now has 73

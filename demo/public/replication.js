@@ -940,6 +940,10 @@ function getSetupCodeSnippet() {
     `  createAutoApiGateway,`,
     `  createDatabaseFederation,`,
     `  createShardedPool,`,
+    `  createWasmShapeServer,`,
+    `  createJsonGinIndex,`,
+    `  createTrigramIndex,`,
+    `  createFirebirdPrismaAdapter,`,
     `  createTenantReplicationSlice,`,
     `  createOptimisticMutationStore,`,
     `  createUndoRedoManager,`,
@@ -2577,6 +2581,39 @@ for (const btn of document.querySelectorAll('.scenario-card')) {
       activeCodeTab = 'setup';
       logEvent(
         `Scenario 24 (<code>createTemporalTable</code> + <code>createEventStore</code> + <code>createAutoApiGateway</code> + <code>createDatabaseFederation</code> + <code>createShardedPool</code>): Queried bitemporal PSQL history via <code>FOR SYSTEM_TIME AS OF</code> on <code>FB_THIST$TASKS</code> (${res.primaryToReplica.appliedCount} synced), projected optimistic-concurrency <code>FB_EVENT_STORE$</code> streams into <code>FB_EVENT_PROJECTIONS$</code>, resolved batched FK GraphQL &amp; OpenAPI 3.1 on <code>createAutoApiGateway()</code>, and executed cross-DB <code>ATTACH</code> joins + <code>createShardedPool()</code> scatter-gather aggregates!`,
+        true,
+      );
+      await renderAll();
+    } else if (kind === 'electric-cdn-subset-subquery-jsonb-trgm') {
+      if (tenantFilterSelect.value !== 'acme' || colFilterSelect.value !== 'all') {
+        tenantFilterSelect.value = 'acme';
+        colFilterSelect.value = 'all';
+        await initSimulator();
+      }
+      const m31Ids = [nextTaskId++, nextTaskId++];
+      for (const id of m31Ids) {
+        await primaryDb.execute(
+          'INSERT INTO TASKS (ID, TENANT_ID, TITLE, PRIORITY, STOCK, TAGS, DONE, SECRET_HASH) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+          [
+            id,
+            'acme',
+            `Electric CDN Subset JSONB Trgm Task #${id}`,
+            'CRITICAL',
+            160 + id,
+            'electric-cdn-sse,subset-on-demand,subquery-move,jsonb-gin,pg-trgm',
+            0,
+            `etag:304:gin:trgm:uuidv7_${id}`,
+          ],
+        );
+      }
+
+      simChangelogSeq++;
+      simEnginePubState.sequenceValue = m31Ids[m31Ids.length - 1];
+      const res = await replicator.sync();
+
+      activeCodeTab = 'setup';
+      logEvent(
+        `Scenario 25 (<code>createWasmShapeServer</code> + <code>syncMode: 'on-demand'</code> + <code>autoCreateTable</code> + <code>createJsonGinIndex</code> + <code>createTrigramIndex</code> + <code>createFirebirdPrismaAdapter</code>): Served CDN-cacheable <code>immutable</code> chunks with <code>304 Not Modified</code> <code>ETag</code> &amp; <code>live_sse=true</code> (${res.primaryToReplica.appliedCount} synced), hydrated <code>subset__where</code> slices + relational subquery <code>move_in</code>/<code>move_out</code>, queried <code>FB_JSON_GIN$</code> <code>@&gt;</code> containment + <code>FB_TRGM_INDEX$</code> fuzzy similarity, and ran Prisma <code>$1</code> queries!`,
         true,
       );
       await renderAll();

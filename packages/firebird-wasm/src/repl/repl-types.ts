@@ -29,6 +29,8 @@ import type { JobQueueStats } from '../job-queue';
 import type { TimeSeriesPolicyInfo } from '../timeseries';
 import type { TemporalTableInfo } from '../temporal-table';
 import type { EventProjectionStatus } from '../event-store';
+import type { JsonGinIndexInfo } from '../jsonb-gin';
+import type { TrigramIndexInfo } from '../trigram';
 
 export type {
   WorkloadAdvisorReport,
@@ -36,6 +38,8 @@ export type {
   TimeSeriesPolicyInfo,
   TemporalTableInfo,
   EventProjectionStatus,
+  JsonGinIndexInfo,
+  TrigramIndexInfo,
 };
 
 /** Persisted 2D Spatial R-Tree index summary (`FB_SPATIAL_INDEX$`) displayed in `<firebird-repl>` (`M29 Item 5`). */

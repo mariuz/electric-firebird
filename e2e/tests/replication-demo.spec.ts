@@ -436,4 +436,30 @@ test.describe('Replication Simulator v2 (replication.html)', () => {
     await expect(page.locator('#event-feed')).toContainText('FB_EVENT_PROJECTIONS$');
     await expect(page.locator('#event-feed')).toContainText('createShardedPool()');
   });
+
+  test('Scenario 25: Electric Postgres Parity — CDN /v1/shape + SSE, subset__* & Subquery move-in/move-out, JSONB GIN & pg_trgm', async ({
+    page,
+  }) => {
+    await openReplicationSim(page);
+
+    await page
+      .locator('.scenario-card[data-scenario="electric-cdn-subset-subquery-jsonb-trgm"]')
+      .click();
+
+    await expect(page.locator('#primary-rows')).toContainText(
+      'Electric CDN Subset JSONB Trgm Task #4',
+    );
+    await expect(page.locator('#replica-rows')).toContainText(
+      'Electric CDN Subset JSONB Trgm Task #5',
+    );
+    await expect(page.locator('#code-inspector')).toContainText('createWasmShapeServer');
+    await expect(page.locator('#code-inspector')).toContainText('createJsonGinIndex');
+    await expect(page.locator('#code-inspector')).toContainText('createTrigramIndex');
+    await expect(page.locator('#code-inspector')).toContainText('createFirebirdPrismaAdapter');
+    await expect(page.locator('#event-feed')).toContainText('Scenario 25');
+    await expect(page.locator('#event-feed')).toContainText('live_sse=true');
+    await expect(page.locator('#event-feed')).toContainText('subset__where');
+    await expect(page.locator('#event-feed')).toContainText('FB_JSON_GIN$');
+    await expect(page.locator('#event-feed')).toContainText('FB_TRGM_INDEX$');
+  });
 });

@@ -730,6 +730,67 @@ test.describe('<firebird-repl>', () => {
     expect(outcome.inspectorText).toContain('CQRS Event Projections (FB_EVENT_PROJECTIONS$)');
   });
 
+  test('M31: inspects JSONB GIN Indexes (FB_JSON_GIN$) & Fuzzy Trigram Indexes (FB_TRGM_INDEX$) in <firebird-repl>', async ({
+    page,
+  }) => {
+    await page.goto('/no-isolation/browser-harness-frameworks-st');
+    await page.waitForFunction(() => Boolean((window as any).FB && (window as any).Frameworks));
+
+    const outcome = await page.evaluate(async () => {
+      const w = window as any;
+      w.Frameworks.FBRepl.defineFirebirdRepl();
+      const repl = document.createElement('firebird-repl') as any;
+      const db = new w.FB.FirebirdBrowser('memory://repl-m31');
+      repl.db = db;
+      document.getElementById('app')!.replaceChildren(repl);
+
+      await repl.run(
+        'CREATE TABLE DOCS (ID INTEGER NOT NULL PRIMARY KEY, META VARCHAR(512) NOT NULL, TITLE VARCHAR(128) NOT NULL)',
+      );
+      await repl.run(
+        `INSERT INTO DOCS VALUES (1, '{"role":"admin","tags":["wasm"]}', 'Electric Postgres Sync')`,
+      );
+
+      const emptyGin = await repl.jsonGinIndexes();
+      const emptyTrgm = await repl.trigramIndexes();
+
+      const gin = await w.FB.createJsonGinIndex(db, {
+        table: 'DOCS',
+        column: 'META',
+        keyColumn: 'ID',
+      });
+      gin.dispose();
+
+      const trgm = await w.FB.createTrigramIndex(db, {
+        table: 'DOCS',
+        column: 'TITLE',
+        keyColumn: 'ID',
+      });
+      trgm.dispose();
+
+      await repl.schema();
+      const activeGin = await repl.jsonGinIndexes();
+      const activeTrgm = await repl.trigramIndexes();
+      const inspectorText = repl.shadowRoot?.querySelector('.inspector')?.textContent ?? '';
+
+      await db.close();
+      return {
+        emptyGinLen: emptyGin.length,
+        emptyTrgmLen: emptyTrgm.length,
+        activeGinDocs: activeGin[0]?.docCount ?? 0,
+        activeTrgmDocs: activeTrgm[0]?.docCount ?? 0,
+        inspectorText,
+      };
+    });
+
+    expect(outcome.emptyGinLen).toBe(0);
+    expect(outcome.emptyTrgmLen).toBe(0);
+    expect(outcome.activeGinDocs).toBe(1);
+    expect(outcome.activeTrgmDocs).toBe(1);
+    expect(outcome.inspectorText).toContain('JSONB GIN Indexes (FB_JSON_GIN$)');
+    expect(outcome.inspectorText).toContain('Fuzzy Trigram Indexes (FB_TRGM_INDEX$)');
+  });
+
   test('takes a db property set before it was defined, and reports runs', async ({ page }) => {
     await page.goto('/no-isolation/browser-harness-frameworks-st');
     await page.waitForFunction(() => Boolean((window as any).FB && (window as any).Frameworks));

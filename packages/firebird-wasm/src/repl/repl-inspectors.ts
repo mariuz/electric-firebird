@@ -56,6 +56,7 @@ export {
 };
 import type {
   EventProjectionStatus,
+  JsonGinIndexInfo,
   ReplArrowInspectorInfo,
   ReplDatabase,
   ReplInspectorTab,
@@ -63,6 +64,7 @@ import type {
   ReplSpatialIndexSummary,
   TemporalTableInfo,
   TimeSeriesPolicyInfo,
+  TrigramIndexInfo,
 } from './repl-types';
 
 export interface ReplInspectorRenderContext {
@@ -77,6 +79,8 @@ export interface ReplInspectorRenderContext {
   readonly lastTimeSeriesPolicies?: readonly TimeSeriesPolicyInfo[];
   readonly lastTemporalTables?: readonly TemporalTableInfo[];
   readonly lastEventProjections?: readonly EventProjectionStatus[];
+  readonly lastJsonGinIndexes?: readonly JsonGinIndexInfo[];
+  readonly lastTrigramIndexes?: readonly TrigramIndexInfo[];
   readonly lastSchemaDiff?: SchemaSyncResult | null;
   readonly schemaDiffDraft?: string;
   readonly lastMigrations: AppliedMigration[];
@@ -711,6 +715,8 @@ export function renderReplInspector(ctx: ReplInspectorRenderContext): void {
         timeSeriesPolicies: ctx.lastTimeSeriesPolicies,
         temporalTables: ctx.lastTemporalTables,
         eventProjections: ctx.lastEventProjections,
+        jsonGinIndexes: ctx.lastJsonGinIndexes,
+        trigramIndexes: ctx.lastTrigramIndexes,
       });
 
       if (ctx.onPreviewSchemaDiff || ctx.lastSchemaDiff) {

@@ -70,6 +70,10 @@
       "types": "./dist/drizzle/index.d.ts",
       "default": "./dist/drizzle/index.js"
     },
+    "./prisma": {
+      "types": "./dist/prisma/index.d.ts",
+      "default": "./dist/prisma/index.js"
+    },
     "./vector": {
       "types": "./dist/vector/index.d.ts",
       "default": "./dist/vector/index.js"

@@ -524,6 +524,10 @@
           <strong>24. Bitemporal <code>FOR SYSTEM_TIME AS OF</code> + Event Sourcing CQRS, Auto GraphQL/REST Gateway &amp; Sharded Federation</strong>
           <span>Capture PSQL row history via <code>createTemporalTable()</code>, project CQRS streams in <code>createEventStore()</code>, serve batched GraphQL via <code>createAutoApiGateway()</code>, and scatter-gather <code>createShardedPool()</code>!</span>
         </button>
+        <button type="button" class="scenario-card" data-scenario="electric-cdn-subset-subquery-jsonb-trgm">
+          <strong>25. Electric Postgres Parity: CDN <code>/v1/shape</code> + SSE, <code>subset__*</code> &amp; Subquery <code>move-in</code>/<code>move-out</code>, <code>JSONB</code> GIN &amp; <code>pg_trgm</code></strong>
+          <span>Serve immutable CDN chunks &amp; <code>live_sse=true</code> via <code>createWasmShapeServer()</code>, hydrate <code>syncMode: 'on-demand'</code> subsets + <code>autoCreateTable</code>, query <code>createJsonGinIndex()</code> + <code>createTrigramIndex()</code>, and connect Prisma!</span>
+        </button>
       </section>
 
       <!-- Dual Database Nodes Grid -->

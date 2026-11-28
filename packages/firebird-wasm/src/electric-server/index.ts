@@ -31,14 +31,24 @@ import { planTable, quote, relationName, renderValue, selectColumnWithAlias } fr
 import type { FirebirdColumn, TablePlan } from './catalog';
 import { CHANGES, CHANGE_EVENT, KEY_COLUMNS, META, installCapture, pruneLog, stampCommitted } from './capture';
 import { WhereError, translateWhere } from './where';
-import type { FirebirdWhere, TranslateWhereOptions } from './where';
+import type { FirebirdWhere } from './where';
 import { WriteRejected } from '../electric/writes';
 
 export { triggerName, tableTrigger } from './capture';
 export { translateWhere, WhereError } from './where';
-export type { FirebirdWhere, TranslateWhereOptions };
+export type { FirebirdWhere, SubqueryDependency, TranslateWhereOptions } from './where';
 export { planTable, planColumn, shapeName, selectColumnWithAlias } from './catalog';
 export type { TablePlan, ColumnPlan, FirebirdColumn } from './catalog';
+export {
+  WASM_SHAPE_CHANGES_TABLE,
+  WASM_SHAPE_META_TABLE,
+  computeElectricCursor,
+  computeShapeEtag,
+  createWasmShapeServer,
+  type WasmShapeDatabase,
+  type WasmShapeServer,
+  type WasmShapeServerOptions,
+} from './wasm-shape-server';
 
 /** Options of {@link createShapeServer}. */
 export interface ShapeServerOptions {

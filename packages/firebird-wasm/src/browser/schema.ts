@@ -63,6 +63,10 @@ const INTERNAL_TABLES = new Set([
   'FB_EVENT_STORE$',
   'FB_EVENT_SNAPSHOTS$',
   'FB_EVENT_PROJECTIONS$',
+  'FB_JSON_GIN$',
+  'FB_TRGM_INDEX$',
+  'ELECTRIC_WASM_CHANGES$',
+  'ELECTRIC_WASM_META$',
   'ELECTRIC_SHAPES',
   'ELECTRIC_WRITES',
   'KYSELY_MIGRATION',
@@ -97,6 +101,7 @@ function isInternalTriggerName(name: string): boolean {
     upper.startsWith('FB$LIVE_') ||
     upper.startsWith('FB_REPL_') ||
     upper.startsWith('FB_TTRG$') ||
+    upper.startsWith('FB_EL_TRG$') ||
     upper.startsWith('FB_OMIG_TRG$') ||
     upper.startsWith('ELECTRIC_TRIG$')
   );

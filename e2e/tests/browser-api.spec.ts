@@ -4020,4 +4020,46 @@ test.describe('FirebirdBrowser', () => {
     expect(result.hasFedFn).toBe(true);
     expect(result.hasShardedFn).toBe(true);
   });
+
+  test('M31: JSONB helpers, pg_trgm similarity, monotonic UUIDv7/ULID, Prisma adapter & createWasmShapeServer in browser bundle', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      const w = window as any;
+      const containsOk = w.FB.jsonContains(
+        '{"role":"admin","tags":["eu","wasm"]}',
+        '{"tags":["wasm"]}',
+      );
+      const sim = w.FB.trigramSimilarity('postgresql', 'postgrsql');
+      const u1 = w.FB.uuidv7(1_700_000_000_000);
+      const u2 = w.FB.uuidv7(1_700_000_000_000);
+      const l1 = w.FB.ulid(1_700_000_000_000);
+      const l2 = w.FB.ulid(1_700_000_000_000);
+      const cursorEq =
+        w.FB.computeElectricCursor('h1', '0_0', 5000, 10_100) ===
+        w.FB.computeElectricCursor('h1', '0_0', 5000, 14_900);
+
+      return {
+        containsOk,
+        simHigh: sim > 0.5,
+        uuidMonotonic: u1 < u2 && u1.length === 36,
+        ulidMonotonic: l1 < l2 && l1.length === 26,
+        cursorEq,
+        hasWasmShapeSrv: typeof w.FB.createWasmShapeServer === 'function',
+        hasJsonGin: typeof w.FB.createJsonGinIndex === 'function',
+        hasTrigram: typeof w.FB.createTrigramIndex === 'function',
+        hasPrisma: typeof w.FB.createFirebirdPrismaAdapter === 'function',
+      };
+    });
+
+    expect(result.containsOk).toBe(true);
+    expect(result.simHigh).toBe(true);
+    expect(result.uuidMonotonic).toBe(true);
+    expect(result.ulidMonotonic).toBe(true);
+    expect(result.cursorEq).toBe(true);
+    expect(result.hasWasmShapeSrv).toBe(true);
+    expect(result.hasJsonGin).toBe(true);
+    expect(result.hasTrigram).toBe(true);
+    expect(result.hasPrisma).toBe(true);
+  });
 });

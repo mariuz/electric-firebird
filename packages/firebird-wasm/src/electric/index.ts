@@ -37,6 +37,20 @@ export type { ElectricSchema, ElectricColumn } from './values';
 export type { ElectricTransaction } from './apply';
 export { createWriteQueue, WriteRejected, WriteConflict, mergeWriteConflict, DEFAULT_WRITE_QUEUE_TABLE } from './writes';
 export type { WriteQueue, WriteQueueOptions, LocalWrite, SendResult, WritesDatabase, ConflictStrategy, ConflictResolution, WriteConflictContext, ResolvedConflictOutcome } from './writes';
+export {
+  ensureTableFromElectricSchema,
+  fetchAndApplyShapeSubset,
+  type AutoCreateTableOption,
+  type ElectricSyncMode,
+  type SubsetSnapshotRequest,
+} from './subset-ddl';
+import {
+  ensureTableFromElectricSchema,
+  fetchAndApplyShapeSubset,
+  type AutoCreateTableOption,
+  type ElectricSyncMode,
+  type SubsetSnapshotRequest,
+} from './subset-ddl';
 import type { WriteQueue } from './writes';
 import { writeKeyText } from './writes';
 import { serialDatabase } from './serial';
@@ -75,6 +89,12 @@ export interface SyncShapeToTableOptions {
   onError?: (error: Error) => void;
   /** Local writes to keep over what the sync applies, and to drop once confirmed: {@link createWriteQueue}. */
   writes?: WriteQueue;
+  /** Automatically create the Firebird table (and optionally `ALTER TABLE ... ADD` new columns) from `electric-schema` (`M31 Item 2`). */
+  autoCreateTable?: AutoCreateTableOption;
+  /** Sync hydration mode: `'full'` (default), `'progressive'`, or `'on-demand'` (`offset: 'now'` + `requestSubset`) (`M31 Item 2`). */
+  syncMode?: ElectricSyncMode;
+  /** Initial fast subset hydrated immediately when `syncMode === 'progressive'` (`M31 Item 2`). */
+  initialSubset?: SubsetSnapshotRequest;
   /** For tests: the ShapeStream class to use. */
   ShapeStream?: typeof ShapeStream;
 }
@@ -129,6 +149,12 @@ export interface SyncShapesToTablesOptions {
   onBatchCommitted?: (info: SyncBatchCommitInfo) => void;
   /** Local writes to keep over what the sync applies, and to drop once confirmed: {@link createWriteQueue}. */
   writes?: WriteQueue;
+  /** Automatically create the Firebird table (and optionally `ALTER TABLE ... ADD` new columns) from `electric-schema` (`M31 Item 2`). */
+  autoCreateTable?: AutoCreateTableOption;
+  /** Sync hydration mode: `'full'` (default), `'progressive'`, or `'on-demand'` (`offset: 'now'` + `requestSubset`) (`M31 Item 2`). */
+  syncMode?: ElectricSyncMode;
+  /** Initial fast subset hydrated immediately when `syncMode === 'progressive'` (`M31 Item 2`). */
+  initialSubset?: SubsetSnapshotRequest;
   /** For tests: the ShapeStream class to use. */
   ShapeStream?: typeof ShapeStream;
 }
@@ -139,8 +165,15 @@ export interface ShapeSync {
   readonly upToDate: Promise<void>;
   /** True once a batch marked up-to-date has been applied. */
   readonly isUpToDate: boolean;
+  /** Resolves once `initialSubset` is hydrated in `'progressive'` mode (or immediately otherwise) (`M31 Item 2`). */
+  readonly initialSubsetReady: Promise<void>;
   /** Why the sync stopped, if it stopped on an error. */
   readonly error: Error | undefined;
+  /** Fetch and apply an on-demand `subset__*` snapshot into a synced table (`M31 Item 2`). */
+  requestSubset(
+    subset: SubsetSnapshotRequest,
+    shapeName?: string,
+  ): Promise<{ appliedRows: number }>;
   /** Stop syncing.  The rows and the position stay; a later sync resumes. */
   unsubscribe(): Promise<void>;
 }
@@ -155,7 +188,7 @@ const KEEP_TEXT = Object.fromEntries(
 
 /**
  * Keep `options.table` in step with a shape: an initial copy, then every
- * change, until {@link ShapeSync.unsubscribe}.  The table must exist.
+ * change, until {@link ShapeSync.unsubscribe}.  The table must exist unless `autoCreateTable` is enabled.
  */
 export async function syncShapeToTable(
   db: ElectricDatabase,
@@ -172,6 +205,9 @@ export async function syncShapeToTable(
     event: options.event === undefined ? `electric_${options.shapeKey ?? options.table}` : options.event,
     onError: options.onError,
     writes: options.writes,
+    autoCreateTable: options.autoCreateTable,
+    syncMode: options.syncMode,
+    initialSubset: options.initialSubset,
     ShapeStream: options.ShapeStream,
   });
 }
@@ -181,13 +217,6 @@ export async function syncShapeToTable(
  * applied in one Firebird transaction with all the shapes' positions, so a
  * Postgres transaction that wrote to two of them never shows in one table
  * and not the other.
- *
- * A batch is applied once every shape has reached up-to-date after the last
- * change it received.  Electric marks each up-to-date with the last
- * Postgres position it has seen (`global_last_seen_lsn`); where it does, the
- * shapes must also be at the same one, and a shape behind is asked to
- * refresh, so the batch holds the whole of each transaction it holds any of.
- * The tables must exist.
  */
 export async function syncShapesToTables(
   db: ElectricDatabase,
@@ -207,6 +236,9 @@ export async function syncShapesToTables(
     onError: options.onError,
     onBatchCommitted: options.onBatchCommitted,
     writes: options.writes,
+    autoCreateTable: options.autoCreateTable,
+    syncMode: options.syncMode,
+    initialSubset: options.initialSubset,
     ShapeStream: options.ShapeStream,
   });
 }
@@ -394,6 +426,7 @@ interface ShapeState {
   abort: AbortController;
   schema: ElectricSchema | undefined;
   checked: boolean;
+  ddlChecked: boolean;
   /** Operations received since the last commit. */
   pending: LogEntry[];
   /** A change came after the last up-to-date: the shape is mid-transaction. */
@@ -419,9 +452,13 @@ async function syncShapesInternal(
     onError?: (error: Error) => void;
     onBatchCommitted?: (info: SyncBatchCommitInfo) => void;
     writes?: WriteQueue;
+    autoCreateTable?: AutoCreateTableOption;
+    syncMode?: ElectricSyncMode;
+    initialSubset?: SubsetSnapshotRequest;
     ShapeStream?: typeof ShapeStream;
   },
 ): Promise<ShapeSync> {
+  const syncMode = options.syncMode ?? 'full';
   const report = options.onError ?? ((e: Error) => console.error('[firebird-wasm/electric] sync stopped', e));
   const eventName = options.event;
   // One transaction at a time with the other syncs and the write queue.
@@ -530,6 +567,21 @@ async function syncShapesInternal(
       }
       return { table: s.table, column: s.column, schema, primaryKey };
     });
+    if (options.autoCreateTable) {
+      for (const i of parentOrder) {
+        const { s } = batch[i]!;
+        if (!s.ddlChecked && s.schema) {
+          await ensureTableFromElectricSchema(
+            db,
+            s.spec.table,
+            s.schema,
+            options.autoCreateTable,
+            s.spec.columns,
+          );
+          s.ddlChecked = true;
+        }
+      }
+    }
     await db.transaction(async (tx) => {
       if (hasDependencies) {
         const split = batch.map(({ entries }, i) =>
@@ -658,16 +710,23 @@ async function syncShapesInternal(
       if (header) {
         state.schema = JSON.parse(header) as ElectricSchema;
         state.checked = false;
+        state.ddlChecked = false;
       }
       return response;
     };
+
+    const startOffset = position
+      ? { handle: position.handle, offset: position.offset as ShapeStreamOptions['offset'] }
+      : syncMode === 'on-demand'
+        ? { offset: 'now' as ShapeStreamOptions['offset'] }
+        : {};
 
     const stream = new Stream({
       ...spec.shape,
       signal: abort.signal,
       fetchClient,
       parser: KEEP_TEXT,
-      ...(position ? { handle: position.handle, offset: position.offset as ShapeStreamOptions['offset'] } : {}),
+      ...startOffset,
       onError: (error: Error) => {
         // The client has already retried what it retries; this is final.
         void stop(error);
@@ -722,7 +781,8 @@ async function syncShapesInternal(
       abort: new AbortController(),
       schema: position?.schema,
       checked: false,
-      pending: position ? [] : [{ kind: 'reset' }],
+      ddlChecked: false,
+      pending: position || syncMode === 'on-demand' ? [] : [{ kind: 'reset' }],
       dirty: false,
       seen: false,
       lsn: undefined,
@@ -749,14 +809,55 @@ async function syncShapesInternal(
     }
   }
 
+  const requestSubset = async (
+    subset: SubsetSnapshotRequest,
+    shapeName?: string,
+  ): Promise<{ appliedRows: number }> => {
+    const targetState = shapeName
+      ? states.find(
+          (s) =>
+            s.spec.shapeName === shapeName ||
+            s.spec.table.toLowerCase() === shapeName.toLowerCase(),
+        )
+      : states[0];
+    if (!targetState) {
+      throw new RangeError(`Unknown shape "${shapeName ?? ''}" in requestSubset()`);
+    }
+    const subRes = await fetchAndApplyShapeSubset({
+      db,
+      shapeUrl: targetState.spec.shape.url,
+      shapeParams: targetState.spec.shape.params as Record<string, unknown> | undefined,
+      fetchClient: targetState.spec.shape.fetchClient,
+      table: targetState.spec.table,
+      columns: targetState.spec.columns,
+      primaryKey: targetState.spec.primaryKey,
+      knownSchema: targetState.schema,
+      autoCreateTable: options.autoCreateTable,
+      subset,
+      eventName,
+    });
+    if (!targetState.schema) targetState.schema = subRes.schema;
+    return { appliedRows: subRes.appliedRows };
+  };
+
+  const initialSubsetReady: Promise<void> =
+    syncMode === 'progressive' && options.initialSubset
+      ? requestSubset(options.initialSubset).then(() => undefined)
+      : Promise.resolve();
+  initialSubsetReady.catch((err) => {
+    report(err instanceof Error ? err : new Error(String(err)));
+  });
+
   return {
     upToDate: ready,
+    initialSubsetReady,
     get isUpToDate() {
       return upToDate;
     },
     get error() {
       return failure;
     },
+    requestSubset,
     unsubscribe: async () => {
       for (const u of unregister) u();
       await stop();
