@@ -944,6 +944,13 @@ function getSetupCodeSnippet() {
     `  createJsonGinIndex,`,
     `  createTrigramIndex,`,
     `  createFirebirdPrismaAdapter,`,
+    `  createFirebirdCollection,`,
+    `  createLiveDifferentialView,`,
+    `  createIncrementalView,`,
+    `  createPgWireSession,`,
+    `  createElectricProxy,`,
+    `  createShapeWebhookSink,`,
+    `  createGraphStore,`,
     `  createTenantReplicationSlice,`,
     `  createOptimisticMutationStore,`,
     `  createUndoRedoManager,`,
@@ -2614,6 +2621,39 @@ for (const btn of document.querySelectorAll('.scenario-card')) {
       activeCodeTab = 'setup';
       logEvent(
         `Scenario 25 (<code>createWasmShapeServer</code> + <code>syncMode: 'on-demand'</code> + <code>autoCreateTable</code> + <code>createJsonGinIndex</code> + <code>createTrigramIndex</code> + <code>createFirebirdPrismaAdapter</code>): Served CDN-cacheable <code>immutable</code> chunks with <code>304 Not Modified</code> <code>ETag</code> &amp; <code>live_sse=true</code> (${res.primaryToReplica.appliedCount} synced), hydrated <code>subset__where</code> slices + relational subquery <code>move_in</code>/<code>move_out</code>, queried <code>FB_JSON_GIN$</code> <code>@&gt;</code> containment + <code>FB_TRGM_INDEX$</code> fuzzy similarity, and ran Prisma <code>$1</code> queries!`,
+        true,
+      );
+      await renderAll();
+    } else if (kind === 'tanstack-ivm-pgwire-proxy-age-graph') {
+      if (tenantFilterSelect.value !== 'acme' || colFilterSelect.value !== 'all') {
+        tenantFilterSelect.value = 'acme';
+        colFilterSelect.value = 'all';
+        await initSimulator();
+      }
+      const m32Ids = [nextTaskId++, nextTaskId++];
+      for (const id of m32Ids) {
+        await primaryDb.execute(
+          'INSERT INTO TASKS (ID, TENANT_ID, TITLE, PRIORITY, STOCK, TAGS, DONE, SECRET_HASH) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+          [
+            id,
+            'acme',
+            `TanStack IVM PgWire Proxy AGE Task #${id}`,
+            'CRITICAL',
+            170 + id,
+            'tanstack-db,zset-ivm,pgwire-v3,electric-proxy,age-graph',
+            0,
+            `zset:pgwire:rls:age_${id}`,
+          ],
+        );
+      }
+
+      simChangelogSeq++;
+      simEnginePubState.sequenceValue = m32Ids[m32Ids.length - 1];
+      const res = await replicator.sync();
+
+      activeCodeTab = 'setup';
+      logEvent(
+        `Scenario 26 (<code>createFirebirdCollection</code> + <code>createLiveDifferentialView</code> + <code>createIncrementalView</code> + <code>createPgWireSession</code> + <code>createElectricProxy</code> + <code>createShapeWebhookSink</code> + <code>createGraphStore</code>): Reconciled optimistic TanStack DB <code>txid</code> mutations (${res.primaryToReplica.appliedCount} synced), propagated <code>O(&Delta;)</code> <code>Z-Set</code> deltas in <code>FB_IVM_VIEWS$</code>, served PostgreSQL v3 <code>pgwire</code> Extended Query frames, enforced JWT tenant RLS + signed <code>FB_WEBHOOK_OUTBOX$</code> fan-out, and matched multi-hop Cypher paths in <code>FB_AGE_GRAPHS$</code>!`,
         true,
       );
       await renderAll();

@@ -931,34 +931,4 @@ export * from '../fts';
 export * from '../schema-sync';
 export * from '../replication/presence';
 export * from '../audit-log';
-export * from '../rag-cache';
-export * from '../data-seeder';
-export * from '../mcp-server';
-export * from '../rag-ingester';
-export * from '../otel-metrics';
-export * from '../encrypted-backup';
-export * from '../job-queue';
-export * from '../knowledge-graph';
-export * from '../online-migrator';
-export * from '../workload-advisor';
-export * from '../timeseries';
-export * from '../spatial';
-export * from '../cdc-sink';
-export * from '../edge-gateway';
-export * from '../temporal-table';
-export * from '../event-store';
-export * from '../auto-api-gateway';
-export * from '../federation';
-export * from '../jsonb-gin';
-export * from '../trigram';
-export * from '../prisma';
-export {
-  WASM_SHAPE_CHANGES_TABLE,
-  WASM_SHAPE_META_TABLE,
-  computeElectricCursor,
-  computeShapeEtag,
-  createWasmShapeServer,
-  type WasmShapeDatabase,
-  type WasmShapeServer,
-  type WasmShapeServerOptions,
-} from '../electric-server/wasm-shape-server';
+export * from '../features-barrel';

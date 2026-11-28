@@ -56,7 +56,9 @@ export {
 };
 import type {
   EventProjectionStatus,
+  IncrementalViewInfo,
   JsonGinIndexInfo,
+  PropertyGraphSummary,
   ReplArrowInspectorInfo,
   ReplDatabase,
   ReplInspectorTab,
@@ -81,6 +83,8 @@ export interface ReplInspectorRenderContext {
   readonly lastEventProjections?: readonly EventProjectionStatus[];
   readonly lastJsonGinIndexes?: readonly JsonGinIndexInfo[];
   readonly lastTrigramIndexes?: readonly TrigramIndexInfo[];
+  readonly lastIncrementalViews?: readonly IncrementalViewInfo[];
+  readonly lastGraphs?: readonly PropertyGraphSummary[];
   readonly lastSchemaDiff?: SchemaSyncResult | null;
   readonly schemaDiffDraft?: string;
   readonly lastMigrations: AppliedMigration[];
@@ -717,6 +721,8 @@ export function renderReplInspector(ctx: ReplInspectorRenderContext): void {
         eventProjections: ctx.lastEventProjections,
         jsonGinIndexes: ctx.lastJsonGinIndexes,
         trigramIndexes: ctx.lastTrigramIndexes,
+        incrementalViews: ctx.lastIncrementalViews,
+        graphs: ctx.lastGraphs,
       });
 
       if (ctx.onPreviewSchemaDiff || ctx.lastSchemaDiff) {

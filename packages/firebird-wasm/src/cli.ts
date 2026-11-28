@@ -68,6 +68,7 @@ import {
   runCliWorker,
 } from './cli-m28-commands';
 import { runCliProjections, runCliServeApi } from './cli-m30-commands';
+import { runCliServePgWire } from './cli-m32-commands';
 export {
   startCliReplicationServer,
   type CliReplicationServerHandle,
@@ -139,6 +140,7 @@ Commands:
   cdc-sink <uri> --webhook <url> Stream FB_REPL_JOURNAL$ as CloudEvents v1.0 / Arrow IPC ([--secret <k>] [--sink-id <id>] [--json])
   projections [uri]              Inspect persisted CQRS FB_EVENT_PROJECTIONS$ watermarks & lag [--json]
   serve-api [uri]                Start zero-code GraphQL (/graphql), REST (/rest/*) & OpenAPI (/openapi.json) gateway [--port <n>] [--openapi] [--sdl]
+  serve-pgwire [uri]             Start PostgreSQL v3 wire protocol server [--port 5432] [--host 127.0.0.1] [--user <u>] [--password <p>]
   bench [uri]                    Benchmark IBatch, row query, columnar, Arrow IPC stream & preparePipeline [--rows <n>]
 
 Global Options:
@@ -953,6 +955,8 @@ export async function runCli(
         return runCliProjections(tableCtx);
       case 'serve-api':
         return runCliServeApi(tableCtx);
+      case 'serve-pgwire':
+        return runCliServePgWire(tableCtx);
 
       default: {
         err(`Unknown command "${cmd}". Run "firebird-wasm --help" for usage.\n`);

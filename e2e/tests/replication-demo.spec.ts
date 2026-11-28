@@ -462,4 +462,31 @@ test.describe('Replication Simulator v2 (replication.html)', () => {
     await expect(page.locator('#event-feed')).toContainText('FB_JSON_GIN$');
     await expect(page.locator('#event-feed')).toContainText('FB_TRGM_INDEX$');
   });
+
+  test('Scenario 26: TanStack DB Collections + Algebraic Z-Set IVM, pgwire v3 Server, Electric Auth Proxy & AGE Property Graph', async ({
+    page,
+  }) => {
+    await openReplicationSim(page);
+
+    await page
+      .locator('.scenario-card[data-scenario="tanstack-ivm-pgwire-proxy-age-graph"]')
+      .click();
+
+    await expect(page.locator('#primary-rows')).toContainText(
+      'TanStack IVM PgWire Proxy AGE Task #4',
+    );
+    await expect(page.locator('#replica-rows')).toContainText(
+      'TanStack IVM PgWire Proxy AGE Task #5',
+    );
+    await expect(page.locator('#code-inspector')).toContainText('createFirebirdCollection');
+    await expect(page.locator('#code-inspector')).toContainText('createIncrementalView');
+    await expect(page.locator('#code-inspector')).toContainText('createPgWireSession');
+    await expect(page.locator('#code-inspector')).toContainText('createElectricProxy');
+    await expect(page.locator('#code-inspector')).toContainText('createGraphStore');
+    await expect(page.locator('#event-feed')).toContainText('Scenario 26');
+    await expect(page.locator('#event-feed')).toContainText('FB_IVM_VIEWS$');
+    await expect(page.locator('#event-feed')).toContainText('pgwire');
+    await expect(page.locator('#event-feed')).toContainText('FB_WEBHOOK_OUTBOX$');
+    await expect(page.locator('#event-feed')).toContainText('FB_AGE_GRAPHS$');
+  });
 });

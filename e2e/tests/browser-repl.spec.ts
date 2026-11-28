@@ -791,6 +791,69 @@ test.describe('<firebird-repl>', () => {
     expect(outcome.inspectorText).toContain('Fuzzy Trigram Indexes (FB_TRGM_INDEX$)');
   });
 
+  test('M32: inspects Z-Set Incremental Views (FB_IVM_VIEWS$) & AGE Property Graphs (FB_AGE_GRAPHS$) in <firebird-repl>', async ({
+    page,
+  }) => {
+    await page.goto('/no-isolation/browser-harness-frameworks-st');
+    await page.waitForFunction(() => Boolean((window as any).FB && (window as any).Frameworks));
+
+    const outcome = await page.evaluate(async () => {
+      const w = window as any;
+      w.Frameworks.FBRepl.defineFirebirdRepl();
+      const repl = document.createElement('firebird-repl') as any;
+      const db = new w.FB.FirebirdBrowser('memory://repl-m32');
+      repl.db = db;
+      document.getElementById('app')!.replaceChildren(repl);
+
+      await repl.run(
+        'CREATE TABLE ORDERS (ID INTEGER NOT NULL PRIMARY KEY, REGION VARCHAR(32) NOT NULL, TOTAL INTEGER NOT NULL)',
+      );
+      await repl.run(`INSERT INTO ORDERS VALUES (1, 'EU', 150)`);
+
+      const emptyIvm = await repl.incrementalViews();
+      const emptyGraphs = await repl.graphs();
+
+      const ivm = await w.FB.createIncrementalView(db, {
+        name: 'orders_by_region',
+        sourceTable: 'ORDERS',
+        sourceKey: 'ID',
+        groupBy: {
+          columns: ['REGION'],
+          aggregates: [{ alias: 'TOTAL_SUM', op: 'SUM', column: 'TOTAL' }],
+        },
+      });
+      await ivm.dispose();
+
+      const graph = await w.FB.createGraphStore(db, { graphName: 'social' });
+      await graph.upsertNode({ id: 'u1', labels: ['User'], properties: { name: 'Ada' } });
+      await graph.upsertNode({ id: 'u2', labels: ['User'], properties: { name: 'Grace' } });
+      await graph.upsertEdge({ srcId: 'u1', dstId: 'u2', label: 'FOLLOWS' });
+
+      await repl.schema();
+      const activeIvm = await repl.incrementalViews();
+      const activeGraphs = await repl.graphs();
+      const inspectorText = repl.shadowRoot?.querySelector('.inspector')?.textContent ?? '';
+
+      await db.close();
+      return {
+        emptyIvmLen: emptyIvm.length,
+        emptyGraphsLen: emptyGraphs.length,
+        activeIvmRows: activeIvm[0]?.rowCount ?? 0,
+        activeGraphNodes: activeGraphs[0]?.nodeCount ?? 0,
+        activeGraphEdges: activeGraphs[0]?.edgeCount ?? 0,
+        inspectorText,
+      };
+    });
+
+    expect(outcome.emptyIvmLen).toBe(0);
+    expect(outcome.emptyGraphsLen).toBe(0);
+    expect(outcome.activeIvmRows).toBe(1);
+    expect(outcome.activeGraphNodes).toBe(2);
+    expect(outcome.activeGraphEdges).toBe(1);
+    expect(outcome.inspectorText).toContain('Incremental Views — Z-Set IVM (FB_IVM_VIEWS$)');
+    expect(outcome.inspectorText).toContain('Property Graphs — AGE (FB_AGE_GRAPHS$)');
+  });
+
   test('takes a db property set before it was defined, and reports runs', async ({ page }) => {
     await page.goto('/no-isolation/browser-harness-frameworks-st');
     await page.waitForFunction(() => Boolean((window as any).FB && (window as any).Frameworks));

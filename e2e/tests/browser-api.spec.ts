@@ -4062,4 +4062,47 @@ test.describe('FirebirdBrowser', () => {
     expect(result.hasTrigram).toBe(true);
     expect(result.hasPrisma).toBe(true);
   });
+
+  test('M32: TanStack DB collections, Z-Set IVM, pgwire v3 session, Electric Auth Proxy & AGE GraphStore in browser bundle', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      const w = window as any;
+      const z = new w.FB.ZSet();
+      z.add('k1', { id: 1 }, 1);
+      z.add('k1', { id: 1 }, -1);
+      const merged = w.FB.mergeServerAndClientWhere(
+        'tenant_id = $1',
+        { '1': 'acme' },
+        'status = $1 AND amount > $2',
+        { '1': 'paid', '2': '100' },
+      );
+
+      return {
+        zCancelled: z.size === 0,
+        mergedWhere: merged.where,
+        mergedParam2: merged.params['2'],
+        mergedParam3: merged.params['3'],
+        hasCollection: typeof w.FB.createFirebirdCollection === 'function',
+        hasDiffView: typeof w.FB.createLiveDifferentialView === 'function',
+        hasIvm: typeof w.FB.createIncrementalView === 'function',
+        hasPgWireSession: typeof w.FB.createPgWireSession === 'function',
+        hasElectricProxy: typeof w.FB.createElectricProxy === 'function',
+        hasWebhookSink: typeof w.FB.createShapeWebhookSink === 'function',
+        hasGraphStore: typeof w.FB.createGraphStore === 'function',
+      };
+    });
+
+    expect(result.zCancelled).toBe(true);
+    expect(result.mergedWhere).toBe('(tenant_id = $1) AND (status = $2 AND amount > $3)');
+    expect(result.mergedParam2).toBe('paid');
+    expect(result.mergedParam3).toBe('100');
+    expect(result.hasCollection).toBe(true);
+    expect(result.hasDiffView).toBe(true);
+    expect(result.hasIvm).toBe(true);
+    expect(result.hasPgWireSession).toBe(true);
+    expect(result.hasElectricProxy).toBe(true);
+    expect(result.hasWebhookSink).toBe(true);
+    expect(result.hasGraphStore).toBe(true);
+  });
 });

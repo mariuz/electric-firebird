@@ -2117,6 +2117,32 @@ Next-horizon improvements across **Replication**, **Speed & Performance**, **Int
 
 ---
 
+### M32 — TanStack DB Sync Collections, Algebraic Incremental View Maintenance (`IVM`), Postgres v3 Wire Protocol (`pgwire`) Server, Electric Auth Proxy + Signed Webhooks & `AGE`-Style Property Graph Engine
+
+- [x] **1. TanStack DB Collection Adapter (`firebird-wasm/tanstack-db`) & Live Differential Queries (`createLiveDifferentialView`).**
+      Ship a `@tanstack/db`-compatible collection adapter (`createFirebirdCollection`, `electricFirebirdCollectionOptions`) supporting
+      optimistic `insert` / `update` / `delete` mutations with server `txid` reconciliation (`waitForTxId`) and local Firebird persistence,
+      plus cross-collection reactive live joins (`createLiveDifferentialView`) emitting fine-grained `(added, modified, removed)` row deltas.
+- [x] **2. Algebraic Incremental View Maintenance (`createIncrementalView` — Differential `Z-Set` Engine).**
+      Add persistent `O(Δ)` Incremental View Maintenance (`FB_IVM_VIEWS$`) over weighted `Z-Set` (`+1` / `-1` multiplicity) delta streams
+      supporting `FILTER`, `PROJECT`, `INNER`/`LEFT JOIN`, `GROUP BY` (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`), and `DISTINCT` — updating
+      materialized view tables incrementally on base-table mutations without re-scanning base tables.
+- [x] **3. Postgres v3 Wire Protocol (`pgwire`) TCP/WebSocket Server (`createPgWireServer` & CLI `serve-pgwire`).**
+      Implement the PostgreSQL v3 binary Frontend/Backend wire protocol (`StartupMessage`, SSL-neg decline, cleartext / trust auth,
+      `SimpleQuery`, Extended Query `Parse`/`Bind`/`Describe`/`Execute`/`Sync`, `$1..$n` -> `?` rewriting, and `pg_catalog` /
+      `information_schema` compatibility queries) over `node:net` TCP and duplex streams, plus `firebird-wasm serve-pgwire`.
+- [x] **4. Electric Auth Proxy, Shape-Scoped Row-Level Security & Signed Webhook Sink (`createElectricProxy` + `createShapeWebhookSink`).**
+      Add WinterCG/HTTP middleware (`createElectricProxy`) wrapping `createShapeServer` / `createWasmShapeServer` with Bearer JWT & API-key
+      verification, server-injected tenant `WHERE` predicates and column allow-lists, per-tenant token-bucket rate limiting, and
+      HMAC-SHA256-signed webhook fan-out (`createShapeWebhookSink`) with retry backoff & durable `FB_WEBHOOK_OUTBOX$` dead-letter storage.
+- [x] **5. `Apache AGE`-Style Labeled Property Graph (`createGraphStore`), `<firebird-repl>` IVM/Graph Inspector & Simulator Scenario 26.**
+      Add multi-graph Cypher-style pattern matching (`match("(a:User {tier: 'pro'})-[:FOLLOWS*1..3]->(b:User)")`), weighted Dijkstra / BFS
+      `shortestPath`, PageRank & connected-components analytics (`FB_AGE_GRAPHS$`, `FB_AGE_NODES$`, `FB_AGE_EDGES$`), surface `<firebird-repl>`
+      `repl.incrementalViews()` & `repl.graphs()` inspectors, add Simulator **Scenario 26** (`tanstack-ivm-pgwire-proxy-age-graph`), and keep
+      every non-test `.ts` file in `packages/firebird-wasm/src` strictly `< 1,000` lines.
+
+---
+
 ## 5. Test coverage added alongside this review
 
 `src/browser/` was excluded from Jest and had no browser tests.  It now has 73

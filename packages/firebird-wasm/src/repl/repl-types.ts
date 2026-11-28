@@ -31,6 +31,8 @@ import type { TemporalTableInfo } from '../temporal-table';
 import type { EventProjectionStatus } from '../event-store';
 import type { JsonGinIndexInfo } from '../jsonb-gin';
 import type { TrigramIndexInfo } from '../trigram';
+import type { IncrementalViewInfo } from '../ivm';
+import type { PropertyGraphSummary } from '../age-graph';
 
 export type {
   WorkloadAdvisorReport,
@@ -40,6 +42,8 @@ export type {
   EventProjectionStatus,
   JsonGinIndexInfo,
   TrigramIndexInfo,
+  IncrementalViewInfo,
+  PropertyGraphSummary,
 };
 
 /** Persisted 2D Spatial R-Tree index summary (`FB_SPATIAL_INDEX$`) displayed in `<firebird-repl>` (`M29 Item 5`). */

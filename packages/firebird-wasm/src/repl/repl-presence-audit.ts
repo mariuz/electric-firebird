@@ -44,6 +44,14 @@ import {
   fetchPersistedTrigramIndexes,
   type TrigramIndexInfo,
 } from '../trigram';
+import {
+  fetchPersistedIncrementalViews,
+  type IncrementalViewInfo,
+} from '../ivm';
+import {
+  fetchPersistedGraphs,
+  type PropertyGraphSummary,
+} from '../age-graph';
 import type { OptimisticMutationStore } from '../optimistic-store';
 import type { UndoRedoEntry, UndoRedoManager } from '../undo-redo';
 import type { ReplicationStats } from '../replication';
@@ -387,6 +395,8 @@ export function appendSpatialAndTimeSeriesSections(
     eventProjections?: readonly EventProjectionStatus[];
     jsonGinIndexes?: readonly JsonGinIndexInfo[];
     trigramIndexes?: readonly TrigramIndexInfo[];
+    incrementalViews?: readonly IncrementalViewInfo[];
+    graphs?: readonly PropertyGraphSummary[];
   },
 ): void {
   if (opts.spatialIndexes && opts.spatialIndexes.length > 0) {
@@ -503,6 +513,44 @@ export function appendSpatialAndTimeSeriesSections(
     trgmBox.append(trgmList);
     panel.append(trgmBox);
   }
+
+  if (opts.incrementalViews && opts.incrementalViews.length > 0) {
+    const ivmBox = el('div', 'schema-sub ivm-views-panel');
+    const title = el('div', 'schema-group-title');
+    title.textContent = 'Incremental Views — Z-Set IVM (FB_IVM_VIEWS$)';
+    ivmBox.append(title);
+    const ivmList = el('ul', 'schema-list ivm-view-list');
+    for (const v of opts.incrementalViews) {
+      const li = el('li', 'schema-meta-item ivm-view-item');
+      const nameSpan = el('span', 'col-name');
+      nameSpan.textContent = `${v.name} (${v.sourceTable}${v.joinTable ? ` ⋈ ${v.joinTable}` : ''} → ${v.viewTable})`;
+      const badge = el('span', 'schema-badge');
+      badge.textContent = `${v.operators} · rows:${v.rowCount} · deltas:${v.deltaAppliedCount}`;
+      li.append(nameSpan, badge);
+      ivmList.append(li);
+    }
+    ivmBox.append(ivmList);
+    panel.append(ivmBox);
+  }
+
+  if (opts.graphs && opts.graphs.length > 0) {
+    const gBox = el('div', 'schema-sub age-graphs-panel');
+    const title = el('div', 'schema-group-title');
+    title.textContent = 'Property Graphs — AGE (FB_AGE_GRAPHS$)';
+    gBox.append(title);
+    const gList = el('ul', 'schema-list age-graph-list');
+    for (const g of opts.graphs) {
+      const li = el('li', 'schema-meta-item age-graph-item');
+      const nameSpan = el('span', 'col-name');
+      nameSpan.textContent = g.graphName;
+      const badge = el('span', 'schema-badge');
+      badge.textContent = `nodes:${g.nodeCount} · edges:${g.edgeCount}`;
+      li.append(nameSpan, badge);
+      gList.append(li);
+    }
+    gBox.append(gList);
+    panel.append(gBox);
+  }
 }
 
 export async function fetchReplJsonGinIndexes(db: ReplDatabase): Promise<JsonGinIndexInfo[]> {
@@ -516,6 +564,24 @@ export async function fetchReplJsonGinIndexes(db: ReplDatabase): Promise<JsonGin
 export async function fetchReplTrigramIndexes(db: ReplDatabase): Promise<TrigramIndexInfo[]> {
   try {
     return await fetchPersistedTrigramIndexes(createReplObjectQueryAdapter(db));
+  } catch {
+    return [];
+  }
+}
+
+export async function fetchReplIncrementalViews(
+  db: ReplDatabase,
+): Promise<IncrementalViewInfo[]> {
+  try {
+    return await fetchPersistedIncrementalViews(createReplObjectQueryAdapter(db));
+  } catch {
+    return [];
+  }
+}
+
+export async function fetchReplGraphs(db: ReplDatabase): Promise<PropertyGraphSummary[]> {
+  try {
+    return await fetchPersistedGraphs(createReplObjectQueryAdapter(db));
   } catch {
     return [];
   }

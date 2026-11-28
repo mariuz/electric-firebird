@@ -31,8 +31,10 @@ import type { PresenceRoom } from '../replication/presence';
 import type { ReplSearchIndexSummary } from './repl-actions';
 import type {
   EventProjectionStatus,
+  IncrementalViewInfo,
   JobQueueStats,
   JsonGinIndexInfo,
+  PropertyGraphSummary,
   ReplArrowInspectorInfo,
   ReplDatabase,
   ReplEditableTableConfig,
@@ -109,6 +111,10 @@ export interface FirebirdReplElement extends HTMLElement {
   jsonGinIndexes(): Promise<JsonGinIndexInfo[]>;
   /** List persisted fuzzy trigram indexes recorded in `FB_TRGM_INDEX$` (`M31 Item 5`). */
   trigramIndexes(): Promise<TrigramIndexInfo[]>;
+  /** List persisted algebraic `Z-Set` Incremental Views recorded in `FB_IVM_VIEWS$` (`M32 Item 5`). */
+  incrementalViews(): Promise<IncrementalViewInfo[]>;
+  /** List persisted `AGE`-style labeled property graphs recorded in `FB_AGE_GRAPHS$` (`M32 Item 5`). */
+  graphs(): Promise<PropertyGraphSummary[]>;
   previewSchemaDiff(desiredSource: DeclarativeSchemaInput): Promise<SchemaSyncResult | null>;
   applySchemaPush(
     desiredSource: DeclarativeSchemaInput,
@@ -163,6 +169,8 @@ import {
   executeReplWorkloadAdvisor,
   exportReplPrometheusMetrics,
   fetchReplEventProjections,
+  fetchReplGraphs,
+  fetchReplIncrementalViews,
   fetchReplJobQueueStats,
   fetchReplJsonGinIndexes,
   fetchReplSpatialIndexes,
@@ -212,6 +220,8 @@ export function defineFirebirdRepl(
     private lastEventProjections: EventProjectionStatus[] = [];
     private lastJsonGinIndexes: JsonGinIndexInfo[] = [];
     private lastTrigramIndexes: TrigramIndexInfo[] = [];
+    private lastIncrementalViews: IncrementalViewInfo[] = [];
+    private lastGraphs: PropertyGraphSummary[] = [];
     private lastSchemaDiff: SchemaSyncResult | null = null;
     private schemaDiffDraft = '';
     private lastMigrations: AppliedMigration[] = [];
@@ -403,7 +413,7 @@ export function defineFirebirdRepl(
     }
 
     private async loadSchemaTabData(options?: IntrospectOptions): Promise<SchemaIntrospection> {
-      const [schema, mvs, searchIdxs, spatialIdxs, tsPolicies, tmpTables, evProjs, ginIdxs, trgmIdxs] =
+      const [schema, mvs, searchIdxs, spatialIdxs, tsPolicies, tmpTables, evProjs, ginIdxs, trgmIdxs, ivmViews, ageGraphs] =
         await Promise.all([
           fetchReplSchema(this.db!, options),
           fetchReplMaterializedViews(this.db!),
@@ -414,6 +424,8 @@ export function defineFirebirdRepl(
           fetchReplEventProjections(this.db!),
           fetchReplJsonGinIndexes(this.db!),
           fetchReplTrigramIndexes(this.db!),
+          fetchReplIncrementalViews(this.db!),
+          fetchReplGraphs(this.db!),
         ]);
       this.lastSchema = schema;
       this.lastMatViews = mvs;
@@ -424,6 +436,8 @@ export function defineFirebirdRepl(
       this.lastEventProjections = evProjs;
       this.lastJsonGinIndexes = ginIdxs;
       this.lastTrigramIndexes = trgmIdxs;
+      this.lastIncrementalViews = ivmViews;
+      this.lastGraphs = ageGraphs;
       return schema;
     }
 
@@ -478,6 +492,8 @@ export function defineFirebirdRepl(
         lastEventProjections: this.lastEventProjections,
         lastJsonGinIndexes: this.lastJsonGinIndexes,
         lastTrigramIndexes: this.lastTrigramIndexes,
+        lastIncrementalViews: this.lastIncrementalViews,
+        lastGraphs: this.lastGraphs,
         lastSchemaDiff: this.lastSchemaDiff,
         schemaDiffDraft: this.schemaDiffDraft,
         lastMigrations: this.lastMigrations,
@@ -807,6 +823,20 @@ export function defineFirebirdRepl(
       this.lastTrigramIndexes = await fetchReplTrigramIndexes(this.db);
       if (this.isInspectorOpen && this.activeTab === 'schema') this.renderInspector();
       return this.lastTrigramIndexes;
+    }
+
+    async incrementalViews(): Promise<IncrementalViewInfo[]> {
+      if (!this.db) return [];
+      this.lastIncrementalViews = await fetchReplIncrementalViews(this.db);
+      if (this.isInspectorOpen && this.activeTab === 'schema') this.renderInspector();
+      return this.lastIncrementalViews;
+    }
+
+    async graphs(): Promise<PropertyGraphSummary[]> {
+      if (!this.db) return [];
+      this.lastGraphs = await fetchReplGraphs(this.db);
+      if (this.isInspectorOpen && this.activeTab === 'schema') this.renderInspector();
+      return this.lastGraphs;
     }
 
     async previewSchemaDiff(desiredSource: DeclarativeSchemaInput): Promise<SchemaSyncResult | null> {

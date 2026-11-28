@@ -46,6 +46,14 @@
       "types": "./dist/tanstack/index.d.ts",
       "default": "./dist/tanstack/index.js"
     },
+    "./tanstack-db": {
+      "types": "./dist/tanstack-db/index.d.ts",
+      "default": "./dist/tanstack-db/index.js"
+    },
+    "./pgwire": {
+      "types": "./dist/pgwire/index.d.ts",
+      "default": "./dist/pgwire/index.js"
+    },
     "./rxdb": {
       "types": "./dist/rxdb/index.d.ts",
       "default": "./dist/rxdb/index.js"
