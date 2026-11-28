@@ -12,9 +12,11 @@ import {
   quoteIdent,
   splitTopLevelCommaList,
   sqlTypeToFieldInfo,
+  type ComputedColumnRecord,
   type ParsedSelectStatement,
   type RegisteredFunctionRecord,
   type RegisteredProcedureRecord,
+  type UdrSqlExecutor,
 } from './udr-parser';
 
 export function findTopLevelKeyword(
@@ -431,4 +433,97 @@ export async function filterSortAndProjectUdrRows<T = Row>(
   }
 
   return { rows: outRows, fields: projectedFields };
+}
+
+export async function executeUdrProcedureCall<T = Row>(
+  host: UdrSelectEvalHost,
+  sql: string,
+  params: QueryParams,
+  rowMode: RowMode,
+): Promise<QueryResult<T> | null> {
+  const match =
+    /^\s*EXECUTE\s+PROCEDURE\s+("?[A-Za-z_][A-Za-z0-9_$]*"?)\s*(?:\(([\s\S]*)\))?\s*;?\s*$/i.exec(
+      sql,
+    );
+  if (!match) return null;
+
+  const procName = normalizeRoutineIdentifier(match[1]!, 'procedure name');
+  const proc = host.procedures.get(procName);
+  if (!proc || proc.engine !== 'psql-bridge') return null;
+
+  const argsRaw = match[2] ?? '';
+  const argExprs = argsRaw.trim() ? splitTopLevelCommaList(argsRaw) : [];
+  const cursor = { index: 0 };
+  const argValues: unknown[] = [];
+  for (const expr of argExprs) {
+    const ev = await host.evalExpression(expr, params, cursor, undefined);
+    argValues.push(ev.supported ? ev.value : null);
+  }
+
+  const rawResult = await proc.fn(...argValues);
+  if (proc.returns.length === 0) return { rows: [], fields: [] };
+
+  const wireRows = await normalizeProcedureRowsAsync(rawResult, proc.returns);
+  const firstRow = wireRows[0] ?? proc.returns.map(() => null);
+  const fields = proc.returns.map((c) => ({ ...c.fieldInfo }));
+  const row =
+    rowMode === 'array'
+      ? (firstRow as unknown as T)
+      : (Object.fromEntries(proc.returns.map((c, idx) => [c.name, firstRow[idx]])) as unknown as T);
+  return { rows: [row], fields };
+}
+
+export async function selectTableWithUdrBridgeColumns<T = Row>(
+  host: UdrSelectEvalHost,
+  computedColumns: Map<string, Map<string, ComputedColumnRecord>>,
+  sql: string,
+  params: QueryParams,
+  rowMode: RowMode,
+  executor: UdrSqlExecutor,
+): Promise<QueryResult<T> | null> {
+  const parsed = parseSimpleSelectStatement(sql);
+  if (!parsed || parsed.fromIsCall) return null;
+
+  const tableName = normalizeRoutineIdentifier(parsed.fromName, 'table name');
+  if (tableName === 'RDB$DATABASE') return null;
+
+  const computedForTable = computedColumns.get(tableName);
+  const upper = sql.toUpperCase();
+  let mentionsBridgeFn = false;
+  for (const fn of host.functions.values()) {
+    if (fn.engine === 'psql-bridge' && upper.includes(fn.name)) {
+      mentionsBridgeFn = true;
+      break;
+    }
+  }
+  const hasComputedCols = Boolean(computedForTable && computedForTable.size > 0);
+  if (!mentionsBridgeFn && !hasComputedCols) return null;
+
+  const baseResult = await executor.query<Record<string, unknown>>(
+    `SELECT * FROM ${quoteIdent(tableName)}`,
+    [],
+    { rowMode: 'object' },
+  );
+
+  const enrichedRows: Record<string, unknown>[] = [];
+  for (const rawRow of baseResult.rows) {
+    const rowCopy: Record<string, unknown> = { ...rawRow };
+    if (computedForTable) {
+      for (const comp of computedForTable.values()) {
+        const ev = await host.evalExpression(comp.expression, [], { index: 0 }, rowCopy);
+        if (ev.supported) rowCopy[comp.columnName] = ev.value;
+      }
+    }
+    enrichedRows.push(rowCopy);
+  }
+
+  return filterSortAndProjectUdrRows<T>(
+    host,
+    enrichedRows,
+    baseResult.fields,
+    parsed,
+    params,
+    countPlaceholders(parsed.selectRaw),
+    rowMode,
+  );
 }

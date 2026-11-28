@@ -31,7 +31,6 @@ import {
   normalizeRowKeysUpper,
   normalizeTableName,
   quoteIdent,
-  rowsEqual,
   serializeKeyRecord,
 } from './shared';
 import {
@@ -48,7 +47,10 @@ import { enableEnginePublication } from './native-changelog';
 import { compactJournal } from './dlq-compaction';
 import { exportPageDiff } from '../browser/snapshots';
 import { compressGzipBytes } from './bootstrap';
-import { fetchPublicationChangesSince } from './publication-fetch';
+import {
+  capturePublicationTableChanges,
+  fetchPublicationChangesSince,
+} from './publication-fetch';
 
 interface NormalizedPublishedTableConfig extends Omit<PublishedTableConfig, 'primaryKey'> {
   table: string;
@@ -902,107 +904,23 @@ export async function createPublication(
       if (isWildcard) {
         await publication.refreshPublishedTables();
       }
-      const captured: ReplicationLogEntry[] = [];
       const txid = captureOpts.txid ?? nextTxId();
       const ts = captureOpts.timestamp ?? Date.now();
-      // With capture triggers installed, writes made since the last capture are
-      // already in the journal; the diff only refreshes the mirror for them.
       const alreadyJournalled = await triggerCapturedKeys(captureWatermark);
-      const isTriggerCaptured = (
-        tableUpper: string,
-        rec: Record<string, unknown>,
-        pkCols: readonly string[],
-      ): boolean => alreadyJournalled.has(looseKey(tableUpper, rec, pkCols));
-
-      for (const [tableUpper, cfg] of tablesMap.entries()) {
-        const pkCols = cfg.primaryKey;
-        let res: QueryResult<Row>;
-        try {
-          res = await db.query<Row>(`SELECT * FROM ${quoteIdent(tableUpper)}`);
-        } catch {
-          continue;
-        }
-
-        const prevMirror = tableMirrors.get(tableUpper) ?? new Map<string, Record<string, unknown>>();
-        const nextMirror = new Map<string, Record<string, unknown>>();
-
-        for (const rawRow of res.rows) {
-          const normRow = normalizeRowKeysUpper(rawRow);
-          if (!matchesRowFilter(normRow, cfg.where)) {
-            continue;
-          }
-          const projectedRow =
-            projectReplicatedRow(normRow, pkCols, cfg.columns, cfg.excludeColumns) ?? normRow;
-          const keyRec = extractKeyRecord(projectedRow, pkCols);
-          const k = serializeKeyRecord(keyRec, pkCols);
-          nextMirror.set(k, projectedRow);
-
-          const prevRow = prevMirror.get(k);
-          if (isTriggerCaptured(tableUpper, keyRec, pkCols)) {
-            continue;
-          }
-          if (!prevRow) {
-            const entry: ReplicationLogEntry = {
-              lsn: await allocateLsn(),
-              txid,
-              origin: nodeId,
-              publication: pubName,
-              table: tableUpper,
-              operation: 'INSERT',
-              key: keyRec,
-              after: projectedRow,
-              before: null,
-              ddlSql: null,
-              timestamp: ts,
-              hlc: hlc.now(ts),
-            };
-            await insertJournalEntry(entry);
-            captured.push(entry);
-          } else if (!rowsEqual(prevRow, projectedRow)) {
-            const entry: ReplicationLogEntry = {
-              lsn: await allocateLsn(),
-              txid,
-              origin: nodeId,
-              publication: pubName,
-              table: tableUpper,
-              operation: 'UPDATE',
-              key: keyRec,
-              after: projectedRow,
-              before: prevRow,
-              ddlSql: null,
-              timestamp: ts,
-              hlc: hlc.now(ts),
-            };
-            await insertJournalEntry(entry);
-            captured.push(entry);
-          }
-        }
-
-        for (const [k, prevRow] of prevMirror.entries()) {
-          if (!nextMirror.has(k) && !isTriggerCaptured(tableUpper, extractKeyRecord(prevRow, pkCols), pkCols)) {
-            const keyRec = extractKeyRecord(prevRow, pkCols);
-            const entry: ReplicationLogEntry = {
-              lsn: await allocateLsn(),
-              txid,
-              origin: nodeId,
-              publication: pubName,
-              table: tableUpper,
-              operation: 'DELETE',
-              key: keyRec,
-              after: null,
-              before: prevRow,
-              ddlSql: null,
-              timestamp: ts,
-              hlc: hlc.now(ts),
-            };
-            await insertJournalEntry(entry);
-            captured.push(entry);
-          }
-        }
-
-        tableMirrors.set(tableUpper, nextMirror);
-      }
-
+      const captured = await capturePublicationTableChanges({
+        db,
+        pubName,
+        nodeId,
+        txid,
+        ts,
+        hlc,
+        tablesMap,
+        tableMirrors,
+        isTriggerCaptured: (tableUpper, rec, pkCols) =>
+          alreadyJournalled.has(looseKey(tableUpper, rec, pkCols)),
+        allocateLsn,
+        insertJournalEntry,
+      });
       if (triggerCapture) {
         captureWatermark = await publication.currentLsn();
       }

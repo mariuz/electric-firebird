@@ -29,11 +29,9 @@ import {
   isTopLevelSelectItemStart,
   normalizeArgDefinitions,
   normalizeOutputDefinitions,
-  normalizeProcedureRowsAsync,
   normalizeRoutineIdentifier,
   normalizeSqlTypeDeclaration,
   parseFunctionCallExpr,
-  parseSimpleSelectStatement,
   quoteIdent,
   splitBinaryOperatorTopLevel,
   splitKeywordOperatorTopLevel,
@@ -47,8 +45,9 @@ import {
   type UdrSqlExecutor,
 } from './udr-parser';
 import {
-  filterSortAndProjectUdrRows,
+  executeUdrProcedureCall,
   selectFromUdrProcedure,
+  selectTableWithUdrBridgeColumns,
   type UdrSelectEvalHost,
 } from './udr-select';
 
@@ -903,195 +902,43 @@ export class UdrManager {
     return null;
   }
 
-  /**
-   * Intercept `EXECUTE PROCEDURE` in `db.exec()` when targeting a `'psql-bridge'` procedure.
-   */
   async executeIfIntercepted(
     sql: string,
     params: QueryParams,
   ): Promise<{ intercepted: boolean; affectedRows: number }> {
-    if (!this.hasBridgeRoutines) {
-      return { intercepted: false, affectedRows: 0 };
-    }
-    const execProc = await this.tryExecuteProcedure(sql, params, 'object');
-    if (execProc) {
-      return { intercepted: true, affectedRows: 0 };
-    }
-    return { intercepted: false, affectedRows: 0 };
+    if (!this.hasBridgeRoutines) return { intercepted: false, affectedRows: 0 };
+    const execProc = await executeUdrProcedureCall(this.selectEvalHost, sql, params, 'object');
+    return { intercepted: Boolean(execProc), affectedRows: 0 };
   }
 
-  /**
-   * Intercept `SELECT` or `EXECUTE PROCEDURE` in `db.query()` when targeting
-   * a `'psql-bridge'` procedure, a scalar function with column arguments, or a
-   * `COMPUTED BY` column backed by a registered JS function.
-   */
   async queryIfIntercepted<T = Row>(
     sql: string,
     params: QueryParams,
     rowMode: RowMode,
     executor: UdrSqlExecutor,
   ): Promise<QueryResult<T> | null> {
-    if (!this.hasBridgeRoutines) {
-      return null;
-    }
-
-    // 1. `EXECUTE PROCEDURE <procName>(...)`
-    const execProc = await this.tryExecuteProcedure<T>(sql, params, rowMode);
-    if (execProc) {
-      return execProc;
-    }
-
-    // 2. `SELECT ... FROM <procName>(...) ...`
-    const selectProc = await this.trySelectFromProcedure<T>(sql, params, rowMode);
-    if (selectProc) {
-      return selectProc;
-    }
-
-    // 3. `SELECT ... FROM <tableName> ...` referencing a bridge function on columns
-    //    or a tracked `COMPUTED BY` column.
-    const selectTable = await this.trySelectWithBridgeColumns<T>(
-      sql,
-      params,
-      rowMode,
-      executor,
-    );
-    if (selectTable) {
-      return selectTable;
-    }
-
-    return null;
-  }
-
-  private async tryExecuteProcedure<T = Row>(
-    sql: string,
-    params: QueryParams,
-    rowMode: RowMode,
-  ): Promise<QueryResult<T> | null> {
-    const match =
-      /^\s*EXECUTE\s+PROCEDURE\s+("?[A-Za-z_][A-Za-z0-9_$]*"?)\s*(?:\(([\s\S]*)\))?\s*;?\s*$/i.exec(
+    if (!this.hasBridgeRoutines) return null;
+    return (
+      (await executeUdrProcedureCall<T>(this.selectEvalHost, sql, params, rowMode)) ??
+      (await selectFromUdrProcedure<T>(this.selectEvalHost, sql, params, rowMode)) ??
+      (await selectTableWithUdrBridgeColumns<T>(
+        this.selectEvalHost,
+        this.computedColumns,
         sql,
-      );
-    if (!match) return null;
-
-    const procName = normalizeRoutineIdentifier(match[1]!, 'procedure name');
-    const proc = this.procedures.get(procName);
-    if (!proc || proc.engine !== 'psql-bridge') {
-      return null;
-    }
-
-    const argsRaw = match[2] ?? '';
-    const argExprs = argsRaw.trim() ? splitTopLevelCommaList(argsRaw) : [];
-    const cursor = { index: 0 };
-    const argValues: unknown[] = [];
-    for (const expr of argExprs) {
-      const ev = await this.evalExpression(expr, params, cursor, undefined);
-      argValues.push(ev.supported ? ev.value : null);
-    }
-
-    const rawResult = await proc.fn(...argValues);
-    if (proc.returns.length === 0) {
-      return { rows: [], fields: [] };
-    }
-
-    const wireRows = await normalizeProcedureRowsAsync(rawResult, proc.returns);
-    const firstRow = wireRows[0] ?? proc.returns.map(() => null);
-    const fields = proc.returns.map((c) => ({ ...c.fieldInfo }));
-    const row =
-      rowMode === 'array'
-        ? (firstRow as unknown as T)
-        : (Object.fromEntries(
-            proc.returns.map((c, idx) => [c.name, firstRow[idx]]),
-          ) as unknown as T);
-    return { rows: [row], fields };
+        params,
+        rowMode,
+        executor,
+      ))
+    );
   }
 
   private get selectEvalHost(): UdrSelectEvalHost {
     return {
       functions: this.functions,
       procedures: this.procedures,
-      evalExpression: (expr, p, cursor, row) =>
-        this.evalExpression(expr, p, cursor, row),
-      evalCondition: (cond, p, cursor, row) =>
-        this.evalCondition(cond, p, cursor, row),
+      evalExpression: (expr, p, cursor, row) => this.evalExpression(expr, p, cursor, row),
+      evalCondition: (cond, p, cursor, row) => this.evalCondition(cond, p, cursor, row),
     };
-  }
-
-  private async trySelectFromProcedure<T = Row>(
-    sql: string,
-    params: QueryParams,
-    rowMode: RowMode,
-  ): Promise<QueryResult<T> | null> {
-    return selectFromUdrProcedure<T>(this.selectEvalHost, sql, params, rowMode);
-  }
-
-  private async trySelectWithBridgeColumns<T = Row>(
-    sql: string,
-    params: QueryParams,
-    rowMode: RowMode,
-    executor: UdrSqlExecutor,
-  ): Promise<QueryResult<T> | null> {
-    const parsed = parseSimpleSelectStatement(sql);
-    if (!parsed || parsed.fromIsCall) return null;
-
-    const tableName = normalizeRoutineIdentifier(parsed.fromName, 'table name');
-    if (tableName === 'RDB$DATABASE') return null;
-
-    const computedForTable = this.computedColumns.get(tableName);
-    const mentionsBridgeFn = this.sqlMentionsBridgeFunction(sql);
-    const hasComputedCols = Boolean(
-      computedForTable && computedForTable.size > 0,
-    );
-
-    if (!mentionsBridgeFn && !hasComputedCols) {
-      return null;
-    }
-
-    // Fetch base rows from the table
-    const baseResult = await executor.query<Record<string, unknown>>(
-      `SELECT * FROM ${quoteIdent(tableName)}`,
-      [],
-      { rowMode: 'object' },
-    );
-
-    const enrichedRows: Record<string, unknown>[] = [];
-    for (const rawRow of baseResult.rows) {
-      const rowCopy: Record<string, unknown> = { ...rawRow };
-      if (computedForTable) {
-        for (const comp of computedForTable.values()) {
-          const ev = await this.evalExpression(
-            comp.expression,
-            [],
-            { index: 0 },
-            rowCopy,
-          );
-          if (ev.supported) {
-            rowCopy[comp.columnName] = ev.value;
-          }
-        }
-      }
-      enrichedRows.push(rowCopy);
-    }
-
-    const paramsBeforeWhere = countPlaceholders(parsed.selectRaw);
-    return filterSortAndProjectUdrRows<T>(
-      this.selectEvalHost,
-      enrichedRows,
-      baseResult.fields,
-      parsed,
-      params,
-      paramsBeforeWhere,
-      rowMode,
-    );
-  }
-
-  private sqlMentionsBridgeFunction(sql: string): boolean {
-    const upper = sql.toUpperCase();
-    for (const fn of this.functions.values()) {
-      if (fn.engine === 'psql-bridge' && upper.includes(fn.name)) {
-        return true;
-      }
-    }
-    return false;
   }
 }
 

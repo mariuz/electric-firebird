@@ -43,13 +43,7 @@ const littleEndian = os.endianness() === 'LE';
 export const STMT_SELECT = 1;
 let nativeDriver: NativeDriver | undefined;
 
-/**
- * The native driver, loaded on first use rather than at import.
- *
- * It is an optional dependency: a browser-only install (`--omit=optional`) has
- * none, and a top-level import made the whole root entry fail to load there,
- * `sql` and `loadFirebirdWasm` included, with a bare MODULE_NOT_FOUND.
- */
+/** The native driver, loaded lazily on first use (`node-firebird-driver-native` is optional). */
 export function loadNativeDriver(): NativeDriver {
   if (!nativeDriver) {
     try {
@@ -812,7 +806,7 @@ export async function resolveOutputRows(
   }
 }
 
-export async function openNativeQueryBlobStream(
+export function openNativeQueryBlobStream(
   attachment: Attachment,
   transaction: Transaction,
   statements: StatementCache,
@@ -840,18 +834,12 @@ export async function bindParams(stmt: Statement, transaction: Transaction, give
     const handle = extractBlobHandle(p, idx);
     if (!handle) return p;
     const staged = handle[BLOB_INTERNAL_DATA]?.stagedBytes;
-    if (staged) {
-      return Buffer.from(staged.buffer, staged.byteOffset, staged.byteLength);
-    }
+    if (staged) return Buffer.from(staged.buffer, staged.byteOffset, staged.byteLength);
     const nativeBlob = handle[BLOB_INTERNAL_DATA]?.nativeBlob;
-    if (nativeBlob) {
-      return nativeBlob;
-    }
+    if (nativeBlob) return nativeBlob;
     const attachment = (stmt as unknown as NativeStatement).attachment;
     return attachment ? new FbBlob(attachment, handle.blobId) : p;
   });
-  // Bytes as the driver takes them: a Buffer (the browser engine takes a
-  // Uint8Array or an ArrayBuffer, so the same call works on both).
   const params = given.some((p) => p instanceof Uint8Array || p instanceof ArrayBuffer)
     ? given.map((p) => p instanceof ArrayBuffer
       ? Buffer.from(p)
@@ -888,18 +876,7 @@ export async function bindParams(stmt: Statement, transaction: Transaction, give
 
 export { writeNativeBlob as writeBlob };
 
-/**
- * Put in place the input message that takes the parameters at `positions`
- * as VARCHAR text and every other as the driver prepared it, making it the
- * first time. False when that cannot be done: the driver's internals are not
- * what this expects.
- *
- * The message is what the driver encodes into and what Firebird reads from;
- * Firebird converts each value from the message's type to the parameter's,
- * which is how the driver itself binds every integer as a double. A
- * statement is used by one call at a time (the cache leases it), so the
- * message in place is the one this call chose.
- */
+/** Install the input message accepting `positions` as UTF-8 `VARCHAR` text. */
 export async function useMessage(stmt: Statement, positions: number[]): Promise<boolean> {
   const binding = await bindingOf(stmt);
   const key = positions.join(',');

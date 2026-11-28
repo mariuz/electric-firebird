@@ -28,259 +28,38 @@
 import type { ElectricTransaction } from './apply';
 import { firebirdColumn, firebirdName } from './values';
 import { serialDatabase } from './serial';
-import { ensureWritesTable } from './writes-schema';
+import {
+  DEFAULT_WRITE_QUEUE_TABLE,
+  WriteConflict,
+  WriteRejected,
+  ensureWritesTable,
+  type ConflictResolution,
+  type ConflictStrategy,
+  type LocalWrite,
+  type ResolvedConflictOutcome,
+  type SendResult,
+  type WriteConflictContext,
+  type WriteQueue,
+  type WriteQueueOptions,
+  type WriteSync,
+  type WritesDatabase,
+} from './writes-schema';
 
-/** Standard durable write-queue table name (`FB_WRITE_QUEUE$`). */
-export const DEFAULT_WRITE_QUEUE_TABLE = 'FB_WRITE_QUEUE$';
-
-/** What a write queue needs of a database: `FirebirdBrowser` and `FirebirdLite` have it. */
-export interface WritesDatabase {
-  transaction<T>(fn: (tx: ElectricTransaction) => Promise<T>): Promise<T>;
-}
-
-/** One write, as `send` receives it. */
-export interface LocalWrite {
-  /** Its number in this database, in the order it was made. */
-  id: number;
-  /** The table, as given to the queue. */
-  table: string;
-  operation: 'insert' | 'update' | 'delete';
-  /** The primary key's values, by column name. */
-  key: Record<string, unknown>;
-  /** The values written (for a delete, none), by column name. */
-  value: Record<string, unknown>;
-  /**
-   * Pre-mutation snapshot of the local row before this write was applied
-   * (`null` when inserting a new row or when unavailable).
-   */
-  before?: Record<string, unknown> | null;
-  /**
-   * Set to `true` when `send` is re-invoked after `onConflict` resolved a
-   * conflict with `'client-wins'` or `'merge'`.
-   */
-  conflictResolved?: boolean;
-}
-
-/** What `send` may return: the source transaction that applied the write. */
-export interface SendResult {
-  /** The source's transaction id, as Electric reports it in `txids`. */
-  txid?: string | number | bigint;
-}
-
-/** Thrown by `send` when the source refuses a write: it is rolled back, not retried. */
-export class WriteRejected extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'WriteRejected';
-  }
-}
-
-/**
- * Thrown by `send` when the remote server reports a concurrency / version
- * conflict (e.g. HTTP 409) and optionally provides the current server row.
- * Handled according to {@link WriteQueueOptions.onConflict}.
- */
-export class WriteConflict extends Error {
-  readonly conflict = true;
-  readonly server: Record<string, unknown> | null;
-
-  constructor(
-    message: string,
-    serverOrOptions?:
-      | { server?: Record<string, unknown> | null }
-      | Record<string, unknown>
-      | null,
-  ) {
-    super(message);
-    this.name = 'WriteConflict';
-    if (serverOrOptions === undefined || serverOrOptions === null) {
-      this.server = null;
-    } else if (
-      typeof serverOrOptions === 'object' &&
-      'server' in serverOrOptions &&
-      Object.keys(serverOrOptions).every((k) => k === 'server')
-    ) {
-      this.server =
-        (serverOrOptions as { server?: Record<string, unknown> | null }).server ??
-        null;
-    } else {
-      this.server = serverOrOptions as Record<string, unknown>;
-    }
-  }
-}
-
-/** Context passed to a custom {@link WriteQueueOptions.onConflict} callback. */
-export interface WriteConflictContext {
-  /** The queued local mutation that conflicted. */
-  write: LocalWrite;
-  /**
-   * The local row's snapshot before `write` was applied (`BEFORE_JSON`),
-   * or `null` if the row did not exist locally before `write`.
-   */
-  before: Record<string, unknown> | null;
-  /**
-   * The current server row state (from `WriteConflict.server`, `getServerRow`,
-   * or an incoming Electric sync batch), or `null` if the row does not exist
-   * on the server.
-   */
-  server: Record<string, unknown> | null;
-  /**
-   * Where the conflict was detected:
-   * - `'send'`: while flushing `write` to the remote backend
-   * - `'sync'`: while reconciling an incoming Electric shape batch touching the same row
-   */
-  source: 'send' | 'sync';
-  /** The `WriteConflict` error thrown by `send`, when applicable. */
-  error?: Error;
-  /** 1-based conflict resolution attempt count for this write. */
-  attempt: number;
-}
-
-/** Normalized conflict resolution outcome. */
-export type ResolvedConflictOutcome =
-  | { action: 'client-wins' }
-  | { action: 'server-wins' }
-  | {
-      action: 'merge';
-      value: Record<string, unknown>;
-      operation: LocalWrite['operation'];
-    };
-
-/**
- * Outcome returned by a custom `onConflict` resolver callback:
- * - `'client-wins'` or `{ action: 'client-wins' }`: keep the client's write over `server`.
- * - `'server-wins'` or `{ action: 'server-wins' }`: discard the client's write and adopt `server`.
- * - `'merge'`: perform a 3-way field-level merge using `before`, `server`, and `write.value`.
- * - `{ action: 'merge', value, operation? }` or a plain `Record<string, unknown>`: replace the
- *   queued write's `value` (and optionally `operation`) with the merged values.
- */
-export type ConflictResolution =
-  | 'client-wins'
-  | 'server-wins'
-  | 'merge'
-  | { action: 'client-wins' }
-  | { action: 'server-wins' }
-  | {
-      action: 'merge';
-      value: Record<string, unknown>;
-      operation?: LocalWrite['operation'];
-    }
-  | Record<string, unknown>;
-
-/**
- * Pluggable conflict strategy or custom resolver callback for {@link createWriteQueue}.
- */
-export type ConflictStrategy =
-  | 'client-wins'
-  | 'server-wins'
-  | 'merge'
-  | ((
-      context: WriteConflictContext,
-    ) => ConflictResolution | Promise<ConflictResolution>);
-
-/** Options of {@link createWriteQueue}. */
-export interface WriteQueueOptions {
-  /** Hand one write to the source (the app's API); throw `WriteRejected` to refuse it or `WriteConflict` on conflict. */
-  send: (write: LocalWrite) => Promise<SendResult | void>;
-  /**
-   * Pluggable conflict handler invoked when flushing offline mutations after
-   * reconnect (`send` throws `WriteConflict` or `getServerRow` detects a
-   * concurrent server change) or when an incoming Electric sync batch modifies
-   * a row that has an unconfirmed pending local write.
-   *
-   * - `'client-wins'` (default): keep the client's mutation over the server state.
-   * - `'server-wins'`: discard the client's mutation and adopt the server's row state.
-   * - `'merge'`: 3-way field-level merge comparing `before`, `server`, and `write.value`.
-   * - Custom callback `(ctx) => ...`: inspect `{ write, before, server, source }` and
-   *   return `'client-wins'`, `'server-wins'`, `'merge'`, or a merged `value` object.
-   *
-   * @default 'client-wins'
-   */
-  onConflict?: ConflictStrategy;
-  /**
-   * Optional helper to fetch the current server row for a queued write during
-   * `flush()` (for pre-send conflict detection against `write.before` or when
-   * `WriteConflict` does not embed the server row).
-   */
-  getServerRow?: (write: LocalWrite) => Promise<Record<string, unknown> | null>;
-  /**
-   * Called whenever a conflict is resolved via `onConflict`.
-   */
-  onConflictResolved?: (
-    context: WriteConflictContext,
-    outcome: ResolvedConflictOutcome,
-  ) => void;
-  /** Called when a write is rejected and rolled back, and on each failed send. */
-  onError?: (error: Error, write: LocalWrite) => void;
-  /** Called whenever one or more queued writes finish sending in a flush pass. */
-  onFlush?: (sent: LocalWrite[]) => void;
-  /** How long to wait before sending again after a failure.  Default 2000 ms. */
-  retryMs?: number;
-  /** Drop a sent write whose change has not come back after this long.  Default 60 000 ms. */
-  confirmTimeoutMs?: number;
-  /**
-   * Local Firebird table used to persist the write queue across page reloads.
-   * Accepts `'FB_WRITE_QUEUE$'`, `'ELECTRIC_WRITES'`, or any valid Firebird
-   * table identifier.
-   *
-   * @default 'ELECTRIC_WRITES'
-   */
-  tableName?: string;
-  /**
-   * Automatically flush pending writes when the browser fires an `online`
-   * connectivity event.
-   *
-   * @default true
-   */
-  autoFlushOnOnline?: boolean;
-  /**
-   * Start the queue in a paused (offline) state where local mutations are
-   * applied and persisted to disk without calling `send` until `resume()` or
-   * `flush()` is called.
-   *
-   * @default false
-   */
-  paused?: boolean;
-}
-
-/** A running write queue.  Returned by {@link createWriteQueue}. */
-export interface WriteQueue {
-  /** Insert (or replace) a row, here at once and at the source in turn. */
-  insert(table: string, value: Record<string, unknown>): Promise<LocalWrite>;
-  /** Update the row with `key`, setting `value`'s columns. */
-  update(table: string, key: Record<string, unknown>, value: Record<string, unknown>): Promise<LocalWrite>;
-  /** Delete the row with `key`. */
-  delete(table: string, key: Record<string, unknown>): Promise<LocalWrite>;
-  /** Writes not yet confirmed by the sync: pending or sent. */
-  pending(): Promise<LocalWrite[]>;
-  /** Revert a specific pending write by `id`, restoring the local table row. */
-  discard(id: number): Promise<boolean>;
-  /** Revert and remove all unconfirmed writes in the queue, restoring local rows. */
-  clear(): Promise<number>;
-  /** Pause background sending (local writes still persist durably). */
-  pause(): void;
-  /** Resume background sending and trigger an immediate flush. */
-  resume(): void;
-  /** Whether background sending is currently paused. */
-  readonly paused: boolean;
-  /** Send whatever is pending now, rather than at the next retry. */
-  flush(): Promise<void>;
-  /** Stop sending.  Pending writes stay recorded, for the next queue. */
-  close(): Promise<void>;
-  /** @internal The sync's part: called inside each batch's transaction. */
-  readonly sync: WriteSync;
-}
-
-/** @internal What the sync calls. */
-export interface WriteSync {
-  /**
-   * After a batch was applied to `table` in `tx`: drop the writes it
-   * confirms, and apply again the ones still pending.
-   */
-  reconcile(tx: ElectricTransaction, table: string, touched: Set<string> | 'all', txids: Set<string>): Promise<void>;
-  /** A sync of `table` that can be asked to fetch its shape again (after a rejection). */
-  register(table: string, refetch: () => void): () => void;
-}
+export {
+  DEFAULT_WRITE_QUEUE_TABLE,
+  WriteConflict,
+  WriteRejected,
+  type ConflictResolution,
+  type ConflictStrategy,
+  type LocalWrite,
+  type ResolvedConflictOutcome,
+  type SendResult,
+  type WriteConflictContext,
+  type WriteQueue,
+  type WriteQueueOptions,
+  type WriteSync,
+  type WritesDatabase,
+};
 
 /** Characters of JSON a write's values may take: the widest UTF-8 VARCHAR a row holds. */
 const MAX_VALUE = 8191;

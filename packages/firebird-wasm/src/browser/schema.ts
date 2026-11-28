@@ -59,6 +59,10 @@ const INTERNAL_TABLES = new Set([
   'FB_SPATIAL_INDEX$',
   'FB_CDC_OFFSETS$',
   'FB_CDC_DLQ$',
+  'FB_TEMPORAL_META$',
+  'FB_EVENT_STORE$',
+  'FB_EVENT_SNAPSHOTS$',
+  'FB_EVENT_PROJECTIONS$',
   'ELECTRIC_SHAPES',
   'ELECTRIC_WRITES',
   'KYSELY_MIGRATION',
@@ -80,6 +84,8 @@ function isInternalTableName(name: string): boolean {
   return (
     INTERNAL_TABLES.has(upper) ||
     upper.startsWith('FB_REPL_') ||
+    upper.startsWith('FB_THIST$') ||
+    upper.startsWith('FED_') ||
     upper.startsWith('ELECTRIC_SHADOW$') ||
     upper.startsWith('ELECTRIC_META$')
   );
@@ -90,6 +96,8 @@ function isInternalTriggerName(name: string): boolean {
   return (
     upper.startsWith('FB$LIVE_') ||
     upper.startsWith('FB_REPL_') ||
+    upper.startsWith('FB_TTRG$') ||
+    upper.startsWith('FB_OMIG_TRG$') ||
     upper.startsWith('ELECTRIC_TRIG$')
   );
 }

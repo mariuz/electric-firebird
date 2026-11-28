@@ -956,3 +956,7 @@ export * from './timeseries';
 export * from './spatial';
 export * from './cdc-sink';
 export * from './edge-gateway';
+export * from './temporal-table';
+export * from './event-store';
+export * from './auto-api-gateway';
+export * from './federation';

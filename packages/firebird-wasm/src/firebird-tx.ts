@@ -15,22 +15,18 @@ import type {
   FieldInfo,
   PreparedStatement,
   QueryDescription,
-  QueryOptions,
   QueryParams,
   QueryResult,
-  QueryStreamOptions,
   Row,
   RowMode,
   StatementExecutionOptions,
 } from './types';
-import { statementKind } from './statement-types';
 import { applyTypes, applySerializers, type TypeOptions } from './browser/value-types';
 import { buildCopyToStream, executeCopyFromStream } from './browser/copy-stream';
 import type { UdrManager } from './browser/udr';
 import {
   type ArrayModeOptions,
   assertNotAborted,
-  createTimeoutError,
   type FirebirdTransactionClient,
   runWithCancellation,
   type UnifiedExecuteResult,
@@ -66,7 +62,6 @@ import {
   type LoadArrowIpcOptions,
 } from './arrow-ingest';
 import {
-  assertPreparedParamCount,
   executeArrowFromColumnar,
   executeColumnarViaArrayQuery,
   extractEffectiveQuerySchema,
@@ -74,9 +69,9 @@ import {
   isNonCountingDdlStatement,
   querySystemRowCount,
   resolveColumnarQueryCall,
-  resolvePreparedCallArgs,
   type QueryArrowOptions,
 } from './shared-driver-ops';
+import { buildNodeTxPreparedStatement } from './firebird-tx-prepared';
 import {
   createNodeTxBlobStream,
   describeNodeTxQuery,
@@ -96,13 +91,10 @@ import {
   bindParams,
   cancelAttachmentOperation,
   characterSets,
-  describeInputFields,
   fetchRows,
   inputParams,
   outputFields,
-  readAffectedRecords,
   shapeRows,
-  streamRows,
   tryExecuteNativeBatch,
 } from './node-native-bindings';
 
@@ -738,251 +730,19 @@ export class FirebirdTransaction implements FirebirdTransactionClient {
     const sqlText = toStatement(sql).sql;
     const nativeStmt = await this.attachment.prepare(this.transaction, sqlText);
 
-    let params: FieldInfo[];
-    let fields: FieldInfo[];
-    let type: number;
-    try {
-      params = await describeInputFields(nativeStmt);
-      fields = await outputFields(nativeStmt);
-      type = await nativeStmt.type;
-    } catch (err) {
-      await nativeStmt.dispose().catch(() => undefined);
-      throw err;
-    }
-
-    const statementType = statementKind(type);
-    const hasResultSet = nativeStmt.hasResultSet;
-    let isClosed = false;
-    let currentTimeoutMs = 0;
-    const isTxFinished = () => this.isFinished;
-
-    const assertOpen = (): void => {
-      if (isClosed) {
-        throw new Error('PreparedStatement has been closed');
-      }
-      this.assertUsable();
-    };
-
-    const checkParamCount = (actual: number): void => {
-      assertPreparedParamCount(params.length, actual);
-    };
-
-    const stmt: PreparedStatement = {
-      sql: sqlText,
-      get params() {
-        return params.map((p) => ({ ...p }));
+    return buildNodeTxPreparedStatement(
+      {
+        attachment: this.attachment,
+        transaction: this.transaction,
+        types: this.types,
+        isTxFinished: () => this.isFinished,
+        assertUsable: () => this.assertUsable(),
+        beforeStatement: () => this.beforeStatement(),
+        serialize: (p) => this.serialize(p),
       },
-      get fields() {
-        return fields.map((f) => ({ ...f }));
-      },
-      statementType,
-      hasResultSet,
-      get closed() {
-        return isClosed || isTxFinished();
-      },
-      get timeoutMs() {
-        return currentTimeoutMs;
-      },
-      setTimeout: async (timeoutMs: number) => {
-        assertOpen();
-        const validated = validateTimeoutMs(timeoutMs) ?? 0;
-        currentTimeoutMs = validated;
-        await applyStatementHandleTimeout(nativeStmt, validated);
-      },
-      query: (async <T = Row>(
-        paramsOrOptions: QueryParams | QueryOptions<T> = [],
-        maybeOptions: QueryOptions<T> = {},
-      ): Promise<QueryResult<T>> => {
-        assertOpen();
-        const { callParams, rawOptions, callOptions } = resolvePreparedCallArgs<QueryOptions<T>>(
-          paramsOrOptions,
-          maybeOptions,
-          currentTimeoutMs,
-        );
-        checkParamCount(callParams.length);
-        assertNotAborted(callOptions.signal);
-        validateTimeoutMs(callOptions.timeoutMs);
-        await this.beforeStatement();
-        const rowMode: RowMode = callOptions.rowMode ?? 'object';
-        const hasPerCallTimeout =
-          rawOptions.timeoutMs !== undefined && rawOptions.timeoutMs !== currentTimeoutMs;
-        if (hasPerCallTimeout) {
-          await applyStatementHandleTimeout(nativeStmt, rawOptions.timeoutMs);
-        }
-        let rawRows: unknown[][];
-        try {
-          rawRows = await runWithCancellation(
-            () =>
-              fetchRows(
-                nativeStmt,
-                this.transaction,
-                this.serialize(callParams),
-                fields,
-                this.types,
-              ),
-            callOptions,
-            () => cancelAttachmentOperation(this.attachment),
-          );
-        } finally {
-          if (hasPerCallTimeout) {
-            await applyStatementHandleTimeout(nativeStmt, currentTimeoutMs).catch(() => undefined);
-          }
-        }
-        const outFields = fields.map((f) => ({ ...f }));
-        return finalizeQueryResultWithSchema(
-          applyTypes(
-            { rows: shapeRows<T>(rawRows, outFields, rowMode), fields: outFields },
-            this.types,
-            rowMode,
-          ),
-          callOptions.schema,
-          rowMode,
-        );
-      }) as PreparedStatement['query'],
-      queryStream: (<T = Row>(
-        paramsOrOptions: QueryParams | QueryStreamOptions = [],
-        maybeOptions: QueryStreamOptions = {},
-      ): AsyncIterableIterator<QueryResult<T>> => {
-        assertOpen();
-        const callParams = Array.isArray(paramsOrOptions)
-          ? paramsOrOptions
-          : [];
-        const rawOptions = Array.isArray(paramsOrOptions)
-          ? maybeOptions
-          : (paramsOrOptions ?? {});
-        const callOptions: QueryStreamOptions =
-          rawOptions.timeoutMs === undefined && currentTimeoutMs > 0
-            ? { ...rawOptions, timeoutMs: currentTimeoutMs }
-            : rawOptions;
-        checkParamCount(callParams.length);
-        validateTimeoutMs(callOptions.timeoutMs);
-        const batchSize = resolveBatchSize(callOptions.batchSize);
-        const rowMode: RowMode = callOptions.rowMode ?? 'object';
-        const beforeStmt = () => this.beforeStatement();
-        const serializeParams = () => this.serialize(callParams);
-        const tx = this.transaction;
-        const customTypes = this.types;
-
-        return (async function* (): AsyncIterableIterator<QueryResult<T>> {
-          assertOpen();
-          assertNotAborted(callOptions.signal);
-          const totalTimeoutMs = validateTimeoutMs(callOptions.timeoutMs);
-          const deadline =
-            totalTimeoutMs && totalTimeoutMs > 0
-              ? Date.now() + totalTimeoutMs
-              : undefined;
-          const checkStreamDeadline = (): void => {
-            assertNotAborted(callOptions.signal);
-            if (deadline !== undefined && Date.now() >= deadline) {
-              throw createTimeoutError(totalTimeoutMs!);
-            }
-          };
-          await beforeStmt();
-          const serializedParams = serializeParams();
-          const hasPerCallTimeout =
-            rawOptions.timeoutMs !== undefined && rawOptions.timeoutMs !== currentTimeoutMs;
-          if (hasPerCallTimeout) {
-            await applyStatementHandleTimeout(nativeStmt, rawOptions.timeoutMs);
-          }
-          try {
-            for await (const batch of streamRows<T>(
-              nativeStmt,
-              tx,
-              serializedParams,
-              fields,
-              rowMode,
-              batchSize,
-              customTypes,
-              () => undefined,
-            )) {
-              checkStreamDeadline();
-              yield batch;
-              checkStreamDeadline();
-            }
-          } finally {
-            if (hasPerCallTimeout) {
-              await applyStatementHandleTimeout(nativeStmt, currentTimeoutMs).catch(() => undefined);
-            }
-          }
-        })();
-      }) as PreparedStatement['queryStream'],
-      exec: async (
-        callParams: QueryParams = [],
-        execOptions: StatementExecutionOptions = {},
-      ) => {
-        assertOpen();
-        checkParamCount(callParams.length);
-        const effectiveOptions: StatementExecutionOptions =
-          execOptions.timeoutMs === undefined && currentTimeoutMs > 0
-            ? { ...execOptions, timeoutMs: currentTimeoutMs }
-            : execOptions;
-        assertNotAborted(effectiveOptions.signal);
-        validateTimeoutMs(effectiveOptions.timeoutMs);
-        await this.beforeStatement();
-        const hasPerCallTimeout =
-          execOptions.timeoutMs !== undefined && execOptions.timeoutMs !== currentTimeoutMs;
-        if (hasPerCallTimeout) {
-          await applyStatementHandleTimeout(nativeStmt, execOptions.timeoutMs);
-        }
-        try {
-          await runWithCancellation(
-            async () => {
-              await nativeStmt.execute(
-                this.transaction,
-                await bindParams(nativeStmt, this.transaction, this.serialize(callParams)),
-              );
-            },
-            effectiveOptions,
-            () => cancelAttachmentOperation(this.attachment),
-          );
-          const affectedRows = await readAffectedRecords(nativeStmt);
-          return { affectedRows };
-        } finally {
-          if (hasPerCallTimeout) {
-            await applyStatementHandleTimeout(nativeStmt, currentTimeoutMs).catch(() => undefined);
-          }
-        }
-      },
-      execBatch: async (rows: QueryParams[]) => {
-        assertOpen();
-        await this.beforeStatement();
-        if (!Array.isArray(rows)) {
-          throw new TypeError('execBatch takes an array of parameter rows');
-        }
-        for (const row of rows) {
-          checkParamCount(row.length);
-        }
-        if (rows.length === 0) return { affectedRows: 0 };
-        const serializedRows = this.types?.serializers?.length
-          ? rows.map((row) => this.serialize(row))
-          : rows;
-        if (
-          serializedRows.length > 1 &&
-          (await tryExecuteNativeBatch(nativeStmt, this.transaction, serializedRows))
-        ) {
-          return { affectedRows: serializedRows.length };
-        }
-        let total = 0;
-        for (const row of serializedRows) {
-          await nativeStmt.execute(
-            this.transaction,
-            await bindParams(nativeStmt, this.transaction, row),
-          );
-          total += (await readAffectedRecords(nativeStmt)) || 1;
-        }
-        return { affectedRows: total };
-      },
-      close: async () => {
-        if (isClosed) return;
-        isClosed = true;
-        await nativeStmt.dispose().catch(() => undefined);
-      },
-      [Symbol.asyncDispose]: async () => {
-        await stmt.close();
-      },
-    };
-
-    return stmt;
+      sqlText,
+      nativeStmt,
+    );
   }
 
   async describeQuery(sql: string | SqlFragment): Promise<QueryDescription> {

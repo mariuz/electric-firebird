@@ -56,17 +56,15 @@ import {
 import { decodeWireParamRows } from './wire-params';
 import { WorkerTransport } from './worker-transport';
 import {
-  assertBatchParameterRows,
-  assertPreparedParamCount,
   decodePayloadColumnar,
   executeArrowFromColumnar,
   executeColumnarViaArrayQuery,
   extractEffectiveQuerySchema,
   finalizeQueryResultWithSchema,
   resolveColumnarQueryCall,
-  resolvePreparedCallArgs,
   type QueryArrowOptions,
 } from '../shared-driver-ops';
+import { buildBrowserTxPreparedStatement } from './firebird-browser-tx-prepared';
 import type {
   ArrayRow,
   BlobHandle,
@@ -82,7 +80,6 @@ import type {
   QueryOptions,
   QueryParams,
   QueryResult,
-  QueryStreamOptions,
   Row,
   RowMode,
   StatementExecutionOptions,
@@ -720,185 +717,41 @@ export class FirebirdBrowserTransaction implements FirebirdTransactionClient {
         ? await this.engine.prepare(this.dbHandle, this.txHandle, sqlText)
         : await this.engine.describe(this.dbHandle, this.txHandle, sqlText);
 
-    const params = desc.params.map((p) => ({ ...p }));
-    const fields = desc.fields.map((f) => ({ ...f }));
-    const stmtHandle = desc.handle ?? 0;
-    let isClosed = false;
-    let currentTimeoutMs = 0;
-
-    const assertOpen = (): void => {
-      if (isClosed) {
-        throw new Error('PreparedStatement has been closed');
-      }
-      this.assertUsable();
-    };
-
-    const checkParamCount = (actual: number): void => {
-      assertPreparedParamCount(params.length, actual);
-    };
-
-    const isTxFinished = () => this.isFinished;
-
-    const stmt: PreparedStatement = {
-      sql: sqlText,
-      get params() {
-        return params.map((p) => ({ ...p }));
+    return buildBrowserTxPreparedStatement(
+      {
+        engine: this.engine,
+        dbHandle: this.dbHandle,
+        txHandle: this.txHandle,
+        types: this.types,
+        isTxFinished: () => this.isFinished,
+        assertUsable: () => this.assertUsable(),
+        applyOneShotTimeout: (t) => this.applyOneShotTimeout(t),
+        cancelOperation: () => this.cancelOperation(),
+        queryFallback: <T extends Row>(s: string, p: QueryParams, o: QueryOptions<T>) =>
+          this.query<T>(s, p, {
+            rowMode: o.rowMode,
+            schema: o.schema,
+            signal: o.signal,
+            timeoutMs: o.timeoutMs,
+          }),
+        queryStreamFallback: <T extends Row>(
+          s: string,
+          p: QueryParams,
+          o: { rowMode?: RowMode; batchSize?: number } & StatementExecutionOptions,
+        ) => this.queryStream<T>(s, p, o),
+        streamWithHandle: <T>(
+          stmtObj: Statement,
+          rm: RowMode,
+          bs: number,
+          handle: EngineHandle,
+          opts: StatementExecutionOptions,
+        ) => this.streamQuery<T>(stmtObj, rm, bs, handle, opts),
+        execFallback: (s, p, o) => this.exec(s, p, o),
+        execBatchFallback: (s, r) => this.execBatch(s, r),
       },
-      get fields() {
-        return fields.map((f) => ({ ...f }));
-      },
-      statementType: desc.statementType,
-      hasResultSet: desc.hasResultSet,
-      get closed() {
-        return isClosed || isTxFinished();
-      },
-      get timeoutMs() {
-        return currentTimeoutMs;
-      },
-      setTimeout: async (timeoutMs: number) => {
-        assertOpen();
-        const validated = validateTimeoutMs(timeoutMs) ?? 0;
-        currentTimeoutMs = validated;
-        if (stmtHandle > 0 && typeof this.engine.stmtSetTimeout === 'function') {
-          await this.engine.stmtSetTimeout(stmtHandle, validated);
-        }
-      },
-      query: (async <T = Row>(
-        paramsOrOptions: QueryParams | QueryOptions<T> = [],
-        maybeOptions: QueryOptions<T> = {},
-      ) => {
-        assertOpen();
-        const { callParams, callOptions } = resolvePreparedCallArgs<QueryOptions<T>>(
-          paramsOrOptions,
-          maybeOptions,
-          currentTimeoutMs,
-        );
-        checkParamCount(callParams.length);
-        if (stmtHandle > 0 && typeof this.engine.queryStmt === 'function') {
-          assertNotAborted(callOptions.signal);
-          validateTimeoutMs(callOptions.timeoutMs);
-          const rowMode = callOptions.rowMode ?? 'object';
-          const raw = await runWithCancellation(
-            async () => {
-              await this.applyOneShotTimeout(callOptions.timeoutMs);
-              return this.engine.queryStmt!<T>(
-                this.dbHandle,
-                this.txHandle,
-                stmtHandle,
-                applySerializers(callParams, this.types?.serializers),
-                rowMode,
-                this.types?.binary === true,
-              );
-            },
-            callOptions,
-            () => this.cancelOperation(),
-          );
-          return finalizeQueryResultWithSchema(
-            applyTypes(raw, this.types, rowMode),
-            callOptions.schema,
-            rowMode,
-          );
-        }
-        return this.query<T & Row>(sqlText, callParams, {
-          rowMode: callOptions.rowMode,
-          schema: callOptions.schema as StandardSchemaV1<unknown, T & Row> | undefined,
-          signal: callOptions.signal,
-          timeoutMs: callOptions.timeoutMs,
-        });
-      }) as PreparedStatement['query'],
-      queryStream: ((
-        paramsOrOptions: QueryParams | QueryStreamOptions = [],
-        maybeOptions: QueryStreamOptions = {},
-      ) => {
-        assertOpen();
-        const { callParams, callOptions } = resolvePreparedCallArgs<QueryStreamOptions>(
-          paramsOrOptions,
-          maybeOptions,
-          currentTimeoutMs,
-        );
-        checkParamCount(callParams.length);
-        validateTimeoutMs(callOptions.timeoutMs);
-        const batchSize = resolveBatchSize(callOptions.batchSize);
-        const openStream = () =>
-          stmtHandle > 0
-            ? this.streamQuery(
-                { sql: sqlText, params: callParams },
-                callOptions.rowMode ?? 'object',
-                batchSize,
-                stmtHandle,
-                callOptions,
-              )
-            : this.queryStream(sqlText, callParams, {
-                rowMode: callOptions.rowMode,
-                batchSize: callOptions.batchSize,
-                signal: callOptions.signal,
-                timeoutMs: callOptions.timeoutMs,
-              });
-        return (async function* () {
-          assertOpen();
-          yield* openStream();
-        })();
-      }) as PreparedStatement['queryStream'],
-      exec: async (
-        callParams: QueryParams = [],
-        execOptions: StatementExecutionOptions = {},
-      ) => {
-        assertOpen();
-        checkParamCount(callParams.length);
-        const effectiveOptions: StatementExecutionOptions =
-          execOptions.timeoutMs === undefined && currentTimeoutMs > 0
-            ? { ...execOptions, timeoutMs: currentTimeoutMs }
-            : execOptions;
-        if (stmtHandle > 0 && typeof this.engine.executeStmt === 'function') {
-          assertNotAborted(effectiveOptions.signal);
-          validateTimeoutMs(effectiveOptions.timeoutMs);
-          const affectedRows = await runWithCancellation(
-            async () => {
-              await this.applyOneShotTimeout(effectiveOptions.timeoutMs);
-              return this.engine.executeStmt!(
-                this.dbHandle,
-                this.txHandle,
-                stmtHandle,
-                applySerializers(callParams, this.types?.serializers),
-              );
-            },
-            effectiveOptions,
-            () => this.cancelOperation(),
-          );
-          return { affectedRows };
-        }
-        return this.exec(sqlText, callParams, effectiveOptions);
-      },
-      execBatch: async (rows: QueryParams[]) => {
-        assertOpen();
-        assertBatchParameterRows(rows, params.length);
-        if (
-          stmtHandle > 0 &&
-          typeof this.engine.executeBatchStmt === 'function'
-        ) {
-          const affectedRows = await this.engine.executeBatchStmt(
-            this.dbHandle,
-            this.txHandle,
-            stmtHandle,
-            rows.map((row) => applySerializers(row, this.types?.serializers)),
-          );
-          return { affectedRows };
-        }
-        return this.execBatch(sqlText, rows);
-      },
-      close: async () => {
-        if (isClosed) return;
-        isClosed = true;
-        if (stmtHandle > 0 && typeof this.engine.stmtClose === 'function') {
-          await this.engine.stmtClose(stmtHandle).catch(() => undefined);
-        }
-      },
-      [Symbol.asyncDispose]: async () => {
-        await stmt.close();
-      },
-    };
-
-    return stmt;
+      sqlText,
+      desc,
+    );
   }
 
   /**

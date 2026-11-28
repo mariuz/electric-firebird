@@ -3,15 +3,23 @@
  * `createPublication` (`M28 Item 5`).
  */
 
-import type { Row } from '../types';
+import type { QueryResult, Row } from '../types';
 import type {
   CreatePublicationOptions,
+  HybridLogicalClock,
   PublishedTableConfig,
   ReplicableDatabase,
   ReplicationLogEntry,
   ReplicationOperation,
 } from './types';
-import { decodeJson } from './shared';
+import {
+  decodeJson,
+  extractKeyRecord,
+  normalizeRowKeysUpper,
+  quoteIdent,
+  rowsEqual,
+  serializeKeyRecord,
+} from './shared';
 import {
   formatHlc,
   matchesRowFilter,
@@ -234,4 +242,127 @@ export async function fetchPublicationChangesSince(
     }
   }
   return out;
+}
+
+export async function capturePublicationTableChanges(ctx: {
+  db: ReplicableDatabase;
+  pubName: string;
+  nodeId: string;
+  txid: string;
+  ts: number;
+  hlc: HybridLogicalClock;
+  tablesMap: Map<string, NormalizedPubTableCfg>;
+  tableMirrors: Map<string, Map<string, Record<string, unknown>>>;
+  isTriggerCaptured: (
+    tableUpper: string,
+    rec: Record<string, unknown>,
+    pkCols: readonly string[],
+  ) => boolean;
+  allocateLsn: () => Promise<number>;
+  insertJournalEntry: (entry: ReplicationLogEntry) => Promise<void>;
+}): Promise<ReplicationLogEntry[]> {
+  const {
+    db,
+    pubName,
+    nodeId,
+    txid,
+    ts,
+    hlc,
+    tablesMap,
+    tableMirrors,
+    isTriggerCaptured,
+    allocateLsn,
+    insertJournalEntry,
+  } = ctx;
+  const captured: ReplicationLogEntry[] = [];
+
+  for (const [tableUpper, cfg] of tablesMap.entries()) {
+    const pkCols = cfg.primaryKey;
+    let res: QueryResult<Row>;
+    try {
+      res = await db.query<Row>(`SELECT * FROM ${quoteIdent(tableUpper)}`);
+    } catch {
+      continue;
+    }
+
+    const prevMirror = tableMirrors.get(tableUpper) ?? new Map<string, Record<string, unknown>>();
+    const nextMirror = new Map<string, Record<string, unknown>>();
+
+    for (const rawRow of res.rows) {
+      const normRow = normalizeRowKeysUpper(rawRow);
+      if (!matchesRowFilter(normRow, cfg.where)) continue;
+      const projectedRow =
+        projectReplicatedRow(normRow, pkCols, cfg.columns, cfg.excludeColumns) ?? normRow;
+      const keyRec = extractKeyRecord(projectedRow, pkCols);
+      const k = serializeKeyRecord(keyRec, pkCols);
+      nextMirror.set(k, projectedRow);
+
+      if (isTriggerCaptured(tableUpper, keyRec, pkCols)) continue;
+      const prevRow = prevMirror.get(k);
+      if (!prevRow) {
+        const entry: ReplicationLogEntry = {
+          lsn: await allocateLsn(),
+          txid,
+          origin: nodeId,
+          publication: pubName,
+          table: tableUpper,
+          operation: 'INSERT',
+          key: keyRec,
+          after: projectedRow,
+          before: null,
+          ddlSql: null,
+          timestamp: ts,
+          hlc: hlc.now(ts),
+        };
+        await insertJournalEntry(entry);
+        captured.push(entry);
+      } else if (!rowsEqual(prevRow, projectedRow)) {
+        const entry: ReplicationLogEntry = {
+          lsn: await allocateLsn(),
+          txid,
+          origin: nodeId,
+          publication: pubName,
+          table: tableUpper,
+          operation: 'UPDATE',
+          key: keyRec,
+          after: projectedRow,
+          before: prevRow,
+          ddlSql: null,
+          timestamp: ts,
+          hlc: hlc.now(ts),
+        };
+        await insertJournalEntry(entry);
+        captured.push(entry);
+      }
+    }
+
+    for (const [k, prevRow] of prevMirror.entries()) {
+      if (
+        !nextMirror.has(k) &&
+        !isTriggerCaptured(tableUpper, extractKeyRecord(prevRow, pkCols), pkCols)
+      ) {
+        const keyRec = extractKeyRecord(prevRow, pkCols);
+        const entry: ReplicationLogEntry = {
+          lsn: await allocateLsn(),
+          txid,
+          origin: nodeId,
+          publication: pubName,
+          table: tableUpper,
+          operation: 'DELETE',
+          key: keyRec,
+          after: null,
+          before: prevRow,
+          ddlSql: null,
+          timestamp: ts,
+          hlc: hlc.now(ts),
+        };
+        await insertJournalEntry(entry);
+        captured.push(entry);
+      }
+    }
+
+    tableMirrors.set(tableUpper, nextMirror);
+  }
+
+  return captured;
 }

@@ -14,7 +14,6 @@ import {
   DEFAULT_REPL_WATERMARK_TABLE,
   type CreateSubscriptionOptions,
   type ReplicationConflictContext,
-  type ReplicationConflictStrategy,
   type ReplicationLogEntry,
   type ReplicationPublication,
   type ReplicationStats,
@@ -33,80 +32,11 @@ import {
   rowsEqual,
   serializeKeyRecord,
 } from './shared';
-import {
-  compareHlc,
-  mergeReplicatedRow,
-  orderEntriesByTopology,
-} from './hlc-crdt';
+import { orderEntriesByTopology } from './hlc-crdt';
 import { classifyDdlStatement, resolveDdlConflict } from './ddl-guard';
 import { createReplicationDlq } from './dlq-compaction';
 import { bootstrapReplica, needsBootstrap } from './bootstrap';
-
-async function evaluateConflictResolution(
-  strategy: ReplicationConflictStrategy,
-  ctx: ReplicationConflictContext,
-): Promise<{
-  outcome: 'remote-wins' | 'local-wins' | 'merge';
-  mergedRow?: Record<string, unknown>;
-}> {
-  if (typeof strategy === 'function') {
-    const res = await strategy(ctx);
-    if (res === 'remote-wins' || (typeof res === 'object' && res.action === 'remote-wins')) {
-      return { outcome: 'remote-wins' };
-    }
-    if (res === 'local-wins' || (typeof res === 'object' && res.action === 'local-wins')) {
-      return { outcome: 'local-wins' };
-    }
-    if (res === 'merge') {
-      return {
-        outcome: 'merge',
-        mergedRow: mergeReplicatedRow(
-          ctx.incoming.before,
-          ctx.localRow,
-          ctx.incoming.after,
-        ),
-      };
-    }
-    return {
-      outcome: 'merge',
-      mergedRow: normalizeRowKeysUpper(res.row),
-    };
-  }
-
-  switch (strategy) {
-    case 'remote-wins':
-    case 'primary-wins':
-      return { outcome: 'remote-wins' };
-    case 'local-wins':
-    case 'replica-wins':
-      return { outcome: 'local-wins' };
-    case 'last-write-wins': {
-      if (ctx.incoming.hlc && ctx.localEntry?.hlc) {
-        return compareHlc(ctx.incoming.hlc, ctx.localEntry.hlc) >= 0
-          ? { outcome: 'remote-wins' }
-          : { outcome: 'local-wins' };
-      }
-      const remoteTs = ctx.incoming.timestamp;
-      const localTs = ctx.localEntry?.timestamp ?? 0;
-      if (remoteTs > localTs) return { outcome: 'remote-wins' };
-      if (remoteTs < localTs) return { outcome: 'local-wins' };
-      // Deterministic tie-breaker on origin node ID
-      return ctx.incoming.origin >= (ctx.localEntry?.origin ?? '')
-        ? { outcome: 'remote-wins' }
-        : { outcome: 'local-wins' };
-    }
-    case 'merge':
-      return {
-        outcome: 'merge',
-        mergedRow: mergeReplicatedRow(
-          ctx.incoming.before,
-          ctx.localRow,
-          ctx.incoming.after,
-        ),
-      };
-  }
-}
-
+import { evaluateConflictResolution } from './subscription-conflict';
 
 /**
  * Create a logical replication subscription on `targetDb`.

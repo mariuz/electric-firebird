@@ -19,6 +19,7 @@ import type {
   TableSchemaInfo,
 } from '../types';
 import { introspect } from './schema';
+export * from './codegen-kysely';
 
 /**
  * Identifier casing strategy between Drizzle / Kysely and Firebird.
@@ -82,53 +83,6 @@ export interface DrizzleCodegenOptions extends IntrospectOptions {
    * @default 'firebird-wasm/drizzle'
    */
   importPath?: string;
-  /**
-   * Include the generated file header comment.
-   * @default true
-   */
-  includeHeader?: boolean;
-}
-
-/**
- * Options for {@link generateKyselyTypes} and {@link generateKyselyTypesFromCatalog}.
- */
-export interface KyselyCodegenOptions extends IntrospectOptions {
-  /**
-   * Identifier casing strategy for table keys in `Database` and column property names.
-   * @default 'lower'
-   */
-  identifierCase?: CodegenIdentifierCase;
-  /**
-   * Name of the root Kysely database interface.
-   * @default 'Database'
-   */
-  databaseInterfaceName?: string;
-  /**
-   * Include database views (`schema.views`) as read-only interfaces in `Database`.
-   * @default true
-   */
-  includeViews?: boolean;
-  /**
-   * Export `Selectable<T>`, `Insertable<T>`, and `Updateable<T>` helper type aliases
-   * for each table.
-   * @default true
-   */
-  exportCrudTypes?: boolean;
-  /**
-   * TypeScript type emitted for `NUMERIC(p, s)` and `DECIMAL(p, s)` columns.
-   * @default 'number'
-   */
-  numericType?: 'number' | 'string';
-  /**
-   * TypeScript type emitted for `BIGINT` and `INT128` columns.
-   * @default 'number'
-   */
-  bigintType?: 'number' | 'bigint' | 'string';
-  /**
-   * TypeScript type emitted for `DATE`, `TIME`, and `TIMESTAMP` columns.
-   * @default 'string'
-   */
-  dateType?: 'string' | 'Date';
   /**
    * Include the generated file header comment.
    * @default true
@@ -240,7 +194,7 @@ export async function resolveSchemaIntrospection(
   );
 }
 
-function foldSqlIdentifier(name: string, mode: CodegenIdentifierCase): string {
+export function foldSqlIdentifier(name: string, mode: CodegenIdentifierCase): string {
   if (mode === 'lower' && /^[A-Z_][A-Z0-9_$]*$/.test(name)) {
     return name.toLowerCase();
   }
@@ -273,7 +227,7 @@ function toCamelCase(name: string): string {
   return /^[0-9]/.test(joined) ? `_${joined}` : joined;
 }
 
-function toPascalCase(name: string): string {
+export function toPascalCase(name: string): string {
   const words = splitIdentifierWords(name);
   if (words.length === 0) return 'Unnamed';
   const joined = words
@@ -288,7 +242,7 @@ function toSafeVariableName(candidate: string): string {
   return JS_RESERVED_WORDS.has(prefixed) ? `${prefixed}_` : prefixed;
 }
 
-function formatObjectPropertyKey(key: string): string {
+export function formatObjectPropertyKey(key: string): string {
   return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(key) ? key : JSON.stringify(key);
 }
 
@@ -851,203 +805,4 @@ export async function generateDrizzleSchema(
 ): Promise<string> {
   const schema = await resolveSchemaIntrospection(source, options);
   return generateDrizzleSchemaFromCatalog(schema, options);
-}
-
-function mapColumnToKyselyBaseType(
-  col: ColumnSchemaInfo,
-  options: Required<Pick<KyselyCodegenOptions, 'numericType' | 'bigintType' | 'dateType'>>,
-): string {
-  switch (col.dataType) {
-    case 'SMALLINT':
-    case 'INTEGER':
-    case 'FLOAT':
-    case 'DOUBLE':
-    case 'DECFLOAT16':
-    case 'DECFLOAT34':
-      return 'number';
-    case 'BIGINT':
-    case 'INT128':
-      return options.bigintType;
-    case 'NUMERIC':
-      return options.numericType;
-    case 'BOOLEAN':
-      return 'boolean';
-    case 'TEXT':
-    case 'VARYING':
-      return 'string';
-    case 'BLOB':
-      return col.subType === 1 ? 'string' : 'Uint8Array';
-    case 'DATE':
-    case 'TIME':
-    case 'TIME_TZ':
-    case 'TIMESTAMP':
-    case 'TIMESTAMP_TZ':
-      return options.dateType;
-    default:
-      return 'unknown';
-  }
-}
-
-/**
- * Synchronously generate Kysely TypeScript `Database` and table/view interfaces
- * from a {@link SchemaIntrospection} catalog.
- */
-export function generateKyselyTypesFromCatalog(
-  schema: SchemaIntrospection,
-  options: KyselyCodegenOptions = {},
-): string {
-  const identifierCase = options.identifierCase ?? 'lower';
-  const databaseInterfaceName = options.databaseInterfaceName ?? 'Database';
-  const includeViews = options.includeViews ?? true;
-  const exportCrudTypes = options.exportCrudTypes ?? true;
-  const numericType = options.numericType ?? 'number';
-  const bigintType = options.bigintType ?? 'number';
-  const dateType = options.dateType ?? 'string';
-  const includeHeader = options.includeHeader ?? true;
-
-  const typeImports = new Set<string>();
-  const interfaceBlocks: string[] = [];
-  const dbEntries: string[] = [];
-  const usedInterfaceNames = new Set<string>([databaseInterfaceName]);
-
-  const allocInterfaceName = (base: string): string => {
-    let candidate = base;
-    let suffix = 2;
-    while (usedInterfaceNames.has(candidate)) {
-      candidate = `${base}${suffix++}`;
-    }
-    usedInterfaceNames.add(candidate);
-    return candidate;
-  };
-
-  for (const tbl of schema.tables) {
-    const pascalBase = toPascalCase(tbl.name);
-    const ifaceName = allocInterfaceName(`${pascalBase}Table`);
-    const dbKey = formatObjectPropertyKey(
-      foldSqlIdentifier(tbl.name, identifierCase),
-    );
-    dbEntries.push(`  ${dbKey}: ${ifaceName};`);
-
-    const colLines: string[] = [];
-    for (const col of tbl.columns) {
-      const colKey = formatObjectPropertyKey(
-        foldSqlIdentifier(col.name, identifierCase),
-      );
-      const baseType = mapColumnToKyselyBaseType(col, {
-        numericType,
-        bigintType,
-        dateType,
-      });
-      const selectType = col.nullable ? `${baseType} | null` : baseType;
-
-      let typeExpr: string;
-      if (col.isComputed) {
-        typeImports.add('ColumnType');
-        typeExpr = `ColumnType<${selectType}, never, never>`;
-      } else if (col.isIdentity || col.defaultSource !== null) {
-        typeImports.add('Generated');
-        typeExpr = `Generated<${selectType}>`;
-      } else {
-        typeExpr = selectType;
-      }
-
-      colLines.push(`  ${colKey}: ${typeExpr};`);
-    }
-
-    const blockLines = [
-      `export interface ${ifaceName} {`,
-      ...colLines,
-      '}',
-    ];
-
-    if (exportCrudTypes) {
-      typeImports.add('Selectable');
-      typeImports.add('Insertable');
-      typeImports.add('Updateable');
-      const selectAlias = allocInterfaceName(pascalBase);
-      const insertAlias = allocInterfaceName(`New${pascalBase}`);
-      const updateAlias = allocInterfaceName(`${pascalBase}Update`);
-      blockLines.push(
-        `export type ${selectAlias} = Selectable<${ifaceName}>;`,
-        `export type ${insertAlias} = Insertable<${ifaceName}>;`,
-        `export type ${updateAlias} = Updateable<${ifaceName}>;`,
-      );
-    }
-
-    interfaceBlocks.push(blockLines.join('\n'));
-  }
-
-  if (includeViews) {
-    for (const vw of schema.views) {
-      const pascalBase = toPascalCase(vw.name);
-      const ifaceName = allocInterfaceName(`${pascalBase}View`);
-      const dbKey = formatObjectPropertyKey(
-        foldSqlIdentifier(vw.name, identifierCase),
-      );
-      dbEntries.push(`  ${dbKey}: ${ifaceName};`);
-
-      const colLines: string[] = [];
-      for (const col of vw.columns) {
-        typeImports.add('ColumnType');
-        const colKey = formatObjectPropertyKey(
-          foldSqlIdentifier(col.name, identifierCase),
-        );
-        const baseType = mapColumnToKyselyBaseType(col, {
-          numericType,
-          bigintType,
-          dateType,
-        });
-        const selectType = col.nullable ? `${baseType} | null` : baseType;
-        colLines.push(`  ${colKey}: ColumnType<${selectType}, never, never>;`);
-      }
-
-      const blockLines = [
-        `export interface ${ifaceName} {`,
-        ...colLines,
-        '}',
-      ];
-      if (exportCrudTypes) {
-        typeImports.add('Selectable');
-        const selectAlias = allocInterfaceName(pascalBase);
-        blockLines.push(`export type ${selectAlias} = Selectable<${ifaceName}>;`);
-      }
-      interfaceBlocks.push(blockLines.join('\n'));
-    }
-  }
-
-  const lines: string[] = [];
-  if (includeHeader) {
-    lines.push(
-      '// Generated by firebird-wasm/kysely (generateKyselyTypes) — do not edit manually.',
-      '',
-    );
-  }
-  const sortedTypeImports = Array.from(typeImports).sort();
-  if (sortedTypeImports.length > 0) {
-    lines.push(
-      `import type { ${sortedTypeImports.join(', ')} } from 'kysely';`,
-      '',
-    );
-  }
-  if (interfaceBlocks.length > 0) {
-    lines.push(interfaceBlocks.join('\n\n'), '');
-  }
-  lines.push(
-    `export interface ${databaseInterfaceName} {`,
-    ...dbEntries,
-    '}',
-  );
-  return `${lines.join('\n').trimEnd()}\n`;
-}
-
-/**
- * Introspect a Firebird database (or use an existing {@link SchemaIntrospection})
- * and generate Kysely TypeScript `Database` and table/view interfaces.
- */
-export async function generateKyselyTypes(
-  source: IntrospectableSource,
-  options: KyselyCodegenOptions = {},
-): Promise<string> {
-  const schema = await resolveSchemaIntrospection(source, options);
-  return generateKyselyTypesFromCatalog(schema, options);
 }

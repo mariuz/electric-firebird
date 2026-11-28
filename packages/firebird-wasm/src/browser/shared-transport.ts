@@ -782,161 +782,61 @@ export class SharedEngineTransport implements EngineTransport {
     return this.normalizeBinaryPayload(raw);
   }
 
-  cursorClose(cursorHandle: EngineHandle): Promise<void> {
-    return this.call<void>('cursorClose', cursorHandle);
+  cursorClose(cursorHandle: EngineHandle): Promise<void> { return this.call<void>('cursorClose', cursorHandle); }
+  blobCreate(dbHandle: EngineHandle, txHandle: EngineHandle) {
+    return this.call<{ blobHandle: EngineHandle; blobId: Uint8Array }>('blobCreate', dbHandle, txHandle);
   }
-
-  blobCreate(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-  ): Promise<{ blobHandle: EngineHandle; blobId: Uint8Array }> {
-    return this.call<{ blobHandle: EngineHandle; blobId: Uint8Array }>(
-      'blobCreate',
-      dbHandle,
-      txHandle,
-    );
-  }
-
   blobPutSegment(blobHandle: EngineHandle, segment: Uint8Array): Promise<void> {
     return this.call<void>('blobPutSegment', blobHandle, segment);
   }
-
-  blobOpenId(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-    blobId: Uint8Array,
-  ): Promise<EngineHandle> {
+  blobOpenId(dbHandle: EngineHandle, txHandle: EngineHandle, blobId: Uint8Array): Promise<EngineHandle> {
     return this.call<EngineHandle>('blobOpenId', dbHandle, txHandle, blobId);
   }
-
-  blobOpenQuery(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-    sql: string,
-    params: QueryParams = [],
-    colIndex = 0,
-  ): Promise<EngineHandle> {
-    return this.call<EngineHandle>(
-      'blobOpenQuery',
-      dbHandle,
-      txHandle,
-      sql,
-      params,
-      colIndex,
-    );
+  blobOpenQuery(dbHandle: EngineHandle, txHandle: EngineHandle, sql: string, params: QueryParams = [], colIndex = 0): Promise<EngineHandle> {
+    return this.call<EngineHandle>('blobOpenQuery', dbHandle, txHandle, sql, params, colIndex);
   }
-
-  blobGetSegment(
-    blobHandle: EngineHandle,
-    maxLength: number,
-  ): Promise<Uint8Array | null> {
-    return this.call<Uint8Array | null>(
-      'blobGetSegment',
-      blobHandle,
-      maxLength,
-    );
+  blobGetSegment(blobHandle: EngineHandle, maxLength: number): Promise<Uint8Array | null> {
+    return this.call<Uint8Array | null>('blobGetSegment', blobHandle, maxLength);
   }
-
   blobClose(blobHandle: EngineHandle, cancel = false): Promise<Uint8Array> {
     return this.call<Uint8Array>('blobClose', blobHandle, cancel);
   }
-
   setSharedReads(dbHandle: EngineHandle, on: boolean): Promise<void> {
     return this.call<void>('setSharedReads', dbHandle, on);
   }
-
-  describe(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-    sql: string,
-  ): Promise<QueryDescription> {
+  describe(dbHandle: EngineHandle, txHandle: EngineHandle, sql: string): Promise<QueryDescription> {
     return this.call<QueryDescription>('describe', dbHandle, txHandle, sql);
   }
-
-  explain(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-    sql: string,
-    detailed = false,
-  ): Promise<string> {
+  explain(dbHandle: EngineHandle, txHandle: EngineHandle, sql: string, detailed = false): Promise<string> {
     return this.call<string>('explain', dbHandle, txHandle, sql, detailed);
   }
-
   databaseInfo(dbHandle: EngineHandle): Promise<DatabaseInfo> {
     return this.call<DatabaseInfo>('databaseInfo', dbHandle);
   }
-
   sweep(dbHandle: EngineHandle): Promise<SweepResult> {
     return this.call<SweepResult>('sweep', dbHandle);
   }
-
-  setReplicaMode(
-    dbHandle: EngineHandle,
-    mode: 0 | 1 | 2 | 'none' | 'read_only' | 'read_write',
-  ): Promise<void> {
+  setReplicaMode(dbHandle: EngineHandle, mode: 0 | 1 | 2 | 'none' | 'read_only' | 'read_write'): Promise<void> {
     return this.call<void>('setReplicaMode', dbHandle, mode);
   }
-
-  replicateChangelog(
-    dbHandle: EngineHandle,
-    data: Uint8Array,
-  ): Promise<number> {
+  replicateChangelog(dbHandle: EngineHandle, data: Uint8Array): Promise<number> {
     return this.call<number>('replicateChangelog', dbHandle, data);
   }
-
-  prepare(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-    sql: string,
-  ): Promise<QueryDescription & { handle?: EngineHandle }> {
-    return this.call<QueryDescription & { handle?: EngineHandle }>(
-      'prepare',
-      dbHandle,
-      txHandle,
-      sql,
-    );
+  prepare(dbHandle: EngineHandle, txHandle: EngineHandle, sql: string): Promise<QueryDescription & { handle?: EngineHandle }> {
+    return this.call<QueryDescription & { handle?: EngineHandle }>('prepare', dbHandle, txHandle, sql);
   }
-
-  stmtClose(stmtHandle: EngineHandle): Promise<void> {
-    return this.call<void>('stmtClose', stmtHandle);
-  }
-
+  stmtClose(stmtHandle: EngineHandle): Promise<void> { return this.call<void>('stmtClose', stmtHandle); }
   stmtSetTimeout(stmtHandle: EngineHandle, timeoutMs: number): Promise<void> {
     return this.call<void>('stmtSetTimeout', stmtHandle, timeoutMs);
   }
-
   cancelOperation(dbHandle: EngineHandle, option = 3): Promise<void> {
     return this.call<void>('cancelOperation', dbHandle, option);
   }
-
-  executeStmt(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-    stmtHandle: EngineHandle,
-    params: QueryParams = [],
-  ): Promise<number> {
-    return this.call<number>(
-      'executeStmt',
-      dbHandle,
-      txHandle,
-      stmtHandle,
-      params,
-    );
+  executeStmt(dbHandle: EngineHandle, txHandle: EngineHandle, stmtHandle: EngineHandle, params: QueryParams = []): Promise<number> {
+    return this.call<number>('executeStmt', dbHandle, txHandle, stmtHandle, params);
   }
-
-  executeBatchStmt(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-    stmtHandle: EngineHandle,
-    rows: QueryParams[],
-  ): Promise<number> {
-    return this.call<number>(
-      'executeBatchStmt',
-      dbHandle,
-      txHandle,
-      stmtHandle,
-      rows,
-    );
+  executeBatchStmt(dbHandle: EngineHandle, txHandle: EngineHandle, stmtHandle: EngineHandle, rows: QueryParams[]): Promise<number> {
+    return this.call<number>('executeBatchStmt', dbHandle, txHandle, stmtHandle, rows);
   }
 
   async queryStmt<T = Row>(

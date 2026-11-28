@@ -409,4 +409,31 @@ test.describe('Replication Simulator v2 (replication.html)', () => {
     await expect(page.locator('#event-feed')).toContainText('FB_CDC_OFFSETS$');
     await expect(page.locator('#event-feed')).toContainText('KeyValuePageVFS');
   });
+
+  test('Scenario 24: Bitemporal FOR SYSTEM_TIME AS OF + Event Sourcing CQRS, Auto GraphQL/REST Gateway & Sharded Federation', async ({
+    page,
+  }) => {
+    await openReplicationSim(page);
+
+    await page
+      .locator('.scenario-card[data-scenario="temporal-eventstore-graphql-federation"]')
+      .click();
+
+    await expect(page.locator('#primary-rows')).toContainText(
+      'Temporal EventStore GraphQL Fed Task #4',
+    );
+    await expect(page.locator('#replica-rows')).toContainText(
+      'Temporal EventStore GraphQL Fed Task #5',
+    );
+    await expect(page.locator('#code-inspector')).toContainText('createTemporalTable');
+    await expect(page.locator('#code-inspector')).toContainText('createEventStore');
+    await expect(page.locator('#code-inspector')).toContainText('createAutoApiGateway');
+    await expect(page.locator('#code-inspector')).toContainText('createDatabaseFederation');
+    await expect(page.locator('#code-inspector')).toContainText('createShardedPool');
+    await expect(page.locator('#event-feed')).toContainText('Scenario 24');
+    await expect(page.locator('#event-feed')).toContainText('FOR SYSTEM_TIME AS OF');
+    await expect(page.locator('#event-feed')).toContainText('FB_EVENT_STORE$');
+    await expect(page.locator('#event-feed')).toContainText('FB_EVENT_PROJECTIONS$');
+    await expect(page.locator('#event-feed')).toContainText('createShardedPool()');
+  });
 });

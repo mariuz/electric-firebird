@@ -28,6 +28,14 @@ import {
   createTimeSeriesStore,
   type TimeSeriesPolicyInfo,
 } from '../timeseries';
+import {
+  listTemporalTables,
+  type TemporalTableInfo,
+} from '../temporal-table';
+import {
+  fetchPersistedEventProjections,
+  type EventProjectionStatus,
+} from '../event-store';
 import type { OptimisticMutationStore } from '../optimistic-store';
 import type { UndoRedoEntry, UndoRedoManager } from '../undo-redo';
 import type { ReplicationStats } from '../replication';
@@ -367,6 +375,8 @@ export function appendSpatialAndTimeSeriesSections(
   opts: {
     spatialIndexes?: readonly ReplSpatialIndexSummary[];
     timeSeriesPolicies?: readonly TimeSeriesPolicyInfo[];
+    temporalTables?: readonly TemporalTableInfo[];
+    eventProjections?: readonly EventProjectionStatus[];
   },
 ): void {
   if (opts.spatialIndexes && opts.spatialIndexes.length > 0) {
@@ -406,6 +416,62 @@ export function appendSpatialAndTimeSeriesSections(
     }
     tsBox.append(tsList);
     panel.append(tsBox);
+  }
+
+  if (opts.temporalTables && opts.temporalTables.length > 0) {
+    const tmpBox = el('div', 'schema-sub temporal-tables-panel');
+    const title = el('div', 'schema-group-title');
+    title.textContent = 'System-Versioned Temporal Tables (FB_TEMPORAL_META$)';
+    tmpBox.append(title);
+    const tmpList = el('ul', 'schema-list temporal-table-list');
+    for (const t of opts.temporalTables) {
+      const li = el('li', 'schema-meta-item temporal-table-item');
+      const nameSpan = el('span', 'col-name');
+      nameSpan.textContent = `${t.tableName} → ${t.historyTable}`;
+      const badge = el('span', 'schema-badge');
+      badge.textContent = `${t.versionCount} ${t.versionCount === 1 ? 'version' : 'versions'} · pk:${t.primaryKey}`;
+      li.append(nameSpan, badge);
+      tmpList.append(li);
+    }
+    tmpBox.append(tmpList);
+    panel.append(tmpBox);
+  }
+
+  if (opts.eventProjections && opts.eventProjections.length > 0) {
+    const evBox = el('div', 'schema-sub event-projections-panel');
+    const title = el('div', 'schema-group-title');
+    title.textContent = 'CQRS Event Projections (FB_EVENT_PROJECTIONS$)';
+    evBox.append(title);
+    const evList = el('ul', 'schema-list event-projection-list');
+    for (const pr of opts.eventProjections) {
+      const li = el('li', 'schema-meta-item event-projection-item');
+      const nameSpan = el('span', 'col-name');
+      nameSpan.textContent = pr.name;
+      const badge = el('span', 'schema-badge');
+      badge.textContent = `seq:${pr.lastGlobalSeq} · processed:${pr.processedCount} · lag:${pr.lagEvents}`;
+      li.append(nameSpan, badge);
+      evList.append(li);
+    }
+    evBox.append(evList);
+    panel.append(evBox);
+  }
+}
+
+export async function fetchReplTemporalTables(db: ReplDatabase): Promise<TemporalTableInfo[]> {
+  try {
+    return await listTemporalTables(createReplObjectQueryAdapter(db));
+  } catch {
+    return [];
+  }
+}
+
+export async function fetchReplEventProjections(
+  db: ReplDatabase,
+): Promise<EventProjectionStatus[]> {
+  try {
+    return await fetchPersistedEventProjections(createReplObjectQueryAdapter(db));
+  } catch {
+    return [];
   }
 }
 

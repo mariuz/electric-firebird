@@ -689,46 +689,15 @@ export class DirectTransport implements EngineTransport {
     };
   }
 
-  private resolveStagedBlobParams(params: QueryParams): QueryParams {
-    return this.blobOps.resolveStagedBlobParams(params);
-  }
-
-  blobCreate(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-  ): Promise<{ blobHandle: EngineHandle; blobId: Uint8Array }> {
-    return this.blobOps.blobCreate(this.blobHost, dbHandle, txHandle);
-  }
-
-  blobPutSegment(blobHandle: EngineHandle, segment: Uint8Array): Promise<void> {
-    return this.blobOps.blobPutSegment(this.blobHost, blobHandle, segment);
-  }
-
-  blobOpenId(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-    blobId: Uint8Array,
-  ): Promise<EngineHandle> {
-    return this.blobOps.blobOpenId(this.blobHost, dbHandle, txHandle, blobId);
-  }
-
-  blobOpenQuery(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-    sql: string,
-    params: QueryParams = [],
-    colIndex = 0,
-  ): Promise<EngineHandle> {
+  private resolveStagedBlobParams(params: QueryParams): QueryParams { return this.blobOps.resolveStagedBlobParams(params); }
+  blobCreate(dbHandle: EngineHandle, txHandle: EngineHandle) { return this.blobOps.blobCreate(this.blobHost, dbHandle, txHandle); }
+  blobPutSegment(blobHandle: EngineHandle, segment: Uint8Array) { return this.blobOps.blobPutSegment(this.blobHost, blobHandle, segment); }
+  blobOpenId(dbHandle: EngineHandle, txHandle: EngineHandle, blobId: Uint8Array) { return this.blobOps.blobOpenId(this.blobHost, dbHandle, txHandle, blobId); }
+  blobOpenQuery(dbHandle: EngineHandle, txHandle: EngineHandle, sql: string, params: QueryParams = [], colIndex = 0) {
     return this.blobOps.blobOpenQuery(this.blobHost, dbHandle, txHandle, sql, params, colIndex);
   }
-
-  blobGetSegment(blobHandle: EngineHandle, maxLength: number): Promise<Uint8Array | null> {
-    return this.blobOps.blobGetSegment(this.blobHost, blobHandle, maxLength);
-  }
-
-  blobClose(blobHandle: EngineHandle, cancel = false): Promise<Uint8Array> {
-    return this.blobOps.blobClose(this.blobHost, blobHandle, cancel);
-  }
+  blobGetSegment(blobHandle: EngineHandle, maxLength: number) { return this.blobOps.blobGetSegment(this.blobHost, blobHandle, maxLength); }
+  blobClose(blobHandle: EngineHandle, cancel = false) { return this.blobOps.blobClose(this.blobHost, blobHandle, cancel); }
 
   async setSharedReads(dbHandle: EngineHandle, on: boolean): Promise<void> {
     const mod = this.module;
@@ -737,63 +706,36 @@ export class DirectTransport implements EngineTransport {
     }
   }
 
-  async describe(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-    sql: string,
-  ): Promise<QueryDescription> {
+  async describe(dbHandle: EngineHandle, txHandle: EngineHandle, sql: string): Promise<QueryDescription> {
     const mod = this.module;
     return this.withString(sql, (sqlPtr) => {
       const resultPtr = mod._fb_describe(dbHandle, txHandle, sqlPtr);
-      if (resultPtr === 0) {
-        throw engineError(mod, `Firebird could not describe: ${sql}`);
-      }
-
-      // Same ownership rule as a result set: the engine owns it until freed.
+      if (resultPtr === 0) throw engineError(mod, `Firebird could not describe: ${sql}`);
       const json = mod.UTF8ToString(resultPtr);
       mod._fb_free_result(resultPtr);
-
       return decodeDescription(json);
     });
   }
 
-  async prepare(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-    sql: string,
-  ): Promise<QueryDescription & { handle?: EngineHandle }> {
+  async prepare(dbHandle: EngineHandle, txHandle: EngineHandle, sql: string): Promise<QueryDescription & { handle?: EngineHandle }> {
     const mod = this.module;
     if (typeof mod._fb_prepare !== 'function') {
       const desc = await this.describe(dbHandle, txHandle, sql);
       const fallbackHandle = this.nextFallbackStmtHandle++;
-      this.preparedStatements.set(fallbackHandle, {
-        dbHandle,
-        sql,
-        native: false,
-      });
+      this.preparedStatements.set(fallbackHandle, { dbHandle, sql, native: false });
       return { ...desc, handle: fallbackHandle };
     }
     const prepareFn = mod._fb_prepare;
     return this.withString(sql, (sqlPtr) => {
       const resultPtr = prepareFn.call(mod, dbHandle, txHandle, sqlPtr);
-      if (resultPtr === 0) {
-        throw engineError(mod, `Firebird could not prepare: ${sql}`);
-      }
+      if (resultPtr === 0) throw engineError(mod, `Firebird could not prepare: ${sql}`);
       const json = mod.UTF8ToString(resultPtr);
       mod._fb_free_result(resultPtr);
       const parsed = JSON.parse(json) as { handle?: number };
       const rawHandle = typeof parsed.handle === 'number' ? parsed.handle : 0;
-      const handle =
-        rawHandle > 0 ? rawHandle : this.nextFallbackStmtHandle++;
-      this.preparedStatements.set(handle, {
-        dbHandle,
-        sql,
-        native: rawHandle > 0,
-      });
-      return {
-        ...decodeDescription(json),
-        handle,
-      };
+      const handle = rawHandle > 0 ? rawHandle : this.nextFallbackStmtHandle++;
+      this.preparedStatements.set(handle, { dbHandle, sql, native: rawHandle > 0 });
+      return { ...decodeDescription(json), handle };
     });
   }
 
@@ -802,10 +744,7 @@ export class DirectTransport implements EngineTransport {
     const entry = this.preparedStatements.get(stmtHandle);
     this.preparedStatements.delete(stmtHandle);
     const mod = this.module;
-    if (
-      (!entry || entry.native) &&
-      typeof mod._fb_stmt_close === 'function'
-    ) {
+    if ((!entry || entry.native) && typeof mod._fb_stmt_close === 'function') {
       mod._fb_stmt_close(stmtHandle);
     }
   }
@@ -825,91 +764,31 @@ export class DirectTransport implements EngineTransport {
     };
   }
 
-  async executeStmt(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-    stmtHandle: EngineHandle,
-    params: QueryParams | Uint8Array = [],
-  ): Promise<number> {
+  executeStmt(dbHandle: EngineHandle, txHandle: EngineHandle, stmtHandle: EngineHandle, params: QueryParams | Uint8Array = []) {
     return runDirectExecuteStmt(this.stmtOpsHost, dbHandle, txHandle, stmtHandle, params);
   }
-
-  async executeBatchStmt(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-    stmtHandle: EngineHandle,
-    rows: QueryParams[] | Uint8Array,
-  ): Promise<number> {
+  executeBatchStmt(dbHandle: EngineHandle, txHandle: EngineHandle, stmtHandle: EngineHandle, rows: QueryParams[] | Uint8Array) {
     return runDirectExecuteBatchStmt(this.stmtOpsHost, dbHandle, txHandle, stmtHandle, rows);
   }
-
-  async queryStmt<T = Row>(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-    stmtHandle: EngineHandle,
-    params: QueryParams | Uint8Array = [],
-    rowMode: RowMode = 'object',
-    binaryBlobs = false,
-  ): Promise<QueryResult<T>> {
-    return runDirectQueryStmt<T>(
-      this.stmtOpsHost,
-      dbHandle,
-      txHandle,
-      stmtHandle,
-      params,
-      rowMode,
-      binaryBlobs,
-    );
+  queryStmt<T = Row>(dbHandle: EngineHandle, txHandle: EngineHandle, stmtHandle: EngineHandle, params: QueryParams | Uint8Array = [], rowMode: RowMode = 'object', binaryBlobs = false) {
+    return runDirectQueryStmt<T>(this.stmtOpsHost, dbHandle, txHandle, stmtHandle, params, rowMode, binaryBlobs);
   }
-
-  async queryStmtBinary(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-    stmtHandle: EngineHandle,
-    params: QueryParams | Uint8Array = [],
-    binaryBlobs = false,
-  ): Promise<BinaryResultPayload> {
-    return runDirectQueryStmtBinary(
-      this.stmtOpsHost,
-      dbHandle,
-      txHandle,
-      stmtHandle,
-      params,
-      binaryBlobs,
-    );
+  queryStmtBinary(dbHandle: EngineHandle, txHandle: EngineHandle, stmtHandle: EngineHandle, params: QueryParams | Uint8Array = [], binaryBlobs = false) {
+    return runDirectQueryStmtBinary(this.stmtOpsHost, dbHandle, txHandle, stmtHandle, params, binaryBlobs);
   }
-
-  async cursorOpenStmt(
-    dbHandle: EngineHandle,
-    txHandle: EngineHandle,
-    stmtHandle: EngineHandle,
-    params: QueryParams | Uint8Array = [],
-  ): Promise<EngineHandle> {
+  cursorOpenStmt(dbHandle: EngineHandle, txHandle: EngineHandle, stmtHandle: EngineHandle, params: QueryParams | Uint8Array = []) {
     return runDirectCursorOpenStmt(this.stmtOpsHost, dbHandle, txHandle, stmtHandle, params);
   }
-
-  async stmtSetTimeout(
-    stmtHandle: EngineHandle,
-    timeoutMs: number,
-  ): Promise<void> {
+  async stmtSetTimeout(stmtHandle: EngineHandle, timeoutMs: number): Promise<void> {
     runDirectStmtSetTimeout(this.module, stmtHandle, timeoutMs);
   }
 
-  async cancelOperation(
-    dbHandle: EngineHandle,
-    option = 3,
-  ): Promise<void> {
+  async cancelOperation(dbHandle: EngineHandle, option = 3): Promise<void> {
     const mod = this.module;
-    if (typeof mod._fb_wasm_cancel_operation === 'function') {
-      const rc = mod._fb_wasm_cancel_operation(dbHandle, option);
-      if (rc !== 0) {
-        throw engineError(mod, 'Firebird cancelOperation failed', rc);
-      }
-    } else if (typeof mod._fb_cancel_operation === 'function') {
-      const rc = mod._fb_cancel_operation(dbHandle, option);
-      if (rc !== 0) {
-        throw engineError(mod, 'Firebird cancelOperation failed', rc);
-      }
+    const fn = mod._fb_wasm_cancel_operation ?? mod._fb_cancel_operation;
+    if (typeof fn === 'function') {
+      const rc = fn.call(mod, dbHandle, option);
+      if (rc !== 0) throw engineError(mod, 'Firebird cancelOperation failed', rc);
     }
   }
 

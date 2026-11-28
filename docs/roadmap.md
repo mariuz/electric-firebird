@@ -2058,6 +2058,35 @@ Next-horizon improvements across **Replication**, **Speed & Performance**, **Int
 
 ---
 
+### M30 — System-Versioned Bitemporal Tables, Append-Only Event Store & CQRS Projections, Auto-GraphQL / JSON:API Zero-Code Gateway, Multi-Database `ATTACH` Federation & Sub-1,000-Line Module Split
+
+- [x] **1. System-Versioned Bitemporal History Tables (`createTemporalTable` & `FOR SYSTEM_TIME AS OF` Rewriter).**
+      Add SQL:2011-style temporal versioning over Firebird tables (`FB_THIST$<TABLE>` + `FB_TEMPORAL_META$` + automatic
+      `AFTER INSERT OR UPDATE OR DELETE` PSQL triggers): point-in-time queries (`queryAsOf(ts)`, `queryBetween(startTs, endTs)`),
+      `rewriteTemporalSql()` (`FOR SYSTEM_TIME AS OF <ts>` / `BETWEEN <a> AND <b>`), row-level revision history (`diffRowHistory(pk)`),
+      selective row restoration (`revertRowAsOf(pk, ts)`), and retention pruning (`pruneHistoryBefore(cutoffTs)`).
+- [x] **2. Append-Only Event Sourcing Store, Snapshots & CQRS Projections (`createEventStore` & CLI `npx firebird-wasm projections`).**
+      Add optimistic-concurrency (`expectedVersion`, `ConcurrencyConflictError`) stream append & reading over `FB_EVENT_STORE$` +
+      `FB_EVENT_SNAPSHOTS$`, schema upcasters (`upcasters`), idempotent checkpointed read-model projectors (`FB_EVENT_PROJECTIONS$`,
+      `runProjections`, `rebuildProjection`, live `autoProject` auto-projection), and CLI `npx firebird-wasm projections <uri>`.
+- [x] **3. Zero-Code Introspected GraphQL & RESTful JSON Gateway (`createAutoApiGateway` & CLI `npx firebird-wasm serve-api`).**
+      Automatically introspect `db.introspect()` tables, primary keys, and foreign-key relations to serve a zero-dependency WinterCG
+      `fetch(Request)` GraphQL (`POST /graphql` supporting nested FK relation batching without $N+1$ queries, `where` filtering,
+      `limit`/`offset` pagination, and `insert`/`update`/`delete` mutations) + REST CRUD (`/rest/<table>`) endpoint with Bearer /
+      JWT `rls` claims and OpenAPI 3.1 schema generation (`GET /openapi.json`), plus CLI `npx firebird-wasm serve-api <uri>`.
+- [x] **4. Multi-Database `ATTACH` Cross-DB SQL Federation & Sharded Scatter-Gather (`createDatabaseFederation` & `createShardedPool`).**
+      Query and join across multiple local/remote `FirebirdBrowser` or `FirebirdLite` instances (`attach('analytics', db)` /
+      `ATTACH 'memory://analytics' AS analytics` -> `SELECT ... FROM orders o JOIN analytics.events e ON ...`), plus deterministic
+      hash / range horizontal sharding (`createShardedPool`) with scatter-gather `SELECT` aggregation (`COUNT`/`SUM`/`MIN`/`MAX`/`AVG`/
+      `ORDER BY`/`FIRST`), shard routing (`shardForKey`/`dbForKey`), and live shard rebalancing (`rebalanceTable`).
+- [x] **5. `<firebird-repl>` Temporal & Event-Store Inspector, Simulator Scenario 24 & Sub-1,000-Line Module Split.**
+      Surface temporal table & CQRS event-projection inspection inside `<firebird-repl>` (`repl.temporalTables()`,
+      `repl.eventProjections()`), add Simulator **Scenario 24** (`temporal-eventstore-graphql-federation`), and decompose all 20
+      remaining source files in the `1,000–1,098` line band so every non-test `.ts` source file across `packages/firebird-wasm/src`
+      sits strictly under 1,000 lines.
+
+---
+
 ## 5. Test coverage added alongside this review
 
 `src/browser/` was excluded from Jest and had no browser tests.  It now has 73

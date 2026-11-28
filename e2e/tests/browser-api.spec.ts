@@ -3984,4 +3984,40 @@ test.describe('FirebirdBrowser', () => {
     expect(result.readBackByte).toBe(0x42);
     expect(result.hasEdgeGateway).toBe(true);
   });
+
+  test('M30: rewriteTemporalSql, fnv1aHash32, ConcurrencyConflictError & M30 exports in browser bundle', async ({
+    page,
+  }) => {
+    const result = await page.evaluate(async () => {
+      const w = window as any;
+      const rewritten = w.FB.rewriteTemporalSql(
+        'SELECT ID, AMOUNT FROM CONTRACTS FOR SYSTEM_TIME AS OF 1700000000000 ORDER BY ID',
+      );
+      const hashA = w.FB.fnv1aHash32('tenant-acme');
+      const hashB = w.FB.fnv1aHash32('tenant-acme');
+      const conflictErr = new w.FB.ConcurrencyConflictError('stream-1', 2, 5);
+
+      return {
+        hasHistorySubquery: rewritten.includes('FB_THIST$CONTRACTS') && rewritten.includes('SYS_START_MS'),
+        deterministicHash: hashA === hashB && typeof hashA === 'number',
+        conflictStream: conflictErr.streamId,
+        conflictActual: conflictErr.actualVersion,
+        hasTemporalFn: typeof w.FB.createTemporalTable === 'function',
+        hasEventStoreFn: typeof w.FB.createEventStore === 'function',
+        hasAutoApiFn: typeof w.FB.createAutoApiGateway === 'function',
+        hasFedFn: typeof w.FB.createDatabaseFederation === 'function',
+        hasShardedFn: typeof w.FB.createShardedPool === 'function',
+      };
+    });
+
+    expect(result.hasHistorySubquery).toBe(true);
+    expect(result.deterministicHash).toBe(true);
+    expect(result.conflictStream).toBe('stream-1');
+    expect(result.conflictActual).toBe(5);
+    expect(result.hasTemporalFn).toBe(true);
+    expect(result.hasEventStoreFn).toBe(true);
+    expect(result.hasAutoApiFn).toBe(true);
+    expect(result.hasFedFn).toBe(true);
+    expect(result.hasShardedFn).toBe(true);
+  });
 });

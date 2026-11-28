@@ -67,6 +67,7 @@ import {
   runCliMigrateOnline,
   runCliWorker,
 } from './cli-m28-commands';
+import { runCliProjections, runCliServeApi } from './cli-m30-commands';
 export {
   startCliReplicationServer,
   type CliReplicationServerHandle,
@@ -136,6 +137,8 @@ Commands:
   migrate-online <uri>           Run zero-downtime Expand/Backfill/Contract online migration (--plan <fileOrJson> [--drop-source])
   advise [uri]                   Inspect query plans & catalog for missing/redundant/FK indexes ([--sql <queries>] [--apply] [--json])
   cdc-sink <uri> --webhook <url> Stream FB_REPL_JOURNAL$ as CloudEvents v1.0 / Arrow IPC ([--secret <k>] [--sink-id <id>] [--json])
+  projections [uri]              Inspect persisted CQRS FB_EVENT_PROJECTIONS$ watermarks & lag [--json]
+  serve-api [uri]                Start zero-code GraphQL (/graphql), REST (/rest/*) & OpenAPI (/openapi.json) gateway [--port <n>] [--openapi] [--sdl]
   bench [uri]                    Benchmark IBatch, row query, columnar, Arrow IPC stream & preparePipeline [--rows <n>]
 
 Global Options:
@@ -946,6 +949,10 @@ export async function runCli(
         return runCliAdvise(tableCtx);
       case 'cdc-sink':
         return runCliCdcSink(tableCtx);
+      case 'projections':
+        return runCliProjections(tableCtx);
+      case 'serve-api':
+        return runCliServeApi(tableCtx);
 
       default: {
         err(`Unknown command "${cmd}". Run "firebird-wasm --help" for usage.\n`);

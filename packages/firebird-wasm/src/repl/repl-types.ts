@@ -27,8 +27,16 @@ import type {
 import type { WorkloadAdvisorReport } from '../workload-advisor';
 import type { JobQueueStats } from '../job-queue';
 import type { TimeSeriesPolicyInfo } from '../timeseries';
+import type { TemporalTableInfo } from '../temporal-table';
+import type { EventProjectionStatus } from '../event-store';
 
-export type { WorkloadAdvisorReport, JobQueueStats, TimeSeriesPolicyInfo };
+export type {
+  WorkloadAdvisorReport,
+  JobQueueStats,
+  TimeSeriesPolicyInfo,
+  TemporalTableInfo,
+  EventProjectionStatus,
+};
 
 /** Persisted 2D Spatial R-Tree index summary (`FB_SPATIAL_INDEX$`) displayed in `<firebird-repl>` (`M29 Item 5`). */
 export interface ReplSpatialIndexSummary {

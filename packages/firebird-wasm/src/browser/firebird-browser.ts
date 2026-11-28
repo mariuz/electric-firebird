@@ -101,64 +101,23 @@ import {
   reopenBrowserDatabaseAfterEngineChange,
 } from './firebird-browser-lifecycle';
 import type {
-  ArrayRow,
-  FieldInfo,
-  QueryResult,
-  QueryDescription,
-  ExplainOptions,
-  DatabaseInfo,
-  SweepResult,
-  PreparedStatement,
-  DataStreamOptions,
-  CopyFromOptions,
-  CopyToOptions,
-  CopyResult,
-  IntrospectOptions,
-  SchemaIntrospection,
-  Migration,
-  MigrateOptions,
-  BlobStreamOptions,
-  BlobHandle,
-  BlobWritableStream,
-  MigrateResult,
-  JsFunctionHandler,
-  JsProcedureHandler,
-  RegisterFunctionOptions,
-  RegisterProcedureOptions,
-  RegisteredRoutine,
-  MonitorStats,
-  PageIoCounters,
-  QueryProfileListener,
-  QueryOptions,
-  QueryStreamOptions,
-  StatementExecutionOptions,
-  Row,
-  QueryParams,
-  TransactionOptions,
+  ArrayRow, FieldInfo, QueryResult, QueryDescription, ExplainOptions, DatabaseInfo,
+  SweepResult, PreparedStatement, DataStreamOptions, CopyFromOptions, CopyToOptions,
+  CopyResult, IntrospectOptions, SchemaIntrospection, Migration, MigrateOptions,
+  BlobStreamOptions, BlobHandle, BlobWritableStream, MigrateResult, JsFunctionHandler,
+  JsProcedureHandler, RegisterFunctionOptions, RegisterProcedureOptions, RegisteredRoutine,
+  MonitorStats, PageIoCounters, QueryProfileListener, QueryOptions, QueryStreamOptions,
+  StatementExecutionOptions, Row, QueryParams, TransactionOptions,
 } from '../types';
 import { FirebirdBrowserTransaction, type ExecResult } from './firebird-browser-tx';
 export { FirebirdBrowserTransaction, type ExecResult } from './firebird-browser-tx';
 import {
-  ephemeralFileName,
-  IDB_PREFIX,
-  MEMORY_PREFIX,
-  OPFS_PREFIX,
-  type ArrayModeOptions,
-  type ArrayStreamOptions,
-  type BranchOptions,
-  type EventSubscription,
-  type FirebirdBrowserOptions,
-  type ListenOptions,
-  type LiveQuery,
-  type LiveQueryOptions,
+  ephemeralFileName, IDB_PREFIX, MEMORY_PREFIX, OPFS_PREFIX,
+  type ArrayModeOptions, type ArrayStreamOptions, type BranchOptions, type EventSubscription,
+  type FirebirdBrowserOptions, type ListenOptions, type LiveQuery, type LiveQueryOptions,
 } from './firebird-browser-types';
 export type {
-  BranchOptions,
-  EventSubscription,
-  FirebirdBrowserOptions,
-  ListenOptions,
-  LiveQuery,
-  LiveQueryOptions,
+  BranchOptions, EventSubscription, FirebirdBrowserOptions, ListenOptions, LiveQuery, LiveQueryOptions,
 } from './firebird-browser-types';
 import {
   createBrowserPreparedStatement,
@@ -825,26 +784,14 @@ export class FirebirdBrowser implements FirebirdDatabase {
     );
   }
 
-  async createBlobStream(
-    options: BlobStreamOptions = {},
-  ): Promise<BlobWritableStream> {
+  createBlobStream(options: BlobStreamOptions = {}): Promise<BlobWritableStream> {
     return createBrowserBlobStream(this.storageHost, options);
   }
 
-  async openBlobStream(
-    handle: BlobHandle,
-    options?: BlobStreamOptions,
-  ): Promise<ReadableStream<Uint8Array>>;
-  async openBlobStream(
-    sql: SqlFragment,
-    options?: BlobStreamOptions,
-  ): Promise<ReadableStream<Uint8Array>>;
-  async openBlobStream(
-    sql: string | SqlFragment,
-    params?: QueryParams | BlobStreamOptions,
-    options?: BlobStreamOptions,
-  ): Promise<ReadableStream<Uint8Array>>;
-  async openBlobStream(
+  openBlobStream(handle: BlobHandle, options?: BlobStreamOptions): Promise<ReadableStream<Uint8Array>>;
+  openBlobStream(sql: SqlFragment, options?: BlobStreamOptions): Promise<ReadableStream<Uint8Array>>;
+  openBlobStream(sql: string | SqlFragment, params?: QueryParams | BlobStreamOptions, options?: BlobStreamOptions): Promise<ReadableStream<Uint8Array>>;
+  openBlobStream(
     sqlOrHandle: string | SqlFragment | BlobHandle,
     paramsOrOptions: QueryParams | BlobStreamOptions = [],
     maybeOptions: BlobStreamOptions = {},
@@ -852,35 +799,22 @@ export class FirebirdBrowser implements FirebirdDatabase {
     return openBrowserBlobStream(this.storageHost, sqlOrHandle, paramsOrOptions, maybeOptions);
   }
 
-  async snapshot(
-    labelOrOptions?: string | SnapshotOptions,
-  ): Promise<DatabaseSnapshot> {
+  snapshot(labelOrOptions?: string | SnapshotOptions): Promise<DatabaseSnapshot> {
     return captureBrowserSnapshot(this.storageHost, labelOrOptions);
   }
-
-  async restoreSnapshot(
-    snapshotOrId: DatabaseSnapshot | string | Uint8Array,
-  ): Promise<void> {
+  restoreSnapshot(snapshotOrId: DatabaseSnapshot | string | Uint8Array): Promise<void> {
     return restoreBrowserSnapshot(this.storageHost, snapshotOrId);
   }
-
-  listSnapshots(): DatabaseSnapshotInfo[] {
-    return this.snapshotStore.listSnapshots();
-  }
-
-  deleteSnapshot(snapshotOrId: DatabaseSnapshot | string): boolean {
-    return this.snapshotStore.deleteSnapshot(snapshotOrId);
-  }
-
-  async exportDiff(
+  listSnapshots(): DatabaseSnapshotInfo[] { return this.snapshotStore.listSnapshots(); }
+  deleteSnapshot(snapshotOrId: DatabaseSnapshot | string): boolean { return this.snapshotStore.deleteSnapshot(snapshotOrId); }
+  exportDiff(
     fromSnapshot?: DatabaseSnapshot | string | Uint8Array | null,
     toSnapshot?: DatabaseSnapshot | string | Uint8Array,
     options?: PageDiffOptions,
   ): Promise<Uint8Array> {
     return exportBrowserDiff(this.storageHost, fromSnapshot, toSnapshot, options);
   }
-
-  async applyDiff(
+  applyDiff(
     diffBytes: Uint8Array,
     baseSnapshot?: DatabaseSnapshot | string | Uint8Array | null,
     options: ApplyPageDiffOptions = {},
@@ -888,10 +822,7 @@ export class FirebirdBrowser implements FirebirdDatabase {
     return applyBrowserDiff(this.storageHost, diffBytes, baseSnapshot, options);
   }
 
-  async branch(
-    branchName?: string,
-    options: BranchOptions = {},
-  ): Promise<FirebirdBrowser> {
+  async branch(branchName?: string, options: BranchOptions = {}): Promise<FirebirdBrowser> {
     const { targetName, mergedOptions } = await prepareBrowserBranchArgs(
       this.fileName,
       this.options,
@@ -907,46 +838,25 @@ export class FirebirdBrowser implements FirebirdDatabase {
     await this.ensureReady();
     return this.engine.readFile(this.dbPath);
   }
-
   dumpDataStream(options: DataStreamOptions = {}): ReadableStream<Uint8Array> {
     return createBrowserDumpDataStream(this.storageHost, options);
   }
-
-  async loadDataStream(
-    stream: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array>,
-    options: DataStreamOptions = {},
-  ): Promise<void> {
+  loadDataStream(stream: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array>, options: DataStreamOptions = {}): Promise<void> {
     return runBrowserLoadDataStream(this.storageHost, stream, options);
   }
-
   async copyFromStream(
     tableName: string,
-    stream:
-      | ReadableStream<Uint8Array | string>
-      | AsyncIterable<Uint8Array | string>,
+    stream: ReadableStream<Uint8Array | string> | AsyncIterable<Uint8Array | string>,
     options: CopyFromOptions = {},
   ): Promise<CopyResult> {
     assertNotAborted(options.signal);
     validateTimeoutMs(options.timeoutMs);
     await this.ensureReady();
-    return this.transaction((tx) =>
-      tx.copyFromStream(tableName, stream, options),
-    );
+    return this.transaction((tx) => tx.copyFromStream(tableName, stream, options));
   }
-
-  copyToStream(
-    sql: SqlFragment,
-    options?: CopyToOptions,
-  ): ReadableStream<Uint8Array>;
-  copyToStream(
-    tableOrQuery: string,
-    options?: CopyToOptions,
-  ): ReadableStream<Uint8Array>;
-  copyToStream(
-    sql: string | SqlFragment,
-    params?: QueryParams,
-    options?: CopyToOptions,
-  ): ReadableStream<Uint8Array>;
+  copyToStream(sql: SqlFragment, options?: CopyToOptions): ReadableStream<Uint8Array>;
+  copyToStream(tableOrQuery: string, options?: CopyToOptions): ReadableStream<Uint8Array>;
+  copyToStream(sql: string | SqlFragment, params?: QueryParams, options?: CopyToOptions): ReadableStream<Uint8Array>;
   copyToStream(
     tableOrQuery: string | SqlFragment,
     paramsOrOptions: QueryParams | CopyToOptions = [],
@@ -956,20 +866,14 @@ export class FirebirdBrowser implements FirebirdDatabase {
   }
 
   async loadIcuLocaleData(data: Uint8Array | ArrayBufferLike): Promise<void> {
-    if (this.closed) {
-      throw new Error('FirebirdBrowser instance has been closed');
-    }
+    if (this.closed) throw new Error('FirebirdBrowser instance has been closed');
     await this.ensureReady();
     await this.applyIcuLocaleData(data);
   }
-
-  private async applyIcuLocaleData(data: Uint8Array | ArrayBufferLike): Promise<void> {
+  private applyIcuLocaleData(data: Uint8Array | ArrayBufferLike): Promise<void> {
     return applyBrowserIcuLocaleData(this.engine, data);
   }
-
-  async persist(): Promise<void> {
-    return this.persistScheduler.persist();
-  }
+  persist(): Promise<void> { return this.persistScheduler.persist(); }
 
   async close(): Promise<void> {
     if (this.closed) return;

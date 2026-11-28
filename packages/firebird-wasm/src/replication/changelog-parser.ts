@@ -12,22 +12,15 @@ import {
   quoteIdent,
 } from './shared';
 
-/**
- * Magic 12-byte signature at the start of every native Firebird binary
- * changelog segment file (`ChangeLog::Header::magic = "FBCHANGELOG\0"`).
- */
+/** Magic 12-byte signature (`"FBCHANGELOG\0"`). */
 export const FB_CHANGELOG_MAGIC = 'FBCHANGELOG\0';
-
 /** Byte size of Firebird's `Replication::ChangeLog::Header` (`48` bytes). */
 export const FB_CHANGELOG_HEADER_BYTES = 48;
-
 /** Byte size of Firebird's `Replication::Block` header (`16` bytes). */
 export const FB_CHANGELOG_BLOCK_HEADER_BYTES = 16;
-
-/** `Replication::Block` flag indicating the start of a replicated transaction (`1`). */
+/** `Replication::Block` start-of-transaction flag (`1`). */
 export const FB_CHANGELOG_BLOCK_BEGIN_TRANS = 1;
-
-/** `Replication::Block` flag indicating the end (commit/rollback) of a replicated transaction (`2`). */
+/** `Replication::Block` end-of-transaction flag (`2`). */
 export const FB_CHANGELOG_BLOCK_END_TRANS = 2;
 
 /**
@@ -962,23 +955,14 @@ function decodeFbChangelogBlockOperationsStrict(
   return ops;
 }
 
-/**
- * Decode all binary `Replication::Block` opcodes inside a single {@link FbChangelogBlock}
- * according to Firebird's `BlockReader` (`src/jrd/replication/Applier.cpp`) (`M17 Item 1`).
- */
+/** Decode all binary `Replication::Block` opcodes inside a single {@link FbChangelogBlock}. */
 export function decodeFbChangelogBlockOperations(
   block: FbChangelogBlock,
 ): DecodedFbChangelogOperation[] {
   return decodeFbChangelogBlockOperationsStrict(block);
 }
 
-/**
- * Decode all binary `Replication::Block` operations across an entire `"FBCHANGELOG\0"`
- * segment (`opStartTransaction`, `opCommitTransaction`, `opRollbackTransaction`,
- * `opStartSavepoint`, `opReleaseSavepoint`, `opRollbackSavepoint`, `opDefineAtom`,
- * `opInsertRecord`, `opUpdateRecord`, `opDeleteRecord`, `opStoreBlob`,
- * `opExecuteSql`, `opSetSequence`, `opExecuteSqlIntl`) (`M17 Item 1`).
- */
+/** Decode all binary `Replication::Block` operations across an entire `"FBCHANGELOG\0"` segment. */
 export function decodeFbChangelogOperations(
   segmentOrBytes: Uint8Array | ParsedFbChangelogSegment,
 ): DecodedFbChangelogOperation[] {

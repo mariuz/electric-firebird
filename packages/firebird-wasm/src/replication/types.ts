@@ -4,6 +4,14 @@
 
 import type { QueryParams, QueryResult, Row } from '../types';
 import type { StandardSchemaV1 } from '../schema-validation';
+import type {
+  CompactJournalOptions,
+  JournalCompactionResult,
+  ReplicationDlqEntry,
+  RowTransformer,
+} from './types-dlq';
+
+export * from './types-dlq';
 
 // ---------------------------------------------------------------------------
 // Constants & Structural Database Contract
@@ -904,135 +912,4 @@ export interface ReplicationSubscription {
   start(): void;
   /** Stop background polling. */
   stop(): Promise<void>;
-}
-
-
-/** A quarantined replication journal entry stored in `FB_REPL_DLQ$`. */
-export interface ReplicationDlqEntry {
-  /** Journal LSN of the quarantined entry. */
-  readonly lsn: number;
-  /** Subscription name that encountered the failure. */
-  readonly subscriptionName: string;
-  /** Original `ReplicationLogEntry` payload. */
-  readonly entry: ReplicationLogEntry;
-  /** Error message explaining why the entry was quarantined. */
-  readonly errorMessage: string;
-  /** Number of retry attempts made so far (`0` on initial failure). */
-  readonly retryCount: number;
-  /** Total apply attempts made so far (`1` on initial failure, `retryCount + 1`). */
-  readonly attempts: number;
-  /** Epoch timestamp (`Date.now()`) when the entry was first quarantined. */
-  readonly quarantinedAt: number;
-  /** Epoch timestamp (`Date.now()`) of the most recent retry attempt, or `null`. */
-  readonly lastRetriedAt: number | null;
-}
-
-/** Options for {@link createReplicationDlq}. */
-export interface ReplicationDlqOptions {
-  /** Default subscription name. @default 'default_sub' */
-  subscriptionName?: string;
-  /** Custom dead-letter queue table name. @default 'FB_REPL_DLQ$' */
-  dlqTable?: string;
-}
-
-/** Dead-Letter Queue manager returned by {@link createReplicationDlq}. */
-export interface ReplicationDlq {
-  /** Record a failed `ReplicationLogEntry` into `FB_REPL_DLQ$`. */
-  recordFailure(
-    entry: ReplicationLogEntry,
-    error: unknown,
-    subscriptionName?: string,
-  ): Promise<ReplicationDlqEntry>;
-  /** Enqueue a failed `ReplicationLogEntry` into `FB_REPL_DLQ$`. */
-  enqueue(input: {
-    subscriptionName?: string;
-    entry: ReplicationLogEntry;
-    errorMessage: string;
-  }): Promise<ReplicationDlqEntry>;
-  /** List all quarantined entries (optionally filtered by `subscriptionName`). */
-  listEntries(subscriptionName?: string): Promise<ReplicationDlqEntry[]>;
-  /** Alias for {@link listEntries}. */
-  list(subscriptionName?: string): Promise<ReplicationDlqEntry[]>;
-  /**
-   * Retry applying quarantined entries through `subscription.applyChanges()`,
-   * removing entries that succeed and incrementing `RETRY_COUNT` on entries that fail.
-   */
-  retryDlq(
-    subscription: ReplicationSubscription,
-    options?: {
-      lsn?: number;
-      transformEntry?: (
-        entry: ReplicationLogEntry,
-      ) => ReplicationLogEntry | Promise<ReplicationLogEntry>;
-    },
-  ): Promise<{ retried: number; succeeded: number; failed: number }>;
-  /** Discard quarantined entry/entries from `FB_REPL_DLQ$`. */
-  discardDlq(lsn?: number, subscriptionName?: string): Promise<number>;
-}
-
-/** Context passed to a {@link RowTransformer} callback. */
-export interface RowTransformContext {
-  /** Upper-case table name. */
-  readonly table: string;
-  /** DML operation (`'INSERT'`, `'UPDATE'`, or `'DELETE'`). */
-  readonly operation: 'INSERT' | 'UPDATE' | 'DELETE';
-  /** Primary key values of the row. */
-  readonly key: Record<string, unknown>;
-  /** Originating node identifier. */
-  readonly origin: string;
-}
-
-/**
- * Pluggable outbound or inbound row transformation callback (`M14 Item 3`).
- * Returning `null` filters/drops the row from the replication stream.
- */
-export type RowTransformer = (
-  row: Record<string, unknown>,
-  ctx: RowTransformContext,
-) => Record<string, unknown> | null | Promise<Record<string, unknown> | null>;
-
-/** Built-in column masking strategy supported by {@link createPiiMaskingTransformer}. */
-export type PiiColumnMaskStrategy =
-  | 'redact'
-  | 'email-mask'
-  | 'card-last4'
-  | 'hash-fnv1a'
-  | 'hash-sha256'
-  | 'null'
-  | 'zero'
-  | ((value: unknown, row: Record<string, unknown>) => unknown | Promise<unknown>);
-
-/** Options for {@link compactJournal}. */
-export interface CompactJournalOptions {
-  /** Filter by publication name (optional; when omitted, compacts each publication independently). */
-  publication?: string;
-  /** Minimum LSN (inclusive) of the compaction window. */
-  fromLsn?: number;
-  /** Maximum LSN (inclusive) of the compaction window. */
-  upToLsn?: number;
-  /**
-   * When `true` (default), an `INSERT` followed by a `DELETE` for the same
-   * `(publication, table, key)` within the compaction window cancels out completely
-   * unless it holds the highest LSN in the journal (in which case a tombstone is kept
-   * if needed to preserve `currentLsn()`).
-   *
-   * @default true
-   */
-  elideTransientInserts?: boolean;
-  /** Custom journal table name. @default 'FB_REPL_JOURNAL$' */
-  journalTable?: string;
-}
-
-/** Result returned by {@link compactJournal}. */
-export interface JournalCompactionResult {
-  /** Number of journal entries scanned in the compaction window. */
-  readonly entriesBefore: number;
-  /** Number of journal entries remaining in the compaction window after coalescing. */
-  readonly entriesAfter: number;
-  /** Number of superseded journal entries removed (`entriesBefore - entriesAfter`). */
-  readonly entriesRemoved: number;
-  /** Number of distinct `(table, key)` row chains that were coalesced. */
-  readonly keysCompacted: number;
-  /** Highest LSN in the journal after compaction. */
-  readonly highestLsn: number;
 }

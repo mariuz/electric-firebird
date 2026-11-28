@@ -671,6 +671,65 @@ test.describe('<firebird-repl>', () => {
     expect(outcome.inspectorText).toContain('Time-Series Policies (FB_TS_POLICIES$)');
   });
 
+  test('M30: inspects System-Versioned Temporal Tables (FB_TEMPORAL_META$) & CQRS Event Projections (FB_EVENT_PROJECTIONS$) in <firebird-repl>', async ({
+    page,
+  }) => {
+    await page.goto('/no-isolation/browser-harness-frameworks-st');
+    await page.waitForFunction(() => Boolean((window as any).FB && (window as any).Frameworks));
+
+    const outcome = await page.evaluate(async () => {
+      const w = window as any;
+      w.Frameworks.FBRepl.defineFirebirdRepl();
+      const repl = document.createElement('firebird-repl') as any;
+      const db = new w.FB.FirebirdBrowser('memory://repl-m30');
+      repl.db = db;
+      document.getElementById('app')!.replaceChildren(repl);
+
+      await repl.run('CREATE TABLE LEDGER (ID INTEGER NOT NULL PRIMARY KEY, BALANCE INTEGER NOT NULL)');
+      await repl.run('INSERT INTO LEDGER VALUES (1, 500)');
+
+      const emptyTemporal = await repl.temporalTables();
+      const emptyProj = await repl.eventProjections();
+
+      const tmp = w.FB.createTemporalTable(db, { table: 'LEDGER', primaryKey: 'ID', initialNowMs: 1000 });
+      await tmp.enable();
+
+      const evStore = w.FB.createEventStore(db);
+      await evStore.appendToStream('acct-1', [{ type: 'Credited', payload: { amount: 50 } }]);
+      evStore.registerProjection({
+        name: 'ledger_summary',
+        handler: async () => {},
+      });
+      await evStore.runProjections();
+      evStore.dispose();
+
+      await repl.schema();
+      const activeTemporal = await repl.temporalTables();
+      const activeProj = await repl.eventProjections();
+      const inspectorText = repl.shadowRoot?.querySelector('.inspector')?.textContent ?? '';
+
+      await db.close();
+      return {
+        emptyTemporalLen: emptyTemporal.length,
+        emptyProjLen: emptyProj.length,
+        activeTemporalTbl: activeTemporal[0]?.tableName ?? '',
+        activeTemporalVersions: activeTemporal[0]?.versionCount ?? 0,
+        activeProjName: activeProj[0]?.name ?? '',
+        activeProjProcessed: activeProj[0]?.processedCount ?? 0,
+        inspectorText,
+      };
+    });
+
+    expect(outcome.emptyTemporalLen).toBe(0);
+    expect(outcome.emptyProjLen).toBe(0);
+    expect(outcome.activeTemporalTbl).toBe('LEDGER');
+    expect(outcome.activeTemporalVersions).toBe(1);
+    expect(outcome.activeProjName).toBe('ledger_summary');
+    expect(outcome.activeProjProcessed).toBe(1);
+    expect(outcome.inspectorText).toContain('System-Versioned Temporal Tables (FB_TEMPORAL_META$)');
+    expect(outcome.inspectorText).toContain('CQRS Event Projections (FB_EVENT_PROJECTIONS$)');
+  });
+
   test('takes a db property set before it was defined, and reports runs', async ({ page }) => {
     await page.goto('/no-isolation/browser-harness-frameworks-st');
     await page.waitForFunction(() => Boolean((window as any).FB && (window as any).Frameworks));

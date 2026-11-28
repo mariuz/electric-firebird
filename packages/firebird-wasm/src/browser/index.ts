@@ -927,63 +927,10 @@ export type {
   PersistentVectorIndexSearchOptions,
   PersistentVectorIndex,
 } from '../vector';
-export {
-  createFtsIndex,
-  hybridSearch,
-  reciprocalRankFusion,
-} from '../fts';
-export type {
-  CreateFtsIndexOptions,
-  PersistentFtsSearchOptions,
-  PersistentFtsIndex,
-  HybridSearchOptions,
-  HybridSearchRow,
-} from '../fts';
-export {
-  DestructiveSchemaSyncError,
-  introspectSqlScript,
-  syncDatabaseSchema,
-} from '../schema-sync';
-export type {
-  DeclarativeSchemaInput,
-  SchemaSyncTarget,
-  SyncDatabaseSchemaOptions,
-  SchemaSyncResult,
-} from '../schema-sync';
-export {
-  createPresenceRoom,
-  createPresenceHub,
-} from '../replication/presence';
-export type {
-  PresenceCursor,
-  PresencePeerState,
-  PresenceRoomSnapshot,
-  PresenceHttpSseTransportOptions,
-  PresenceRoomOptions,
-  PresenceWireFrame,
-  PresenceRoom,
-  PresenceHubUpsertInput,
-  PresenceHub,
-} from '../replication/presence';
-export {
-  DEFAULT_AUDIT_LOG_TABLE,
-  GENESIS_AUDIT_HASH,
-  canonicalAuditJson,
-  computeAuditEntryHash,
-  computeAuditMerkleRoot,
-  verifyAuditChain,
-  createAuditLog,
-} from '../audit-log';
-export type {
-  AuditSignAlgorithm,
-  AuditDatabaseExecutor,
-  AuditDiffPayload,
-  AuditLogEntry,
-  RecordAuditInput,
-  AuditChainVerificationResult,
-  AuditLogOptions,
-  AuditLogHandle,
-} from '../audit-log';
+export * from '../fts';
+export * from '../schema-sync';
+export * from '../replication/presence';
+export * from '../audit-log';
 export * from '../rag-cache';
 export * from '../data-seeder';
 export * from '../mcp-server';
@@ -998,3 +945,7 @@ export * from '../timeseries';
 export * from '../spatial';
 export * from '../cdc-sink';
 export * from '../edge-gateway';
+export * from '../temporal-table';
+export * from '../event-store';
+export * from '../auto-api-gateway';
+export * from '../federation';
